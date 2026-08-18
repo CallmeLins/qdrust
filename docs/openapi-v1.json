@@ -1,0 +1,306 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "qdrust API",
+    "version": "0.1.0"
+  },
+  "servers": [{ "url": "/" }],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "responses": { "200": { "description": "Process is alive" } }
+      }
+    },
+    "/ready": {
+      "get": {
+        "operationId": "ready",
+        "responses": {
+          "200": { "description": "Database is ready" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/v1/auth/bootstrap": {
+      "post": { "operationId": "bootstrap", "requestBody": { "$ref": "#/components/requestBodies/AuthCredentials" }, "responses": { "200": { "$ref": "#/components/responses/AuthSuccess" }, "409": { "$ref": "#/components/responses/Conflict" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/auth/login": {
+      "post": { "operationId": "login", "requestBody": { "$ref": "#/components/requestBodies/AuthCredentials" }, "responses": { "200": { "$ref": "#/components/responses/AuthSuccess" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "429": { "$ref": "#/components/responses/RateLimited" } } }
+    },
+    "/api/v1/auth/session": {
+      "get": { "operationId": "getCurrentSession", "responses": { "200": { "$ref": "#/components/responses/AuthSuccess" }, "401": { "$ref": "#/components/responses/Unauthorized" } } }
+    },
+    "/api/v1/auth/logout": {
+      "post": { "operationId": "logout", "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }], "responses": { "204": { "description": "Session revoked" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
+    },
+    "/api/v1/auth/password": {
+      "post": { "operationId": "changePassword", "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }], "requestBody": { "$ref": "#/components/requestBodies/ChangePassword" }, "responses": { "204": { "description": "Password changed and sessions revoked" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/tasks": {
+      "get": {
+        "operationId": "listTasks",
+        "responses": { "200": { "description": "Task list" } }
+      },
+      "post": {
+        "operationId": "createTask",
+        "requestBody": { "$ref": "#/components/requestBodies/CreateTask" },
+        "responses": {
+          "201": { "description": "Task created" },
+          "422": { "$ref": "#/components/responses/ValidationError" }
+        }
+      }
+    },
+    "/api/v1/tasks/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "getTask", "responses": { "200": { "description": "Task" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "put": { "operationId": "updateTask", "requestBody": { "$ref": "#/components/requestBodies/UpdateTask" }, "responses": { "200": { "description": "Task updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } },
+      "delete": { "operationId": "deleteTask", "responses": { "204": { "description": "Task deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/tasks/{id}/runs": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "listTaskRuns", "responses": { "200": { "description": "Run list" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/tasks/{id}/run": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": { "operationId": "runTask", "responses": { "202": { "description": "Run queued" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
+    },
+    "/api/v1/runs/{id}/steps": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "listRunSteps", "responses": { "200": { "description": "Run step list" }, "404": { "$ref": "#/components/responses/NotFound" }, "401": { "$ref": "#/components/responses/Unauthorized" } } }
+    },
+    "/api/v1/runs/{id}/cancel": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": { "operationId": "cancelRun", "responses": { "202": { "description": "Cancellation requested" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
+    },
+    "/api/v1/notes": {
+      "get": { "operationId": "listNotes", "responses": { "200": { "description": "Note list" } } },
+      "post": { "operationId": "createNote", "requestBody": { "$ref": "#/components/requestBodies/CreateNote" }, "responses": { "201": { "description": "Note created" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/notes/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "getNote", "responses": { "200": { "description": "Note" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "put": { "operationId": "updateNote", "requestBody": { "$ref": "#/components/requestBodies/UpdateNote" }, "responses": { "200": { "description": "Note updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } },
+      "delete": { "operationId": "deleteNote", "responses": { "204": { "description": "Note deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/notification-channels": {
+      "get": { "operationId": "listNotificationChannels", "responses": { "200": { "description": "Notification channel list" } } },
+      "post": { "operationId": "createNotificationChannel", "requestBody": { "$ref": "#/components/requestBodies/CreateNotificationChannel" }, "responses": { "201": { "description": "Notification channel created" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/notification-channels/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "getNotificationChannel", "responses": { "200": { "description": "Notification channel" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "put": { "operationId": "updateNotificationChannel", "requestBody": { "$ref": "#/components/requestBodies/UpdateNotificationChannel" }, "responses": { "200": { "description": "Notification channel updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } },
+      "delete": { "operationId": "deleteNotificationChannel", "responses": { "204": { "description": "Notification channel deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/tasks/{id}/notification-actions": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "listNotificationActions", "responses": { "200": { "description": "Notification action list" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "post": { "operationId": "createNotificationAction", "requestBody": { "$ref": "#/components/requestBodies/CreateNotificationAction" }, "responses": { "201": { "description": "Notification action created" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/notification-actions/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "delete": { "operationId": "deleteNotificationAction", "responses": { "204": { "description": "Notification action deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/plugins": {
+      "get": { "operationId": "listPlugins", "responses": { "200": { "description": "Plugin list" } } },
+      "post": { "operationId": "createPlugin", "requestBody": { "$ref": "#/components/requestBodies/CreatePlugin" }, "responses": { "201": { "description": "Plugin created" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/plugins/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "getPlugin", "responses": { "200": { "description": "Plugin" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "put": { "operationId": "updatePlugin", "requestBody": { "$ref": "#/components/requestBodies/UpdatePlugin" }, "responses": { "200": { "description": "Plugin updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } },
+      "delete": { "operationId": "deletePlugin", "responses": { "204": { "description": "Plugin deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/plugins/{id}/invoke": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": { "operationId": "invokePlugin", "requestBody": { "$ref": "#/components/requestBodies/InvokePlugin" }, "responses": { "200": { "description": "Plugin response" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/public-templates": {
+      "get": { "operationId": "listPublicTemplates", "responses": { "200": { "description": "Public template list" } } }
+    },
+    "/api/v1/templates/{id}/publish": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": { "operationId": "publishTemplate", "responses": { "204": { "description": "Template published" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "delete": { "operationId": "unpublishTemplate", "responses": { "204": { "description": "Template unpublished" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/templates/{id}/qd-har": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "put": { "operationId": "updateQdHar", "requestBody": { "$ref": "#/components/requestBodies/UpdateQdHar" }, "responses": { "200": { "description": "QD HAR template updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/public-templates/{id}/copy": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": { "operationId": "copyPublicTemplate", "responses": { "201": { "description": "Template copied" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    },
+    "/api/v1/templates": {
+      "get": { "operationId": "listTemplates", "responses": { "200": { "description": "Template list" } } },
+      "post": { "operationId": "createTemplate", "requestBody": { "$ref": "#/components/requestBodies/CreateTemplate" }, "responses": { "201": { "description": "Template created" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/templates/import-qd-har": {
+      "post": { "operationId": "importQdHar", "requestBody": { "$ref": "#/components/requestBodies/ImportQdHar" }, "responses": { "201": { "description": "QD HAR imported" }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/templates/validate-qd-har": {
+      "post": { "operationId": "validateQdHar", "requestBody": { "$ref": "#/components/requestBodies/ValidateQdHar" }, "responses": { "200": { "description": "QD HAR validation result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QdHarValidation" } } } }, "422": { "$ref": "#/components/responses/ValidationError" } } }
+    },
+    "/api/v1/templates/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": { "operationId": "getTemplate", "responses": { "200": { "description": "Template" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+      "put": { "operationId": "updateTemplate", "requestBody": { "$ref": "#/components/requestBodies/UpdateTemplate" }, "responses": { "200": { "description": "Template updated" }, "404": { "$ref": "#/components/responses/NotFound" }, "422": { "$ref": "#/components/responses/ValidationError" } } },
+      "delete": { "operationId": "deleteTemplate", "responses": { "204": { "description": "Template deleted" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Id": { "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } },
+      "CsrfToken": { "name": "X-CSRF-Token", "in": "header", "required": true, "schema": { "type": "string" } }
+    },
+    "requestBodies": {
+      "CreateTask": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTask" } } } },
+      "UpdateTask": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTask" } } } },
+      "CreateNote": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateNote" } } } },
+      "UpdateNote": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateNote" } } } },
+      "CreateNotificationChannel": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateNotificationChannel" } } } },
+      "UpdateNotificationChannel": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateNotificationChannel" } } } },
+      "CreateNotificationAction": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateNotificationAction" } } } },
+      "CreatePlugin": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreatePlugin" } } } },
+      "UpdatePlugin": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdatePlugin" } } } },
+      "InvokePlugin": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InvokePlugin" } } } },
+      "UpdateQdHar": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImportQdHar" } } } },
+      "CreateTemplate": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTemplate" } } } },
+      "UpdateTemplate": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTemplate" } } } },
+      "ImportQdHar": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImportQdHar" } } } },
+      "ValidateQdHar": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidateQdHar" } } } },
+      "AuthCredentials": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthCredentials" } } } }
+      ,"ChangePassword": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChangePassword" } } } }
+    },
+    "schemas": {
+      "AuthCredentials": {
+        "type": "object", "required": ["username", "password"],
+        "properties": { "username": { "type": "string", "minLength": 3, "maxLength": 64 }, "password": { "type": "string", "minLength": 12, "maxLength": 1024 } }
+      },
+      "ChangePassword": {
+        "type": "object", "required": ["current_password", "new_password"],
+        "properties": { "current_password": { "type": "string" }, "new_password": { "type": "string", "minLength": 12, "maxLength": 1024 } }
+      },
+      "User": {
+        "type": "object", "required": ["id", "username", "role", "disabled", "created_at", "updated_at"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" }, "username": { "type": "string" },
+          "role": { "type": "string", "enum": ["admin", "user"] }, "disabled": { "type": "boolean" },
+          "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" }
+        }
+      },
+      "AuthResponse": {
+        "type": "object", "required": ["user", "expires_at"],
+        "properties": { "user": { "$ref": "#/components/schemas/User" }, "expires_at": { "type": "integer", "format": "int64" } }
+      },
+      "CreateTask": {
+        "type": "object",
+        "required": ["name", "cron", "url"],
+        "properties": {
+          "name": { "type": "string" },
+          "cron": { "type": "string" },
+          "method": { "type": ["string", "null"], "default": "GET" },
+          "url": { "type": "string", "format": "uri" },
+          "headers": { "type": "object", "additionalProperties": true },
+          "body": { "type": ["string", "null"] },
+          "disabled": { "type": "boolean", "default": false },
+          "template_id": { "type": ["integer", "null"], "format": "int64" }
+        }
+      },
+      "UpdateTask": {
+        "type": "object",
+        "properties": {
+          "name": { "type": ["string", "null"] }, "cron": { "type": ["string", "null"] },
+          "method": { "type": ["string", "null"] }, "url": { "type": ["string", "null"], "format": "uri" },
+          "headers": { "type": ["object", "null"], "additionalProperties": true },
+          "body": { "type": ["string", "null"] }, "disabled": { "type": ["boolean", "null"] },
+          "template_id": { "type": ["integer", "null"], "format": "int64" }
+        }
+      },
+      "Task": {
+        "allOf": [
+          { "$ref": "#/components/schemas/CreateTask" },
+          { "type": "object", "required": ["id", "method", "headers", "disabled", "created_at", "updated_at", "last_run_at", "last_status", "last_error"], "properties": {
+            "id": { "type": "integer", "format": "int64" }, "method": { "type": "string" },
+            "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" },
+            "last_run_at": { "type": ["integer", "null"], "format": "int64" }, "last_status": { "type": ["integer", "null"] },
+            "last_error": { "type": ["string", "null"] }
+          } }
+        ]
+      },
+      "Run": {
+        "type": "object", "required": ["id", "task_id", "status", "http_status", "error", "started_at", "finished_at", "created_at", "lease_owner", "lease_expires_at", "attempt", "cancel_requested"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" }, "task_id": { "type": "integer", "format": "int64" }, "status": { "type": "string" },
+          "http_status": { "type": ["integer", "null"] }, "error": { "type": ["string", "null"] },
+          "started_at": { "type": ["integer", "null"], "format": "int64" }, "finished_at": { "type": ["integer", "null"], "format": "int64" },
+          "created_at": { "type": "integer", "format": "int64" }, "lease_owner": { "type": ["string", "null"] }, "lease_expires_at": { "type": ["integer", "null"], "format": "int64" }, "attempt": { "type": "integer", "format": "int64" }, "cancel_requested": { "type": "boolean" }
+        }
+      },
+      "Note": { "type": "object", "required": ["id", "title", "content", "created_at", "updated_at"], "properties": { "id": { "type": "integer", "format": "int64" }, "title": { "type": "string" }, "content": { "type": "string" }, "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" } } },
+      "CreateNote": { "type": "object", "required": ["title"], "properties": { "title": { "type": "string" }, "content": { "type": "string", "default": "" } } },
+      "UpdateNote": { "type": "object", "properties": { "title": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] } } },
+      "NotificationChannel": { "type": "object", "required": ["id", "name", "kind", "config", "enabled", "created_at", "updated_at"], "properties": { "id": { "type": "integer", "format": "int64" }, "name": { "type": "string" }, "kind": { "type": "string", "enum": ["webhook", "email"] }, "config": { "type": "object", "additionalProperties": true }, "enabled": { "type": "boolean" }, "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" } } },
+      "CreateNotificationChannel": { "type": "object", "required": ["name", "kind", "config"], "properties": { "name": { "type": "string" }, "kind": { "type": "string", "enum": ["webhook", "email"] }, "config": { "type": "object", "additionalProperties": true }, "enabled": { "type": "boolean", "default": true } } },
+      "UpdateNotificationChannel": { "type": "object", "properties": { "name": { "type": ["string", "null"] }, "config": { "type": ["object", "null"], "additionalProperties": true }, "enabled": { "type": ["boolean", "null"] } } },
+      "NotificationAction": { "type": "object", "required": ["id", "task_id", "channel_id", "event", "created_at"], "properties": { "id": { "type": "integer", "format": "int64" }, "task_id": { "type": "integer", "format": "int64" }, "channel_id": { "type": "integer", "format": "int64" }, "event": { "type": "string", "enum": ["success", "failure", "always"] }, "created_at": { "type": "integer", "format": "int64" } } },
+      "CreateNotificationAction": { "type": "object", "required": ["channel_id", "event"], "properties": { "channel_id": { "type": "integer", "format": "int64" }, "event": { "type": "string", "enum": ["success", "failure", "always"] } } },
+      "Plugin": { "type": "object", "required": ["id", "name", "command", "config", "enabled", "created_at", "updated_at"], "properties": { "id": { "type": "integer", "format": "int64" }, "name": { "type": "string" }, "command": { "type": "string" }, "config": { "type": "object", "additionalProperties": true }, "enabled": { "type": "boolean" }, "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" } } },
+      "CreatePlugin": { "type": "object", "required": ["name", "command"], "properties": { "name": { "type": "string" }, "command": { "type": "string" }, "config": { "type": "object", "additionalProperties": true }, "enabled": { "type": "boolean", "default": true } } },
+      "UpdatePlugin": { "type": "object", "properties": { "name": { "type": ["string", "null"] }, "command": { "type": ["string", "null"] }, "config": { "type": ["object", "null"], "additionalProperties": true }, "enabled": { "type": ["boolean", "null"] } } },
+      "InvokePlugin": { "type": "object", "required": ["action"], "properties": { "action": { "type": "string" }, "query": { "type": "object", "additionalProperties": { "type": "string" } } } },
+      "CreateTemplate": {
+        "type": "object", "required": ["name", "definition"],
+        "properties": { "name": { "type": "string" }, "description": { "type": ["string", "null"] }, "definition": { "type": "object", "additionalProperties": true } }
+      },
+      "UpdateTemplate": {
+        "type": "object", "properties": { "name": { "type": ["string", "null"] }, "description": { "type": ["string", "null"] }, "definition": { "type": ["object", "null"], "additionalProperties": true } }
+      },
+      "ImportQdHar": {
+        "type": "object", "required": ["name", "har"],
+        "properties": { "name": { "type": "string" }, "description": { "type": ["string", "null"] }, "har": { "type": "object", "additionalProperties": true } }
+      },
+      "ValidateQdHar": {
+        "type": "object", "required": ["har"],
+        "properties": { "har": { "type": "object", "additionalProperties": true } }
+      },
+      "QdHarValidation": {
+        "type": "object", "required": ["valid", "entries", "enabled", "requests", "controls", "extract_variables"],
+        "properties": {
+          "valid": { "type": "boolean" }, "entries": { "type": "integer", "minimum": 1 },
+          "enabled": { "type": "integer", "minimum": 0 }, "requests": { "type": "integer", "minimum": 0 },
+          "controls": { "type": "integer", "minimum": 0 }, "extract_variables": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "Template": {
+        "type": "object", "required": ["id", "name", "description", "schema_version", "source_format", "created_at", "updated_at"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" }, "name": { "type": "string" }, "description": { "type": ["string", "null"] },
+          "schema_version": { "type": "integer" }, "source_format": { "type": "string", "enum": ["native_v1", "qd_har"] },
+          "definition": { "type": "object", "additionalProperties": true }, "qd_har": { "type": "object", "additionalProperties": true },
+          "created_at": { "type": "integer", "format": "int64" }, "updated_at": { "type": "integer", "format": "int64" }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": ["code", "message", "field_errors", "request_id"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "field_errors": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" } } },
+          "request_id": { "type": "string" }
+        }
+      }
+    },
+    "responses": {
+      "AuthSuccess": { "description": "Authenticated session", "headers": { "Set-Cookie": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthResponse" } } } },
+      "Unauthorized": { "description": "Authentication required or credentials invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "Forbidden": { "description": "CSRF validation or authorization failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "Conflict": { "description": "Resource state conflict", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "RateLimited": { "description": "Too many login attempts", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "NotFound": { "description": "Resource not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "ValidationError": { "description": "Request validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+      "InternalError": { "description": "Internal error", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
+    }
+  }
+}

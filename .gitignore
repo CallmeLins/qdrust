@@ -1,0 +1,36 @@
+# Rust
+/target/
+*.pdb
+
+# Runtime data and local databases
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Frontend
+/webui/node_modules/
+/webui/dist/
+/.npm-cache/
+coverage/
+
+# Python compatibility tooling
+/.venv-py311/
+/.uv-cache/
+/.uv-python/
+__pycache__/
+*.py[cod]
+
+# Local configuration and diagnostics
+.env
+.env.*
+!.env.example
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

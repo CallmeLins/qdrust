@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/qdrust-core",
+    "crates/qdrust-cli",
+    "crates/qdrust-server",
+]
+default-members = ["crates/qdrust-server"]
+resolver = "3"

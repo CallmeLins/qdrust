@@ -1,0 +1,11 @@
+.git
+.npm-cache
+.uv-cache
+.uv-python
+.venv-py311
+data
+target
+webui/dist
+webui/node_modules
+*.log
+.env

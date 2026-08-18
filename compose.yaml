@@ -1,0 +1,22 @@
+services:
+  qdrust:
+    build:
+      context: .
+    image: qdrust:local
+    ports:
+      - "8923:8923"
+    environment:
+      DATABASE_URL: sqlite:///data/qdrust.db
+      RUST_LOG: qdrust_server=info,tower_http=info
+    volumes:
+      - qdrust-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8923/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  qdrust-data:
