@@ -2,9 +2,10 @@
 name = "qdrust-cli"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"
-qdrust-core = { path = "../qdrust-core" }
+qdrust-core = { path = "../qdrust-core", version = "0.1.0" }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

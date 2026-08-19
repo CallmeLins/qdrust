@@ -71,7 +71,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:8923/
           docker logs qdrust-ci
       - name: Scan container image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: qdrust:ci
           format: table
