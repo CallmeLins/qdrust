@@ -347,6 +347,228 @@ impl Default for QdExpressionEngine {
             Ok::<_, Error>(if result.ends_with('.') { result } else { format!("{}.", result) })
         });
 
+        // String manipulation filters
+        environment.add_filter("upper", |value: String| {
+            Ok::<_, Error>(value.to_uppercase())
+        });
+
+        environment.add_filter("lower", |value: String| {
+            Ok::<_, Error>(value.to_lowercase())
+        });
+
+        environment.add_filter("capitalize", |value: String| {
+            let mut chars = value.chars();
+            match chars.next() {
+                None => Ok::<_, Error>(String::new()),
+                Some(first) => Ok(first.to_uppercase().chain(chars.as_str().to_lowercase().chars()).collect()),
+            }
+        });
+
+        environment.add_filter("title", |value: String| {
+            let result = value.split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().chain(chars).collect(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok::<_, Error>(result)
+        });
+
+        environment.add_filter("trim", |value: String| {
+            Ok::<_, Error>(value.trim().to_string())
+        });
+
+        environment.add_filter("strip", |value: String| {
+            Ok::<_, Error>(value.trim().to_string())
+        });
+
+        environment.add_filter("replace", |value: String, old: String, new: String| {
+            Ok::<_, Error>(value.replace(&old, &new))
+        });
+
+        environment.add_filter("split", |value: String, sep: Option<String>| {
+            let separator = sep.as_deref().unwrap_or(" ");
+            let parts: Vec<JinjaValue> = value.split(separator)
+                .map(|s| JinjaValue::from(s))
+                .collect();
+            Ok::<_, Error>(JinjaValue::from_iter(parts))
+        });
+
+        environment.add_filter("join", |value: JinjaValue, sep: Option<String>| {
+            let separator = sep.as_deref().unwrap_or("");
+            if let Ok(iter) = value.try_iter() {
+                let parts: Vec<String> = iter.map(|v| v.to_string()).collect();
+                Ok::<_, Error>(parts.join(separator))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "join requires an iterable"))
+            }
+        });
+
+        // Collection filters
+        environment.add_filter("first", |value: JinjaValue| {
+            if let Ok(mut iter) = value.try_iter() {
+                iter.next()
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "first requires an iterable"))
+            }
+        });
+
+        environment.add_filter("last", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                let items: Vec<_> = iter.collect();
+                items.last()
+                    .cloned()
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "last requires an iterable"))
+            }
+        });
+
+        environment.add_filter("reverse", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                let mut items: Vec<_> = iter.collect();
+                items.reverse();
+                Ok::<_, Error>(JinjaValue::from_iter(items))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "reverse requires an iterable"))
+            }
+        });
+
+        environment.add_filter("sort", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                let mut items: Vec<_> = iter.map(|v| v.to_string()).collect();
+                items.sort();
+                Ok::<_, Error>(JinjaValue::from_iter(items))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "sort requires an iterable"))
+            }
+        });
+
+        environment.add_filter("unique", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                let mut seen = std::collections::HashSet::new();
+                let items: Vec<JinjaValue> = iter
+                    .filter(|v| seen.insert(v.to_string()))
+                    .collect();
+                Ok::<_, Error>(JinjaValue::from_iter(items))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "unique requires an iterable"))
+            }
+        });
+
+        environment.add_filter("slice", |value: JinjaValue, start: Option<i64>, end: Option<i64>| {
+            if let Ok(iter) = value.try_iter() {
+                let items: Vec<_> = iter.collect();
+                let len = items.len() as i64;
+                let start_idx = start.unwrap_or(0).max(0) as usize;
+                let end_idx = end.map(|e| if e < 0 { (len + e).max(0) } else { e }).unwrap_or(len) as usize;
+                let end_idx = end_idx.min(items.len());
+
+                if start_idx <= end_idx {
+                    Ok::<_, Error>(JinjaValue::from_iter(items[start_idx..end_idx].iter().cloned()))
+                } else {
+                    Ok(JinjaValue::from_iter(Vec::<JinjaValue>::new()))
+                }
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "slice requires an iterable"))
+            }
+        });
+
+        // JSON filters
+        environment.add_filter("tojson", |value: JinjaValue| {
+            serde_json::to_string(&value)
+                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson failed: {e}")))
+        });
+
+        environment.add_filter("fromjson", |value: String| {
+            serde_json::from_str::<serde_json::Value>(&value)
+                .map(|v| JinjaValue::from_serialize(&v))
+                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("fromjson failed: {e}")))
+        });
+
+        // Utility filters
+        environment.add_filter("default", |value: JinjaValue, default_value: JinjaValue| {
+            if value.is_undefined() || value.is_none() {
+                Ok::<_, Error>(default_value)
+            } else {
+                Ok(value)
+            }
+        });
+
+        environment.add_filter("d", |value: JinjaValue, default_value: JinjaValue| {
+            if value.is_undefined() || value.is_none() {
+                Ok::<_, Error>(default_value)
+            } else {
+                Ok(value)
+            }
+        });
+
+        environment.add_filter("abs", |value: JinjaValue| {
+            let num = parse_f64(&value)?;
+            Ok::<_, Error>(num.abs())
+        });
+
+        environment.add_filter("round", |value: JinjaValue, precision: Option<i32>| {
+            let num = parse_f64(&value)?;
+            let prec = precision.unwrap_or(0);
+            if prec == 0 {
+                Ok::<_, Error>(num.round())
+            } else {
+                let multiplier = 10f64.powi(prec);
+                Ok((num * multiplier).round() / multiplier)
+            }
+        });
+
+        environment.add_filter("min", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                iter.map(|v| parse_f64(&v))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "min requires an iterable"))
+            }
+        });
+
+        environment.add_filter("max", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                iter.map(|v| parse_f64(&v))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "max requires an iterable"))
+            }
+        });
+
+        environment.add_filter("sum", |value: JinjaValue| {
+            if let Ok(iter) = value.try_iter() {
+                let sum: f64 = iter.map(|v| parse_f64(&v))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .sum();
+                Ok::<_, Error>(sum)
+            } else {
+                Err(Error::new(ErrorKind::InvalidOperation, "sum requires an iterable"))
+            }
+        });
+
+        // String test filters
+        environment.add_filter("startswith", |value: String, prefix: String| {
+            Ok::<_, Error>(value.starts_with(&prefix))
+        });
+
+        environment.add_filter("endswith", |value: String, suffix: String| {
+            Ok::<_, Error>(value.ends_with(&suffix))
+        });
+
         Self { environment }
     }
 }
