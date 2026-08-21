@@ -3,8 +3,9 @@ use std::{path::Path, str::FromStr, time::Duration};
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
 use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    MySql, MySqlPool, Row, Sqlite, SqlitePool,
+    mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 
 use crate::auth::{new_token, token_hash};
@@ -18,45 +19,87 @@ use crate::model::{
 };
 use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
 
-#[derive(Clone)]
-pub struct Store {
-    pool: SqlitePool,
+static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations-mysql");
+
+fn sqlite_options(url: &str) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal))
 }
 
-impl Store {
-    pub async fn connect(url: &str, min_connections: u32, max_connections: u32) -> Result<Self> {
-        Self::connect_with_timeouts(
-            url,
-            min_connections,
-            max_connections,
-            Duration::from_secs(30),
-            Duration::from_secs(600),
-        )
-        .await
-    }
+fn mysql_options(url: &str) -> Result<MySqlConnectOptions> {
+    Ok(MySqlConnectOptions::from_str(url)?)
+}
 
-    pub async fn connect_with_timeouts(
-        url: &str,
-        min_connections: u32,
-        max_connections: u32,
-        acquire_timeout: Duration,
-        idle_timeout: Duration,
-    ) -> Result<Self> {
-        ensure_sqlite_parent(url)?;
-        let options = SqliteConnectOptions::from_str(url)?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal);
-        let pool = SqlitePoolOptions::new()
-            .min_connections(min_connections)
-            .max_connections(max_connections)
-            .acquire_timeout(acquire_timeout)
-            .idle_timeout(idle_timeout)
-            .connect_with(options)
-            .await?;
-        sqlx::migrate!("../../migrations").run(&pool).await?;
-        Ok(Self { pool })
-    }
+fn no_parent_check(_url: &str) -> Result<()> {
+    Ok(())
+}
+
+fn sqlite_username_cmp() -> &'static str {
+    "username = ? COLLATE NOCASE"
+}
+
+fn mysql_username_cmp() -> &'static str {
+    "username = ?"
+}
+
+macro_rules! define_store {
+    ($module:ident, $db:ty, $pool:ty, $pool_options:ty, $options_builder:path, $migrator:expr,
+     $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $parent_check:path) => {
+        #[allow(clippy::all)]
+        pub mod $module {
+            use super::*;
+
+            #[derive(Clone)]
+            pub struct Store {
+                pub(crate) pool: $pool,
+            }
+
+            impl Store {
+                pub async fn connect(
+                    url: &str,
+                    min_connections: u32,
+                    max_connections: u32,
+                ) -> Result<Self> {
+                    Self::connect_with_timeouts(
+                        url,
+                        min_connections,
+                        max_connections,
+                        Duration::from_secs(30),
+                        Duration::from_secs(600),
+                    )
+                    .await
+                }
+
+                pub async fn connect_with_timeouts(
+                    url: &str,
+                    min_connections: u32,
+                    max_connections: u32,
+                    acquire_timeout: Duration,
+                    idle_timeout: Duration,
+                ) -> Result<Self> {
+                    $parent_check(url)?;
+                    let options = $options_builder(url)?;
+                    let pool = <$pool_options>::new()
+                        .min_connections(min_connections)
+                        .max_connections(max_connections)
+                        .acquire_timeout(acquire_timeout)
+                        .idle_timeout(idle_timeout)
+                        .connect_with(options)
+                        .await?;
+                    let store = Self { pool };
+                    $migrator.run(&store.pool).await?;
+                    Ok(store)
+                }
+
+                async fn last_insert_id(
+                    &self,
+                    conn: &mut <$db as sqlx::Database>::Connection,
+                ) -> Result<i64> {
+                    Ok(sqlx::query_scalar($last_id_sql).fetch_one(conn).await?)
+                }
 
     pub async fn ready(&self) -> Result<()> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
@@ -76,7 +119,8 @@ impl Store {
         );
         ensure!(matches!(role, "admin" | "user"), "invalid user role");
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO users(username, password_hash, role, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -85,9 +129,11 @@ impl Store {
         .bind(role)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get_user(result.last_insert_rowid())
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_user(id)
             .await?
             .context("created user disappeared")
     }
@@ -111,7 +157,7 @@ impl Store {
             return Ok(None);
         }
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        sqlx::query(
             "INSERT INTO users(username,password_hash,role,created_at,updated_at)
              VALUES (?,?,'admin',?,?)",
         )
@@ -121,7 +167,7 @@ impl Store {
         .bind(now)
         .execute(&mut *transaction)
         .await?;
-        let id = result.last_insert_rowid();
+        let id = self.last_insert_id(&mut *transaction).await?;
         transaction.commit().await?;
         self.get_user(id).await
     }
@@ -135,10 +181,10 @@ impl Store {
     }
 
     pub async fn credentials_by_username(&self, username: &str) -> Result<Option<UserCredentials>> {
-        let row = sqlx::query(
-            "SELECT id,username,password_hash,role,disabled,session_version,created_at,updated_at
-             FROM users WHERE username = ? COLLATE NOCASE",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT id,username,password_hash,role,disabled,session_version,created_at,updated_at FROM users WHERE {}",
+            $username_cmp()
+        ))
         .bind(username.trim())
         .fetch_optional(&self.pool)
         .await?;
@@ -301,7 +347,8 @@ impl Store {
     async fn create_with_owner(&self, owner_id: Option<i64>, input: CreateTask) -> Result<Task> {
         validate(&input.name, &input.cron, &input.url)?;
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -317,9 +364,11 @@ impl Store {
         .bind(owner_id)
         .bind(input.template_id)
         .bind(input.grp.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get(result.last_insert_rowid())
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get(id)
             .await?
             .context("created task disappeared")
     }
@@ -469,34 +518,44 @@ impl Store {
 
     pub async fn start_run(&self, task_id: i64) -> Result<Run> {
         let started_at = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO runs(task_id,status,started_at,created_at,attempt)
              VALUES (?,'running',?,?,1)",
         )
         .bind(task_id)
         .bind(started_at)
         .bind(started_at)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get_run(result.last_insert_rowid())
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_run(id)
             .await?
             .context("created run disappeared")
     }
 
     pub async fn enqueue_run(&self, task_id: i64) -> Result<Option<Run>> {
         let now = Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,attempt) VALUES (?,'pending',?,0)",
+            "INSERT INTO runs(task_id,status,created_at,attempt)
+             SELECT ?, 'pending', ?, 0
+             WHERE NOT EXISTS (
+                SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
+             )",
         )
         .bind(task_id)
         .bind(now)
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(result) => self.get_run(result.last_insert_rowid()).await,
-            Err(error) if error.to_string().contains("UNIQUE") => Ok(None),
-            Err(error) => Err(error.into()),
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
         }
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_run(id).await
     }
 
     pub async fn claim_run(&self, worker: &str, lease_seconds: i64) -> Result<Option<Run>> {
@@ -647,7 +706,8 @@ impl Store {
     pub async fn create_note(&self, owner_id: i64, input: CreateNote) -> Result<Note> {
         ensure!(!input.title.trim().is_empty(), "note title cannot be empty");
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO notes(owner_id,title,content,created_at,updated_at) VALUES (?,?,?,?,?)",
         )
         .bind(owner_id)
@@ -655,9 +715,11 @@ impl Store {
         .bind(input.content)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get_note(result.last_insert_rowid(), owner_id)
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_note(id, owner_id)
             .await?
             .context("created note disappeared")
     }
@@ -718,9 +780,12 @@ impl Store {
     ) -> Result<NotificationChannel> {
         validate_notification(&input.name, &input.kind, &input.config)?;
         let now = Utc::now().timestamp();
-        let result = sqlx::query("INSERT INTO notification_channels(owner_id,name,kind,config,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
-            .bind(owner_id).bind(input.name.trim()).bind(input.kind).bind(serde_json::to_string(&input.config)?).bind(input.enabled).bind(now).bind(now).execute(&self.pool).await?;
-        self.get_notification_channel(result.last_insert_rowid(), owner_id)
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("INSERT INTO notification_channels(owner_id,name,kind,config,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+            .bind(owner_id).bind(input.name.trim()).bind(input.kind).bind(serde_json::to_string(&input.config)?).bind(input.enabled).bind(now).bind(now).execute(&mut *conn).await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_notification_channel(id, owner_id)
             .await?
             .context("created notification channel disappeared")
     }
@@ -788,9 +853,12 @@ impl Store {
         if !owns {
             return Ok(None);
         }
-        let result = sqlx::query("INSERT INTO notification_actions(task_id,channel_id,event,created_at) VALUES (?,?,?,?)")
-            .bind(task_id).bind(input.channel_id).bind(input.event).bind(Utc::now().timestamp()).execute(&self.pool).await?;
-        self.get_notification_action(result.last_insert_rowid(), owner_id)
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("INSERT INTO notification_actions(task_id,channel_id,event,created_at) VALUES (?,?,?,?)")
+            .bind(task_id).bind(input.channel_id).bind(input.event).bind(Utc::now().timestamp()).execute(&mut *conn).await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_notification_action(id, owner_id)
             .await
     }
 
@@ -837,8 +905,11 @@ impl Store {
     ) -> Result<PluginManifest> {
         validate_plugin(&input.name, &input.command, &input.config)?;
         let now = Utc::now().timestamp();
-        let result=sqlx::query("INSERT INTO plugins(owner_id,name,command,config,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(owner_id).bind(input.name.trim()).bind(input.command).bind(serde_json::to_string(&input.config)?).bind(input.enabled).bind(now).bind(now).execute(&self.pool).await?;
-        self.get_plugin(result.last_insert_rowid(), owner_id)
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("INSERT INTO plugins(owner_id,name,command,config,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").bind(owner_id).bind(input.name.trim()).bind(input.command).bind(serde_json::to_string(&input.config)?).bind(input.enabled).bind(now).bind(now).execute(&mut *conn).await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_plugin(id, owner_id)
             .await?
             .context("created plugin disappeared")
     }
@@ -906,7 +977,8 @@ impl Store {
         validate_template_name(&input.name)?;
         input.definition.validate()?;
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO templates(name, description, schema_version, definition, created_at, updated_at, owner_id, grp)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -918,9 +990,11 @@ impl Store {
         .bind(now)
         .bind(owner_id)
         .bind(input.grp.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get_template(result.last_insert_rowid())
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_template(id)
             .await?
             .context("created template disappeared")
     }
@@ -945,7 +1019,8 @@ impl Store {
         validate_template_name(&input.name)?;
         QdHar::parse(input.har.clone())?;
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
             "INSERT INTO templates(name, description, schema_version, definition, source_format, source, created_at, updated_at, owner_id)
              VALUES (?, ?, 1, '{}', 'qd_har', ?, ?, ?, ?)",
         )
@@ -955,9 +1030,11 @@ impl Store {
         .bind(now)
         .bind(now)
         .bind(owner_id)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
-        self.get_template(result.last_insert_rowid())
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_template(id)
             .await?
             .context("imported template disappeared")
     }
@@ -1135,8 +1212,11 @@ impl Store {
         let row=sqlx::query("SELECT name,description,schema_version,source_format,definition,source FROM templates WHERE id=? AND published=1").bind(id).fetch_optional(&self.pool).await?;
         let Some(row) = row else { return Ok(None) };
         let now = Utc::now().timestamp();
-        let result=sqlx::query("INSERT INTO templates(name,description,schema_version,source_format,definition,source,created_at,updated_at,owner_id,published) VALUES(?,?,?,?,?,?,?,?,?,0)").bind(format!("{} (copy)",row.try_get::<String,_>("name")?)).bind(row.try_get::<Option<String>,_>("description")?).bind(row.try_get::<i64,_>("schema_version")?).bind(row.try_get::<String,_>("source_format")?).bind(row.try_get::<String,_>("definition")?).bind(row.try_get::<Option<String>,_>("source")?).bind(now).bind(now).bind(owner_id).execute(&self.pool).await?;
-        self.get_template_for_owner(result.last_insert_rowid(), owner_id)
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("INSERT INTO templates(name,description,schema_version,source_format,definition,source,created_at,updated_at,owner_id,published) VALUES(?,?,?,?,?,?,?,?,?,0)").bind(format!("{} (copy)",row.try_get::<String,_>("name")?)).bind(row.try_get::<Option<String>,_>("description")?).bind(row.try_get::<i64,_>("schema_version")?).bind(row.try_get::<String,_>("source_format")?).bind(row.try_get::<String,_>("definition")?).bind(row.try_get::<Option<String>,_>("source")?).bind(now).bind(now).bind(owner_id).execute(&mut *conn).await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_template_for_owner(id, owner_id)
             .await
     }
 
@@ -1295,8 +1375,10 @@ impl Store {
 
     pub async fn set_setting(&self, key: &str, input: &SetSiteSetting) -> Result<SiteSetting> {
         sqlx::query(
-            "INSERT INTO site_settings(key,value,updated_at) VALUES(?,?,?) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            &format!(
+                "INSERT INTO site_settings(key,value,updated_at) VALUES(?,?,?) {}",
+                $setting_upsert
+            )
         )
         .bind(key)
         .bind(serde_json::to_string(&input.value)?)
@@ -1390,9 +1472,9 @@ impl Store {
         .fetch_one(&self.pool)
         .await?)
     }
-}
+            }
 
-fn setting_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SiteSetting> {
+fn setting_from_row(row: $row) -> Result<SiteSetting> {
     Ok(SiteSetting {
         key: row.try_get("key")?,
         value: serde_json::from_str(&row.try_get::<String, _>("value")?)?,
@@ -1405,7 +1487,7 @@ const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definit
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,created_at,updated_at FROM users";
 
-fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<User> {
+fn user_from_row(row: &$row) -> Result<User> {
     Ok(User {
         id: row.try_get("id")?,
         username: row.try_get("username")?,
@@ -1416,7 +1498,7 @@ fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<User> {
     })
 }
 
-fn credentials_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserCredentials> {
+fn credentials_from_row(row: &$row) -> Result<UserCredentials> {
     Ok(UserCredentials {
         user: user_from_row(row)?,
         password_hash: row.try_get("password_hash")?,
@@ -1424,7 +1506,7 @@ fn credentials_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserCredentials
     })
 }
 
-fn authenticated_session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuthenticatedSession> {
+fn authenticated_session_from_row(row: &$row) -> Result<AuthenticatedSession> {
     Ok(AuthenticatedSession {
         user: user_from_row(row)?,
         csrf_token_hash: row.try_get("csrf_token_hash")?,
@@ -1432,7 +1514,7 @@ fn authenticated_session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Authe
     })
 }
 
-fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
+fn task_from_row(row: $row) -> Result<Task> {
     let headers: String = row.try_get("headers")?;
     Ok(Task {
         id: row.try_get("id")?,
@@ -1453,7 +1535,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
     })
 }
 
-fn run_step_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunStep> {
+fn run_step_from_row(row: $row) -> Result<RunStep> {
     Ok(RunStep {
         id: row.try_get("id")?,
         run_id: row.try_get("run_id")?,
@@ -1468,7 +1550,7 @@ fn run_step_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunStep> {
     })
 }
 
-fn template_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Template> {
+fn template_from_row(row: $row) -> Result<Template> {
     let definition: String = row.try_get("definition")?;
     let source_format: String = row.try_get("source_format")?;
     let source: Option<String> = row.try_get("source")?;
@@ -1502,7 +1584,7 @@ fn template_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Template> {
     })
 }
 
-fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Run> {
+fn run_from_row(row: $row) -> Result<Run> {
     Ok(Run {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
@@ -1519,7 +1601,7 @@ fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Run> {
     })
 }
 
-fn note_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Note> {
+fn note_from_row(row: $row) -> Result<Note> {
     Ok(Note {
         id: row.try_get("id")?,
         title: row.try_get("title")?,
@@ -1529,7 +1611,7 @@ fn note_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Note> {
     })
 }
 
-fn notification_from_row(row: sqlx::sqlite::SqliteRow) -> Result<NotificationChannel> {
+fn notification_from_row(row: $row) -> Result<NotificationChannel> {
     Ok(NotificationChannel {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
@@ -1541,7 +1623,7 @@ fn notification_from_row(row: sqlx::sqlite::SqliteRow) -> Result<NotificationCha
     })
 }
 
-fn notification_action_from_row(row: sqlx::sqlite::SqliteRow) -> Result<NotificationAction> {
+fn notification_action_from_row(row: $row) -> Result<NotificationAction> {
     Ok(NotificationAction {
         id: row.try_get("id")?,
         task_id: row.try_get("task_id")?,
@@ -1551,7 +1633,7 @@ fn notification_action_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Notifica
     })
 }
 
-fn plugin_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PluginManifest> {
+fn plugin_from_row(row: $row) -> Result<PluginManifest> {
     Ok(PluginManifest {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
@@ -1561,6 +1643,200 @@ fn plugin_from_row(row: sqlx::sqlite::SqliteRow) -> Result<PluginManifest> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+            }
+        }
+    }
+define_store!(
+    sqlite_store,
+    Sqlite,
+    SqlitePool,
+    SqlitePoolOptions,
+    sqlite_options,
+    &SQLITE_MIGRATOR,
+    SqliteRow,
+    "SELECT last_insert_rowid()",
+    sqlite_username_cmp,
+    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    sqlite_parent_check
+);
+
+define_store!(
+    mysql_store,
+    MySql,
+    MySqlPool,
+    MySqlPoolOptions,
+    mysql_options,
+    &MYSQL_MIGRATOR,
+    MySqlRow,
+    "SELECT LAST_INSERT_ID()",
+    mysql_username_cmp,
+    "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
+    no_parent_check
+);
+macro_rules! delegate {
+    ($(pub async fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty { $($call:ident),* };)*) => {
+        $(
+            pub async fn $name(&self, $($arg: $ty),*) -> $ret {
+                match self {
+                    Store::Sqlite(s) => s.$name($($call),*).await,
+                    Store::MySql(s) => s.$name($($call),*).await,
+                }
+            }
+        )*
+    };
+}
+
+impl Store {
+    #[cfg(test)]
+    pub(crate) fn sqlite_pool(&self) -> &SqlitePool {
+        match self {
+            Store::Sqlite(s) => &s.pool,
+            Store::MySql(_) => panic!("mysql not available in tests"),
+        }
+    }
+}
+
+/// Runtime database backend. The API and scheduler layers work with this enum
+/// so SQLite and MySQL deployments share one binary and one code path.
+#[derive(Clone)]
+pub enum Store {
+    Sqlite(sqlite_store::Store),
+    MySql(mysql_store::Store),
+}
+
+impl Store {
+    pub async fn connect(url: &str, min_connections: u32, max_connections: u32) -> Result<Self> {
+        Self::connect_with_timeouts(
+            url,
+            min_connections,
+            max_connections,
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+        )
+        .await
+    }
+
+    pub async fn connect_with_timeouts(
+        url: &str,
+        min_connections: u32,
+        max_connections: u32,
+        acquire_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Result<Self> {
+        if url.starts_with("mysql://") || url.starts_with("mysql+") {
+            Ok(Self::MySql(
+                mysql_store::Store::connect_with_timeouts(
+                    url,
+                    min_connections,
+                    max_connections,
+                    acquire_timeout,
+                    idle_timeout,
+                )
+                .await?,
+            ))
+        } else {
+            Ok(Self::Sqlite(
+                sqlite_store::Store::connect_with_timeouts(
+                    url,
+                    min_connections,
+                    max_connections,
+                    acquire_timeout,
+                    idle_timeout,
+                )
+                .await?,
+            ))
+        }
+    }
+
+    delegate! {
+        pub async fn ready() -> Result<()> {  };
+        pub async fn create_user(username: &str, password_hash: &str, role: &str) -> Result<User> { username, password_hash, role };
+        pub async fn create_first_admin(username: &str, password_hash: &str) -> Result<Option<User>> { username, password_hash };
+        pub async fn get_user(id: i64) -> Result<Option<User>> { id };
+        pub async fn credentials_by_username(username: &str) -> Result<Option<UserCredentials>> { username };
+        pub async fn create_session(user_id: i64, ttl: Duration) -> Result<IssuedSession> { user_id, ttl };
+        pub async fn authenticate_session(session_token: &str) -> Result<Option<AuthenticatedSession>> { session_token };
+        pub async fn revoke_session(session_token: &str) -> Result<bool> { session_token };
+        pub async fn revoke_all_sessions(user_id: i64) -> Result<()> { user_id };
+        pub async fn change_password(user_id: i64, password_hash: &str) -> Result<bool> { user_id, password_hash };
+        pub async fn record_audit(actor_user_id: Option<i64>, action: &str, resource_type: Option<&str>, resource_id: Option<i64>, request_id: Option<&str>, details: &serde_json::Value) -> Result<()> { actor_user_id, action, resource_type, resource_id, request_id, details };
+        pub async fn purge_expired_sessions() -> Result<u64> {  };
+        pub async fn create(input: CreateTask) -> Result<Task> { input };
+        pub async fn create_for_owner(owner_id: i64, input: CreateTask) -> Result<Task> { owner_id, input };
+        pub async fn list() -> Result<Vec<Task>> {  };
+        pub async fn list_for_owner(owner_id: i64) -> Result<Vec<Task>> { owner_id };
+        pub async fn list_for_owner_with_group(owner_id: i64, grp: Option<&str>) -> Result<Vec<Task>> { owner_id, grp };
+        pub async fn get(id: i64) -> Result<Option<Task>> { id };
+        pub async fn get_for_owner(id: i64, owner_id: i64) -> Result<Option<Task>> { id, owner_id };
+        pub async fn update(id: i64, input: UpdateTask) -> Result<Option<Task>> { id, input };
+        pub async fn update_for_owner(id: i64, owner_id: i64, input: UpdateTask) -> Result<Option<Task>> { id, owner_id, input };
+        pub async fn delete(id: i64) -> Result<bool> { id };
+        pub async fn delete_for_owner(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn record_run(id: i64, status: Option<u16>, error: Option<&str>) -> Result<()> { id, status, error };
+        pub async fn start_run(task_id: i64) -> Result<Run> { task_id };
+        pub async fn enqueue_run(task_id: i64) -> Result<Option<Run>> { task_id };
+        pub async fn claim_run(worker: &str, lease_seconds: i64) -> Result<Option<Run>> { worker, lease_seconds };
+        pub async fn start_leased_run(run_id: i64, worker: &str) -> Result<bool> { run_id, worker };
+        pub async fn renew_run(run_id: i64, worker: &str, lease_seconds: i64) -> Result<bool> { run_id, worker, lease_seconds };
+        pub async fn cancel_run(run_id: i64) -> Result<bool> { run_id };
+        pub async fn recover_expired_runs() -> Result<u64> {  };
+        pub async fn finish_run(run_id: i64, http_status: Option<u16>, error: Option<&str>) -> Result<()> { run_id, http_status, error };
+        pub async fn record_run_step(step: &RunStep) -> Result<()> { step };
+        pub async fn list_run_steps(run_id: i64) -> Result<Vec<RunStep>> { run_id };
+        pub async fn list_run_steps_for_owner(run_id: i64, owner_id: i64) -> Result<Option<Vec<RunStep>>> { run_id, owner_id };
+        pub async fn get_run(id: i64) -> Result<Option<Run>> { id };
+        pub async fn list_task_runs(task_id: i64) -> Result<Vec<Run>> { task_id };
+        pub async fn list_task_runs_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Vec<Run>>> { task_id, owner_id };
+        pub async fn create_note(owner_id: i64, input: CreateNote) -> Result<Note> { owner_id, input };
+        pub async fn list_notes(owner_id: i64) -> Result<Vec<Note>> { owner_id };
+        pub async fn get_note(id: i64, owner_id: i64) -> Result<Option<Note>> { id, owner_id };
+        pub async fn update_note(id: i64, owner_id: i64, input: UpdateNote) -> Result<Option<Note>> { id, owner_id, input };
+        pub async fn delete_note(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn create_notification_channel(owner_id: i64, input: CreateNotificationChannel) -> Result<NotificationChannel> { owner_id, input };
+        pub async fn list_notification_channels(owner_id: i64) -> Result<Vec<NotificationChannel>> { owner_id };
+        pub async fn get_notification_channel(id: i64, owner_id: i64) -> Result<Option<NotificationChannel>> { id, owner_id };
+        pub async fn update_notification_channel(id: i64, owner_id: i64, input: UpdateNotificationChannel) -> Result<Option<NotificationChannel>> { id, owner_id, input };
+        pub async fn delete_notification_channel(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn create_notification_action(task_id: i64, owner_id: i64, input: CreateNotificationAction) -> Result<Option<NotificationAction>> { task_id, owner_id, input };
+        pub async fn list_notification_actions(task_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationAction>>> { task_id, owner_id };
+        pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationChannel>> { task_id, event };
+        pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
+        pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
+        pub async fn get_plugin(id: i64, owner_id: i64) -> Result<Option<PluginManifest>> { id, owner_id };
+        pub async fn update_plugin(id: i64, owner_id: i64, input: UpdatePluginManifest) -> Result<Option<PluginManifest>> { id, owner_id, input };
+        pub async fn delete_plugin(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn create_template(input: CreateTemplate) -> Result<Template> { input };
+        pub async fn create_template_for_owner(owner_id: i64, input: CreateTemplate) -> Result<Template> { owner_id, input };
+        pub async fn import_qd_har(input: ImportQdHarTemplate) -> Result<Template> { input };
+        pub async fn import_qd_har_for_owner(owner_id: i64, input: ImportQdHarTemplate) -> Result<Template> { owner_id, input };
+        pub async fn update_qd_har_for_owner(id: i64, owner_id: i64, input: UpdateQdHarTemplate) -> Result<Option<Template>> { id, owner_id, input };
+        pub async fn list_templates() -> Result<Vec<Template>> {  };
+        pub async fn list_templates_for_owner(owner_id: i64) -> Result<Vec<Template>> { owner_id };
+        pub async fn get_template(id: i64) -> Result<Option<Template>> { id };
+        pub async fn get_template_for_owner(id: i64, owner_id: i64) -> Result<Option<Template>> { id, owner_id };
+        pub async fn update_template(id: i64, input: UpdateTemplate) -> Result<Option<Template>> { id, input };
+        pub async fn update_template_for_owner(id: i64, owner_id: i64, input: UpdateTemplate) -> Result<Option<Template>> { id, owner_id, input };
+        pub async fn delete_template(id: i64) -> Result<bool> { id };
+        pub async fn delete_template_for_owner(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn set_template_published(id: i64, owner_id: i64, published: bool) -> Result<bool> { id, owner_id, published };
+        pub async fn list_public_templates() -> Result<Vec<Template>> {  };
+        pub async fn copy_public_template(id: i64, owner_id: i64) -> Result<Option<Template>> { id, owner_id };
+        pub async fn list_groups_for_owner(owner_id: i64) -> Result<Vec<String>> { owner_id };
+        pub async fn batch_operations_for_owner(owner_id: i64, input: &BatchTaskOperation) -> Result<usize> { owner_id, input };
+        pub async fn search_templates_for_owner(owner_id: i64, query: Option<&str>, grp: Option<&str>, cursor: Option<i64>, limit: i64) -> Result<Vec<Template>> { owner_id, query, grp, cursor, limit };
+        pub async fn list_users() -> Result<Vec<User>> {  };
+        pub async fn update_user(id: i64, input: &AdminUserUpdate) -> Result<Option<User>> { id, input };
+        pub async fn get_setting(key: &str) -> Result<Option<SiteSetting>> { key };
+        pub async fn set_setting(key: &str, input: &SetSiteSetting) -> Result<SiteSetting> { key, input };
+        pub async fn list_settings() -> Result<Vec<SiteSetting>> {  };
+        pub async fn create_password_reset_token(user_id: i64, ttl_seconds: i64) -> Result<(String, i64)> { user_id, ttl_seconds };
+        pub async fn consume_password_reset_token(token: &str, new_password_hash: &str) -> Result<Option<i64>> { token, new_password_hash };
+        pub async fn purge_expired_reset_tokens() -> Result<u64> {  };
+        pub async fn prune_run_logs(before: i64) -> Result<u64> { before };
+        pub async fn count_old_runs(before: i64) -> Result<i64> { before };
+    }
 }
 
 fn validate_plugin(name: &str, command: &str, config: &serde_json::Value) -> Result<()> {
@@ -1630,7 +1906,7 @@ fn validate_username(username: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_sqlite_parent(url: &str) -> Result<()> {
+fn sqlite_parent_check(url: &str) -> Result<()> {
     let Some(path) = url.strip_prefix("sqlite://") else {
         return Ok(());
     };
@@ -1873,7 +2149,7 @@ mod tests {
         let stored: String =
             sqlx::query_scalar("SELECT token_hash FROM sessions WHERE token_hash=?")
                 .bind(token_hash(&first.session_token))
-                .fetch_one(&store.pool)
+                .fetch_one(store.sqlite_pool())
                 .await
                 .unwrap();
         assert_ne!(stored, first.session_token);
@@ -1946,7 +2222,7 @@ mod tests {
         let action: String =
             sqlx::query_scalar("SELECT action FROM audit_logs WHERE actor_user_id=?")
                 .bind(user.id)
-                .fetch_one(&store.pool)
+                .fetch_one(store.sqlite_pool())
                 .await
                 .unwrap();
         assert_eq!(action, "auth.password_changed");
@@ -2015,7 +2291,7 @@ mod tests {
             .unwrap();
         sqlx::query("UPDATE sessions SET expires_at=0 WHERE token_hash=?")
             .bind(token_hash(&session.session_token))
-            .execute(&store.pool)
+            .execute(store.sqlite_pool())
             .await
             .unwrap();
 
@@ -2415,7 +2691,7 @@ mod tests {
         sqlx::query("UPDATE runs SET lease_expires_at=? WHERE id=?")
             .bind(0_i64)
             .bind(first.id)
-            .execute(&store.pool)
+            .execute(store.sqlite_pool())
             .await
             .unwrap();
         assert_eq!(store.recover_expired_runs().await.unwrap(), 1);
