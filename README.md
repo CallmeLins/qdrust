@@ -9,7 +9,7 @@ qdrust 是按 QD2 路线重新设计的 Rust 项目，提供旧 QD HAR 的解析
 - `crates/qdrust-server`：基于 Axum、SQLx 和 SQLite 的 API、认证、调度与运行管理。
 - `webui`：基于 Vue 3、TypeScript 和 Vite 的 WebUI。
 
-当前服务包含用户认证与会话（含开放注册与忘记/重置密码）、管理员 API（用户管理、站点设置、日志清理）、模板（搜索/分组/分页）、任务（分组/批量操作）、运行记录与步骤、WebSocket 实时步骤流、立即执行与取消、租约恢复、公共模板、插件、通知（Webhook + Email）、记事本以及 OpenAPI。所有用户资源均在服务端执行归属校验。
+当前服务包含用户认证与会话（开放注册、忘记/重置密码、邮箱验证、CSRF 轮换）、管理员 API（用户管理、站点设置、日志清理、备份/恢复）、模板（搜索/分组/分页、公共发布审批 PushRequest、订阅仓库自动导入）、任务（分组/批量操作）、运行记录与步骤、WebSocket 实时步骤流（运行 + 订阅进度）、租约恢复、插件、通知（Webhook + Email）、记事本、可选 Redis 会话缓存、GA 注入、运行时配置热更新以及 OpenAPI。支持 SQLite 与 MySQL 双后端（按 DATABASE_URL 自动选择）。所有用户资源均在服务端执行归属校验。
 
 ## 环境要求
 
@@ -43,10 +43,15 @@ cargo run -p qdrust-server
 - 数据库就绪检查：`GET /ready`
 - OpenAPI：`GET /api/v1/openapi.json`
 - 运行步骤实时流：`GET /api/v1/runs/{id}/steps/live`（WebSocket）
+- 订阅同步进度：`GET /api/v1/subscriptions/{id}/sync/live`（WebSocket）
 - 管理员用户管理：`GET/PATCH /api/v1/admin/users`、`/api/v1/admin/users/{id}`
 - 管理员站点设置：`GET/PUT /api/v1/admin/settings/{key}`
+- 管理员备份/恢复：`GET /api/v1/admin/backup`、`POST /api/v1/admin/restore`
+- 模板发布审批：`POST /api/v1/push-requests`、`POST /api/v1/admin/push-requests/{id}/decision`
 - 任务批量操作：`POST /api/v1/tasks/batch`（enable/disable/delete/run）
 - 任务分组：`GET /api/v1/task-groups`
+- CSRF 轮换：`POST /api/v1/auth/csrf/rotate`
+- 邮箱验证：`POST /api/v1/auth/verify-email`
 
 前后端分开开发时运行：
 

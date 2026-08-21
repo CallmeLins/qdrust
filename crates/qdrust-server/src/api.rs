@@ -35,16 +35,30 @@ use crate::{
     model::{
         AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession, BatchTaskOperation,
         BatchTaskResult, ChangePassword, ClearLogs, CreateNote, CreateNotificationAction,
-        CreateNotificationChannel, CreatePluginManifest, CreateTask, CreateTemplate,
-        ForgotPassword, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
-        RegisterUser, ResetPassword, SetSiteSetting, UpdateNote, UpdateNotificationChannel,
-        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate, ValidateQdHar,
+        CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask,
+        CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ForgotPassword,
+        ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
+        ResetPassword, SetSiteSetting, UpdateNote, UpdateNotificationChannel, UpdatePluginManifest,
+        UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
+        VerifyEmail,
     },
     store::Store,
 };
 
 const SESSION_COOKIE: &str = "qd_session";
 const CSRF_COOKIE: &str = "qd_csrf";
+
+/// Runtime-tunable settings that can be updated without a restart.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeSettings {
+    pub require_email_verification: bool,
+    pub ga_key: Option<String>,
+    pub log_retention_days: u64,
+}
+
+pub fn runtime_settings() -> std::sync::Arc<std::sync::RwLock<RuntimeSettings>> {
+    std::sync::Arc::new(std::sync::RwLock::new(RuntimeSettings::default()))
+}
 
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
@@ -71,6 +85,10 @@ struct AppState {
     auth: AuthConfig,
     login_limiter: LoginRateLimiter,
     run_events: broadcast::Sender<Value>,
+    subscription_events: broadcast::Sender<Value>,
+    settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
+    http_client: reqwest::Client,
+    session_cache: crate::redis_cache::SessionCache,
 }
 
 impl FromRef<AppState> for Store {
@@ -106,10 +124,31 @@ pub fn run_event_channel() -> (RunEventSender, broadcast::Receiver<Value>) {
 
 pub fn router(store: Store) -> Router {
     let (run_events, _) = run_event_channel();
-    router_with_auth(store, AuthConfig::default(), run_events)
+    let (subscription_events, _) = subscription_event_channel();
+    router_with_auth(
+        store,
+        AuthConfig::default(),
+        run_events,
+        subscription_events,
+        runtime_settings(),
+        reqwest::Client::new(),
+        crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+    )
 }
 
-pub fn router_with_auth(store: Store, auth: AuthConfig, run_events: RunEventSender) -> Router {
+pub fn subscription_event_channel() -> (broadcast::Sender<Value>, broadcast::Receiver<Value>) {
+    broadcast::channel(256)
+}
+
+pub fn router_with_auth(
+    store: Store,
+    auth: AuthConfig,
+    run_events: RunEventSender,
+    subscription_events: broadcast::Sender<Value>,
+    settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
+    http_client: reqwest::Client,
+    session_cache: crate::redis_cache::SessionCache,
+) -> Router {
     let login_limiter =
         LoginRateLimiter::new(auth.login_rate_limit_attempts, auth.login_rate_limit_window)
             .expect("login rate limit configuration must be valid");
@@ -146,6 +185,51 @@ pub fn router_with_auth(store: Store, auth: AuthConfig, run_events: RunEventSend
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
         .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
+        .route(
+            "/api/v1/auth/verify-email",
+            axum::routing::post(verify_email),
+        )
+        .route(
+            "/api/v1/auth/resend-verification",
+            axum::routing::post(resend_verification),
+        )
+        .route(
+            "/api/v1/auth/csrf/rotate",
+            axum::routing::post(rotate_csrf_token),
+        )
+        .route(
+            "/api/v1/subscriptions",
+            get(list_subscriptions).post(create_subscription),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}",
+            get(get_subscription)
+                .put(update_subscription)
+                .delete(delete_subscription),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/sync",
+            axum::routing::post(sync_subscription_now),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/syncs",
+            get(list_subscription_syncs),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/sync/live",
+            get(subscription_sync_websocket),
+        )
+        .route(
+            "/api/v1/push-requests",
+            get(list_my_push_requests).post(create_push_request),
+        )
+        .route("/api/v1/admin/push-requests", get(list_admin_push_requests))
+        .route(
+            "/api/v1/admin/push-requests/{id}/decision",
+            axum::routing::post(decide_push_request),
+        )
+        .route("/api/v1/admin/backup", get(admin_backup))
+        .route("/api/v1/admin/restore", axum::routing::post(admin_restore))
         .route("/api/v1/admin/users", get(admin_list_users))
         .route(
             "/api/v1/admin/users/{id}",
@@ -232,6 +316,10 @@ pub fn router_with_auth(store: Store, auth: AuthConfig, run_events: RunEventSend
             auth,
             login_limiter,
             run_events,
+            subscription_events,
+            settings,
+            http_client,
+            session_cache,
         })
 }
 
@@ -306,6 +394,19 @@ async fn login(
         .await
         .map_err(anyhow::Error::from)?;
     let credentials = credentials.filter(|credentials| valid && !credentials.user.disabled);
+    if let Some(credentials) = credentials.as_ref() {
+        let require_verification = state
+            .settings
+            .read()
+            .map(|s| s.require_email_verification)
+            .unwrap_or(false);
+        if require_verification && !credentials.user.email_verified {
+            return Err(ApiError::Forbidden(
+                "email_not_verified",
+                "Email address is not verified",
+            ));
+        }
+    }
     if credentials.is_none() {
         state.login_limiter.record_failure(&rate_key).await;
         state
@@ -450,7 +551,31 @@ async fn require_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(String, AuthenticatedSession), ApiError> {
-    require_session_from_store(&state.store, headers).await
+    let token = cookie(headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized(
+        "authentication_required",
+        "Authentication required",
+    ))?;
+    let token_hash = crate::auth::token_hash(&token);
+    if let Some(session) = state.session_cache.get(&token_hash).await {
+        return Ok((token, session));
+    }
+    let session = state
+        .store
+        .authenticate_session(&token)
+        .await?
+        .ok_or(ApiError::Unauthorized(
+            "authentication_required",
+            "Authentication required",
+        ))?;
+    state
+        .session_cache
+        .set(
+            &token_hash,
+            &session,
+            i64::try_from(state.auth.session_ttl.as_secs().min(86_400 * 7)).unwrap_or(86_400 * 7),
+        )
+        .await;
+    Ok((token, session))
 }
 
 async fn require_session_from_store(
@@ -1210,6 +1335,28 @@ async fn register(
                 "Username is already registered or invalid",
             )
         })?;
+    if let Some(email) = input.email.as_deref() {
+        let _ = state.store.set_user_email(user.id, email).await;
+        let (token, _expires) = state
+            .store
+            .create_email_verification_token(user.id, 3600)
+            .await?;
+        let email_client = crate::email::EmailClient::new(crate::email::EmailConfig::from_env())?;
+        let base_url = std::env::var("QDRUST_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:8923".to_string());
+        let verify_url = format!("{base_url}/verify-email?token={token}");
+        let _ = email_client
+            .send(
+                email.trim(),
+                None,
+                "[qdrust] Verify your email",
+                &format!(
+                    "Hello {},\n\nVerify your email address by opening this link:\n{}\n\nIf you did not request this, you can ignore this message.\n",
+                    user.username, verify_url
+                ),
+            )
+            .ok();
+    }
     state
         .store
         .record_audit(
@@ -1506,6 +1653,416 @@ async fn require_admin(
         ));
     }
     Ok((token, session))
+}
+
+// ==================== P1 features: email verification, CSRF rotation, subscriptions, push requests, backup ====================
+
+async fn verify_email(
+    State(state): State<AppState>,
+    ApiJson(input): ApiJson<VerifyEmail>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(user_id) = state
+        .store
+        .consume_email_verification_token(&input.token)
+        .await?
+    else {
+        return Err(ApiError::Unauthorized(
+            "invalid_or_expired_verification_token",
+            "The verification token is invalid or has expired",
+        ));
+    };
+    state
+        .store
+        .record_audit(
+            Some(user_id),
+            "auth.email_verified",
+            Some("user"),
+            Some(user_id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({"ok": true, "user_id": user_id})))
+}
+
+async fn resend_verification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let email = state
+        .store
+        .get_user(session.user.id)
+        .await?
+        .and_then(|u| u.email);
+    let Some(email) = email else {
+        return Err(ApiError::Unprocessable(anyhow::anyhow!(
+            "no email address on this account"
+        )));
+    };
+    let (token, expires_at) = state
+        .store
+        .create_email_verification_token(session.user.id, 3600)
+        .await?;
+    let base_url =
+        std::env::var("QDRUST_BASE_URL").unwrap_or_else(|_| "http://localhost:8923".to_string());
+    let verify_url = format!("{base_url}/verify-email?token={token}");
+    let email_client = crate::email::EmailClient::new(crate::email::EmailConfig::from_env())?;
+    let _ = email_client
+        .send(
+            &email,
+            None,
+            "[qdrust] Verify your email",
+            &format!(
+                "Hello {},\n\nVerify your email address by opening this link:\n{}\n\nIf you did not request this, you can ignore this message.\n",
+                session.user.username, verify_url
+            ),
+        )
+        .ok();
+    Ok(Json(json!({
+        "sent": true,
+        "expires_at": expires_at,
+        "verify_token": token,
+    })))
+}
+
+async fn rotate_csrf_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (token, _session) = require_session(&state, &headers).await?;
+    let new_csrf = crate::auth::new_token();
+    state
+        .store
+        .rotate_csrf(&token, &crate::auth::token_hash(&new_csrf))
+        .await?;
+    let mut response = Json(json!({"csrf_token": new_csrf})).into_response();
+    let max_age = state.auth.session_ttl.as_secs();
+    let secure = if state.auth.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie =
+        format!("{CSRF_COOKIE}={new_csrf}; Path=/; SameSite=Strict; Max-Age={max_age}{secure}");
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("static cookie attributes are valid"),
+    );
+    Ok(response)
+}
+
+async fn list_subscriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    Ok(Json(json!(
+        state.store.list_subscriptions(session.user.id).await?
+    )))
+}
+
+async fn create_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<CreateTemplateSubscription>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = state
+        .store
+        .create_subscription(session.user.id, input)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    Ok((StatusCode::CREATED, Json(json!(subscription))))
+}
+
+async fn get_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    state
+        .store
+        .get_subscription(id, session.user.id)
+        .await?
+        .map(|s| Json(json!(s)))
+        .ok_or(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))
+}
+
+async fn update_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<UpdateTemplateSubscription>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    state
+        .store
+        .update_subscription(id, session.user.id, input)
+        .await
+        .map_err(ApiError::unprocessable)?
+        .map(|s| Json(json!(s)))
+        .ok_or(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))
+}
+
+async fn delete_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    if state.store.delete_subscription(id, session.user.id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))
+    }
+}
+
+async fn sync_subscription_now(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = state
+        .store
+        .get_subscription(id, session.user.id)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))?;
+    let store = state.store.clone();
+    let client = state.http_client.clone();
+    let events = state.subscription_events.clone();
+    tokio::spawn(async move {
+        match crate::subscriptions::sync_subscription(&store, &client, &subscription, Some(events))
+            .await
+        {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::warn!(%err, "subscription sync failed");
+            }
+        }
+    });
+    Ok(Json(json!({"status": "started"})))
+}
+
+async fn list_subscription_syncs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    state
+        .store
+        .list_subscription_syncs(id, session.user.id)
+        .await?
+        .map(|syncs| Json(json!(syncs)))
+        .ok_or(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))
+}
+
+async fn subscription_sync_websocket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    if state
+        .store
+        .get_subscription(id, session.user.id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ));
+    }
+    let events = state.subscription_events.subscribe();
+    Ok(ws.on_upgrade(move |socket| stream_subscription_events(socket, id, events)))
+}
+
+async fn stream_subscription_events(
+    mut socket: axum::extract::ws::WebSocket,
+    subscription_id: i64,
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+) {
+    use futures_util::SinkExt;
+    loop {
+        let event = tokio::select! {
+            _ = socket.recv() => break,
+            event = events.recv() => match event {
+                Ok(value) => value,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            },
+        };
+        if event.get("subscription_id").and_then(|v| v.as_i64()) != Some(subscription_id) {
+            continue;
+        }
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = socket.close().await;
+}
+
+async fn create_push_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<CreatePushRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let request = state
+        .store
+        .create_push_request(session.user.id, input)
+        .await
+        .map_err(ApiError::unprocessable)?
+        .ok_or(ApiError::NotFound(
+            "template_not_found_or_already_public",
+            "Template not found, already public, or note missing",
+        ))?;
+    state
+        .store
+        .record_audit(
+            Some(session.user.id),
+            "template.push_requested",
+            Some("template"),
+            Some(request.template_id),
+            None,
+            &json!({"push_request_id": request.id}),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!(request))))
+}
+
+async fn list_my_push_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    Ok(Json(json!(
+        state
+            .store
+            .list_push_requests_for_owner(session.user.id)
+            .await?
+    )))
+}
+
+async fn list_admin_push_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<serde_json::Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let status = params.get("status").and_then(|v| v.as_str());
+    Ok(Json(json!(state.store.list_push_requests(status).await?)))
+}
+
+async fn decide_push_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<DecidePushRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, admin) = require_admin(&state, &headers).await?;
+    let request = state
+        .store
+        .decide_push_request(id, admin.user.id, &input)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "push_request_not_found",
+            "Push request not found",
+        ))?;
+    state
+        .store
+        .record_audit(
+            Some(admin.user.id),
+            if input.approve {
+                "template.push_approved"
+            } else {
+                "template.push_rejected"
+            },
+            Some("push_request"),
+            Some(request.id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!(request)))
+}
+
+async fn admin_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_admin(&state, &headers).await?;
+    let backup = state.store.export_data().await?;
+    let body = serde_json::to_vec_pretty(&backup).map_err(anyhow::Error::from)?;
+    let filename = format!(
+        "qdrust-backup-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                HeaderName::from_static("content-disposition"),
+                HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+                    .expect("valid header"),
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn admin_restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<serde_json::Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    state
+        .store
+        .import_data(&input)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    state
+        .store
+        .record_audit(
+            None,
+            "admin.restore",
+            Some("system"),
+            None,
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({"ok": true})))
 }
 
 enum ApiError {

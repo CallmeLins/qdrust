@@ -75,10 +75,49 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some("backup") => {
+            let path = args
+                .next()
+                .context("usage: qdrust-cli backup <database.sqlite> [output]")?;
+            let output = args.next().unwrap_or_else(|| {
+                let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+                format!("{path}.backup-{stamp}")
+            });
+            backup_sqlite(&path, &output)?;
+            println!("backup written to {output}");
+            Ok(())
+        }
+        Some("restore") => {
+            let path = args
+                .next()
+                .context("usage: qdrust-cli restore <database.sqlite> <backup-file>")?;
+            let backup = args
+                .next()
+                .context("usage: qdrust-cli restore <database.sqlite> <backup-file>")?;
+            fs::copy(&backup, &path)
+                .with_context(|| format!("cannot restore {backup} into {path}"))?;
+            println!("restored {backup} into {path}");
+            println!("note: stop the server before restoring a SQLite database");
+            Ok(())
+        }
         Some("help") | None => {
             println!("qdrust-cli validate <file.har.json>");
+            println!("qdrust-cli run <file.har.json> [--var key=value] [--timeout seconds]");
+            println!("qdrust-cli backup <database.sqlite> [output]");
+            println!("qdrust-cli restore <database.sqlite> <backup-file>");
             Ok(())
         }
         Some(command) => bail!("unknown command: {command}"),
     }
+}
+
+/// Online SQLite backup using the VACUUM INTO command (SQLite 3.27+).
+fn backup_sqlite(path: &str, output: &str) -> Result<()> {
+    let conn =
+        rusqlite::Connection::open(path).with_context(|| format!("cannot open database {path}"))?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    let escaped = output.replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{escaped}';"))
+        .with_context(|| format!("cannot vacuum into {output}"))?;
+    Ok(())
 }

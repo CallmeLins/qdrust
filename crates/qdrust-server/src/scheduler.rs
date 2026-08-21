@@ -83,7 +83,8 @@ pub fn spawn(
             }
         }
     });
-    // Periodic maintenance: log retention, expired sessions, expired reset tokens.
+    // Periodic maintenance: log retention (runtime-tunable via site settings),
+    // expired sessions, expired reset tokens, expired email verification tokens.
     let maint_store = store.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(3600));
@@ -91,15 +92,24 @@ pub fn spawn(
             ticker.tick().await;
             let _ = maint_store.purge_expired_sessions().await;
             let _ = maint_store.purge_expired_reset_tokens().await;
-            if log_retention_days > 0 {
-                let before = Utc::now().timestamp() - (log_retention_days as i64) * 86_400;
+            let _ = maint_store.purge_expired_email_tokens().await;
+            // Log retention can be tuned at runtime through the site_settings
+            // table (admin API) or the config file; the static env value is the fallback.
+            let retention = match maint_store
+                .get_setting("logs.retention_days")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.value.as_i64())
+            {
+                Some(days) if days > 0 => days as u64,
+                _ => log_retention_days,
+            };
+            if retention > 0 {
+                let before = Utc::now().timestamp() - (retention as i64) * 86_400;
                 let deleted = maint_store.prune_run_logs(before).await.unwrap_or(0);
                 if deleted > 0 {
-                    info!(
-                        deleted,
-                        retention_days = log_retention_days,
-                        "pruned run logs"
-                    );
+                    info!(deleted, retention_days = retention, "pruned run logs");
                 }
             }
         }

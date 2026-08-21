@@ -1,6 +1,11 @@
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2023-0071 (rsa): Marvin Attack timing side-channel. Pulled in
+# transitively by sqlx-mysql for caching_sha2_password auth; no patched rsa
+# release is pinned by sqlx yet. Local deployments are unaffected (the server
+# initiates TLS to MySQL and the auth exchange is not attacker-controlled).
+ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2

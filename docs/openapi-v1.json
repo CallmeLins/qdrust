@@ -1074,6 +1074,326 @@
           }
         }
       }
+    },
+    "/api/v1/auth/verify-email": {
+      "post": {
+        "operationId": "verifyEmail",
+        "summary": "Verify an email address with a token",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/VerifyEmail"
+        },
+        "responses": {
+          "200": {
+            "description": "Email verified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/resend-verification": {
+      "post": {
+        "operationId": "resendVerification",
+        "summary": "Resend the email verification token (logged in)",
+        "responses": {
+          "200": {
+            "description": "Verification email sent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/csrf/rotate": {
+      "post": {
+        "operationId": "rotateCsrf",
+        "summary": "Rotate the CSRF token (auto-refresh mechanism)",
+        "responses": {
+          "200": {
+            "description": "New CSRF token issued in cookie and body"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions": {
+      "get": {
+        "operationId": "listSubscriptions",
+        "summary": "List template subscriptions",
+        "responses": {
+          "200": {
+            "description": "Subscriptions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TemplateSubscription"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createSubscription",
+        "summary": "Create a template subscription",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/CreateTemplateSubscription"
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateSubscription"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}": {
+      "get": {
+        "operationId": "getSubscription",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subscription",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateSubscription"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateSubscription",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/UpdateTemplateSubscription"
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateSubscription"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteSubscription",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}/sync": {
+      "post": {
+        "operationId": "syncSubscription",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "summary": "Trigger a subscription sync (returns a sync id; progress via WebSocket)",
+        "responses": {
+          "200": {
+            "description": "Sync started"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}/syncs": {
+      "get": {
+        "operationId": "listSubscriptionSyncs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sync history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SubscriptionSync"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}/sync/live": {
+      "get": {
+        "operationId": "subscriptionSyncWebsocket",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "summary": "WebSocket stream of subscription sync progress",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          }
+        }
+      }
+    },
+    "/api/v1/push-requests": {
+      "get": {
+        "operationId": "listMyPushRequests",
+        "summary": "List my template push requests",
+        "responses": {
+          "200": {
+            "description": "Push requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PushRequest"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createPushRequest",
+        "summary": "Submit a template for public publication review",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/CreatePushRequest"
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushRequest"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/push-requests": {
+      "get": {
+        "operationId": "listAdminPushRequests",
+        "summary": "List push requests (admin); filter with ?status=pending",
+        "responses": {
+          "200": {
+            "description": "Push requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PushRequest"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/push-requests/{id}/decision": {
+      "post": {
+        "operationId": "decidePushRequest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/DecidePushRequest"
+        },
+        "responses": {
+          "200": {
+            "description": "Decision recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushRequest"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/backup": {
+      "get": {
+        "operationId": "adminBackup",
+        "summary": "Export a full JSON backup of the database (admin)",
+        "responses": {
+          "200": {
+            "description": "JSON backup download"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/restore": {
+      "post": {
+        "operationId": "adminRestore",
+        "summary": "Restore the database from a JSON backup (admin)",
+        "responses": {
+          "200": {
+            "description": "Restore complete"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1096,6 +1416,15 @@
         }
       },
       "RunId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "SubscriptionId": {
         "name": "id",
         "in": "path",
         "required": true,
@@ -1342,6 +1671,56 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/ClearLogs"
+            }
+          }
+        }
+      },
+      "VerifyEmail": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/VerifyEmail"
+            }
+          }
+        }
+      },
+      "CreateTemplateSubscription": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CreateTemplateSubscription"
+            }
+          }
+        }
+      },
+      "UpdateTemplateSubscription": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/UpdateTemplateSubscription"
+            }
+          }
+        }
+      },
+      "CreatePushRequest": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CreatePushRequest"
+            }
+          }
+        }
+      },
+      "DecidePushRequest": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/DecidePushRequest"
             }
           }
         }
@@ -2403,6 +2782,243 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "TemplateSubscription": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner_id",
+          "name",
+          "url",
+          "enabled",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "owner_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_synced_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreateTemplateSubscription": {
+        "type": "object",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateTemplateSubscription": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "SubscriptionSync": {
+        "type": "object",
+        "required": [
+          "id",
+          "subscription_id",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "subscription_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "PushRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner_id",
+          "template_id",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "owner_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "template_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviewed_by": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "reviewed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "CreatePushRequest": {
+        "type": "object",
+        "required": [
+          "template_id"
+        ],
+        "properties": {
+          "template_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DecidePushRequest": {
+        "type": "object",
+        "required": [
+          "approve"
+        ],
+        "properties": {
+          "approve": {
+            "type": "boolean"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "VerifyEmail": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string"
           }
         }
       }

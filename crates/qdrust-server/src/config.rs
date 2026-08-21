@@ -1,4 +1,4 @@
-use std::{env, net::IpAddr, time::Duration};
+use std::{env, net::IpAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 
@@ -18,6 +18,9 @@ pub struct Config {
     pub login_rate_limit_attempts: u32,
     pub login_rate_limit_window: Duration,
     pub log_retention_days: u64,
+    pub ga_key: Option<String>,
+    pub require_email_verification: bool,
+    pub config_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -49,8 +52,72 @@ impl Config {
                 60,
             )?),
             log_retention_days: parse_env("LOG_RETENTION_DAYS", 0)?,
+            ga_key: env::var("GA_KEY").ok().filter(|s| !s.is_empty()),
+            require_email_verification: parse_env("REQUIRE_EMAIL_VERIFICATION", false)?,
+            config_file: env::var("QDRUST_CONFIG_FILE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         })
+        .and_then(Config::load_config_file)
         .and_then(Config::validate)
+        .and_then(Config::validate)
+    }
+
+    /// Apply overrides from an optional JSON config file (local_config equivalent).
+    /// Environment variables always win over the file.
+    fn load_config_file(self) -> Result<Self> {
+        let Some(path) = &self.config_file else {
+            return Ok(self);
+        };
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config file {}", path.display()))?;
+        let json: serde_json::Value = serde_json::from_str(&source)
+            .with_context(|| format!("config file {} is not valid JSON", path.display()))?;
+        let get = |key: &str| json.get(key).and_then(|v| v.as_str());
+        let get_i64 = |key: &str| json.get(key).and_then(|v| v.as_i64());
+        let get_bool = |key: &str| json.get(key).and_then(|v| v.as_bool());
+        let apply = |current: &str, key: &str| -> String {
+            if !current.is_empty() {
+                return current.to_string();
+            }
+            get(key).unwrap_or(current).to_string()
+        };
+        let bind = match get("bind") {
+            Some(value) => value
+                .parse()
+                .with_context(|| "config file BIND must be an IP address")?,
+            None => self.bind,
+        };
+        Ok(Self {
+            bind,
+            port: get_i64("port").map_or(self.port, |v| u16::try_from(v).unwrap_or(self.port)),
+            database_url: apply(&self.database_url, "database_url"),
+            scheduler_interval: get_i64("scheduler_interval_seconds")
+                .map_or(self.scheduler_interval, |v| {
+                    Duration::from_secs(v.max(1) as u64)
+                }),
+            request_timeout: get_i64("request_timeout_seconds").map_or(self.request_timeout, |v| {
+                Duration::from_secs(v.max(1) as u64)
+            }),
+            session_ttl: self.session_ttl,
+            cookie_secure: get_bool("cookie_secure").unwrap_or(self.cookie_secure),
+            database_min_connections: self.database_min_connections,
+            database_max_connections: self.database_max_connections,
+            database_acquire_timeout: self.database_acquire_timeout,
+            database_idle_timeout: self.database_idle_timeout,
+            login_rate_limit_attempts: self.login_rate_limit_attempts,
+            login_rate_limit_window: self.login_rate_limit_window,
+            log_retention_days: get_i64("log_retention_days")
+                .map_or(self.log_retention_days, |v| v.max(0) as u64),
+            ga_key: get("ga_key")
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .or(self.ga_key),
+            require_email_verification: get_bool("require_email_verification")
+                .unwrap_or(self.require_email_verification),
+            config_file: self.config_file,
+        })
     }
 
     fn validate(self) -> Result<Self> {

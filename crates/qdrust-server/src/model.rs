@@ -2,12 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use qdrust_core::template::TemplateDefinition;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,
     pub username: String,
     pub role: String,
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub email_verified: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -135,6 +139,13 @@ pub struct UpdateQdHarTemplate {
 pub struct RegisterUser {
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct VerifyEmail {
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -197,6 +208,70 @@ pub struct QdHarValidation {
     pub requests: usize,
     pub controls: usize,
     pub extract_variables: usize,
+}
+
+// ---- P1 features: template subscriptions, push requests, email verification ----
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateSubscription {
+    pub id: i64,
+    pub owner_id: i64,
+    pub name: String,
+    pub url: String,
+    pub enabled: bool,
+    pub last_synced_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateTemplateSubscription {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateTemplateSubscription {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SubscriptionSync {
+    pub id: i64,
+    pub subscription_id: i64,
+    pub status: String,
+    pub message: Option<String>,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PushRequest {
+    pub id: i64,
+    pub owner_id: i64,
+    pub template_id: i64,
+    pub status: String,
+    pub note: Option<String>,
+    pub reviewed_by: Option<i64>,
+    pub reviewed_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreatePushRequest {
+    pub template_id: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DecidePushRequest {
+    pub approve: bool,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

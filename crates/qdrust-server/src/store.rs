@@ -3,7 +3,7 @@ use std::{path::Path, str::FromStr, time::Duration};
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
 use sqlx::{
-    MySql, MySqlPool, Row, Sqlite, SqlitePool,
+    Column, MySql, MySqlPool, Row, Sqlite, SqlitePool,
     mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
@@ -11,11 +11,12 @@ use sqlx::{
 use crate::auth::{new_token, token_hash};
 use crate::model::{
     AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNote,
-    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreateTask,
-    CreateTemplate, ImportQdHarTemplate, IssuedSession, Note, NotificationAction,
-    NotificationChannel, PluginManifest, Run, RunStep, SetSiteSetting, SiteSetting, Task, Template,
+    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
+    CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ImportQdHarTemplate,
+    IssuedSession, Note, NotificationAction, NotificationChannel, PluginManifest, PushRequest, Run,
+    RunStep, SetSiteSetting, SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription,
     UpdateNote, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-    UpdateTemplate, User, UserCredentials,
+    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
 
@@ -182,7 +183,7 @@ macro_rules! define_store {
 
     pub async fn credentials_by_username(&self, username: &str) -> Result<Option<UserCredentials>> {
         let row = sqlx::query(&format!(
-            "SELECT id,username,password_hash,role,disabled,session_version,created_at,updated_at FROM users WHERE {}",
+            "SELECT id,username,password_hash,role,disabled,email,email_verified,session_version,created_at,updated_at FROM users WHERE {}",
             $username_cmp()
         ))
         .bind(username.trim())
@@ -228,7 +229,7 @@ macro_rules! define_store {
         session_token: &str,
     ) -> Result<Option<AuthenticatedSession>> {
         let row = sqlx::query(
-            "SELECT u.id,u.username,u.role,u.disabled,u.created_at,u.updated_at,
+            "SELECT u.id,u.username,u.role,u.disabled,u.email,u.email_verified,u.created_at,u.updated_at,
                     s.csrf_token_hash,s.expires_at
              FROM sessions s JOIN users u ON u.id=s.user_id
              WHERE s.token_hash=? AND s.expires_at>? AND s.session_version=u.session_version
@@ -327,7 +328,7 @@ macro_rules! define_store {
 
     async fn credentials_by_id(&self, id: i64) -> Result<Option<UserCredentials>> {
         let row = sqlx::query(
-            "SELECT id,username,password_hash,role,disabled,session_version,created_at,updated_at
+            "SELECT id,username,password_hash,role,disabled,email,email_verified,session_version,created_at,updated_at
              FROM users WHERE id=?",
         )
         .bind(id)
@@ -1472,6 +1473,558 @@ macro_rules! define_store {
         .fetch_one(&self.pool)
         .await?)
     }
+
+    // ---- Email verification (MustVerifyEmail) ----
+
+    pub async fn set_user_email(&self, user_id: i64, email: &str) -> Result<bool> {
+        let email = email.trim().to_lowercase();
+        ensure!(email.contains('@') && email.len() <= 255, "invalid email address");
+        Ok(
+            sqlx::query("UPDATE users SET email=?,email_verified=0,updated_at=? WHERE id=?")
+                .bind(&email)
+                .bind(Utc::now().timestamp())
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
+    }
+
+    pub async fn create_email_verification_token(
+        &self,
+        user_id: i64,
+        ttl_seconds: i64,
+    ) -> Result<(String, i64)> {
+        let token = new_token();
+        let now = Utc::now().timestamp();
+        let expires_at = now
+            .checked_add(ttl_seconds.max(60))
+            .context("verification token expiry overflow")?;
+        sqlx::query("DELETE FROM email_verification_tokens WHERE user_id=?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO email_verification_tokens(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+        )
+        .bind(token_hash(&token))
+        .bind(user_id)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok((token, expires_at))
+    }
+
+    pub async fn consume_email_verification_token(&self, token: &str) -> Result<Option<i64>> {
+        let now = Utc::now().timestamp();
+        let row = sqlx::query(
+            "SELECT user_id FROM email_verification_tokens WHERE token_hash=? AND expires_at>?",
+        )
+        .bind(token_hash(token))
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let user_id: i64 = row.try_get("user_id")?;
+        sqlx::query("UPDATE users SET email_verified=1,updated_at=? WHERE id=?")
+            .bind(now)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM email_verification_tokens WHERE token_hash=?")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(user_id))
+    }
+
+    pub async fn purge_expired_email_tokens(&self) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM email_verification_tokens WHERE expires_at<=?")
+                .bind(Utc::now().timestamp())
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    // ---- CSRF rotation ----
+
+    pub async fn rotate_csrf(&self, session_token: &str, new_csrf_hash: &str) -> Result<bool> {
+        Ok(
+            sqlx::query("UPDATE sessions SET csrf_token_hash=? WHERE token_hash=?")
+                .bind(new_csrf_hash)
+                .bind(token_hash(session_token))
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
+    }
+
+    // ---- Template subscriptions ----
+
+    pub async fn create_subscription(
+        &self,
+        owner_id: i64,
+        input: CreateTemplateSubscription,
+    ) -> Result<TemplateSubscription> {
+        let name = input.name.trim().to_string();
+        let url = input.url.trim().to_string();
+        ensure!(!name.is_empty() && name.len() <= 255, "invalid subscription name");
+        ensure!(
+            url.starts_with("https://") || url.starts_with("http://"),
+            "subscription URL must be http(s)"
+        );
+        let now = Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO template_subscriptions(owner_id,name,url,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+        )
+        .bind(owner_id)
+        .bind(&name)
+        .bind(&url)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_subscription(id, owner_id)
+            .await?
+            .context("created subscription disappeared")
+    }
+
+    pub async fn list_subscriptions(&self, owner_id: i64) -> Result<Vec<TemplateSubscription>> {
+        let rows = sqlx::query(
+            "SELECT id,owner_id,name,url,enabled,last_synced_at,last_error,created_at,updated_at FROM template_subscriptions WHERE owner_id=? ORDER BY id",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(subscription_from_row).collect()
+    }
+
+    pub async fn get_subscription(
+        &self,
+        id: i64,
+        owner_id: i64,
+    ) -> Result<Option<TemplateSubscription>> {
+        let row = sqlx::query(
+            "SELECT id,owner_id,name,url,enabled,last_synced_at,last_error,created_at,updated_at FROM template_subscriptions WHERE id=? AND owner_id=?",
+        )
+        .bind(id)
+        .bind(owner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(subscription_from_row).transpose()
+    }
+
+    pub async fn update_subscription(
+        &self,
+        id: i64,
+        owner_id: i64,
+        input: UpdateTemplateSubscription,
+    ) -> Result<Option<TemplateSubscription>> {
+        let Some(current) = self.get_subscription(id, owner_id).await? else {
+            return Ok(None);
+        };
+        let name = input.name.unwrap_or(current.name);
+        let url = input.url.unwrap_or(current.url);
+        ensure!(!name.trim().is_empty() && name.len() <= 255, "invalid subscription name");
+        ensure!(
+            url.starts_with("https://") || url.starts_with("http://"),
+            "subscription URL must be http(s)"
+        );
+        let enabled = input.enabled.unwrap_or(current.enabled);
+        sqlx::query(
+            "UPDATE template_subscriptions SET name=?,url=?,enabled=?,updated_at=? WHERE id=? AND owner_id=?",
+        )
+        .bind(name.trim())
+        .bind(url.trim())
+        .bind(enabled)
+        .bind(Utc::now().timestamp())
+        .bind(id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        self.get_subscription(id, owner_id).await
+    }
+
+    pub async fn delete_subscription(&self, id: i64, owner_id: i64) -> Result<bool> {
+        Ok(
+            sqlx::query("DELETE FROM template_subscriptions WHERE id=? AND owner_id=?")
+                .bind(id)
+                .bind(owner_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
+    }
+
+    pub async fn mark_subscription_synced(
+        &self,
+        id: i64,
+        owner_id: i64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE template_subscriptions SET last_synced_at=?,last_error=?,updated_at=? WHERE id=? AND owner_id=?",
+        )
+        .bind(now)
+        .bind(error)
+        .bind(now)
+        .bind(id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_subscription_sync(
+        &self,
+        subscription_id: i64,
+    ) -> Result<SubscriptionSync> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO subscription_syncs(subscription_id,status,created_at) VALUES(?,'pending',?)",
+        )
+        .bind(subscription_id)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_subscription_sync(id).await?.context("sync record disappeared")
+    }
+
+    pub async fn get_subscription_sync(&self, id: i64) -> Result<Option<SubscriptionSync>> {
+        let row = sqlx::query(
+            "SELECT id,subscription_id,status,message,created_at,finished_at FROM subscription_syncs WHERE id=?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(subscription_sync_from_row).transpose()
+    }
+
+    pub async fn finish_subscription_sync(
+        &self,
+        id: i64,
+        status: &str,
+        message: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE subscription_syncs SET status=?,message=?,finished_at=? WHERE id=?",
+        )
+        .bind(status)
+        .bind(message)
+        .bind(Utc::now().timestamp())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_subscription_syncs(
+        &self,
+        subscription_id: i64,
+        owner_id: i64,
+    ) -> Result<Option<Vec<SubscriptionSync>>> {
+        if self.get_subscription(subscription_id, owner_id).await?.is_none() {
+            return Ok(None);
+        }
+        let rows = sqlx::query(
+            "SELECT id,subscription_id,status,message,created_at,finished_at FROM subscription_syncs WHERE subscription_id=? ORDER BY id DESC LIMIT 50",
+        )
+        .bind(subscription_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(subscription_sync_from_row).collect::<Result<Vec<_>>>().map(Some)
+    }
+
+    // ---- Push requests (template publication approval) ----
+
+    pub async fn create_push_request(
+        &self,
+        owner_id: i64,
+        input: CreatePushRequest,
+    ) -> Result<Option<PushRequest>> {
+        if self.get_template_for_owner(input.template_id, owner_id).await?.is_none() {
+            return Ok(None);
+        }
+        let already_public: bool = sqlx::query_scalar(
+            "SELECT published FROM templates WHERE id=? AND owner_id=?",
+        )
+        .bind(input.template_id)
+        .bind(owner_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if already_public {
+            return Ok(None);
+        }
+        ensure!(
+            input.note.as_deref().map(str::trim).map_or(true, |n| !n.is_empty()),
+            "push request note cannot be empty"
+        );
+        let now = Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO push_requests(owner_id,template_id,status,note,created_at) VALUES(?,?,'pending',?,?)",
+        )
+        .bind(owner_id)
+        .bind(input.template_id)
+        .bind(input.note.as_deref().map(str::trim))
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_push_request(id).await?.context("push request disappeared").map(Some)
+    }
+
+    pub async fn get_push_request(&self, id: i64) -> Result<Option<PushRequest>> {
+        let row = sqlx::query(
+            "SELECT id,owner_id,template_id,status,note,reviewed_by,reviewed_at,created_at FROM push_requests WHERE id=?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(push_request_from_row).transpose()
+    }
+
+    pub async fn list_push_requests_for_owner(&self, owner_id: i64) -> Result<Vec<PushRequest>> {
+        let rows = sqlx::query(
+            "SELECT id,owner_id,template_id,status,note,reviewed_by,reviewed_at,created_at FROM push_requests WHERE owner_id=? ORDER BY created_at DESC,id DESC",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(push_request_from_row).collect()
+    }
+
+    pub async fn list_push_requests(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<PushRequest>> {
+        let rows = match status {
+            Some(status) => {
+                sqlx::query(
+                    "SELECT id,owner_id,template_id,status,note,reviewed_by,reviewed_at,created_at FROM push_requests WHERE status=? ORDER BY created_at DESC,id DESC",
+                )
+                .bind(status)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT id,owner_id,template_id,status,note,reviewed_by,reviewed_at,created_at FROM push_requests ORDER BY created_at DESC,id DESC",
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        rows.into_iter().map(push_request_from_row).collect()
+    }
+
+    pub async fn decide_push_request(
+        &self,
+        id: i64,
+        reviewer_id: i64,
+        input: &DecidePushRequest,
+    ) -> Result<Option<PushRequest>> {
+        let Some(request) = self.get_push_request(id).await? else {
+            return Ok(None);
+        };
+        if request.status != "pending" {
+            return Ok(None);
+        }
+        let now = Utc::now().timestamp();
+        let status = if input.approve { "approved" } else { "rejected" };
+        sqlx::query(
+            "UPDATE push_requests SET status=?,note=COALESCE(?,note),reviewed_by=?,reviewed_at=? WHERE id=?",
+        )
+        .bind(status)
+        .bind(input.note.as_deref())
+        .bind(reviewer_id)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if input.approve {
+            let _ = self
+                .set_template_published(request.template_id, request.owner_id, true)
+                .await;
+        }
+        self.get_push_request(id).await
+    }
+
+    /// Find an existing QD HAR template by owner and display name so a
+    /// subscription re-sync can update it in place instead of duplicating it.
+    pub async fn find_template_by_name(
+        &self,
+        owner_id: i64,
+        name: &str,
+    ) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM templates WHERE owner_id=? AND name=? AND source_format='qd_har' ORDER BY id LIMIT 1",
+        )
+        .bind(owner_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    // ---- Backup & restore ----
+
+    pub async fn export_data(&self) -> Result<serde_json::Value> {
+        use serde_json::{Map, Value as JsonValue};
+        let mut out = Map::new();
+        let tables = [
+            "users",
+            "sessions",
+            "templates",
+            "tasks",
+            "runs",
+            "run_steps",
+            "notes",
+            "notification_channels",
+            "notification_actions",
+            "plugins",
+            "site_settings",
+            "template_subscriptions",
+            "subscription_syncs",
+            "push_requests",
+        ];
+        for table in tables {
+            let rows: Vec<JsonValue> = sqlx::query(&format!("SELECT * FROM {table}"))
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let mut m = Map::new();
+                    for column in row.columns() {
+                        let name = column.name().to_string();
+                        let value =
+                            if let Ok(v) = row.try_get::<Option<i64>, _>(name.as_str()) {
+                                v.map(JsonValue::from).unwrap_or(JsonValue::Null)
+                            } else if let Ok(v) = row.try_get::<Option<f64>, _>(name.as_str()) {
+                                v.map(JsonValue::from).unwrap_or(JsonValue::Null)
+                            } else if let Ok(v) = row.try_get::<Option<String>, _>(name.as_str()) {
+                                v.map(JsonValue::String).unwrap_or(JsonValue::Null)
+                            } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(name.as_str()) {
+                                v.map(|b| JsonValue::String(String::from_utf8_lossy(&b).into_owned()))
+                                    .unwrap_or(JsonValue::Null)
+                            } else {
+                                JsonValue::Null
+                            };
+                        m.insert(name, value);
+                    }
+                    Ok::<_, anyhow::Error>(JsonValue::Object(m))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            out.insert(table.to_string(), JsonValue::Array(rows));
+        }
+        Ok(JsonValue::Object(out))
+    }
+
+    pub async fn import_data(&self, backup: &serde_json::Value) -> Result<()> {
+        use serde_json::Value as JsonValue;
+        let Some(object) = backup.as_object() else {
+            anyhow::bail!("backup must be a JSON object of tables");
+        };
+        let mut tx = self.pool.begin().await?;
+        let tables = [
+            "push_requests",
+            "subscription_syncs",
+            "template_subscriptions",
+            "site_settings",
+            "plugins",
+            "notification_actions",
+            "notification_channels",
+            "notes",
+            "run_steps",
+            "runs",
+            "tasks",
+            "templates",
+            "sessions",
+            "users",
+        ];
+        for table in tables {
+            sqlx::query(&format!("DELETE FROM {table}"))
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Import in dependency order regardless of the JSON key order.
+        let import_order = [
+            "users",
+            "sessions",
+            "templates",
+            "tasks",
+            "runs",
+            "run_steps",
+            "notes",
+            "notification_channels",
+            "notification_actions",
+            "plugins",
+            "site_settings",
+            "template_subscriptions",
+            "subscription_syncs",
+            "push_requests",
+        ];
+        for table in import_order {
+            let Some(rows) = object.get(table).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let columns: Vec<String> = rows[0]
+                .as_object()
+                .map(|row| row.keys().cloned().collect())
+                .unwrap_or_default();
+            if columns.is_empty() {
+                continue;
+            }
+            let column_list = columns.join(",");
+            let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            for row in rows {
+                let Some(row_map) = row.as_object() else {
+                    continue;
+                };
+                let sql = format!(
+                    "INSERT INTO {table}({column_list}) VALUES({placeholders})"
+                );
+                let mut query = sqlx::query::<$db>(&sql);
+                for column in &columns {
+                    let value = row_map.get(column).cloned().unwrap_or(JsonValue::Null);
+                    query = match value {
+                        JsonValue::Null => query.bind(Option::<i64>::None),
+                        JsonValue::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                query.bind(i)
+                            } else if let Some(f) = n.as_f64() {
+                                query.bind(f)
+                            } else {
+                                query.bind(Option::<i64>::None)
+                            }
+                        }
+                        JsonValue::String(s) => query.bind(s),
+                        JsonValue::Bool(b) => query.bind(b),
+                        other => query.bind(other.to_string()),
+                    };
+                }
+                query.execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
             }
 
 fn setting_from_row(row: $row) -> Result<SiteSetting> {
@@ -1485,7 +2038,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested FROM runs";
-const USER_FIELDS: &str = "SELECT id,username,role,disabled,created_at,updated_at FROM users";
+const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
     Ok(User {
@@ -1493,6 +2046,8 @@ fn user_from_row(row: &$row) -> Result<User> {
         username: row.try_get("username")?,
         role: row.try_get("role")?,
         disabled: row.try_get("disabled")?,
+        email: row.try_get("email")?,
+        email_verified: row.try_get("email_verified")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -1642,6 +2197,44 @@ fn plugin_from_row(row: $row) -> Result<PluginManifest> {
         enabled: row.try_get("enabled")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn subscription_from_row(row: $row) -> Result<TemplateSubscription> {
+    Ok(TemplateSubscription {
+        id: row.try_get("id")?,
+        owner_id: row.try_get("owner_id")?,
+        name: row.try_get("name")?,
+        url: row.try_get("url")?,
+        enabled: row.try_get("enabled")?,
+        last_synced_at: row.try_get("last_synced_at")?,
+        last_error: row.try_get("last_error")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn subscription_sync_from_row(row: $row) -> Result<SubscriptionSync> {
+    Ok(SubscriptionSync {
+        id: row.try_get("id")?,
+        subscription_id: row.try_get("subscription_id")?,
+        status: row.try_get("status")?,
+        message: row.try_get("message")?,
+        created_at: row.try_get("created_at")?,
+        finished_at: row.try_get("finished_at")?,
+    })
+}
+
+fn push_request_from_row(row: $row) -> Result<PushRequest> {
+    Ok(PushRequest {
+        id: row.try_get("id")?,
+        owner_id: row.try_get("owner_id")?,
+        template_id: row.try_get("template_id")?,
+        status: row.try_get("status")?,
+        note: row.try_get("note")?,
+        reviewed_by: row.try_get("reviewed_by")?,
+        reviewed_at: row.try_get("reviewed_at")?,
+        created_at: row.try_get("created_at")?,
     })
 }
             }
@@ -1836,6 +2429,29 @@ impl Store {
         pub async fn purge_expired_reset_tokens() -> Result<u64> {  };
         pub async fn prune_run_logs(before: i64) -> Result<u64> { before };
         pub async fn count_old_runs(before: i64) -> Result<i64> { before };
+        pub async fn set_user_email(user_id: i64, email: &str) -> Result<bool> { user_id, email };
+        pub async fn create_email_verification_token(user_id: i64, ttl_seconds: i64) -> Result<(String, i64)> { user_id, ttl_seconds };
+        pub async fn consume_email_verification_token(token: &str) -> Result<Option<i64>> { token };
+        pub async fn purge_expired_email_tokens() -> Result<u64> {  };
+        pub async fn rotate_csrf(session_token: &str, new_csrf_hash: &str) -> Result<bool> { session_token, new_csrf_hash };
+        pub async fn create_subscription(owner_id: i64, input: CreateTemplateSubscription) -> Result<TemplateSubscription> { owner_id, input };
+        pub async fn list_subscriptions(owner_id: i64) -> Result<Vec<TemplateSubscription>> { owner_id };
+        pub async fn get_subscription(id: i64, owner_id: i64) -> Result<Option<TemplateSubscription>> { id, owner_id };
+        pub async fn update_subscription(id: i64, owner_id: i64, input: UpdateTemplateSubscription) -> Result<Option<TemplateSubscription>> { id, owner_id, input };
+        pub async fn delete_subscription(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn mark_subscription_synced(id: i64, owner_id: i64, error: Option<&str>) -> Result<()> { id, owner_id, error };
+        pub async fn create_subscription_sync(subscription_id: i64) -> Result<SubscriptionSync> { subscription_id };
+        pub async fn get_subscription_sync(id: i64) -> Result<Option<SubscriptionSync>> { id };
+        pub async fn finish_subscription_sync(id: i64, status: &str, message: Option<&str>) -> Result<()> { id, status, message };
+        pub async fn list_subscription_syncs(subscription_id: i64, owner_id: i64) -> Result<Option<Vec<SubscriptionSync>>> { subscription_id, owner_id };
+        pub async fn create_push_request(owner_id: i64, input: CreatePushRequest) -> Result<Option<PushRequest>> { owner_id, input };
+        pub async fn get_push_request(id: i64) -> Result<Option<PushRequest>> { id };
+        pub async fn list_push_requests_for_owner(owner_id: i64) -> Result<Vec<PushRequest>> { owner_id };
+        pub async fn list_push_requests(status: Option<&str>) -> Result<Vec<PushRequest>> { status };
+        pub async fn decide_push_request(id: i64, reviewer_id: i64, input: &DecidePushRequest) -> Result<Option<PushRequest>> { id, reviewer_id, input };
+        pub async fn find_template_by_name(owner_id: i64, name: &str) -> Result<Option<i64>> { owner_id, name };
+        pub async fn export_data() -> Result<serde_json::Value> {  };
+        pub async fn import_data(backup: &serde_json::Value) -> Result<()> { backup };
     }
 }
 
@@ -2702,5 +3318,234 @@ mod tests {
             store.get_run(first.id).await.unwrap().unwrap().status,
             "cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn email_verification_flow_marks_users_verified() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let user = store
+            .create_user("verify_me", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        assert!(!user.email_verified);
+        assert!(
+            store
+                .set_user_email(user.id, "A@Example.COM")
+                .await
+                .unwrap()
+        );
+        let updated = store.get_user(user.id).await.unwrap().unwrap();
+        assert_eq!(updated.email.as_deref(), Some("a@example.com"));
+        let (token, _expires) = store
+            .create_email_verification_token(user.id, 3600)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .consume_email_verification_token("bogus")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let verified = store
+            .consume_email_verification_token(&token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified, user.id);
+        assert!(
+            store
+                .get_user(user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_rotation_updates_session_hash() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let user = store
+            .create_user("csrf_rotate", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let session = store
+            .create_session(user.id, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        let new_hash = "new-hash";
+        assert!(
+            store
+                .rotate_csrf(&session.session_token, new_hash)
+                .await
+                .unwrap()
+        );
+        let authenticated = store
+            .authenticate_session(&session.session_token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authenticated.csrf_token_hash, new_hash);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_crud_and_sync_records() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let user = store
+            .create_user("sub_owner", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let created = store
+            .create_subscription(
+                user.id,
+                CreateTemplateSubscription {
+                    name: "qd-templates".into(),
+                    url: "https://github.com/example/qd-templates".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.name, "qd-templates");
+        assert!(created.enabled);
+        assert_eq!(store.list_subscriptions(user.id).await.unwrap().len(), 1);
+        assert!(
+            store
+                .get_subscription(created.id, user.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_subscription(created.id, user.id + 999)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sync = store.create_subscription_sync(created.id).await.unwrap();
+        assert_eq!(sync.status, "pending");
+        store
+            .finish_subscription_sync(sync.id, "succeeded", Some("imported 3"))
+            .await
+            .unwrap();
+        let synced = store.get_subscription_sync(sync.id).await.unwrap().unwrap();
+        assert_eq!(synced.status, "succeeded");
+        assert_eq!(synced.message.as_deref(), Some("imported 3"));
+        assert!(
+            store
+                .delete_subscription(created.id, user.id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn push_requests_require_approval_to_publish() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let alice = store
+            .create_user("push_alice", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let admin = store
+            .create_user("push_admin", "$argon2id$test", "admin")
+            .await
+            .unwrap();
+        let template = store
+            .create_template_for_owner(
+                alice.id,
+                CreateTemplate {
+                    name: "to-publish".into(),
+                    description: None,
+                    definition: template_definition("to-publish"),
+                    grp: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(store.list_public_templates().await.unwrap().is_empty());
+        let request = store
+            .create_push_request(
+                alice.id,
+                CreatePushRequest {
+                    template_id: template.id,
+                    note: Some("please review".into()),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.status, "pending");
+        assert_eq!(
+            store
+                .list_push_requests_for_owner(alice.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_push_requests(Some("pending"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let decided = store
+            .decide_push_request(
+                request.id,
+                admin.id,
+                &DecidePushRequest {
+                    approve: true,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decided.status, "approved");
+        assert!(store.list_public_templates().await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn backup_and_restore_round_trips_data() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let user = store
+            .create_user("backup_user", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(
+                user.id,
+                CreateTask {
+                    name: "backup task".into(),
+                    cron: "0 * * * * * *".into(),
+                    method: Some("GET".into()),
+                    url: "https://example.com".into(),
+                    headers: Default::default(),
+                    body: None,
+                    disabled: false,
+                    template_id: None,
+                    grp: Some("prod".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let backup = store.export_data().await.unwrap();
+        assert!(backup.get("users").is_some());
+        assert!(backup.get("tasks").is_some());
+
+        let target = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        target.import_data(&backup).await.unwrap();
+        let restored = target
+            .get_for_owner(task.id, user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.name, "backup task");
+        assert_eq!(restored.grp.as_deref(), Some("prod"));
+        assert_eq!(target.list().await.unwrap().len(), 1);
+        assert_eq!(target.list_users().await.unwrap().len(), 1);
     }
 }
