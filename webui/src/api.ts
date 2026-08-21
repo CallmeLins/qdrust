@@ -38,6 +38,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   session: () => request<{ user: User; expires_at: number }>("/api/v1/auth/session"),
   bootstrap: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/bootstrap", { method: "POST", body: JSON.stringify({ username, password }) }),
+  register: (username: string, password: string, email?: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/register", { method: "POST", body: JSON.stringify({ username, password, ...(email ? { email } : {}) }) }),
   login: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   templates: () => request<Template[]>("/api/v1/templates"),

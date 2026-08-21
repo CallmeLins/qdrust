@@ -24,8 +24,8 @@ const plugins=ref<Plugin[]>([]);const pluginForm=reactive({name:"",command:""});
 const invokeForm=reactive({action:"run",query:"{}"});const pluginResult=ref("");
 const channels=ref<NotificationChannel[]>([]);const channelForm=reactive({name:"",url:""});
 const actions=ref<NotificationAction[]>([]);const actionForm=reactive({taskId:0,channelId:0,event:"failure"});
-const authMode = ref<"login" | "bootstrap">("login");
-const authForm = reactive({ username: "", password: "" });
+const authMode = ref<"login" | "bootstrap" | "register">("login");
+const authForm = reactive({ username: "", password: "", email: "" });
 const expandedTask = ref<number | null>(null);
 const runs = ref<Run[]>([]);
 const allRuns = ref<Run[]>([]);
@@ -106,7 +106,10 @@ async function remove(task: Task) {
 async function authenticate() {
   saving.value = true; error.value = "";
   try {
-    const session = authMode.value === "login" ? await api.login(authForm.username, authForm.password) : await api.bootstrap(authForm.username, authForm.password);
+    let session;
+    if (authMode.value === "login") session = await api.login(authForm.username, authForm.password);
+    else if (authMode.value === "bootstrap") session = await api.bootstrap(authForm.username, authForm.password);
+    else session = await api.register(authForm.username, authForm.password, authForm.email || undefined);
     currentUser.value = session.user;
     authenticated.value = true; await load();
   } catch (cause) { error.value = cause instanceof Error ? cause.message : "认证失败"; }
@@ -226,12 +229,13 @@ onMounted(async () => {
   <main v-if="!authenticated" class="auth-page">
     <form class="auth-panel" @submit.prevent="authenticate">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
-      <h1>{{ authMode === "login" ? t('login') : t('bootstrap') }}</h1>
+      <h1>{{ authMode === "login" ? t('login') : authMode === "bootstrap" ? t('bootstrap') : "注册" }}</h1>
       <label>用户名<input v-model="authForm.username" required autocomplete="username" /></label>
+      <label v-if="authMode === 'register'">邮箱（可选，用于验证）<input v-model="authForm.email" type="email" autocomplete="email" /></label>
       <label>密码<input v-model="authForm.password" required minlength="12" type="password" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" /></label>
       <div v-if="error" class="error-banner">{{ error }}</div>
-      <button class="primary-button" :disabled="saving" type="submit">{{ saving ? "处理中" : authMode === "login" ? "登录" : "创建管理员" }}</button>
-      <button class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : 'login'; error = ''">{{ authMode === "login" ? "首次使用？初始化管理员" : "已有账户？返回登录" }}</button>
+      <button class="primary-button" :disabled="saving" type="submit">{{ saving ? "处理中" : authMode === "login" ? "登录" : authMode === "bootstrap" ? "创建管理员" : "注册" }}</button>
+      <button class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : authMode === 'bootstrap' ? 'register' : 'login'; error = ''">{{ authMode === "login" ? "首次使用？初始化管理员" : authMode === "bootstrap" ? "需要账户？注册" : "已有账户？返回登录" }}</button>
     </form>
   </main>
   <div v-else class="app-shell">

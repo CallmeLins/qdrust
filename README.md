@@ -114,6 +114,17 @@ npm --prefix webui run build
 
 qdrust 不导入旧 QD 数据库，不复用旧登录 Cookie，也不承诺兼容旧 URL、旧 API 或任意 Python 动态表达式。详细决策、阶段范围和风险控制见 [迁移计划](MIGRATION_PLAN.md)。
 
+## 架构决策说明
+
+与旧 QD 的两处刻意差异：
+
+- **单进程异步模型**：qdrust 采用单进程 Tokio 异步模型（`axum::serve`），而非 Tornado 多进程。
+  横向扩展通过 Docker 副本 + 反向代理（`docker compose up --scale qdrust=N`）实现；
+  开发期热重载使用 `cargo watch -x run`，运行时配置热更新由 `QDRUST_CONFIG_FILE` 与
+  站点设置（admin API）提供，无需重启进程。
+- **非持久化本地队列**：运行队列基于 SQLite 事务（`claim_run`/租约恢复），保证单实例
+  正确性；多实例共享数据库时由租约机制保证不重复执行。Redis 可选用于会话缓存加速。
+
 ## 项目状态
 
 Phase 0-7 已完成；Phase 8 的代码、容器和发布流水线已实现，仍需在正式发布前完成浏览器人工验收和首个镜像发布检查。
