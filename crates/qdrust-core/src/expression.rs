@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Local, TimeZone};
 use fake::Fake;
-use md5::{Digest as _, Md5};
 use minijinja::{Environment, Error, ErrorKind, Value as JinjaValue};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use rand::Rng;
@@ -101,33 +100,37 @@ impl Default for QdExpressionEngine {
         // Hash functions
         environment.add_function("md5", |value: JinjaValue| {
             let s = value.to_string();
-            let digest = Md5::digest(s.as_bytes());
+            let digest = md5::compute(s.as_bytes());
             Ok::<_, Error>(format!("{:x}", digest))
         });
         environment.add_function("sha1", |value: JinjaValue| {
+            use sha1::Digest;
             let s = value.to_string();
             let digest = Sha1::digest(s.as_bytes());
-            Ok::<_, Error>(format!("{:x}", digest))
+            Ok::<_, Error>(hex::encode(digest))
         });
         environment.add_function("hash", |value: JinjaValue, hashtype: Option<String>| {
+            use sha1::Digest as Sha1Digest;
+            use sha2::Digest as Sha2Digest;
+
             let s = value.to_string();
             let hashtype = hashtype.unwrap_or_else(|| "sha1".to_string());
             match hashtype.as_str() {
                 "md5" => {
-                    let digest = Md5::digest(s.as_bytes());
+                    let digest = md5::compute(s.as_bytes());
                     Ok::<_, Error>(format!("{:x}", digest))
                 }
                 "sha1" => {
                     let digest = Sha1::digest(s.as_bytes());
-                    Ok::<_, Error>(format!("{:x}", digest))
+                    Ok::<_, Error>(hex::encode(digest))
                 }
                 "sha256" => {
                     let digest = Sha256::digest(s.as_bytes());
-                    Ok::<_, Error>(format!("{:x}", digest))
+                    Ok::<_, Error>(hex::encode(digest))
                 }
                 "sha512" => {
                     let digest = Sha512::digest(s.as_bytes());
-                    Ok::<_, Error>(format!("{:x}", digest))
+                    Ok::<_, Error>(hex::encode(digest))
                 }
                 _ => Err(Error::new(ErrorKind::InvalidOperation, format!("unsupported hash type: {hashtype}")))
             }

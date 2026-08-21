@@ -224,6 +224,206 @@ impl Plugin for UtilityPlugin {
                         body: format!("delayed {seconds} seconds").into_bytes(),
                     })
                 }
+                "timestamp" => {
+                    let format = request.query.get("format").map(String::as_str);
+                    let timestamp = chrono::Utc::now().timestamp();
+                    let body = match format {
+                        Some("ms") => (timestamp * 1000).to_string(),
+                        _ => timestamp.to_string(),
+                    };
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: body.into_bytes(),
+                    })
+                }
+                "unicode" => {
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let decoded = percent_encoding::percent_decode_str(text)
+                        .decode_utf8()
+                        .context("invalid unicode encoding")?;
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: decoded.into_owned().into_bytes(),
+                    })
+                }
+                "regex" => {
+                    let pattern = request
+                        .query
+                        .get("pattern")
+                        .context("regex pattern is required")?;
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let operation = request.query.get("op").map(String::as_str).unwrap_or("search");
+
+                    let re = regex::Regex::new(pattern).context("invalid regex pattern")?;
+
+                    let result = match operation {
+                        "search" => {
+                            re.find(text).map(|m| m.as_str()).unwrap_or("").to_string()
+                        }
+                        "findall" => {
+                            let matches: Vec<&str> = re.find_iter(text).map(|m| m.as_str()).collect();
+                            serde_json::to_string(&matches)?
+                        }
+                        "replace" => {
+                            let replacement = request.query.get("replacement").map(String::as_str).unwrap_or("");
+                            re.replace_all(text, replacement).to_string()
+                        }
+                        _ => bail!("unsupported regex operation: {operation}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "base64" => {
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let operation = request.query.get("op").map(String::as_str).unwrap_or("encode");
+
+                    let result = match operation {
+                        "encode" => base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text),
+                        "decode" => {
+                            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text)
+                                .context("invalid base64")?;
+                            String::from_utf8(decoded).context("decoded base64 is not valid UTF-8")?
+                        }
+                        _ => bail!("unsupported base64 operation: {operation}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "hash" => {
+                    use sha1::Digest as Sha1Digest;
+                    use sha2::Digest as Sha2Digest;
+
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let algorithm = request.query.get("algo").map(String::as_str).unwrap_or("md5");
+
+                    let result = match algorithm {
+                        "md5" => {
+                            let digest = md5::compute(text.as_bytes());
+                            format!("{:x}", digest)
+                        }
+                        "sha1" => {
+                            let digest = sha1::Sha1::digest(text.as_bytes());
+                            hex::encode(digest)
+                        }
+                        "sha256" => {
+                            let digest = sha2::Sha256::digest(text.as_bytes());
+                            hex::encode(digest)
+                        }
+                        "sha512" => {
+                            let digest = sha2::Sha512::digest(text.as_bytes());
+                            hex::encode(digest)
+                        }
+                        _ => bail!("unsupported hash algorithm: {algorithm}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "uuid" => {
+                    let namespace = request.query.get("namespace").map(String::as_str).unwrap_or("");
+                    let name = request.query.get("name").map(String::as_str).unwrap_or("");
+
+                    let result = if !namespace.is_empty() && !name.is_empty() {
+                        let ns_uuid = uuid::Uuid::parse_str(namespace)
+                            .unwrap_or(uuid::Uuid::NAMESPACE_URL);
+                        uuid::Uuid::new_v5(&ns_uuid, name.as_bytes()).to_string()
+                    } else {
+                        uuid::Uuid::new_v4().to_string()
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "random" => {
+                    use rand::Rng;
+
+                    let kind = request.query.get("type").map(String::as_str).unwrap_or("int");
+                    let min = request.query.get("min").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    let max = request.query.get("max").and_then(|s| s.parse::<i64>().ok()).unwrap_or(100);
+
+                    let mut rng = rand::thread_rng();
+                    let result = match kind {
+                        "int" => rng.gen_range(min..=max).to_string(),
+                        "float" => {
+                            let value: f64 = rng.gen_range(min as f64..=max as f64);
+                            value.to_string()
+                        }
+                        _ => bail!("unsupported random type: {kind}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "urlencode" => {
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let operation = request.query.get("op").map(String::as_str).unwrap_or("encode");
+
+                    let result = match operation {
+                        "encode" => percent_encoding::utf8_percent_encode(
+                            text,
+                            percent_encoding::NON_ALPHANUMERIC,
+                        ).to_string(),
+                        "decode" => {
+                            percent_encoding::percent_decode_str(text)
+                                .decode_utf8()
+                                .context("invalid URL encoding")?
+                                .to_string()
+                        }
+                        _ => bail!("unsupported urlencode operation: {operation}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
+                "json" => {
+                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                    let operation = request.query.get("op").map(String::as_str).unwrap_or("parse");
+
+                    let result = match operation {
+                        "parse" => {
+                            let _: serde_json::Value = serde_json::from_str(text)
+                                .context("invalid JSON")?;
+                            text.to_string()
+                        }
+                        "stringify" => {
+                            let value: serde_json::Value = serde_json::from_str(text)?;
+                            serde_json::to_string(&value)?
+                        }
+                        "pretty" => {
+                            let value: serde_json::Value = serde_json::from_str(text)?;
+                            serde_json::to_string_pretty(&value)?
+                        }
+                        _ => bail!("unsupported json operation: {operation}"),
+                    };
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
                 action => bail!("plugin action unavailable: util/{action}"),
             }
         })
