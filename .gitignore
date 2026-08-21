@@ -34,3 +34,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# pi session exports
+pi-session-*.html
