@@ -11,6 +11,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY migrations migrations
+COPY migrations-mysql migrations-mysql
 COPY docs/openapi-v1.json docs/openapi-v1.json
 RUN cargo build --locked --release -p qdrust-server
 
