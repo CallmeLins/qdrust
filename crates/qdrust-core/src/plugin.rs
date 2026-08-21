@@ -254,20 +254,27 @@ impl Plugin for UtilityPlugin {
                         .get("pattern")
                         .context("regex pattern is required")?;
                     let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let operation = request.query.get("op").map(String::as_str).unwrap_or("search");
+                    let operation = request
+                        .query
+                        .get("op")
+                        .map(String::as_str)
+                        .unwrap_or("search");
 
                     let re = regex::Regex::new(pattern).context("invalid regex pattern")?;
 
                     let result = match operation {
-                        "search" => {
-                            re.find(text).map(|m| m.as_str()).unwrap_or("").to_string()
-                        }
+                        "search" => re.find(text).map(|m| m.as_str()).unwrap_or("").to_string(),
                         "findall" => {
-                            let matches: Vec<&str> = re.find_iter(text).map(|m| m.as_str()).collect();
+                            let matches: Vec<&str> =
+                                re.find_iter(text).map(|m| m.as_str()).collect();
                             serde_json::to_string(&matches)?
                         }
                         "replace" => {
-                            let replacement = request.query.get("replacement").map(String::as_str).unwrap_or("");
+                            let replacement = request
+                                .query
+                                .get("replacement")
+                                .map(String::as_str)
+                                .unwrap_or("");
                             re.replace_all(text, replacement).to_string()
                         }
                         _ => bail!("unsupported regex operation: {operation}"),
@@ -281,14 +288,24 @@ impl Plugin for UtilityPlugin {
                 }
                 "base64" => {
                     let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let operation = request.query.get("op").map(String::as_str).unwrap_or("encode");
+                    let operation = request
+                        .query
+                        .get("op")
+                        .map(String::as_str)
+                        .unwrap_or("encode");
 
                     let result = match operation {
-                        "encode" => base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text),
+                        "encode" => {
+                            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text)
+                        }
                         "decode" => {
-                            let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text)
-                                .context("invalid base64")?;
-                            String::from_utf8(decoded).context("decoded base64 is not valid UTF-8")?
+                            let decoded = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                text,
+                            )
+                            .context("invalid base64")?;
+                            String::from_utf8(decoded)
+                                .context("decoded base64 is not valid UTF-8")?
                         }
                         _ => bail!("unsupported base64 operation: {operation}"),
                     };
@@ -301,10 +318,13 @@ impl Plugin for UtilityPlugin {
                 }
                 "hash" => {
                     use sha1::Digest as Sha1Digest;
-                    use sha2::Digest as Sha2Digest;
 
                     let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let algorithm = request.query.get("algo").map(String::as_str).unwrap_or("md5");
+                    let algorithm = request
+                        .query
+                        .get("algo")
+                        .map(String::as_str)
+                        .unwrap_or("md5");
 
                     let result = match algorithm {
                         "md5" => {
@@ -333,12 +353,16 @@ impl Plugin for UtilityPlugin {
                     })
                 }
                 "uuid" => {
-                    let namespace = request.query.get("namespace").map(String::as_str).unwrap_or("");
+                    let namespace = request
+                        .query
+                        .get("namespace")
+                        .map(String::as_str)
+                        .unwrap_or("");
                     let name = request.query.get("name").map(String::as_str).unwrap_or("");
 
                     let result = if !namespace.is_empty() && !name.is_empty() {
-                        let ns_uuid = uuid::Uuid::parse_str(namespace)
-                            .unwrap_or(uuid::Uuid::NAMESPACE_URL);
+                        let ns_uuid =
+                            uuid::Uuid::parse_str(namespace).unwrap_or(uuid::Uuid::NAMESPACE_URL);
                         uuid::Uuid::new_v5(&ns_uuid, name.as_bytes()).to_string()
                     } else {
                         uuid::Uuid::new_v4().to_string()
@@ -353,9 +377,21 @@ impl Plugin for UtilityPlugin {
                 "random" => {
                     use rand::Rng;
 
-                    let kind = request.query.get("type").map(String::as_str).unwrap_or("int");
-                    let min = request.query.get("min").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                    let max = request.query.get("max").and_then(|s| s.parse::<i64>().ok()).unwrap_or(100);
+                    let kind = request
+                        .query
+                        .get("type")
+                        .map(String::as_str)
+                        .unwrap_or("int");
+                    let min = request
+                        .query
+                        .get("min")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let max = request
+                        .query
+                        .get("max")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(100);
 
                     let mut rng = rand::thread_rng();
                     let result = match kind {
@@ -375,19 +411,22 @@ impl Plugin for UtilityPlugin {
                 }
                 "urlencode" => {
                     let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let operation = request.query.get("op").map(String::as_str).unwrap_or("encode");
+                    let operation = request
+                        .query
+                        .get("op")
+                        .map(String::as_str)
+                        .unwrap_or("encode");
 
                     let result = match operation {
                         "encode" => percent_encoding::utf8_percent_encode(
                             text,
                             percent_encoding::NON_ALPHANUMERIC,
-                        ).to_string(),
-                        "decode" => {
-                            percent_encoding::percent_decode_str(text)
-                                .decode_utf8()
-                                .context("invalid URL encoding")?
-                                .to_string()
-                        }
+                        )
+                        .to_string(),
+                        "decode" => percent_encoding::percent_decode_str(text)
+                            .decode_utf8()
+                            .context("invalid URL encoding")?
+                            .to_string(),
                         _ => bail!("unsupported urlencode operation: {operation}"),
                     };
 
@@ -399,12 +438,16 @@ impl Plugin for UtilityPlugin {
                 }
                 "json" => {
                     let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let operation = request.query.get("op").map(String::as_str).unwrap_or("parse");
+                    let operation = request
+                        .query
+                        .get("op")
+                        .map(String::as_str)
+                        .unwrap_or("parse");
 
                     let result = match operation {
                         "parse" => {
-                            let _: serde_json::Value = serde_json::from_str(text)
-                                .context("invalid JSON")?;
+                            let _: serde_json::Value =
+                                serde_json::from_str(text).context("invalid JSON")?;
                             text.to_string()
                         }
                         "stringify" => {
@@ -422,6 +465,72 @@ impl Plugin for UtilityPlugin {
                         status: 200,
                         headers: BTreeMap::new(),
                         body: result.into_bytes(),
+                    })
+                }
+                action if action.starts_with("dddd/") => {
+                    // DdddOCR verification code recognition. QD proxies this to an
+                    // external DdddOCR HTTP server; here we forward to a configured
+                    // base URL (see api://util/dddd/ocr/... ?_server=... or env).
+                    let base = request
+                        .query
+                        .get("_server")
+                        .cloned()
+                        .or_else(|| std::env::var("QDRUST_DDDDOCR_SERVER").ok())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "DdddOCR is not configured: set _server query param or QDRUST_DDDDOCR_SERVER"
+                            )
+                        })?;
+                    let server = reqwest::Url::parse(&base)
+                        .context("invalid DdddOCR server URL")?
+                        .join(action.trim_start_matches("dddd/"))
+                        .context("invalid DdddOCR route")?;
+                    let client = reqwest::Client::new();
+                    let mut request_builder = client.request(
+                        reqwest::Method::from_bytes(
+                            request
+                                .query
+                                .get("_method")
+                                .map(String::as_str)
+                                .unwrap_or("POST")
+                                .as_bytes(),
+                        )
+                        .unwrap_or(reqwest::Method::POST),
+                        server,
+                    );
+                    if let Some(body) = request.query.get("body") {
+                        request_builder = request_builder.body(body.clone());
+                        request_builder = request_builder.header(
+                            reqwest::header::CONTENT_TYPE,
+                            reqwest::header::HeaderValue::from_str("application/json").unwrap(),
+                        );
+                    } else if let Some(img) = request.query.get("image") {
+                        request_builder = request_builder.body(img.clone());
+                    }
+                    let response = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        request_builder.send(),
+                    )
+                    .await
+                    .context("DdddOCR request timed out")??
+                    .error_for_status()
+                    .context("DdddOCR server error")?;
+                    let status = response.status().as_u16();
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .map(|(n, v)| {
+                            (
+                                n.as_str().to_string(),
+                                v.to_str().unwrap_or_default().to_string(),
+                            )
+                        })
+                        .collect();
+                    let body = response.bytes().await?.to_vec();
+                    Ok(PluginResponse {
+                        status,
+                        headers,
+                        body,
                     })
                 }
                 action => bail!("plugin action unavailable: util/{action}"),

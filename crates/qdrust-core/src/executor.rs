@@ -53,6 +53,8 @@ pub struct ExecutorOptions {
     pub plugin_timeout: Duration,
     pub request_limit: usize,
     pub loop_limit: usize,
+    /// Optional HTTP/SOCKS5 proxy URL applied to outbound requests.
+    pub proxy: Option<String>,
 }
 
 impl Default for ExecutorOptions {
@@ -65,6 +67,7 @@ impl Default for ExecutorOptions {
             plugin_timeout: Duration::from_secs(30),
             request_limit: DEFAULT_REQUEST_LIMIT,
             loop_limit: MAX_LOOP_ITERATIONS,
+            proxy: None,
         }
     }
 }
@@ -126,6 +129,7 @@ pub struct QdExecutor {
     plugin_timeout: Duration,
     request_limit: usize,
     loop_limit: usize,
+    proxy: Option<reqwest::Proxy>,
 }
 
 impl QdExecutor {
@@ -141,6 +145,12 @@ impl QdExecutor {
         ensure!(options.loop_limit > 0, "loop limit must be positive");
         let mut plugins = PluginRegistry::default();
         plugins.register(std::sync::Arc::new(UtilityPlugin::default()))?;
+        let proxy = options
+            .proxy
+            .as_deref()
+            .map(reqwest::Proxy::all)
+            .transpose()
+            .context("invalid proxy URL")?;
         Ok(Self {
             cookies: Arc::new(Jar::default()),
             timeout: options.timeout,
@@ -153,6 +163,7 @@ impl QdExecutor {
             plugin_timeout: options.plugin_timeout,
             request_limit: options.request_limit,
             loop_limit: options.loop_limit,
+            proxy,
         })
     }
 
@@ -420,13 +431,16 @@ impl QdExecutor {
         if !cookies.is_empty() {
             request = request.header(reqwest::header::COOKIE, cookies.join("; "));
         }
-        if let Some(body) = entry
-            .request
-            .post_data
-            .as_ref()
-            .and_then(|body| body.text.as_ref())
-        {
-            request = request.body(self.render(body, context)?);
+        if let Some(post_data) = entry.request.post_data.as_ref() {
+            let is_multipart = post_data
+                .mime_type
+                .as_deref()
+                .is_some_and(|m| m.starts_with("multipart/"));
+            if is_multipart {
+                request = request.multipart(self.build_multipart(post_data, context)?);
+            } else if let Some(text) = post_data.text.as_ref() {
+                request = request.body(self.render(text, context)?);
+            }
         }
 
         let response = request.send().await?;
@@ -531,12 +545,86 @@ impl QdExecutor {
             .context("cannot render QD template value")
     }
 
+    fn build_multipart(
+        &self,
+        post_data: &QdPostData,
+        context: &ExecutionContext,
+    ) -> Result<reqwest::multipart::Form> {
+        let mut form = reqwest::multipart::Form::new();
+        if let Some(text) = post_data.text.as_ref() {
+            // QD sometimes serializes a multipart body as raw text; send it verbatim.
+            let body = self.render(text, context)?;
+            form = form.part("body", reqwest::multipart::Part::bytes(body.into_bytes()));
+            return Ok(form);
+        }
+        if let Some(params) = post_data
+            .extensions
+            .get("params")
+            .and_then(|v| v.as_array())
+        {
+            for param in params {
+                let name = self.render(
+                    param.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    context,
+                )?;
+                if param
+                    .get("fileName")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    let file_name = self.render(
+                        param.get("fileName").and_then(|v| v.as_str()).unwrap_or(""),
+                        context,
+                    )?;
+                    let content = self.render(
+                        param.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+                        context,
+                    )?;
+                    let raw = content.into_bytes();
+                    let mut part =
+                        reqwest::multipart::Part::bytes(raw.clone()).file_name(file_name.clone());
+                    if let Some(mime) = param.get("contentType").and_then(|v| v.as_str())
+                        && let Ok(typed) = reqwest::multipart::Part::bytes(raw)
+                            .file_name(file_name)
+                            .mime_str(mime)
+                    {
+                        part = typed;
+                    }
+                    form = form.part(name, part);
+                } else {
+                    let value = self.render(
+                        param.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+                        context,
+                    )?;
+                    form = form.text(name, value);
+                }
+            }
+        }
+        Ok(form)
+    }
+
     async fn client_for_url(&self, url: &str) -> Result<Client> {
         let (parsed, addresses) = resolve_target(url, self.allow_private_network).await?;
         let host = parsed.host_str().context("URL host is missing")?;
-        self.build_pinned_client(host, addresses[0])
+        let builder = Client::builder()
+            .cookie_provider(self.cookies.clone())
+            .redirect(Policy::none())
+            .danger_accept_invalid_certs(self.allow_invalid_certificates)
+            .timeout(self.timeout);
+        if let Some(proxy) = self.proxy.clone() {
+            // With a proxy, DNS is delegated to the proxy; do not pin the host.
+            return builder
+                .proxy(proxy)
+                .build()
+                .context("cannot build proxied HTTP client");
+        }
+        builder
+            .resolve(host, addresses[0])
+            .build()
+            .context("cannot build pinned HTTP client")
     }
 
+    #[cfg(test)]
     fn build_pinned_client(&self, host: &str, address: std::net::SocketAddr) -> Result<Client> {
         Client::builder()
             .cookie_provider(self.cookies.clone())

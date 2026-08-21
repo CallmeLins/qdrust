@@ -17,6 +17,7 @@ pub struct Config {
     pub database_idle_timeout: Duration,
     pub login_rate_limit_attempts: u32,
     pub login_rate_limit_window: Duration,
+    pub log_retention_days: u64,
 }
 
 impl Config {
@@ -47,6 +48,7 @@ impl Config {
                 "LOGIN_RATE_LIMIT_WINDOW_SECONDS",
                 60,
             )?),
+            log_retention_days: parse_env("LOG_RETENTION_DAYS", 0)?,
         })
         .and_then(Config::validate)
     }

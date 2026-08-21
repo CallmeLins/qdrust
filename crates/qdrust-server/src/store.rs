@@ -9,9 +9,10 @@ use sqlx::{
 
 use crate::auth::{new_token, token_hash};
 use crate::model::{
-    AuthenticatedSession, CreateNote, CreateNotificationAction, CreateNotificationChannel,
-    CreatePluginManifest, CreateTask, CreateTemplate, ImportQdHarTemplate, IssuedSession, Note,
-    NotificationAction, NotificationChannel, PluginManifest, Run, RunStep, Task, Template,
+    AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNote,
+    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreateTask,
+    CreateTemplate, ImportQdHarTemplate, IssuedSession, Note, NotificationAction,
+    NotificationChannel, PluginManifest, Run, RunStep, SetSiteSetting, SiteSetting, Task, Template,
     UpdateNote, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
     UpdateTemplate, User, UserCredentials,
 };
@@ -301,8 +302,8 @@ impl Store {
         validate(&input.name, &input.cron, &input.url)?;
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(input.name)
         .bind(input.cron)
@@ -315,6 +316,7 @@ impl Store {
         .bind(now)
         .bind(owner_id)
         .bind(input.template_id)
+        .bind(input.grp.as_deref())
         .execute(&self.pool)
         .await?;
         self.get(result.last_insert_rowid())
@@ -332,6 +334,26 @@ impl Store {
             .bind(owner_id)
             .fetch_all(&self.pool)
             .await?;
+        rows.into_iter().map(task_from_row).collect()
+    }
+
+    pub async fn list_for_owner_with_group(
+        &self,
+        owner_id: i64,
+        grp: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        let mut statement = TASK_FIELDS.to_string();
+        if grp.is_some() {
+            statement.push_str(" WHERE owner_id=? AND grp=?");
+        } else {
+            statement.push_str(" WHERE owner_id=?");
+        }
+        statement.push_str(" ORDER BY grp, id");
+        let mut query = sqlx::query(&statement).bind(owner_id);
+        if let Some(grp) = grp {
+            query = query.bind(grp);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
         rows.into_iter().map(task_from_row).collect()
     }
 
@@ -387,8 +409,12 @@ impl Store {
             .headers
             .map(serde_json::Value::Object)
             .unwrap_or(current.headers);
+        let grp = match input.grp {
+            Some(grp) => grp,
+            None => current.grp,
+        };
         sqlx::query(
-            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, updated_at=? WHERE id=?",
         )
         .bind(name)
         .bind(cron)
@@ -398,6 +424,7 @@ impl Store {
         .bind(input.body.or(current.body))
         .bind(input.disabled.unwrap_or(current.disabled))
         .bind(input.template_id.or(current.template_id))
+        .bind(grp.as_deref())
         .bind(Utc::now().timestamp())
         .bind(id)
         .execute(&self.pool)
@@ -880,8 +907,8 @@ impl Store {
         input.definition.validate()?;
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            "INSERT INTO templates(name, description, schema_version, definition, created_at, updated_at, owner_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO templates(name, description, schema_version, definition, created_at, updated_at, owner_id, grp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(input.name)
         .bind(input.description)
@@ -890,6 +917,7 @@ impl Store {
         .bind(now)
         .bind(now)
         .bind(owner_id)
+        .bind(input.grp.as_deref())
         .execute(&self.pool)
         .await?;
         self.get_template(result.last_insert_rowid())
@@ -1016,14 +1044,19 @@ impl Store {
         } else {
             ""
         };
+        let grp = match input.grp {
+            Some(grp) => grp,
+            None => current.grp,
+        };
         let statement = format!(
-            "UPDATE templates SET name=?, description=?, schema_version=?, definition=?, updated_at=? WHERE id=?{owner_clause}"
+            "UPDATE templates SET name=?, description=?, schema_version=?, definition=?, grp=?, updated_at=? WHERE id=?{owner_clause}"
         );
         let mut query = sqlx::query(&statement)
             .bind(name)
             .bind(input.description.or(current.description))
             .bind(i64::from(TEMPLATE_SCHEMA_VERSION))
             .bind(serde_json::to_string(&definition)?)
+            .bind(grp.as_deref())
             .bind(Utc::now().timestamp())
             .bind(id);
         if let Some(owner_id) = owner_id {
@@ -1106,10 +1139,269 @@ impl Store {
         self.get_template_for_owner(result.last_insert_rowid(), owner_id)
             .await
     }
+
+    // ---- Task grouping & batch operations ----
+
+    pub async fn list_groups_for_owner(&self, owner_id: i64) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT grp FROM tasks WHERE owner_id=? AND grp IS NOT NULL AND grp<>'' ORDER BY grp",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut groups = Vec::new();
+        for row in rows {
+            groups.push(row.try_get::<String, _>("grp")?);
+        }
+        Ok(groups)
+    }
+
+    /// Apply a batch operation to many owned tasks at once.
+    pub async fn batch_operations_for_owner(
+        &self,
+        owner_id: i64,
+        input: &BatchTaskOperation,
+    ) -> Result<usize> {
+        if input.ids.is_empty() {
+            return Ok(0);
+        }
+        let ids = input
+            .ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let updated = match input.action.as_str() {
+            "enable" => sqlx::query(&format!(
+                "UPDATE tasks SET disabled=0,updated_at=? WHERE owner_id=? AND id IN ({ids})"
+            ))
+            .bind(Utc::now().timestamp())
+            .bind(owner_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            "disable" => sqlx::query(&format!(
+                "UPDATE tasks SET disabled=1,updated_at=? WHERE owner_id=? AND id IN ({ids})"
+            ))
+            .bind(Utc::now().timestamp())
+            .bind(owner_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            "delete" => sqlx::query(&format!(
+                "DELETE FROM tasks WHERE owner_id=? AND id IN ({ids})"
+            ))
+            .bind(owner_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            "run" => {
+                // Enqueue a run for each task; count the ones that were enqueued.
+                let mut count = 0_usize;
+                for id in &input.ids {
+                    if self.get_for_owner(*id, owner_id).await?.is_some()
+                        && self.enqueue_run(*id).await?.is_some()
+                    {
+                        count += 1;
+                    }
+                }
+                return Ok(count);
+            }
+            action => anyhow::bail!("unsupported batch action: {action}"),
+        };
+        Ok(usize::try_from(updated).unwrap_or(usize::MAX))
+    }
+
+    // ---- Template search / pagination ----
+
+    pub async fn search_templates_for_owner(
+        &self,
+        owner_id: i64,
+        query: Option<&str>,
+        grp: Option<&str>,
+        cursor: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Template>> {
+        let limit = limit.clamp(1, 200);
+        let like = query
+            .map(|q| format!("%{}%", q.trim()))
+            .filter(|q| !q.is_empty());
+        let mut statement = format!(
+            "{TEMPLATE_FIELDS} WHERE owner_id=? {}",
+            match (like.is_some(), grp.is_some()) {
+                (true, true) => "AND name LIKE ? AND grp=?",
+                (true, false) => "AND name LIKE ?",
+                (false, true) => "AND grp=?",
+                (false, false) => "",
+            }
+        );
+        if cursor.is_some() {
+            statement.push_str(" AND id>?");
+        }
+        statement.push_str(" ORDER BY id LIMIT ?");
+        let mut query_builder = sqlx::query(&statement).bind(owner_id);
+        if let Some(like) = like {
+            query_builder = query_builder.bind(like);
+        }
+        if let Some(grp) = grp {
+            query_builder = query_builder.bind(grp);
+        }
+        if let Some(cursor) = cursor {
+            query_builder = query_builder.bind(cursor);
+        }
+        query_builder = query_builder.bind(limit + 1);
+        let rows = query_builder.fetch_all(&self.pool).await?;
+        rows.into_iter().map(template_from_row).collect()
+    }
+
+    // ---- Admin: user management ----
+
+    pub async fn list_users(&self) -> Result<Vec<User>> {
+        let rows = sqlx::query(&format!("{USER_FIELDS} ORDER BY id"))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|r| user_from_row(&r)).collect()
+    }
+
+    pub async fn update_user(&self, id: i64, input: &AdminUserUpdate) -> Result<Option<User>> {
+        let Some(current) = self.get_user(id).await? else {
+            return Ok(None);
+        };
+        let role = input.role.clone().unwrap_or(current.role);
+        let disabled = input.disabled.unwrap_or(current.disabled);
+        ensure!(
+            matches!(role.as_str(), "admin" | "user"),
+            "invalid user role"
+        );
+        sqlx::query("UPDATE users SET role=?, disabled=?, updated_at=? WHERE id=?")
+            .bind(role)
+            .bind(disabled)
+            .bind(Utc::now().timestamp())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.get_user(id).await
+    }
+
+    // ---- Site settings ----
+
+    pub async fn get_setting(&self, key: &str) -> Result<Option<SiteSetting>> {
+        let row = sqlx::query("SELECT key,value,updated_at FROM site_settings WHERE key=?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(setting_from_row).transpose()
+    }
+
+    pub async fn set_setting(&self, key: &str, input: &SetSiteSetting) -> Result<SiteSetting> {
+        sqlx::query(
+            "INSERT INTO site_settings(key,value,updated_at) VALUES(?,?,?) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        )
+        .bind(key)
+        .bind(serde_json::to_string(&input.value)?)
+        .bind(Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        self.get_setting(key).await?.context("setting disappeared")
+    }
+
+    pub async fn list_settings(&self) -> Result<Vec<SiteSetting>> {
+        let rows = sqlx::query("SELECT key,value,updated_at FROM site_settings ORDER BY key")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(setting_from_row).collect()
+    }
+
+    // ---- Password reset ----
+
+    pub async fn create_password_reset_token(
+        &self,
+        user_id: i64,
+        ttl_seconds: i64,
+    ) -> Result<(String, i64)> {
+        let token = new_token();
+        let now = Utc::now().timestamp();
+        let expires_at = now + ttl_seconds.max(60);
+        sqlx::query(
+            "INSERT INTO password_reset_tokens(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+        )
+        .bind(token_hash(&token))
+        .bind(user_id)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok((token, expires_at))
+    }
+
+    /// Redeem a reset token; on success returns the user id and revokes the token.
+    pub async fn consume_password_reset_token(
+        &self,
+        token: &str,
+        new_password_hash: &str,
+    ) -> Result<Option<i64>> {
+        let now = Utc::now().timestamp();
+        let row = sqlx::query(
+            "SELECT user_id FROM password_reset_tokens WHERE token_hash=? AND expires_at>?",
+        )
+        .bind(token_hash(token))
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let user_id: i64 = row.try_get("user_id")?;
+        self.change_password(user_id, new_password_hash).await?;
+        sqlx::query("DELETE FROM password_reset_tokens WHERE token_hash=?")
+            .bind(token_hash(token))
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(user_id))
+    }
+
+    pub async fn purge_expired_reset_tokens(&self) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at<=?")
+                .bind(Utc::now().timestamp())
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    // ---- Log retention ----
+
+    /// Delete runs (and their steps via cascade) finished before the given timestamp.
+    pub async fn prune_run_logs(&self, before: i64) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at<?")
+                .bind(before)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    pub async fn count_old_runs(&self, before: i64) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE finished_at IS NOT NULL AND finished_at<?",
+        )
+        .bind(before)
+        .fetch_one(&self.pool)
+        .await?)
+    }
 }
 
-const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id FROM tasks";
-const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at FROM templates";
+fn setting_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SiteSetting> {
+    Ok(SiteSetting {
+        key: row.try_get("key")?,
+        value: serde_json::from_str(&row.try_get::<String, _>("value")?)?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp FROM tasks";
+const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,created_at,updated_at FROM users";
 
@@ -1157,6 +1449,7 @@ fn task_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Task> {
         last_status: row.try_get("last_status")?,
         last_error: row.try_get("last_error")?,
         template_id: row.try_get("template_id")?,
+        grp: row.try_get("grp")?,
     })
 }
 
@@ -1205,6 +1498,7 @@ fn template_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Template> {
         qd_har,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        grp: row.try_get("grp")?,
     })
 }
 
@@ -1370,6 +1664,7 @@ mod tests {
             body: None,
             disabled: false,
             template_id: None,
+            grp: None,
         }
     }
 
@@ -1410,6 +1705,7 @@ mod tests {
                     body: None,
                     disabled: Some(true),
                     template_id: None,
+                    grp: None,
                 },
             )
             .await
@@ -1486,6 +1782,7 @@ mod tests {
                         body: None,
                         disabled: None,
                         template_id: None,
+                        grp: None,
                     },
                 )
                 .await
@@ -1522,6 +1819,7 @@ mod tests {
                     name: "alice template".into(),
                     description: None,
                     definition: template_definition("alice template"),
+                    grp: None,
                 },
             )
             .await
@@ -1756,6 +2054,7 @@ mod tests {
                 name: "health check".into(),
                 description: Some("initial description".into()),
                 definition: template_definition("health check"),
+                grp: None,
             })
             .await
             .unwrap();
@@ -1769,6 +2068,7 @@ mod tests {
                     name: Some("renamed".into()),
                     description: Some("updated description".into()),
                     definition: None,
+                    grp: None,
                 },
             )
             .await
@@ -1785,6 +2085,7 @@ mod tests {
                     name: "invalid".into(),
                     description: None,
                     definition: invalid,
+                    grp: None,
                 })
                 .await
                 .is_err()
@@ -2042,6 +2343,7 @@ mod tests {
                     name: "shared".into(),
                     description: None,
                     definition: template_definition("shared"),
+                    grp: None,
                 },
             )
             .await
@@ -2101,6 +2403,7 @@ mod tests {
                 body: None,
                 disabled: false,
                 template_id: None,
+                grp: None,
             })
             .await
             .unwrap();

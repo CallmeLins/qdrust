@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Local, TimeZone};
 use fake::Fake;
 use minijinja::{Environment, Error, ErrorKind, Value as JinjaValue};
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::Rng;
 use regex::Regex;
 use serde_json::Value;
@@ -41,10 +41,19 @@ impl Default for QdExpressionEngine {
         });
         environment.add_function("b64decode", |value: JinjaValue| {
             let s = value.to_string();
-            BASE64.decode(s.as_bytes())
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("base64 decode failed: {e}")))
-                .and_then(|bytes| String::from_utf8(bytes)
-                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid UTF-8: {e}"))))
+            BASE64
+                .decode(s.as_bytes())
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("base64 decode failed: {e}"),
+                    )
+                })
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|e| {
+                        Error::new(ErrorKind::InvalidOperation, format!("invalid UTF-8: {e}"))
+                    })
+                })
         });
 
         // Encoding functions - hex
@@ -55,9 +64,17 @@ impl Default for QdExpressionEngine {
         environment.add_function("a2b_hex", |value: JinjaValue| {
             let s = value.to_string();
             hex::decode(&s)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("hex decode failed: {e}")))
-                .and_then(|bytes| String::from_utf8(bytes)
-                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid UTF-8: {e}"))))
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("hex decode failed: {e}"),
+                    )
+                })
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|e| {
+                        Error::new(ErrorKind::InvalidOperation, format!("invalid UTF-8: {e}"))
+                    })
+                })
         });
 
         // URL encoding
@@ -70,19 +87,44 @@ impl Default for QdExpressionEngine {
                 .remove(b'~');
             Ok::<_, Error>(utf8_percent_encode(&s, FRAGMENT).to_string())
         });
+        environment.add_function("url_decode", |value: JinjaValue| {
+            let s = value.to_string();
+            percent_encoding::percent_decode_str(&s)
+                .decode_utf8()
+                .map(|decoded| decoded.into_owned())
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("url_decode failed: {e}"),
+                    )
+                })
+        });
+        environment.add_function("url_encode", |value: JinjaValue| {
+            let s = value.to_string();
+            const FRAGMENT: &AsciiSet = &NON_ALPHANUMERIC
+                .remove(b'-')
+                .remove(b'_')
+                .remove(b'.')
+                .remove(b'~');
+            Ok::<_, Error>(utf8_percent_encode(&s, FRAGMENT).to_string())
+        });
 
         // Quote Chinese characters for URL
         environment.add_function("quote_chinese", |value: JinjaValue| {
             let s = value.to_string();
-            let encoded = s.chars().map(|c| {
-                if c.is_ascii() {
-                    c.to_string()
-                } else {
-                    c.to_string().bytes()
-                        .map(|b| format!("%{:02X}", b))
-                        .collect::<String>()
-                }
-            }).collect::<String>();
+            let encoded = s
+                .chars()
+                .map(|c| {
+                    if c.is_ascii() {
+                        c.to_string()
+                    } else {
+                        c.to_string()
+                            .bytes()
+                            .map(|b| format!("%{:02X}", b))
+                            .collect::<String>()
+                    }
+                })
+                .collect::<String>();
             Ok::<_, Error>(encoded)
         });
 
@@ -111,7 +153,6 @@ impl Default for QdExpressionEngine {
         });
         environment.add_function("hash", |value: JinjaValue, hashtype: Option<String>| {
             use sha1::Digest as Sha1Digest;
-            use sha2::Digest as Sha2Digest;
 
             let s = value.to_string();
             let hashtype = hashtype.unwrap_or_else(|| "sha1".to_string());
@@ -132,7 +173,10 @@ impl Default for QdExpressionEngine {
                     let digest = Sha512::digest(s.as_bytes());
                     Ok::<_, Error>(hex::encode(digest))
                 }
-                _ => Err(Error::new(ErrorKind::InvalidOperation, format!("unsupported hash type: {hashtype}")))
+                _ => Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("unsupported hash type: {hashtype}"),
+                )),
             }
         });
 
@@ -147,29 +191,37 @@ impl Default for QdExpressionEngine {
             }
         });
 
-        environment.add_function("date_time", |date: Option<JinjaValue>, time: Option<JinjaValue>, time_difference: Option<JinjaValue>| {
-            let show_date = date.as_ref().map(|v| v.is_true()).unwrap_or(true);
-            let show_time = time.as_ref().map(|v| v.is_true()).unwrap_or(true);
-            let time_diff = time_difference.and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok())).unwrap_or(0);
+        environment.add_function(
+            "date_time",
+            |date: Option<JinjaValue>,
+             time: Option<JinjaValue>,
+             time_difference: Option<JinjaValue>| {
+                let show_date = date.as_ref().map(|v| v.is_true()).unwrap_or(true);
+                let show_time = time.as_ref().map(|v| v.is_true()).unwrap_or(true);
+                let time_diff = time_difference
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .unwrap_or(0);
 
-            let now = Local::now() + chrono::Duration::hours(time_diff);
+                let now = Local::now() + chrono::Duration::hours(time_diff);
 
-            if show_date {
-                if show_time {
-                    Ok::<_, Error>(now.format("%Y-%m-%d %H:%M:%S").to_string())
+                if show_date {
+                    if show_time {
+                        Ok::<_, Error>(now.format("%Y-%m-%d %H:%M:%S").to_string())
+                    } else {
+                        Ok::<_, Error>(now.format("%Y-%m-%d").to_string())
+                    }
+                } else if show_time {
+                    Ok::<_, Error>(now.format("%H:%M:%S").to_string())
                 } else {
-                    Ok::<_, Error>(now.format("%Y-%m-%d").to_string())
+                    Ok::<_, Error>(String::new())
                 }
-            } else if show_time {
-                Ok::<_, Error>(now.format("%H:%M:%S").to_string())
-            } else {
-                Ok::<_, Error>(String::new())
-            }
-        });
+            },
+        );
 
         environment.add_function("strftime", |format: String, second: Option<JinjaValue>| {
             let timestamp = if let Some(sec) = second {
-                sec.to_string().parse::<i64>()
+                sec.to_string()
+                    .parse::<i64>()
                     .map_err(|_| Error::new(ErrorKind::InvalidOperation, "invalid epoch value"))?
             } else {
                 std::time::SystemTime::now()
@@ -178,7 +230,8 @@ impl Default for QdExpressionEngine {
                     .as_secs() as i64
             };
 
-            let datetime = Local.timestamp_opt(timestamp, 0)
+            let datetime = Local
+                .timestamp_opt(timestamp, 0)
                 .single()
                 .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "invalid timestamp"))?;
 
@@ -218,24 +271,30 @@ impl Default for QdExpressionEngine {
         });
 
         // Regex functions
-        environment.add_function("regex_replace", |pattern: String, repl: String, string: JinjaValue| {
-            let s = string.to_string();
-            let re = Regex::new(&pattern)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}")))?;
-            Ok::<_, Error>(re.replace_all(&s, repl.as_str()).to_string())
-        });
+        environment.add_function(
+            "regex_replace",
+            |pattern: String, repl: String, string: JinjaValue| {
+                let s = string.to_string();
+                let re = Regex::new(&pattern).map_err(|e| {
+                    Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}"))
+                })?;
+                Ok::<_, Error>(re.replace_all(&s, repl.as_str()).to_string())
+            },
+        );
 
         environment.add_function("regex_search", |pattern: String, string: JinjaValue| {
             let s = string.to_string();
-            let re = Regex::new(&pattern)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}")))?;
+            let re = Regex::new(&pattern).map_err(|e| {
+                Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}"))
+            })?;
             Ok::<_, Error>(re.is_match(&s))
         });
 
         environment.add_function("regex_findall", |pattern: String, string: JinjaValue| {
             let s = string.to_string();
-            let re = Regex::new(&pattern)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}")))?;
+            let re = Regex::new(&pattern).map_err(|e| {
+                Error::new(ErrorKind::InvalidOperation, format!("invalid regex: {e}"))
+            })?;
             let matches: Vec<String> = re.find_iter(&s).map(|m| m.as_str().to_string()).collect();
             Ok::<_, Error>(JinjaValue::from_iter(matches))
         });
@@ -250,8 +309,12 @@ impl Default for QdExpressionEngine {
             const DNS_NAMESPACE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
             let ns_str = namespace.as_deref().unwrap_or(DNS_NAMESPACE);
 
-            let ns_uuid = Uuid::parse_str(ns_str)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("invalid namespace UUID: {e}")))?;
+            let ns_uuid = Uuid::parse_str(ns_str).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("invalid namespace UUID: {e}"),
+                )
+            })?;
             let name_str = name.to_string();
             Ok::<_, Error>(Uuid::new_v5(&ns_uuid, name_str.as_bytes()).to_string())
         });
@@ -268,10 +331,10 @@ impl Default for QdExpressionEngine {
         });
 
         environment.add_function("fake", |category: String| {
+            use fake::faker::address::en::*;
+            use fake::faker::company::en::*;
             use fake::faker::internet::en::*;
             use fake::faker::name::en::*;
-            use fake::faker::company::en::*;
-            use fake::faker::address::en::*;
             use fake::faker::phone_number::en::*;
 
             let result: String = match category.as_str() {
@@ -288,22 +351,28 @@ impl Default for QdExpressionEngine {
                 "city" => CityName().fake(),
                 "country" => CountryName().fake(),
                 "phone" => PhoneNumber().fake(),
-                _ => return Err(Error::new(
-                    ErrorKind::InvalidOperation,
-                    format!("unknown fake category: {}", category)
-                )),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        format!("unknown fake category: {}", category),
+                    ));
+                }
             };
             Ok::<_, Error>(result)
         });
 
         // Utility functions
-        environment.add_function("ternary", |condition: bool, true_val: JinjaValue, false_val: JinjaValue| {
-            Ok::<_, Error>(if condition { true_val } else { false_val })
-        });
+        environment.add_function(
+            "ternary",
+            |condition: bool, true_val: JinjaValue, false_val: JinjaValue| {
+                Ok::<_, Error>(if condition { true_val } else { false_val })
+            },
+        );
 
         environment.add_function("mandatory", |value: JinjaValue, msg: Option<String>| {
             if value.is_undefined() || value.is_none() {
-                let error_msg = msg.unwrap_or_else(|| "Mandatory variable is undefined".to_string());
+                let error_msg =
+                    msg.unwrap_or_else(|| "Mandatory variable is undefined".to_string());
                 Err(Error::new(ErrorKind::UndefinedError, error_msg))
             } else {
                 Ok::<_, Error>(value)
@@ -363,12 +432,16 @@ impl Default for QdExpressionEngine {
             let mut chars = value.chars();
             match chars.next() {
                 None => Ok::<_, Error>(String::new()),
-                Some(first) => Ok(first.to_uppercase().chain(chars.as_str().to_lowercase().chars()).collect()),
+                Some(first) => Ok(first
+                    .to_uppercase()
+                    .chain(chars.as_str().to_lowercase().chars())
+                    .collect()),
             }
         });
 
         environment.add_filter("title", |value: String| {
-            let result = value.split_whitespace()
+            let result = value
+                .split_whitespace()
                 .map(|word| {
                     let mut chars = word.chars();
                     match chars.next() {
@@ -395,9 +468,7 @@ impl Default for QdExpressionEngine {
 
         environment.add_filter("split", |value: String, sep: Option<String>| {
             let separator = sep.as_deref().unwrap_or(" ");
-            let parts: Vec<JinjaValue> = value.split(separator)
-                .map(|s| JinjaValue::from(s))
-                .collect();
+            let parts: Vec<JinjaValue> = value.split(separator).map(JinjaValue::from).collect();
             Ok::<_, Error>(JinjaValue::from_iter(parts))
         });
 
@@ -407,7 +478,10 @@ impl Default for QdExpressionEngine {
                 let parts: Vec<String> = iter.map(|v| v.to_string()).collect();
                 Ok::<_, Error>(parts.join(separator))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "join requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "join requires an iterable",
+                ))
             }
         });
 
@@ -417,18 +491,25 @@ impl Default for QdExpressionEngine {
                 iter.next()
                     .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "first requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "first requires an iterable",
+                ))
             }
         });
 
         environment.add_filter("last", |value: JinjaValue| {
             if let Ok(iter) = value.try_iter() {
                 let items: Vec<_> = iter.collect();
-                items.last()
+                items
+                    .last()
                     .cloned()
                     .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "last requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "last requires an iterable",
+                ))
             }
         });
 
@@ -438,7 +519,10 @@ impl Default for QdExpressionEngine {
                 items.reverse();
                 Ok::<_, Error>(JinjaValue::from_iter(items))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "reverse requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "reverse requires an iterable",
+                ))
             }
         });
 
@@ -448,39 +532,53 @@ impl Default for QdExpressionEngine {
                 items.sort();
                 Ok::<_, Error>(JinjaValue::from_iter(items))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "sort requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "sort requires an iterable",
+                ))
             }
         });
 
         environment.add_filter("unique", |value: JinjaValue| {
             if let Ok(iter) = value.try_iter() {
                 let mut seen = std::collections::HashSet::new();
-                let items: Vec<JinjaValue> = iter
-                    .filter(|v| seen.insert(v.to_string()))
-                    .collect();
+                let items: Vec<JinjaValue> = iter.filter(|v| seen.insert(v.to_string())).collect();
                 Ok::<_, Error>(JinjaValue::from_iter(items))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "unique requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "unique requires an iterable",
+                ))
             }
         });
 
-        environment.add_filter("slice", |value: JinjaValue, start: Option<i64>, end: Option<i64>| {
-            if let Ok(iter) = value.try_iter() {
-                let items: Vec<_> = iter.collect();
-                let len = items.len() as i64;
-                let start_idx = start.unwrap_or(0).max(0) as usize;
-                let end_idx = end.map(|e| if e < 0 { (len + e).max(0) } else { e }).unwrap_or(len) as usize;
-                let end_idx = end_idx.min(items.len());
+        environment.add_filter(
+            "slice",
+            |value: JinjaValue, start: Option<i64>, end: Option<i64>| {
+                if let Ok(iter) = value.try_iter() {
+                    let items: Vec<_> = iter.collect();
+                    let len = items.len() as i64;
+                    let start_idx = start.unwrap_or(0).max(0) as usize;
+                    let end_idx = end
+                        .map(|e| if e < 0 { (len + e).max(0) } else { e })
+                        .unwrap_or(len) as usize;
+                    let end_idx = end_idx.min(items.len());
 
-                if start_idx <= end_idx {
-                    Ok::<_, Error>(JinjaValue::from_iter(items[start_idx..end_idx].iter().cloned()))
+                    if start_idx <= end_idx {
+                        Ok::<_, Error>(JinjaValue::from_iter(
+                            items[start_idx..end_idx].iter().cloned(),
+                        ))
+                    } else {
+                        Ok(JinjaValue::from_iter(Vec::<JinjaValue>::new()))
+                    }
                 } else {
-                    Ok(JinjaValue::from_iter(Vec::<JinjaValue>::new()))
+                    Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "slice requires an iterable",
+                    ))
                 }
-            } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "slice requires an iterable"))
-            }
-        });
+            },
+        );
 
         // JSON filters
         environment.add_filter("tojson", |value: JinjaValue| {
@@ -491,7 +589,9 @@ impl Default for QdExpressionEngine {
         environment.add_filter("fromjson", |value: String| {
             serde_json::from_str::<serde_json::Value>(&value)
                 .map(|v| JinjaValue::from_serialize(&v))
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("fromjson failed: {e}")))
+                .map_err(|e| {
+                    Error::new(ErrorKind::InvalidOperation, format!("fromjson failed: {e}"))
+                })
         });
 
         // Utility filters
@@ -535,7 +635,10 @@ impl Default for QdExpressionEngine {
                     .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "min requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "min requires an iterable",
+                ))
             }
         });
 
@@ -547,19 +650,26 @@ impl Default for QdExpressionEngine {
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "sequence is empty"))
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "max requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "max requires an iterable",
+                ))
             }
         });
 
         environment.add_filter("sum", |value: JinjaValue| {
             if let Ok(iter) = value.try_iter() {
-                let sum: f64 = iter.map(|v| parse_f64(&v))
+                let sum: f64 = iter
+                    .map(|v| parse_f64(&v))
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
                     .sum();
                 Ok::<_, Error>(sum)
             } else {
-                Err(Error::new(ErrorKind::InvalidOperation, "sum requires an iterable"))
+                Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "sum requires an iterable",
+                ))
             }
         });
 
@@ -723,6 +833,18 @@ mod tests {
             engine.evaluate("quote_chinese('测试')", &vars).unwrap(),
             json!("%E6%B5%8B%E8%AF%95")
         );
+
+        // url_decode and url_encode aliases
+        assert_eq!(
+            engine
+                .evaluate("url_decode('hello%20world')", &vars)
+                .unwrap(),
+            json!("hello world")
+        );
+        assert_eq!(
+            engine.evaluate("url_encode('hello world')", &vars).unwrap(),
+            json!("hello%20world")
+        );
     }
 
     #[test]
@@ -770,7 +892,12 @@ mod tests {
         assert_eq!(result.as_str().unwrap().len(), 36);
 
         // UUID with custom namespace
-        let result = engine.evaluate("to_uuid('test', '6ba7b810-9dad-11d1-80b4-00c04fd430c8')", &vars).unwrap();
+        let result = engine
+            .evaluate(
+                "to_uuid('test', '6ba7b810-9dad-11d1-80b4-00c04fd430c8')",
+                &vars,
+            )
+            .unwrap();
         assert!(result.is_string());
         assert_eq!(result.as_str().unwrap().len(), 36);
     }
@@ -815,7 +942,9 @@ mod tests {
         assert!(s.contains('-'));
 
         // strftime with specific timestamp
-        let result = engine.evaluate("strftime('%Y-%m-%d', 1609459200)", &vars).unwrap();
+        let result = engine
+            .evaluate("strftime('%Y-%m-%d', 1609459200)", &vars)
+            .unwrap();
         assert_eq!(result.as_str().unwrap(), "2021-01-01");
     }
 
@@ -825,20 +954,14 @@ mod tests {
         let vars = BTreeMap::new();
 
         // add
-        assert_eq!(
-            engine.evaluate("add(5, 3)", &vars).unwrap(),
-            json!(8.0)
-        );
+        assert_eq!(engine.evaluate("add(5, 3)", &vars).unwrap(), json!(8.0));
         assert_eq!(
             engine.evaluate("add('5.5', '2.5')", &vars).unwrap(),
             json!(8.0)
         );
 
         // sub
-        assert_eq!(
-            engine.evaluate("sub(10, 3)", &vars).unwrap(),
-            json!(7.0)
-        );
+        assert_eq!(engine.evaluate("sub(10, 3)", &vars).unwrap(), json!(7.0));
 
         // multiply
         assert_eq!(
@@ -847,10 +970,7 @@ mod tests {
         );
 
         // divide
-        assert_eq!(
-            engine.evaluate("divide(10, 2)", &vars).unwrap(),
-            json!(5.0)
-        );
+        assert_eq!(engine.evaluate("divide(10, 2)", &vars).unwrap(), json!(5.0));
 
         // division by zero
         assert!(engine.evaluate("divide(10, 0)", &vars).is_err());
@@ -877,23 +997,31 @@ mod tests {
 
         // regex_replace
         assert_eq!(
-            engine.evaluate("regex_replace('\\\\d+', 'NUM', 'test123foo456')", &vars).unwrap(),
+            engine
+                .evaluate("regex_replace('\\\\d+', 'NUM', 'test123foo456')", &vars)
+                .unwrap(),
             json!("testNUMfooNUM")
         );
 
         // regex_search
         assert_eq!(
-            engine.evaluate("regex_search('\\\\d+', 'test123')", &vars).unwrap(),
+            engine
+                .evaluate("regex_search('\\\\d+', 'test123')", &vars)
+                .unwrap(),
             json!(true)
         );
         assert_eq!(
-            engine.evaluate("regex_search('\\\\d+', 'test')", &vars).unwrap(),
+            engine
+                .evaluate("regex_search('\\\\d+', 'test')", &vars)
+                .unwrap(),
             json!(false)
         );
 
         // regex_findall
         assert_eq!(
-            engine.evaluate("regex_findall('\\\\d+', 'a1b22c333')", &vars).unwrap(),
+            engine
+                .evaluate("regex_findall('\\\\d+', 'a1b22c333')", &vars)
+                .unwrap(),
             json!(["1", "22", "333"])
         );
 
@@ -911,11 +1039,24 @@ mod tests {
 
         // UUID v5 with DNS namespace
         let dns_namespace = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-        let result = engine.evaluate(&format!("to_uuid('example.com', '{}')", dns_namespace), &vars).unwrap();
-        assert_eq!(result.as_str().unwrap(), "cfbff0d1-9375-5685-968c-48ce8b15ae17");
+        let result = engine
+            .evaluate(
+                &format!("to_uuid('example.com', '{}')", dns_namespace),
+                &vars,
+            )
+            .unwrap();
+        assert_eq!(
+            result.as_str().unwrap(),
+            "cfbff0d1-9375-5685-968c-48ce8b15ae17"
+        );
 
         // UUID v5 should be deterministic
-        let result2 = engine.evaluate(&format!("to_uuid('example.com', '{}')", dns_namespace), &vars).unwrap();
+        let result2 = engine
+            .evaluate(
+                &format!("to_uuid('example.com', '{}')", dns_namespace),
+                &vars,
+            )
+            .unwrap();
         assert_eq!(result, result2);
     }
 
@@ -927,21 +1068,39 @@ mod tests {
         // random_int
         let result = engine.evaluate("random_int(1, 10)", &vars).unwrap();
         let num = result.as_i64().unwrap();
-        assert!(num >= 1 && num <= 10);
+        assert!((1..=10).contains(&num));
 
         // random_float
         let result = engine.evaluate("random_float(0.0, 1.0)", &vars).unwrap();
         let num = result.as_f64().unwrap();
-        assert!(num >= 0.0 && num <= 1.0);
+        assert!((0.0..=1.0).contains(&num));
 
         // fake - just verify they return non-empty strings
-        let categories = vec!["name", "first_name", "last_name", "email", "username",
-                              "password", "ipv4", "ipv6", "user_agent", "company",
-                              "city", "country", "phone"];
+        let categories = vec![
+            "name",
+            "first_name",
+            "last_name",
+            "email",
+            "username",
+            "password",
+            "ipv4",
+            "ipv6",
+            "user_agent",
+            "company",
+            "city",
+            "country",
+            "phone",
+        ];
 
         for category in categories {
-            let result = engine.evaluate(&format!("fake('{}')", category), &vars).unwrap();
-            assert!(!result.as_str().unwrap().is_empty(), "fake('{}') returned empty", category);
+            let result = engine
+                .evaluate(&format!("fake('{}')", category), &vars)
+                .unwrap();
+            assert!(
+                !result.as_str().unwrap().is_empty(),
+                "fake('{}') returned empty",
+                category
+            );
         }
 
         // fake with invalid category should error
@@ -955,11 +1114,15 @@ mod tests {
 
         // ternary
         assert_eq!(
-            engine.evaluate("ternary(true, 'yes', 'no')", &vars).unwrap(),
+            engine
+                .evaluate("ternary(true, 'yes', 'no')", &vars)
+                .unwrap(),
             json!("yes")
         );
         assert_eq!(
-            engine.evaluate("ternary(false, 'yes', 'no')", &vars).unwrap(),
+            engine
+                .evaluate("ternary(false, 'yes', 'no')", &vars)
+                .unwrap(),
             json!("no")
         );
 

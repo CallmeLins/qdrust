@@ -63,6 +63,8 @@ pub struct CreateTask {
     #[serde(default)]
     pub disabled: bool,
     pub template_id: Option<i64>,
+    #[serde(default)]
+    pub grp: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -75,6 +77,7 @@ pub struct UpdateTask {
     pub body: Option<String>,
     pub disabled: Option<bool>,
     pub template_id: Option<i64>,
+    pub grp: Option<Option<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,6 +96,8 @@ pub struct Task {
     pub last_status: Option<i64>,
     pub last_error: Option<String>,
     pub template_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grp: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -100,6 +105,8 @@ pub struct CreateTemplate {
     pub name: String,
     pub description: Option<String>,
     pub definition: TemplateDefinition,
+    #[serde(default)]
+    pub grp: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -107,6 +114,7 @@ pub struct UpdateTemplate {
     pub name: Option<String>,
     pub description: Option<String>,
     pub definition: Option<TemplateDefinition>,
+    pub grp: Option<Option<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -124,8 +132,61 @@ pub struct UpdateQdHarTemplate {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct RegisterUser {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminUserUpdate {
+    pub disabled: Option<bool>,
+    pub role: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ForgotPassword {
+    pub username: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResetPassword {
+    pub token: String,
+    pub new_password: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SiteSetting {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetSiteSetting {
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BatchTaskOperation {
+    pub ids: Vec<i64>,
+    #[serde(default)]
+    pub action: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ClearLogs {
+    #[serde(default)]
+    pub older_than_days: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct ValidateQdHar {
     pub har: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BatchTaskResult {
+    pub updated: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -151,6 +212,8 @@ pub struct Template {
     pub qd_har: Option<serde_json::Value>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grp: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

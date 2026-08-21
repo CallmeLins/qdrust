@@ -1,5 +1,11 @@
 use anyhow::Result;
-use qdrust_server::{api, config::Config, scheduler, store::Store};
+use qdrust_server::{
+    api,
+    config::Config,
+    email::{EmailClient, EmailConfig},
+    scheduler,
+    store::Store,
+};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -21,7 +27,16 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(config.request_timeout)
         .build()?;
-    scheduler::spawn(store.clone(), client, config.scheduler_interval);
+    let email = EmailClient::new(EmailConfig::from_env())?;
+    let (run_events, _) = api::run_event_channel();
+    scheduler::spawn(
+        store.clone(),
+        client,
+        config.scheduler_interval,
+        run_events.clone(),
+        email,
+        config.log_retention_days,
+    );
     let app = api::router_with_auth(
         store,
         api::AuthConfig {
@@ -30,6 +45,7 @@ async fn main() -> Result<()> {
             login_rate_limit_attempts: config.login_rate_limit_attempts,
             login_rate_limit_window: config.login_rate_limit_window,
         },
+        run_events,
     )
     .layer(TraceLayer::new_for_http());
     let address = (config.bind, config.port);

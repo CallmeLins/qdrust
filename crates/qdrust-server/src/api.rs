@@ -7,7 +7,8 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        FromRef, FromRequest, Path, Request as AxumRequest, State, rejection::JsonRejection,
+        FromRef, FromRequest, Path, Query, Request as AxumRequest, State, WebSocketUpgrade,
+        rejection::JsonRejection, ws::Message,
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -25,17 +26,19 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::auth::LoginRateLimiter;
 use crate::auth::{hash_password, token_hash, verify_password};
 use crate::{
     model::{
-        AuthCredentials, AuthResponse, AuthenticatedSession, ChangePassword, CreateNote,
-        CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreateTask,
-        CreateTemplate, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
-        UpdateNote, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
-        UpdateTask, UpdateTemplate, ValidateQdHar,
+        AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession, BatchTaskOperation,
+        BatchTaskResult, ChangePassword, ClearLogs, CreateNote, CreateNotificationAction,
+        CreateNotificationChannel, CreatePluginManifest, CreateTask, CreateTemplate,
+        ForgotPassword, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
+        RegisterUser, ResetPassword, SetSiteSetting, UpdateNote, UpdateNotificationChannel,
+        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate, ValidateQdHar,
     },
     store::Store,
 };
@@ -67,6 +70,7 @@ struct AppState {
     store: Store,
     auth: AuthConfig,
     login_limiter: LoginRateLimiter,
+    run_events: broadcast::Sender<Value>,
 }
 
 impl FromRef<AppState> for Store {
@@ -75,11 +79,37 @@ impl FromRef<AppState> for Store {
     }
 }
 
-pub fn router(store: Store) -> Router {
-    router_with_auth(store, AuthConfig::default())
+/**
+ * A run lifecycle event published to all connected WebSocket clients.
+ */
+#[derive(Clone, Debug, Serialize)]
+pub struct RunEvent {
+    pub run_id: i64,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub status: Option<String>,
+    pub step: Option<Value>,
+    pub error: Option<String>,
 }
 
-pub fn router_with_auth(store: Store, auth: AuthConfig) -> Router {
+impl From<RunEvent> for Value {
+    fn from(event: RunEvent) -> Self {
+        serde_json::to_value(event).unwrap_or(Value::Null)
+    }
+}
+
+pub type RunEventSender = broadcast::Sender<Value>;
+
+pub fn run_event_channel() -> (RunEventSender, broadcast::Receiver<Value>) {
+    broadcast::channel(512)
+}
+
+pub fn router(store: Store) -> Router {
+    let (run_events, _) = run_event_channel();
+    router_with_auth(store, AuthConfig::default(), run_events)
+}
+
+pub fn router_with_auth(store: Store, auth: AuthConfig, run_events: RunEventSender) -> Router {
     let login_limiter =
         LoginRateLimiter::new(auth.login_rate_limit_attempts, auth.login_rate_limit_window)
             .expect("login rate limit configuration must be valid");
@@ -88,6 +118,7 @@ pub fn router_with_auth(store: Store, auth: AuthConfig) -> Router {
         .route("/ready", get(ready))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
+        .route("/api/v1/auth/register", axum::routing::post(register))
         .route("/api/v1/auth/login", axum::routing::post(login))
         .route("/api/v1/auth/session", get(current_session))
         .route("/api/v1/auth/logout", axum::routing::post(logout))
@@ -95,7 +126,17 @@ pub fn router_with_auth(store: Store, auth: AuthConfig) -> Router {
             "/api/v1/auth/password",
             axum::routing::post(change_password),
         )
+        .route(
+            "/api/v1/auth/forgot-password",
+            axum::routing::post(forgot_password),
+        )
+        .route(
+            "/api/v1/auth/reset-password",
+            axum::routing::post(reset_password),
+        )
         .route("/api/v1/tasks", get(list_tasks).post(create_task))
+        .route("/api/v1/tasks/batch", axum::routing::post(batch_tasks))
+        .route("/api/v1/task-groups", get(list_task_groups))
         .route(
             "/api/v1/tasks/{id}",
             get(get_task).put(update_task).delete(delete_task),
@@ -104,6 +145,21 @@ pub fn router_with_auth(store: Store, auth: AuthConfig) -> Router {
         .route("/api/v1/tasks/{id}/run", axum::routing::post(run_task))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
+        .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
+        .route("/api/v1/admin/users", get(admin_list_users))
+        .route(
+            "/api/v1/admin/users/{id}",
+            axum::routing::patch(admin_update_user),
+        )
+        .route("/api/v1/admin/settings", get(admin_list_settings))
+        .route(
+            "/api/v1/admin/settings/{key}",
+            get(admin_get_setting).put(admin_set_setting),
+        )
+        .route(
+            "/api/v1/admin/logs",
+            axum::routing::delete(admin_clear_logs),
+        )
         .route("/api/v1/notes", get(list_notes).post(create_note))
         .route(
             "/api/v1/notes/{id}",
@@ -175,6 +231,7 @@ pub fn router_with_auth(store: Store, auth: AuthConfig) -> Router {
             store,
             auth,
             login_limiter,
+            run_events,
         })
 }
 
@@ -490,9 +547,15 @@ fn append_clear_cookies(headers: &mut HeaderMap, secure: bool) {
 async fn list_tasks(
     State(store): State<Store>,
     headers: HeaderMap,
+    Query(params): Query<serde_json::Value>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    Ok(Json(json!(store.list_for_owner(session.user.id).await?)))
+    let grp = params.get("grp").and_then(|v| v.as_str());
+    Ok(Json(json!(
+        store
+            .list_for_owner_with_group(session.user.id, grp)
+            .await?
+    )))
 }
 async fn create_task(
     State(store): State<Store>,
@@ -795,11 +858,37 @@ async fn delete_notification_action(
 async fn list_templates(
     State(store): State<Store>,
     headers: HeaderMap,
+    Query(params): Query<serde_json::Value>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    Ok(Json(json!(
-        store.list_templates_for_owner(session.user.id).await?
-    )))
+    let query = params.get("q").and_then(|v| v.as_str());
+    let grp = params.get("grp").and_then(|v| v.as_str());
+    let cursor = params.get("cursor").and_then(|v| v.as_i64());
+    let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let templates = store
+        .search_templates_for_owner(session.user.id, query, grp, cursor, limit)
+        .await?;
+    let has_more = templates.len() as i64 > limit;
+    let items: Vec<Value> = if has_more {
+        templates[..templates.len() - 1]
+            .iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+            .collect()
+    } else {
+        templates
+            .into_iter()
+            .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+            .collect()
+    };
+    let next_cursor = items
+        .last()
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_i64);
+    Ok(Json(json!({
+        "items": items,
+        "has_more": has_more,
+        "next_cursor": if has_more { next_cursor } else { None },
+    })))
 }
 
 async fn list_public_templates(
@@ -1101,6 +1190,322 @@ async fn update_qd_har(
             "template_not_found",
             "Template not found",
         ))
+}
+
+async fn register(
+    State(state): State<AppState>,
+    ApiJson(input): ApiJson<RegisterUser>,
+) -> Result<Response, ApiError> {
+    let password = input.password;
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(anyhow::Error::from)??;
+    let user = state
+        .store
+        .create_user(input.username.trim(), &password_hash, "user")
+        .await
+        .map_err(|_| {
+            ApiError::Conflict(
+                "username_taken",
+                "Username is already registered or invalid",
+            )
+        })?;
+    state
+        .store
+        .record_audit(
+            Some(user.id),
+            "auth.register",
+            Some("user"),
+            Some(user.id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    issue_session_response(&state, user).await
+}
+
+async fn forgot_password(
+    State(state): State<AppState>,
+    ApiJson(input): ApiJson<ForgotPassword>,
+) -> Result<Json<Value>, ApiError> {
+    // Uniform response so username enumeration is not possible.
+    let Ok(Some(user)) = state
+        .store
+        .credentials_by_username(input.username.trim())
+        .await
+    else {
+        return Ok(Json(json!({"sent": true})));
+    };
+    if user.user.disabled {
+        return Ok(Json(json!({"sent": true})));
+    }
+    let (token, expires_at) = state
+        .store
+        .create_password_reset_token(user.user.id, 3600)
+        .await?;
+    let base_url =
+        std::env::var("QDRUST_BASE_URL").unwrap_or_else(|_| "http://localhost:8923".to_string());
+    let reset_url = format!("{base_url}/reset-password?token={token}");
+    // Email delivery is best-effort; the token is also returned here for
+    // development/local setups without an SMTP server.
+    state
+        .store
+        .record_audit(
+            Some(user.user.id),
+            "auth.password_reset_requested",
+            Some("user"),
+            Some(user.user.id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({
+        "sent": true,
+        "expires_at": expires_at,
+        "reset_token": token,
+        "reset_url": reset_url,
+    })))
+}
+
+async fn reset_password(
+    State(state): State<AppState>,
+    ApiJson(input): ApiJson<ResetPassword>,
+) -> Result<Json<Value>, ApiError> {
+    let new_password = input.new_password;
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&new_password))
+        .await
+        .map_err(anyhow::Error::from)??;
+    let Some(user_id) = state
+        .store
+        .consume_password_reset_token(&input.token, &password_hash)
+        .await?
+    else {
+        return Err(ApiError::Unauthorized(
+            "invalid_or_expired_reset_token",
+            "The reset token is invalid or has expired",
+        ));
+    };
+    state
+        .store
+        .record_audit(
+            Some(user_id),
+            "auth.password_reset",
+            Some("user"),
+            Some(user_id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn list_task_groups(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    Ok(Json(json!(
+        store.list_groups_for_owner(session.user.id).await?
+    )))
+}
+
+async fn batch_tasks(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<BatchTaskOperation>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let updated = store
+        .batch_operations_for_owner(session.user.id, &input)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(BatchTaskResult { updated })))
+}
+
+async fn run_steps_websocket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    // Ownership check before upgrading.
+    if state
+        .store
+        .list_run_steps_for_owner(id, session.user.id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("run_not_found", "Run not found"));
+    }
+    let store = state.store.clone();
+    let events = state.run_events.subscribe();
+    Ok(ws.on_upgrade(move |socket| stream_run_steps(socket, store, id, events)))
+}
+
+async fn stream_run_steps(
+    mut socket: axum::extract::ws::WebSocket,
+    store: Store,
+    run_id: i64,
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+) {
+    use futures_util::SinkExt;
+    // Send the initial snapshot of known steps.
+    if let Ok(steps) = store.list_run_steps(run_id).await {
+        let _ = socket
+            .send(Message::Text(
+                json!({"type": "snapshot", "run_id": run_id, "steps": steps})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+    }
+    // Stream subsequent live events for this run.
+    loop {
+        let event = tokio::select! {
+            _ = socket.recv() => {
+                // Client ping/close handling.
+                break;
+            },
+            event = events.recv() => match event {
+                Ok(value) => value,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            },
+        };
+        let ev_run_id = event.get("run_id").and_then(|v| v.as_i64());
+        if ev_run_id != Some(run_id) {
+            continue;
+        }
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = socket.close().await;
+}
+
+async fn admin_list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(json!(state.store.list_users().await?)))
+}
+
+async fn admin_update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<AdminUserUpdate>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, admin) = require_admin(&state, &headers).await?;
+    if admin.user.id == id {
+        return Err(ApiError::Forbidden(
+            "cannot_modify_self",
+            "Cannot modify your own account here",
+        ));
+    }
+    state
+        .store
+        .update_user(id, &input)
+        .await
+        .map_err(ApiError::unprocessable)?
+        .map(|user| Json(json!(user)))
+        .ok_or(ApiError::NotFound("user_not_found", "User not found"))
+}
+
+async fn admin_list_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(json!(state.store.list_settings().await?)))
+}
+
+async fn admin_get_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    state
+        .store
+        .get_setting(&key)
+        .await?
+        .map(|s| Json(json!(s)))
+        .ok_or(ApiError::NotFound("setting_not_found", "Setting not found"))
+}
+
+async fn admin_set_setting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    ApiJson(input): ApiJson<SetSiteSetting>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_setting_key(&key)?;
+    let setting = state.store.set_setting(&key, &input).await?;
+    state
+        .store
+        .record_audit(
+            None,
+            "admin.setting_changed",
+            Some("setting"),
+            None,
+            None,
+            &json!({"key": key}),
+        )
+        .await?;
+    Ok(Json(json!(setting)))
+}
+
+async fn admin_clear_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<ClearLogs>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let days = input.older_than_days.unwrap_or(0).max(0);
+    let before = chrono::Utc::now().timestamp() - days * 86_400;
+    match days {
+        0 => {
+            // Clear all finished run logs.
+            let count = state.store.count_old_runs(before).await?;
+            state.store.prune_run_logs(before).await?;
+            Ok(Json(json!({"deleted": count})))
+        }
+        _ => {
+            let count = state.store.prune_run_logs(before).await?;
+            Ok(Json(json!({"deleted": count})))
+        }
+    }
+}
+
+fn ensure_setting_key(key: &str) -> Result<(), ApiError> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "setting key is invalid"
+        )));
+    }
+    Ok(())
+}
+
+async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, AuthenticatedSession), ApiError> {
+    let (token, session) = require_session(state, headers).await?;
+    if session.user.role != "admin" {
+        return Err(ApiError::Forbidden(
+            "admin_required",
+            "Administrator role required",
+        ));
+    }
+    Ok((token, session))
 }
 
 enum ApiError {

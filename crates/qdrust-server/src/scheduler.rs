@@ -7,14 +7,25 @@ use qdrust_core::{
     qd_har::{QdHar, QdProgram},
 };
 use reqwest::{Client, Method};
+use serde_json::Value;
+use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use crate::{
+    api::RunEventSender,
+    email::{EmailClient, normalize_recipient},
     model::{RunStep, Task, Template},
     store::Store,
 };
 
-pub fn spawn(store: Store, client: Client, interval: Duration) {
+pub fn spawn(
+    store: Store,
+    client: Client,
+    interval: Duration,
+    run_events: RunEventSender,
+    email: EmailClient,
+    log_retention_days: u64,
+) {
     let worker_store = store.clone();
     let worker_client = client.clone();
     tokio::spawn(async move {
@@ -29,8 +40,22 @@ pub fn spawn(store: Store, client: Client, interval: Duration) {
                         .unwrap_or(false)
                         && let Ok(Some(task)) = worker_store.get(run.task_id).await
                     {
-                        execute_with_run(worker_store.clone(), worker_client.clone(), task, run)
-                            .await;
+                        let _ = run_events.send(Value::from(crate::api::RunEvent {
+                            run_id: run.id,
+                            kind: "status",
+                            status: Some("running".into()),
+                            step: None,
+                            error: None,
+                        }));
+                        execute_with_run(
+                            worker_store.clone(),
+                            worker_client.clone(),
+                            task,
+                            run,
+                            &run_events,
+                            &email,
+                        )
+                        .await;
                     }
                 }
                 Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
@@ -41,11 +66,12 @@ pub fn spawn(store: Store, client: Client, interval: Duration) {
             }
         }
     });
+    let tick_store = store.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let tasks = match store.list().await {
+            let tasks = match tick_store.list().await {
                 Ok(tasks) => tasks,
                 Err(err) => {
                     error!(%err, "cannot load tasks");
@@ -53,7 +79,28 @@ pub fn spawn(store: Store, client: Client, interval: Duration) {
                 }
             };
             for task in tasks.into_iter().filter(|task| due(task, interval)) {
-                let _ = store.enqueue_run(task.id).await;
+                let _ = tick_store.enqueue_run(task.id).await;
+            }
+        }
+    });
+    // Periodic maintenance: log retention, expired sessions, expired reset tokens.
+    let maint_store = store.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            ticker.tick().await;
+            let _ = maint_store.purge_expired_sessions().await;
+            let _ = maint_store.purge_expired_reset_tokens().await;
+            if log_retention_days > 0 {
+                let before = Utc::now().timestamp() - (log_retention_days as i64) * 86_400;
+                let deleted = maint_store.prune_run_logs(before).await.unwrap_or(0);
+                if deleted > 0 {
+                    info!(
+                        deleted,
+                        retention_days = log_retention_days,
+                        "pruned run logs"
+                    );
+                }
             }
         }
     });
@@ -76,7 +123,15 @@ fn due(task: &Task, interval: Duration) -> bool {
         .is_some_and(|next| next <= Utc::now())
 }
 
-async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::model::Run) {
+#[allow(clippy::too_many_arguments)]
+async fn execute_with_run(
+    store: Store,
+    client: Client,
+    task: Task,
+    run: crate::model::Run,
+    run_events: &broadcast::Sender<Value>,
+    email: &EmailClient,
+) {
     let result = async {
         if let Some(template_id) = task.template_id {
             let template = store
@@ -86,20 +141,26 @@ async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::
             let steps = execute_template(template).await?;
             let now = Utc::now().timestamp();
             for (index, step) in steps.iter().enumerate() {
-                store
-                    .record_run_step(&RunStep {
-                        id: 0,
-                        run_id: run.id,
-                        step_index: i64::try_from(index)?,
-                        name: format!("step-{}", index + 1),
-                        status: "succeeded".into(),
-                        http_status: Some(i64::from(step.status)),
-                        body_size: i64::try_from(step.body_size)?,
-                        error: None,
-                        started_at: now,
-                        finished_at: now,
-                    })
-                    .await?;
+                let step_record = RunStep {
+                    id: 0,
+                    run_id: run.id,
+                    step_index: i64::try_from(index)?,
+                    name: format!("step-{}", index + 1),
+                    status: "succeeded".into(),
+                    http_status: Some(i64::from(step.status)),
+                    body_size: i64::try_from(step.body_size)?,
+                    error: None,
+                    started_at: now,
+                    finished_at: now,
+                };
+                store.record_run_step(&step_record).await?;
+                let _ = run_events.send(Value::from(crate::api::RunEvent {
+                    run_id: run.id,
+                    kind: "step",
+                    status: None,
+                    step: Some(serde_json::to_value(&step_record).unwrap_or_default()),
+                    error: None,
+                }));
             }
             return Ok::<_, anyhow::Error>(steps.last().map(|step| step.status).unwrap_or(204));
         }
@@ -123,6 +184,13 @@ async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::
             info!(task_id = task.id, status, "task completed");
             let _ = store.record_run(task.id, Some(status), None).await;
             let _ = store.finish_run(run.id, Some(status), None).await;
+            let _ = run_events.send(Value::from(crate::api::RunEvent {
+                run_id: run.id,
+                kind: "status",
+                status: Some("succeeded".into()),
+                step: None,
+                error: None,
+            }));
             send_notifications(
                 &store,
                 &client,
@@ -131,6 +199,7 @@ async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::
                 "success",
                 Some(status),
                 None,
+                email,
             )
             .await;
         }
@@ -154,6 +223,13 @@ async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::
                 .await;
             let _ = store.record_run(task.id, None, Some(&message)).await;
             let _ = store.finish_run(run.id, None, Some(&message)).await;
+            let _ = run_events.send(Value::from(crate::api::RunEvent {
+                run_id: run.id,
+                kind: "status",
+                status: Some("failed".into()),
+                step: None,
+                error: Some(message.clone()),
+            }));
             send_notifications(
                 &store,
                 &client,
@@ -162,12 +238,14 @@ async fn execute_with_run(store: Store, client: Client, task: Task, run: crate::
                 "failure",
                 None,
                 Some(&message),
+                email,
             )
             .await;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_notifications(
     store: &Store,
     client: &Client,
@@ -176,6 +254,7 @@ async fn send_notifications(
     event: &str,
     http_status: Option<u16>,
     error_message: Option<&str>,
+    email: &EmailClient,
 ) {
     let channels = match store.notification_channels_for_event(task.id, event).await {
         Ok(channels) => channels,
@@ -186,24 +265,63 @@ async fn send_notifications(
     };
     let payload = serde_json::json!({ "event": event, "task_id": task.id, "task_name": task.name, "run_id": run_id, "http_status": http_status, "error": error_message });
     for channel in channels {
-        if channel.kind != "webhook" {
-            info!(
-                channel_id = channel.id,
-                "notification channel sender is not implemented"
-            );
-            continue;
-        }
-        let Some(url) = channel.config.get("url").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if let Err(err) = client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-        {
-            error!(task_id=task.id, channel_id=channel.id, %err, "notification delivery failed");
+        match channel.kind.as_str() {
+            "webhook" => {
+                let Some(url) = channel.config.get("url").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if let Err(err) = client
+                    .post(url)
+                    .json(&payload)
+                    .send()
+                    .await
+                    .and_then(|response| response.error_for_status())
+                {
+                    error!(task_id=task.id, channel_id=channel.id, %err, "notification delivery failed");
+                }
+            }
+            "email" => {
+                let Some(to) = channel
+                    .config
+                    .get("to")
+                    .and_then(|value| value.as_str())
+                    .and_then(normalize_recipient)
+                else {
+                    continue;
+                };
+                let from = channel.config.get("from").and_then(|v| v.as_str());
+                let subject = format!(
+                    "[qdrust] Task \"{}\" {}",
+                    task.name,
+                    if event == "success" {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    }
+                );
+                let body = format!(
+                    "Task: {}\nEvent: {}\nRun: #{}\nHTTP status: {}\nError: {}\n",
+                    task.name,
+                    event,
+                    run_id,
+                    http_status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    error_message.unwrap_or("-"),
+                );
+                if let Err(err) = email.send(&to, from, &subject, &body) {
+                    error!(task_id=task.id, channel_id=channel.id, %err, "email notification failed");
+                } else {
+                    info!(task_id=task.id, channel_id=channel.id, %to, "email notification sent");
+                }
+            }
+            other => {
+                info!(
+                    channel_id = channel.id,
+                    kind = other,
+                    "notification channel sender is not implemented"
+                );
+            }
         }
     }
 }
@@ -271,6 +389,7 @@ mod tests {
             })),
             created_at: 0,
             updated_at: 0,
+            grp: None,
         };
         let results = execute_template(template).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -283,5 +402,15 @@ mod tests {
         let bounded = bounded_error(&message);
         assert!(bounded.len() <= 4_099);
         assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn normalizes_email_recipients() {
+        assert_eq!(normalize_recipient("a@b.com"), Some("a@b.com".into()));
+        assert_eq!(
+            normalize_recipient("Ops <ops@example.com>"),
+            Some("ops@example.com".into())
+        );
+        assert_eq!(normalize_recipient("not an address"), None);
     }
 }

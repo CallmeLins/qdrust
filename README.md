@@ -9,7 +9,7 @@ qdrust 是按 QD2 路线重新设计的 Rust 项目，提供旧 QD HAR 的解析
 - `crates/qdrust-server`：基于 Axum、SQLx 和 SQLite 的 API、认证、调度与运行管理。
 - `webui`：基于 Vue 3、TypeScript 和 Vite 的 WebUI。
 
-当前服务包含用户认证与会话、模板、任务、运行记录与步骤、立即执行与取消、租约恢复、公共模板、插件、通知 Webhook、记事本以及 OpenAPI。所有用户资源均在服务端执行归属校验。
+当前服务包含用户认证与会话（含开放注册与忘记/重置密码）、管理员 API（用户管理、站点设置、日志清理）、模板（搜索/分组/分页）、任务（分组/批量操作）、运行记录与步骤、WebSocket 实时步骤流、立即执行与取消、租约恢复、公共模板、插件、通知（Webhook + Email）、记事本以及 OpenAPI。所有用户资源均在服务端执行归属校验。
 
 ## 环境要求
 
@@ -42,6 +42,11 @@ cargo run -p qdrust-server
 - 健康检查：`GET /health`
 - 数据库就绪检查：`GET /ready`
 - OpenAPI：`GET /api/v1/openapi.json`
+- 运行步骤实时流：`GET /api/v1/runs/{id}/steps/live`（WebSocket）
+- 管理员用户管理：`GET/PATCH /api/v1/admin/users`、`/api/v1/admin/users/{id}`
+- 管理员站点设置：`GET/PUT /api/v1/admin/settings/{key}`
+- 任务批量操作：`POST /api/v1/tasks/batch`（enable/disable/delete/run）
+- 任务分组：`GET /api/v1/task-groups`
 
 前后端分开开发时运行：
 
