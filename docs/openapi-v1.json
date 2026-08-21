@@ -1798,6 +1798,16 @@
           "updated_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email_verified": {
+            "type": "boolean",
+            "default": false
           }
         }
       },

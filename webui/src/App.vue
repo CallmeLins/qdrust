@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { Activity, CalendarClock, Check, ChevronDown, CircleHelp, FileJson2, LayoutDashboard, Menu, MoreHorizontal, Plus, RefreshCw, Search, Settings, Trash2, X, Zap } from "@lucide/vue";
-import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Note, type Plugin, type NotificationChannel, type NotificationAction } from "./api";
+import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Note, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import { formatRunTime } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
@@ -15,7 +15,7 @@ const menuOpen = ref(false);
 const ready = ref(false);
 const authenticated = ref(false);
 const currentUser = ref<User | null>(null);
-const view = ref<"tasks" | "templates" | "notes" | "plugins" | "notifications" | "runs" | "settings">("tasks");
+const view = ref<"tasks" | "templates" | "notes" | "plugins" | "notifications" | "runs" | "subscriptions" | "push" | "admin" | "settings">("tasks");
 const templates = ref<Template[]>([]); const publicTemplates = ref<Template[]>([]);
 const showImport = ref(false); const importForm = reactive({name:"",description:"",har:""});
 const editingTemplate = ref<number | null>(null);
@@ -29,8 +29,18 @@ const authForm = reactive({ username: "", password: "" });
 const expandedTask = ref<number | null>(null);
 const runs = ref<Run[]>([]);
 const allRuns = ref<Run[]>([]);
+const subscriptions = ref<TemplateSubscription[]>([]);
+const subSyncs = ref<SubscriptionSync[]>([]);
+const subForm = reactive({ name: "", url: "" });
+const pushRequests = ref<PushRequest[]>([]);
+const myPushRequests = ref<PushRequest[]>([]);
+const pushNote = ref("");
+const pushTemplateId = ref(0);
+const adminUsers = ref<User[]>([]);
+const adminSettings = ref<SiteSetting[]>([]);
+const settingsForm = reactive({ requireEmail: false, gaKey: "", retentionDays: 0 });
 const steps = ref<RunStep[]>([]);
-const form = reactive<CreateTask>({ name: "", cron: "0 * * * * * *", method: "GET", url: "", disabled: false });
+const form = reactive<CreateTask>({ name: "", cron: "0 * * * * * *", method: "GET", url: "", disabled: false, grp: null });
 
 const filtered = computed(() => {
   const term = search.value.trim().toLowerCase();
@@ -38,7 +48,7 @@ const filtered = computed(() => {
 });
 const activeCount = computed(() => tasks.value.filter((task) => !task.disabled).length);
 const successCount = computed(() => tasks.value.filter((task) => task.last_status && task.last_status < 400).length);
-const currentViewName = computed(() => ({ tasks: "任务", templates: "模板", notes: "记事本", plugins: "插件", notifications: "通知", runs: "运行记录", settings: "设置" })[view.value]);
+const currentViewName = computed(() => ({ tasks: "任务", templates: "模板", notes: "记事本", plugins: "插件", notifications: "通知", runs: "运行记录", subscriptions: "订阅", push: "发布审批", admin: "管理", settings: "设置" })[view.value]);
 const taskName = (taskId: number) => tasks.value.find((task) => task.id === taskId)?.name ?? `任务 #${taskId}`;
 
 async function load() {
@@ -130,6 +140,82 @@ async function saveAction(){await api.createNotificationAction(actionForm.taskId
 async function removeAction(id:number){await api.deleteNotificationAction(id);await loadActions();}
 async function openRuns(){view.value="runs";tasks.value=await api.tasks();const groups=await Promise.all(tasks.value.map((task)=>api.taskRuns(task.id)));allRuns.value=groups.flat().sort((a,b)=>(b.created_at??0)-(a.created_at??0));}
 
+async function openSubscriptions() {
+  view.value = "subscriptions";
+  [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.templates()]);
+}
+async function saveSubscription() {
+  await api.createSubscription(subForm.name, subForm.url);
+  Object.assign(subForm, { name: "", url: "" });
+  await openSubscriptions();
+}
+async function toggleSubscription(sub: TemplateSubscription) {
+  await api.updateSubscription(sub.id, !sub.enabled);
+  await openSubscriptions();
+}
+async function removeSubscription(id: number) {
+  if (!window.confirm("删除该订阅？")) return;
+  await api.deleteSubscription(id);
+  await openSubscriptions();
+}
+async function syncSubscription(id: number) {
+  await api.syncSubscription(id);
+  subSyncs.value = await api.subscriptionSyncs(id);
+}
+async function showSubSyncs(id: number) {
+  subSyncs.value = await api.subscriptionSyncs(id);
+}
+async function openPush() {
+  view.value = "push";
+  [pushRequests.value, myPushRequests.value, templates.value] = await Promise.all([
+    api.adminPushRequests("pending").catch(() => []),
+    api.myPushRequests(),
+    api.templates()
+  ]);
+}
+async function submitPush() {
+  await api.createPushRequest(pushTemplateId.value, pushNote.value);
+  pushNote.value = ""; pushTemplateId.value = 0;
+  await openPush();
+}
+async function decidePush(id: number, approve: boolean) {
+  await api.decidePushRequest(id, approve);
+  await openPush();
+}
+async function openAdmin() {
+  view.value = "admin";
+  [adminUsers.value, adminSettings.value] = await Promise.all([api.adminUsers(), api.adminSettings()]);
+  const requireEmail = adminSettings.value.find((s) => s.key === "require_email_verification");
+  const ga = adminSettings.value.find((s) => s.key === "ga_key");
+  const retention = adminSettings.value.find((s) => s.key === "logs.retention_days");
+  settingsForm.requireEmail = requireEmail?.value === true;
+  settingsForm.gaKey = typeof ga?.value === "string" ? ga.value : "";
+  settingsForm.retentionDays = typeof retention?.value === "number" ? retention.value : 0;
+}
+async function toggleUser(user: User) {
+  await api.adminUpdateUser(user.id, { disabled: !user.disabled });
+  await openAdmin();
+}
+async function saveAdminSettings() {
+  await api.adminSetSetting("require_email_verification", settingsForm.requireEmail);
+  if (settingsForm.gaKey) await api.adminSetSetting("ga_key", settingsForm.gaKey);
+  await api.adminSetSetting("logs.retention_days", settingsForm.retentionDays);
+  await openAdmin();
+}
+async function downloadBackup() {
+  const backup = await api.adminBackup();
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `qdrust-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+  a.click(); URL.revokeObjectURL(url);
+}
+async function restoreBackup(file: File) {
+  const text = await file.text();
+  await api.adminRestore(JSON.parse(text));
+  await openAdmin();
+}
+
 onMounted(async () => {
   try { const session = await api.session(); currentUser.value = session.user; authenticated.value = true; await load(); }
   catch { authenticated.value = false; loading.value = false; }
@@ -158,6 +244,9 @@ onMounted(async () => {
         <a :class="['nav-link',{active:view==='plugins'}]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link',{active:view==='notifications'}]" href="#" @click.prevent="openNotifications"><Activity :size="18" />{{ t('notifications') }}</a>
         <a :class="['nav-link',{active:view==='runs'}]" href="#" @click.prevent="openRuns"><Activity :size="18" />运行记录</a>
+        <a :class="['nav-link',{active:view==='subscriptions'}]" href="#" @click.prevent="openSubscriptions"><RefreshCw :size="18" />订阅</a>
+        <a v-if="currentUser?.role === 'admin'" :class="['nav-link',{active:view==='push'}]" href="#" @click.prevent="openPush"><FileJson2 :size="18" />发布审批</a>
+        <a v-if="currentUser?.role === 'admin'" :class="['nav-link',{active:view==='admin'}]" href="#" @click.prevent="openAdmin"><Settings :size="18" />管理</a>
         <a :class="['nav-link',{active:view==='settings'}]" href="#" @click.prevent="view='settings'"><Settings :size="18" />设置</a>
       </nav>
       <div class="sidebar-bottom">
@@ -167,7 +256,7 @@ onMounted(async () => {
     </aside>
 
     <div v-if="menuOpen" class="scrim" @click="menuOpen = false" />
-    <main v-if="view !== 'runs' && view !== 'settings'">
+    <main v-if="view !== 'runs' && view !== 'settings' && view !== 'subscriptions' && view !== 'push' && view !== 'admin'">
       <header class="topbar">
         <button class="icon-button mobile-menu" title="打开导航" @click="menuOpen = true"><Menu :size="20" /></button>
         <div class="breadcrumb">工作区 <span>/</span> {{ currentViewName }}</div>
@@ -224,6 +313,49 @@ onMounted(async () => {
     </main>
 
     <div v-if="view === 'runs'" class="page overlay-page"><section class="page-heading"><div><p class="eyebrow">RUN HISTORY</p><h1>运行记录</h1><p>查看所有任务的最近执行结果。</p></div><button class="secondary-button" @click="load"><RefreshCw :size="16" />刷新</button></section><section class="task-section content-panel"><div v-if="allRuns.length === 0" class="empty-state"><Activity :size="24" /><h2>暂无运行记录</h2></div><div v-else class="run-list"><div v-for="run in allRuns" :key="run.id" class="run-row"><span class="run-id">#{{ run.id }}</span><strong>{{ taskName(run.task_id) }}</strong><span class="status-text">{{ run.status }}</span><span v-if="run.http_status">HTTP {{ run.http_status }}</span><span class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</span></div></div></section></div>
+    <div v-if="view === 'subscriptions'" class="page overlay-page">
+      <section class="page-heading"><div><p class="eyebrow">TEMPLATE SOURCES</p><h1>订阅</h1><p>订阅 GitHub 仓库或模板文件 URL，自动导入 QD HAR 模板。</p></div></section>
+      <section class="task-section content-panel">
+        <form class="modal" @submit.prevent="saveSubscription"><label>订阅名称<input v-model="subForm.name" required /></label><label>GitHub 仓库或文件 URL<input v-model="subForm.url" required type="url" placeholder="https://github.com/owner/repo 或 https://example.com/template.har.json" /></label><button class="primary-button">添加订阅</button></form>
+        <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
+          <strong>{{ sub.name }}</strong><span>{{ sub.url }}</span>
+          <span v-if="sub.last_synced_at" class="run-time">上次同步 {{ formatRunTime(sub.last_synced_at) }}</span>
+          <span v-if="sub.last_error" class="error-banner" style="margin:0">{{ sub.last_error }}</span>
+          <button class="secondary-button" @click="syncSubscription(sub.id)">同步</button>
+          <button class="secondary-button" @click="showSubSyncs(sub.id)">记录</button>
+          <button class="secondary-button" @click="toggleSubscription(sub)">{{ sub.enabled ? "停用" : "启用" }}</button>
+          <button class="icon-button" title="删除订阅" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
+        </div>
+        <h2 v-if="subSyncs.length">同步记录</h2>
+        <div v-for="s in subSyncs" :key="s.id" class="run-row"><span>#{{ s.id }}</span><strong>{{ s.status }}</strong><span>{{ s.message }}</span><span class="run-time">{{ formatRunTime(s.created_at) }}</span></div>
+      </section>
+    </div>
+    <div v-if="view === 'push'" class="page overlay-page">
+      <section class="page-heading"><div><p class="eyebrow">PUBLISH REVIEW</p><h1>发布审批</h1><p>提交模板到公共库，由管理员审批。</p></div></section>
+      <section class="task-section content-panel">
+        <h2>我的请求</h2>
+        <form class="modal" @submit.prevent="submitPush"><label>模板<select v-model="pushTemplateId" required><option :value="0" disabled>选择模板</option><option v-for="t in templates" :key="t.id" :value="t.id">{{ t.name }}</option></select></label><label>说明<textarea v-model="pushNote" rows="3" placeholder="为什么发布？" /></label><button class="primary-button">提交发布请求</button></form>
+        <div v-for="r in myPushRequests" :key="r.id" class="run-row"><strong>模板 #{{ r.template_id }}</strong><span>{{ r.status }}</span><span v-if="r.note">{{ r.note }}</span></div>
+        <h2>待审批</h2>
+        <div v-for="r in pushRequests" :key="r.id" class="run-row"><strong>模板 #{{ r.template_id }}</strong><span>请求者 #{{ r.owner_id }}</span><span v-if="r.note">{{ r.note }}</span><button class="secondary-button" @click="decidePush(r.id, true)">批准</button><button class="secondary-button" @click="decidePush(r.id, false)">拒绝</button></div>
+      </section>
+    </div>
+    <div v-if="view === 'admin'" class="page overlay-page">
+      <section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>管理</h1><p>用户、站点设置、备份与恢复。</p></div></section>
+      <section class="task-section content-panel">
+        <h2>用户</h2>
+        <div v-for="user in adminUsers" :key="user.id" class="run-row"><strong>{{ user.username }}</strong><span>{{ user.role }}</span><span v-if="user.email">{{ user.email }}</span><span>{{ user.email_verified ? "已验证" : "未验证" }}</span><button class="secondary-button" @click="toggleUser(user)">{{ user.disabled ? "启用" : "禁用" }}</button></div>
+        <h2>站点设置</h2>
+        <form class="modal" @submit.prevent="saveAdminSettings">
+          <label class="checkbox"><input v-model="settingsForm.requireEmail" type="checkbox" />注册后必须验证邮箱</label>
+          <label>GA_KEY <input v-model="settingsForm.gaKey" placeholder="G-XXXXXXX" /></label>
+          <label>日志保留天数 <input v-model.number="settingsForm.retentionDays" type="number" min="0" /></label>
+          <button class="primary-button">保存设置</button>
+        </form>
+        <h2>备份 / 恢复</h2>
+        <div class="run-row"><button class="secondary-button" @click="downloadBackup">导出 JSON 备份</button><label class="secondary-button" style="margin:0">导入恢复<input type="file" accept="application/json" style="display:none" @change="(event) => restoreBackup((event.target as HTMLInputElement).files![0])" /></label></div>
+      </section>
+    </div>
     <div v-if="view === 'settings'" class="page overlay-page"><section class="page-heading"><div><p class="eyebrow">WORKSPACE</p><h1>设置</h1><p>查看当前工作区与账户状态。</p></div></section><section class="settings-grid"><div class="content-panel"><p class="eyebrow">ACCOUNT</p><h2>账户</h2><dl class="settings-list"><div><dt>用户名</dt><dd>{{ currentUser?.username }}</dd></div><div><dt>角色</dt><dd>{{ currentUser?.role }}</dd></div></dl></div><div class="content-panel"><p class="eyebrow">SERVICE</p><h2>服务</h2><dl class="settings-list"><div><dt>状态</dt><dd><span class="state-dot online" />正常</dd></div><div><dt>API 文档</dt><dd><a href="/api/v1/openapi.json" target="_blank">OpenAPI</a></dd></div></dl></div></section></div>
 
     <div v-if="showCreate" class="modal-backdrop" @click.self="showCreate = false">

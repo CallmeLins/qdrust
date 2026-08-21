@@ -514,6 +514,414 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Register a new user (open registration) */
+        post: operations["registerUser"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/forgot-password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request a password reset token (email delivery if configured) */
+        post: operations["forgotPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/reset-password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset a forgotten password using a token */
+        post: operations["resetPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Batch enable/disable/delete/run tasks */
+        post: operations["batchTaskOperations"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/task-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List distinct task group labels for the current user */
+        get: operations["listTaskGroups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/runs/{id}/steps/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** WebSocket stream of run steps and lifecycle events */
+        get: operations["liveRunSteps"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all users (admin) */
+        get: operations["adminListUsers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/users/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Disable/enable a user or change role (admin) */
+        patch: operations["adminUpdateUser"];
+        trace?: never;
+    };
+    "/api/v1/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all site settings (admin) */
+        get: operations["adminListSettings"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/settings/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a site setting (admin) */
+        get: operations["adminGetSetting"];
+        /** Create or update a site setting (admin) */
+        put: operations["adminSetSetting"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Prune run logs older than the retention window (admin) */
+        delete: operations["adminClearLogs"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/verify-email": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify an email address with a token */
+        post: operations["verifyEmail"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/resend-verification": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resend the email verification token (logged in) */
+        post: operations["resendVerification"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/csrf/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate the CSRF token (auto-refresh mechanism) */
+        post: operations["rotateCsrf"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List template subscriptions */
+        get: operations["listSubscriptions"];
+        put?: never;
+        /** Create a template subscription */
+        post: operations["createSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["getSubscription"];
+        put: operations["updateSubscription"];
+        post?: never;
+        delete: operations["deleteSubscription"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trigger a subscription sync (returns a sync id; progress via WebSocket) */
+        post: operations["syncSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}/syncs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listSubscriptionSyncs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}/sync/live": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** WebSocket stream of subscription sync progress */
+        get: operations["subscriptionSyncWebsocket"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/push-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List my template push requests */
+        get: operations["listMyPushRequests"];
+        put?: never;
+        /** Submit a template for public publication review */
+        post: operations["createPushRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/push-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List push requests (admin); filter with ?status=pending */
+        get: operations["listAdminPushRequests"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/push-requests/{id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["decidePushRequest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Export a full JSON backup of the database (admin) */
+        get: operations["adminBackup"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore the database from a JSON backup (admin) */
+        post: operations["adminRestore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -537,6 +945,9 @@ export interface components {
             created_at: number;
             /** Format: int64 */
             updated_at: number;
+            email?: string | null;
+            /** @default false */
+            email_verified: boolean;
         };
         AuthResponse: {
             user: components["schemas"]["User"];
@@ -558,6 +969,8 @@ export interface components {
             disabled: boolean;
             /** Format: int64 */
             template_id?: number | null;
+            /** @default null */
+            grp: string | null;
         };
         UpdateTask: {
             name?: string | null;
@@ -572,6 +985,8 @@ export interface components {
             disabled?: boolean | null;
             /** Format: int64 */
             template_id?: number | null;
+            /** @description Set to a string to change group, null to clear it, omit to leave unchanged */
+            grp?: string | null;
         };
         Task: components["schemas"]["CreateTask"] & {
             /** Format: int64 */
@@ -585,6 +1000,8 @@ export interface components {
             last_run_at: number | null;
             last_status: number | null;
             last_error: string | null;
+            /** @description Group label (QD _groups equivalent) */
+            grp?: string | null;
         };
         Run: {
             /** Format: int64 */
@@ -719,6 +1136,8 @@ export interface components {
             definition: {
                 [key: string]: unknown;
             };
+            /** @default null */
+            grp: string | null;
         };
         UpdateTemplate: {
             name?: string | null;
@@ -726,6 +1145,8 @@ export interface components {
             definition?: {
                 [key: string]: unknown;
             } | null;
+            /** @description Set to a string to change group, null to clear it, omit to leave unchanged */
+            grp?: string | null;
         };
         ImportQdHar: {
             name: string;
@@ -773,6 +1194,127 @@ export interface components {
                 [key: string]: string[];
             };
             request_id: string;
+        };
+        RegisterUser: {
+            username: string;
+            /** Format: password */
+            password: string;
+        };
+        AdminUserUpdate: {
+            disabled?: boolean | null;
+            role?: string | null;
+        };
+        ForgotPassword: {
+            username: string;
+        };
+        ResetPassword: {
+            token: string;
+            /** Format: password */
+            new_password: string;
+        };
+        SiteSetting: {
+            key: string;
+            value: unknown;
+            /** Format: int64 */
+            updated_at: number;
+        };
+        SetSiteSetting: {
+            value: unknown;
+        };
+        BatchTaskOperation: {
+            ids: number[];
+            /**
+             * @default enable
+             * @enum {string}
+             */
+            action: "enable" | "disable" | "delete" | "run";
+        };
+        BatchTaskResult: {
+            /** Format: int64 */
+            updated: number;
+        };
+        ClearLogs: {
+            /**
+             * Format: int64
+             * @default 30
+             */
+            older_than_days: number | null;
+        };
+        RunEvent: {
+            /** Format: int64 */
+            run_id: number;
+            /** @enum {string} */
+            type: "status" | "step" | "snapshot";
+            status?: string | null;
+            step?: unknown;
+            error?: string | null;
+        };
+        TemplateSubscription: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            owner_id: number;
+            name: string;
+            url: string;
+            enabled: boolean;
+            /** Format: int64 */
+            last_synced_at?: number | null;
+            last_error?: string | null;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: int64 */
+            updated_at: number;
+        };
+        CreateTemplateSubscription: {
+            name: string;
+            url: string;
+        };
+        UpdateTemplateSubscription: {
+            name?: string | null;
+            url?: string | null;
+            enabled?: boolean | null;
+        };
+        SubscriptionSync: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            subscription_id: number;
+            /** @enum {string} */
+            status: "pending" | "running" | "succeeded" | "failed";
+            message?: string | null;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: int64 */
+            finished_at?: number | null;
+        };
+        PushRequest: {
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            owner_id: number;
+            /** Format: int64 */
+            template_id: number;
+            /** @enum {string} */
+            status: "pending" | "approved" | "rejected";
+            note?: string | null;
+            /** Format: int64 */
+            reviewed_by?: number | null;
+            /** Format: int64 */
+            reviewed_at?: number | null;
+            /** Format: int64 */
+            created_at: number;
+        };
+        CreatePushRequest: {
+            /** Format: int64 */
+            template_id: number;
+            note?: string | null;
+        };
+        DecidePushRequest: {
+            approve: boolean;
+            note?: string | null;
+        };
+        VerifyEmail: {
+            token: string;
         };
     };
     responses: {
@@ -853,6 +1395,8 @@ export interface components {
     parameters: {
         Id: number;
         CsrfToken: string;
+        RunId: number;
+        SubscriptionId: number;
     };
     requestBodies: {
         CreateTask: {
@@ -938,6 +1482,66 @@ export interface components {
         ChangePassword: {
             content: {
                 "application/json": components["schemas"]["ChangePassword"];
+            };
+        };
+        RegisterUser: {
+            content: {
+                "application/json": components["schemas"]["RegisterUser"];
+            };
+        };
+        AdminUserUpdate: {
+            content: {
+                "application/json": components["schemas"]["AdminUserUpdate"];
+            };
+        };
+        ForgotPassword: {
+            content: {
+                "application/json": components["schemas"]["ForgotPassword"];
+            };
+        };
+        ResetPassword: {
+            content: {
+                "application/json": components["schemas"]["ResetPassword"];
+            };
+        };
+        SetSiteSetting: {
+            content: {
+                "application/json": components["schemas"]["SetSiteSetting"];
+            };
+        };
+        BatchTaskOperation: {
+            content: {
+                "application/json": components["schemas"]["BatchTaskOperation"];
+            };
+        };
+        ClearLogs: {
+            content: {
+                "application/json": components["schemas"]["ClearLogs"];
+            };
+        };
+        VerifyEmail: {
+            content: {
+                "application/json": components["schemas"]["VerifyEmail"];
+            };
+        };
+        CreateTemplateSubscription: {
+            content: {
+                "application/json": components["schemas"]["CreateTemplateSubscription"];
+            };
+        };
+        UpdateTemplateSubscription: {
+            content: {
+                "application/json": components["schemas"]["UpdateTemplateSubscription"];
+            };
+        };
+        CreatePushRequest: {
+            content: {
+                "application/json": components["schemas"]["CreatePushRequest"];
+            };
+        };
+        DecidePushRequest: {
+            content: {
+                "application/json": components["schemas"]["DecidePushRequest"];
             };
         };
     };
@@ -1888,6 +2492,605 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    registerUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["RegisterUser"];
+        responses: {
+            200: components["responses"]["AuthSuccess"];
+            422: components["responses"]["ValidationError"];
+        };
+    };
+    forgotPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["ForgotPassword"];
+        responses: {
+            /** @description Reset token issued or queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resetPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["ResetPassword"];
+        responses: {
+            /** @description Password reset, all sessions revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["ValidationError"];
+        };
+    };
+    batchTaskOperations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["BatchTaskOperation"];
+        responses: {
+            /** @description Batch result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchTaskResult"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    listTaskGroups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Group list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": string[];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    liveRunSteps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["RunId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade; text frames of RunEvent JSON */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    adminListUsers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description User list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    adminUpdateUser: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["AdminUserUpdate"];
+        responses: {
+            /** @description Updated user */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    adminListSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Settings list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SiteSetting"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    adminGetSetting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Setting */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SiteSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    adminSetSetting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["SetSiteSetting"];
+        responses: {
+            /** @description Saved setting */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SiteSetting"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    adminClearLogs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: components["requestBodies"]["ClearLogs"];
+        responses: {
+            /** @description Pruned */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** Format: int64 */
+                        deleted?: number;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    verifyEmail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["VerifyEmail"];
+        responses: {
+            /** @description Email verified */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    resendVerification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verification email sent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    rotateCsrf: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description New CSRF token issued in cookie and body */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    listSubscriptions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subscriptions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateSubscription"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["CreateTemplateSubscription"];
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateSubscription"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Subscription */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateSubscription"];
+                };
+            };
+        };
+    };
+    updateSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["UpdateTemplateSubscription"];
+        responses: {
+            /** @description Updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateSubscription"];
+                };
+            };
+        };
+    };
+    deleteSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    syncSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sync started */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listSubscriptionSyncs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sync history */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SubscriptionSync"][];
+                };
+            };
+        };
+    };
+    subscriptionSyncWebsocket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listMyPushRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Push requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushRequest"][];
+                };
+            };
+        };
+    };
+    createPushRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["CreatePushRequest"];
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushRequest"];
+                };
+            };
+        };
+    };
+    listAdminPushRequests: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Push requests */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushRequest"][];
+                };
+            };
+        };
+    };
+    decidePushRequest: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["DecidePushRequest"];
+        responses: {
+            /** @description Decision recorded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PushRequest"];
+                };
+            };
+        };
+    };
+    adminBackup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description JSON backup download */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    adminRestore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Restore complete */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
 }

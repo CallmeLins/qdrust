@@ -12,6 +12,10 @@ export type Note = components["schemas"]["Note"];
 export type Plugin = components["schemas"]["Plugin"];
 export type NotificationChannel = components["schemas"]["NotificationChannel"];
 export type NotificationAction = components["schemas"]["NotificationAction"];
+export type TemplateSubscription = components["schemas"]["TemplateSubscription"];
+export type SubscriptionSync = components["schemas"]["SubscriptionSync"];
+export type PushRequest = components["schemas"]["PushRequest"];
+export type SiteSetting = components["schemas"]["SiteSetting"];
 
 function csrfToken(): string | undefined {
   return document.cookie.split("; ").find((value) => value.startsWith("qd_csrf="))?.split("=")[1];
@@ -68,5 +72,26 @@ export const api = {
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
   runSteps: (id: number) => request<RunStep[]>(`/api/v1/runs/${id}/steps`),
-  ready: () => request<{ status: string }>("/ready")
+  ready: () => request<{ status: string }>("/ready"),
+  // P1 features
+  rotateCsrf: () => request<{ csrf_token: string }>("/api/v1/auth/csrf/rotate", { method: "POST" }),
+  verifyEmail: (token: string) => request<{ ok: boolean }>("/api/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) }),
+  resendVerification: () => request<{ sent: boolean }>("/api/v1/auth/resend-verification", { method: "POST" }),
+  subscriptions: () => request<TemplateSubscription[]>("/api/v1/subscriptions"),
+  createSubscription: (name: string, url: string) => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url }) }),
+  updateSubscription: (id: number, enabled: boolean) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
+  deleteSubscription: (id: number) => request<void>(`/api/v1/subscriptions/${id}`, { method: "DELETE" }),
+  syncSubscription: (id: number) => request<{ status: string }>(`/api/v1/subscriptions/${id}/sync`, { method: "POST" }),
+  subscriptionSyncs: (id: number) => request<SubscriptionSync[]>(`/api/v1/subscriptions/${id}/syncs`),
+  myPushRequests: () => request<PushRequest[]>("/api/v1/push-requests"),
+  createPushRequest: (templateId: number, note: string) => request<PushRequest>("/api/v1/push-requests", { method: "POST", body: JSON.stringify({ template_id: templateId, note: note || null }) }),
+  adminPushRequests: (status?: string) => request<PushRequest[]>(`/api/v1/admin/push-requests${status ? `?status=${status}` : ""}`),
+  decidePushRequest: (id: number, approve: boolean) => request<PushRequest>(`/api/v1/admin/push-requests/${id}/decision`, { method: "POST", body: JSON.stringify({ approve }) }),
+  adminUsers: () => request<User[]>("/api/v1/admin/users"),
+  adminUpdateUser: (id: number, input: { disabled?: boolean; role?: string }) => request<User>(`/api/v1/admin/users/${id}`, { method: "PATCH", body: JSON.stringify(input) }),
+  adminSettings: () => request<SiteSetting[]>("/api/v1/admin/settings"),
+  adminSetSetting: (key: string, value: unknown) => request<SiteSetting>(`/api/v1/admin/settings/${key}`, { method: "PUT", body: JSON.stringify({ value }) }),
+  adminBackup: () => request<unknown>("/api/v1/admin/backup"),
+  adminRestore: (backup: unknown) => request<{ ok: boolean }>("/api/v1/admin/restore", { method: "POST", body: JSON.stringify(backup) }),
+  adminClearLogs: (olderThanDays: number) => request<{ deleted: number }>("/api/v1/admin/logs", { method: "DELETE", body: JSON.stringify({ older_than_days: olderThanDays }) }),
 };
