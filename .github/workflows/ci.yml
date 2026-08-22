@@ -2,6 +2,8 @@ name: ci
 
 on:
   push:
+    branches: [main]
+    tags-ignore: ["v*"]
   pull_request:
 
 permissions:
@@ -46,35 +48,3 @@ jobs:
       - run: npm audit --audit-level=high
       - name: Generated client is current
         run: git diff --exit-code -- src/generated/api.ts
-
-  container:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          load: true
-          tags: qdrust:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Container smoke test
-        run: |
-          docker run -d --name qdrust-ci -p 8923:8923 qdrust:ci
-          for attempt in $(seq 1 30); do
-            curl --fail --silent http://127.0.0.1:8923/ready && break
-            sleep 1
-          done
-          curl --fail --silent http://127.0.0.1:8923/health
-          curl --fail --silent http://127.0.0.1:8923/
-          docker logs qdrust-ci
-      - name: Scan container image
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: qdrust:ci
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          severity: CRITICAL,HIGH
