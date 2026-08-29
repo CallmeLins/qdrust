@@ -2,10 +2,10 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import {
   Activity, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
-  LayoutDashboard, ListChecks, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
+  LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Note, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LiveRunEvent } from "./api";
+import { api, type CreateTask, type Task, type Run, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
 import { formatRunTime } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
@@ -25,10 +25,6 @@ function fmt(key: Parameters<typeof t>[0], params?: Record<string, string | numb
   if (params) for (const [k, v] of Object.entries(params)) s = s.replace(`{${k}}`, String(v));
   return s;
 }
-function fmtDuration(seconds?: number | null): string {
-  if (seconds == null) return "–";
-  return seconds >= 60 ? `${(seconds / 60).toFixed(1)}m` : `${Math.round(seconds * 10) / 10}s`;
-}
 
 // ---------- app / auth state ----------
 const ready = ref(false);
@@ -39,15 +35,15 @@ const authForm = reactive({ username: "", password: "", email: "", token: "", ne
 const authNotice = ref("");
 const verifyResult = ref<"ok" | "fail" | null>(null);
 const forgotResult = ref<{ sent: boolean; token?: string } | null>(null);
-const view = ref<"tasks" | "templates" | "notes" | "plugins" | "notifications" | "runs" | "subscriptions" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
 const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
-  tasks: t("tasks"), templates: t("templates"), notes: t("notesTitle"), plugins: t("pluginsTitle"),
-  notifications: t("notificationsTitle"), runs: t("runsTitle"), subscriptions: t("subscriptionsTitle"),
+  tasks: t("tasks"), templates: t("templates"), plugins: t("pluginsTitle"),
+  notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
 
@@ -60,11 +56,6 @@ const groupFilter = ref("");
 const selected = reactive(new Set<number>());
 const expandedTask = ref<number | null>(null);
 const runsByTask = ref<Record<number, Run[]>>({});
-const stepsMap = reactive(new Map<number, RunStep[]>());
-const expandedRun = ref<number | null>(null);
-const liveRunId = ref<number | null>(null);
-let liveWs: WebSocket | null = null;
-const expandedSteps = computed(() => (expandedRun.value ? stepsMap.get(expandedRun.value) ?? [] : []));
 
 interface TaskForm {
   id: number | null;
@@ -137,6 +128,25 @@ function harVariableNames(har: unknown): string[] {
   };
   walk(har);
   return [...names].filter((name) => !name.startsWith("__"));
+}
+
+/** 收集模板的提取输出变量名（extract_variables），它们在运行时产生，不需要用户填写 */
+function harExtractedNames(har: unknown): Set<string> {
+  const names = new Set<string>();
+  const entries = (har as Record<string, unknown>)?.log && typeof har === "object"
+    ? ((har as Record<string, unknown>).log as Record<string, unknown>)?.entries
+    : Array.isArray(har) ? har : null;
+  if (!Array.isArray(entries)) return names;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const rule = record.rule && typeof record.rule === "object" ? record.rule as Record<string, unknown> : record;
+    for (const extract of Array.isArray(rule.extract_variables) ? rule.extract_variables : []) {
+      const name = (extract as Record<string, unknown>)?.name;
+      if (typeof name === "string") names.add(name);
+    }
+  }
+  return names;
 }
 
 const filteredTasks = computed(() => {
@@ -298,74 +308,35 @@ async function toggleTaskRuns(task: Task) {
   expandedTask.value = task.id;
   await loadTaskRuns(task.id);
 }
-function closeLive() {
-  if (liveWs) { liveWs.close(); liveWs = null; }
-  liveRunId.value = null;
-}
-async function toggleRunSteps(run: Run) {
-  if (expandedRun.value === run.id) {
-    expandedRun.value = null;
-    closeLive();
-    return;
-  }
-  expandedRun.value = run.id;
-  try {
-    stepsMap.set(run.id, await api.runSteps(run.id));
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-  if (["pending", "leased", "running"].includes(run.status)) openLive(run.id);
-}
-function openLive(runId: number) {
-  closeLive();
-  liveRunId.value = runId;
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/api/v1/runs/${runId}/steps/live`);
-  liveWs = ws;
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data) as LiveRunEvent & { steps?: RunStep[] };
-      if (msg.type === "snapshot" && msg.steps) {
-        stepsMap.set(runId, msg.steps);
-      } else if (msg.step) {
-        const existing = stepsMap.get(runId) ?? [];
-        const idx = existing.findIndex((s) => s.step_index === msg.step!.step_index);
-        if (idx >= 0) existing[idx] = msg.step;
-        else existing.push(msg.step);
-        stepsMap.set(runId, [...existing]);
-      } else if (msg.status) {
-        for (const list of [runsByTask.value, allRuns.value]) {
-          const target = (list as Run[]).find((r) => r.id === runId);
-          if (target) target.status = msg.status;
-        }
-      } else if (msg.error) {
-        notify(msg.error, "error");
-      }
-    } catch { /* ignore malformed frames */ }
-  };
-  ws.onclose = () => { if (liveRunId.value === runId) liveRunId.value = null; liveWs = null; };
-  ws.onerror = () => { notify(t("genericError"), "error"); ws.close(); };
-}
 async function cancelRun(run: Run) {
   try {
     await api.cancelRun(run.id);
     if (expandedTask.value != null) await loadTaskRuns(expandedTask.value);
-    if (view.value === "runs") await loadAllRuns();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function removeRun(run: Run) {
+  if (!window.confirm(t("confirmDeleteRun"))) return;
+  try {
+    await api.deleteRun(run.id);
+    if (expandedTask.value != null) await loadTaskRuns(expandedTask.value);
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+function runStatusLabel(status: string): string {
+  const key = ({ succeeded: "runStSucceeded", failed: "runStFailed", running: "runStRunning", leased: "runStRunning", pending: "runStPending", cancelled: "runStCancelled" } as Record<string, Parameters<typeof t>[0]>)[status];
+  return key ? t(key) : status;
+}
+/** QD 式日志列：成功显示 __log__ 摘要，失败显示错误详情 */
+function runLogText(run: Run): string {
+  if (run.log) return run.log;
+  if (run.error) return run.error;
+  if (run.http_status) return `HTTP ${run.http_status}`;
+  return "–";
 }
 function runStatusClass(status: string): string {
   if (status === "succeeded") return "run-ok";
   if (status === "failed") return "run-bad";
   if (status === "cancelled") return "run-cancelled";
   return "run-active";
-}
-
-// ---------- runs (global view) ----------
-const allRuns = ref<Run[]>([]);
-async function loadAllRuns() {
-  try {
-    const list = await api.tasks();
-    const groups = await Promise.all(list.map((task) => api.taskRuns(task.id).catch(() => [] as Run[])));
-    allRuns.value = groups.flat().sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0)).slice(0, 200);
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
 // ---------- templates ----------
@@ -398,8 +369,10 @@ function onTemplatePicked() {
   if (!tmpl) return;
   if (!taskForm.name) taskForm.name = tmpl.name;
   if (!taskForm.url) taskForm.url = firstHarUrl(tmpl);
-  // QD 式变量联动：从模板 HAR 提取 {{变量名}} 引用，自动生成填值行（保留已输入的同名值）
-  const names = harVariableNames(tmpl.qd_har);
+  // QD 式变量联动：从模板 HAR 提取 {{变量名}} 引用，自动生成填值行（保留已输入的同名值）。
+  // extract_variables 的提取输出（如 points/error/__log__）在运行时产生，不出现在填值表单。
+  const extracted = harExtractedNames(tmpl.qd_har);
+  const names = harVariableNames(tmpl.qd_har).filter((name) => !extracted.has(name));
   if (names.length) {
     const existing = new Map(taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value]));
     taskForm.variables = names.map((name) => ({ name, value: existing.get(name) ?? "" }));
@@ -514,30 +487,6 @@ async function saveHar(doc: object) {
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
   }
-}
-
-// ---------- notes ----------
-const notes = ref<Note[]>([]);
-const noteForm = reactive({ id: 0, title: "", content: "" });
-async function openNotes() {
-  view.value = "notes";
-  try { notes.value = await api.notes(); } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
-function editNote(note?: Note) {
-  Object.assign(noteForm, note ? { id: note.id, title: note.title, content: note.content } : { id: 0, title: "", content: "" });
-}
-async function saveNote() {
-  try {
-    if (noteForm.id) await api.updateNote(noteForm.id, noteForm.title, noteForm.content);
-    else await api.createNote(noteForm.title, noteForm.content);
-    editNote();
-    await openNotes();
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
-async function removeNote(id: number, title: string) {
-  if (!window.confirm(fmt("deleteNoteConfirm", { title }))) return;
-  try { await api.deleteNote(id); await openNotes(); }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
 // ---------- plugins ----------
@@ -831,9 +780,7 @@ async function logout(silent = false) {
   authenticated.value = false;
   currentUser.value = null;
   tasks.value = [];
-  allRuns.value = [];
   runsByTask.value = {};
-  closeLive();
   if (!silent) notify(t("logout"));
   authMode.value = "login";
   Object.assign(authForm, { username: "", password: "" });
@@ -929,10 +876,8 @@ onMounted(async () => {
       <nav aria-label="主导航">
         <a :class="['nav-link', { active: view === 'tasks' }]" href="#" @click.prevent="view='tasks'"><LayoutDashboard :size="18" />{{ t('tasks') }}</a>
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
-        <a :class="['nav-link', { active: view === 'notes' }]" href="#" @click.prevent="openNotes"><ListChecks :size="18" />{{ t('notes') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
-        <a :class="['nav-link', { active: view === 'runs' }]" href="#" @click.prevent="loadAllRuns; view='runs'"><Activity :size="18" />{{ t('runs') }}</a>
         <a :class="['nav-link', { active: view === 'subscriptions' }]" href="#" @click.prevent="openSubscriptions"><RefreshCw :size="18" />{{ t('subscriptions') }}</a>
         <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
@@ -1028,39 +973,13 @@ onMounted(async () => {
                     <td colspan="7">
                       <div v-if="!runsByTask[task.id] || runsByTask[task.id].length === 0" class="muted">{{ t('noRuns') }}</div>
                       <div v-for="run in (runsByTask[task.id] ?? []).slice(0, 10)" :key="run.id" class="run-row">
-                        <span class="run-id">#{{ run.id }}</span>
-                        <strong :class="runStatusClass(run.status)">{{ run.status }}</strong>
-                        <span v-if="run.http_status">HTTP {{ run.http_status }}</span>
-                        <span v-if="run.error" class="error-text">{{ run.error }}</span>
                         <span class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</span>
-                        <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
-                        <button class="secondary-button" @click="toggleRunSteps(run)">{{ expandedRun === run.id ? t('close') : t('viewSteps') }} <span v-if="stepsMap.get(run.id)?.length">({{ stepsMap.get(run.id)!.length }})</span></button>
-                      </div>
-                    </td>
-                  </tr>
-                  <tr v-if="expandedTask === task.id && expandedRun && expandedSteps.length > 0" class="steps-detail">
-                    <td colspan="7">
-                      <div class="steps-panel">
-                        <div class="steps-head">
-                          <span>#{{ expandedRun }} · {{ t('runStatus') }}</span>
-                          <span v-if="liveRunId === expandedRun" class="live-badge"><span class="live-dot" />live</span>
-                        </div>
-                        <table v-if="expandedSteps.length > 0" class="steps-table">
-                          <thead><tr><th>#</th><th>{{ t('name') }}</th><th>{{ t('status') }}</th><th>{{ t('httpStatus') }}</th><th>bytes</th><th>{{ t('duration') }}</th><th>{{ t('error') }}</th></tr></thead>
-                          <tbody>
-                            <tr v-for="step in expandedSteps" :key="step.id">
-                              <td>{{ step.step_index }}</td>
-                              <td><code>{{ step.name }}</code></td>
-                              <td><strong :class="runStatusClass(step.status)">{{ step.status }}</strong></td>
-                              <td>{{ step.http_status ?? '–' }}</td>
-                              <td>{{ step.body_size ?? 0 }}</td>
-                              <td>{{ fmtDuration(step.finished_at && step.started_at ? step.finished_at - step.started_at : null) }}</td>
-                              <td v-if="step.error" class="error-text">{{ step.error }}</td>
-                              <td v-else>–</td>
-                            </tr>
-                          </tbody>
-                        </table>
-                        <div v-else class="muted">{{ t('loading') }}</div>
+                        <strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong>
+                        <span class="run-log">{{ runLogText(run) }}</span>
+                        <span class="run-actions">
+                          <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
+                          <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
+                        </span>
                       </div>
                     </td>
                   </tr>
@@ -1099,25 +1018,6 @@ onMounted(async () => {
             <span>{{ item.source_format }}</span>
             <span v-if="item.description" class="muted">{{ item.description }}</span>
             <button class="secondary-button" @click="copyTemplate(item.id)">{{ t('copy') }}</button>
-          </div>
-        </section>
-      </div>
-
-      <!-- ===== NOTES ===== -->
-      <div v-else-if="view === 'notes'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">NOTES</p><h1>{{ t('notesTitle') }}</h1><p>{{ t('notesHint') }}</p></div></section>
-        <section class="task-section">
-          <form class="modal inline-modal" @submit.prevent="saveNote">
-            <label>{{ t('noteTitle') }}<input v-model="noteForm.title" required /></label>
-            <label>{{ t('noteContent') }}<textarea v-model="noteForm.content" rows="8" /></label>
-            <button class="primary-button">{{ noteForm.id ? t('saveNote') : t('newNote') }}</button>
-          </form>
-          <div v-if="notes.length === 0" class="muted">{{ t('noNotes') }}</div>
-          <div v-for="note in notes" :key="note.id" class="run-row">
-            <strong>{{ note.title }}</strong>
-            <span class="muted">{{ note.content.slice(0, 60) }}</span>
-            <button class="secondary-button" @click="editNote(note)">{{ t('edit') }}</button>
-            <button class="icon-button" :title="t('deleteNote')" @click="removeNote(note.id, note.title)"><Trash2 :size="16" /></button>
           </div>
         </section>
       </div>
@@ -1203,45 +1103,6 @@ onMounted(async () => {
             <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
             <span>{{ t('task') }}: {{ taskName(action.task_id) }}</span>
             <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
-          </div>
-        </section>
-      </div>
-
-      <!-- ===== RUNS (global) ===== -->
-      <div v-else-if="view === 'runs'" class="page">
-        <section class="page-heading">
-          <div><p class="eyebrow">RUN HISTORY</p><h1>{{ t('runsTitle') }}</h1><p>{{ t('runsHint') }}</p></div>
-          <button class="secondary-button" @click="loadAllRuns"><RefreshCw :size="16" />{{ t('refresh') }}</button>
-        </section>
-        <section class="task-section">
-          <div v-if="allRuns.length === 0" class="empty-state"><Activity :size="24" /><h2>{{ t('noRuns') }}</h2></div>
-          <div v-else class="run-list">
-            <div v-for="run in allRuns" :key="run.id" class="run-row clickable" @click="toggleRunSteps(run)">
-              <span class="run-id">#{{ run.id }}</span>
-              <strong>{{ taskName(run.task_id) }}</strong>
-              <strong :class="runStatusClass(run.status)">{{ run.status }}</strong>
-              <span v-if="run.http_status">{{ t('httpStatus') }} {{ run.http_status }}</span>
-              <span v-if="run.error" class="error-text">{{ run.error }}</span>
-              <span class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</span>
-              <span v-if="liveRunId === run.id" class="live-badge"><span class="live-dot" />live</span>
-              <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click.stop="cancelRun(run)"><X :size="15" /></button>
-            </div>
-            <div v-if="expandedRun && expandedSteps.length > 0" class="steps-panel">
-              <div class="steps-head"><span>#{{ expandedRun }} · {{ t('runStatus') }}</span><span v-if="liveRunId === expandedRun" class="live-badge"><span class="live-dot" />live</span></div>
-              <table v-if="expandedSteps.length" class="steps-table">
-                <thead><tr><th>#</th><th>{{ t('name') }}</th><th>{{ t('status') }}</th><th>{{ t('httpStatus') }}</th><th>bytes</th><th>{{ t('duration') }}</th><th>{{ t('error') }}</th></tr></thead>
-                <tbody>
-                  <tr v-for="step in expandedSteps" :key="step.id">
-                    <td>{{ step.step_index }}</td><td><code>{{ step.name }}</code></td>
-                    <td><strong :class="runStatusClass(step.status)">{{ step.status }}</strong></td>
-                    <td>{{ step.http_status ?? '–' }}</td><td>{{ step.body_size ?? 0 }}</td>
-                    <td>{{ fmtDuration(step.finished_at && step.started_at ? step.finished_at - step.started_at : null) }}</td>
-                    <td v-if="step.error" class="error-text">{{ step.error }}</td><td v-else>–</td>
-                  </tr>
-                </tbody>
-              </table>
-              <div v-else class="muted">{{ t('loading') }}</div>
-            </div>
           </div>
         </section>
       </div>

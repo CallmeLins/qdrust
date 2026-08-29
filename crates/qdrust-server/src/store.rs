@@ -10,12 +10,12 @@ use sqlx::{
 
 use crate::auth::{new_token, token_hash};
 use crate::model::{
-    AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNote,
-    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
-    CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ImportQdHarTemplate,
-    IssuedSession, Note, NotificationAction, NotificationChannel, PluginManifest, PushRequest, Run,
-    RunStep, SetSiteSetting, SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription,
-    UpdateNote, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+    AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNotificationAction,
+    CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
+    CreateTemplateSubscription, DecidePushRequest, ImportQdHarTemplate, IssuedSession,
+    NotificationAction, NotificationChannel, PluginManifest, PushRequest, Run, RunStep,
+    SetSiteSetting, SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription,
+    UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
     UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
@@ -722,6 +722,46 @@ macro_rules! define_store {
         Ok(())
     }
 
+    /// Persist the QD-style log line (the final __log__ value) for a run.
+    pub async fn record_run_log(&self, run_id: i64, log: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET log=? WHERE id=?")
+            .bind(log)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a single run (run_steps cascade via FK).
+    pub async fn delete_run(&self, run_id: i64) -> Result<bool> {
+        Ok(sqlx::query("DELETE FROM runs WHERE id=?")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    /// Clear the run history of every task owned by `owner_id`; returns the
+    /// number of deleted runs.
+    pub async fn delete_runs_for_owner(&self, owner_id: i64) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
+        )
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    /// Clear the whole run history (admin).
+    pub async fn delete_all_runs(&self) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM runs")
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
     pub async fn record_run_step(&self, step: &RunStep) -> Result<()> {
         sqlx::query(
             "INSERT INTO run_steps(run_id,step_index,name,status,http_status,body_size,error,started_at,finished_at)
@@ -798,76 +838,6 @@ macro_rules! define_store {
             return Ok(None);
         }
         Ok(Some(self.list_task_runs(task_id).await?))
-    }
-
-    pub async fn create_note(&self, owner_id: i64, input: CreateNote) -> Result<Note> {
-        ensure!(!input.title.trim().is_empty(), "note title cannot be empty");
-        let now = Utc::now().timestamp();
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query(
-            "INSERT INTO notes(owner_id,title,content,created_at,updated_at) VALUES (?,?,?,?,?)",
-        )
-        .bind(owner_id)
-        .bind(input.title.trim())
-        .bind(input.content)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *conn)
-        .await?;
-        let id = self.last_insert_id(&mut conn).await?;
-        drop(conn);
-        self.get_note(id, owner_id)
-            .await?
-            .context("created note disappeared")
-    }
-
-    pub async fn list_notes(&self, owner_id: i64) -> Result<Vec<Note>> {
-        let rows = sqlx::query("SELECT id,title,content,created_at,updated_at FROM notes WHERE owner_id=? ORDER BY updated_at DESC,id DESC")
-            .bind(owner_id).fetch_all(&self.pool).await?;
-        rows.into_iter().map(note_from_row).collect()
-    }
-
-    pub async fn get_note(&self, id: i64, owner_id: i64) -> Result<Option<Note>> {
-        let row = sqlx::query(
-            "SELECT id,title,content,created_at,updated_at FROM notes WHERE id=? AND owner_id=?",
-        )
-        .bind(id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(note_from_row).transpose()
-    }
-
-    pub async fn update_note(
-        &self,
-        id: i64,
-        owner_id: i64,
-        input: UpdateNote,
-    ) -> Result<Option<Note>> {
-        let Some(current) = self.get_note(id, owner_id).await? else {
-            return Ok(None);
-        };
-        let title = input.title.unwrap_or(current.title);
-        ensure!(!title.trim().is_empty(), "note title cannot be empty");
-        sqlx::query("UPDATE notes SET title=?,content=?,updated_at=? WHERE id=? AND owner_id=?")
-            .bind(title.trim())
-            .bind(input.content.unwrap_or(current.content))
-            .bind(Utc::now().timestamp())
-            .bind(id)
-            .bind(owner_id)
-            .execute(&self.pool)
-            .await?;
-        self.get_note(id, owner_id).await
-    }
-
-    pub async fn delete_note(&self, id: i64, owner_id: i64) -> Result<bool> {
-        Ok(sqlx::query("DELETE FROM notes WHERE id=? AND owner_id=?")
-            .bind(id)
-            .bind(owner_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            > 0)
     }
 
     pub async fn create_notification_channel(
@@ -1481,10 +1451,6 @@ macro_rules! define_store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM notes WHERE owner_id=?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
         sqlx::query(
             "DELETE FROM subscription_syncs WHERE subscription_id IN (SELECT id FROM template_subscriptions WHERE owner_id=?)",
         )
@@ -2088,7 +2054,6 @@ macro_rules! define_store {
             "tasks",
             "runs",
             "run_steps",
-            "notes",
             "notification_channels",
             "notification_actions",
             "plugins",
@@ -2153,7 +2118,6 @@ macro_rules! define_store {
             "plugins",
             "notification_actions",
             "notification_channels",
-            "notes",
             "run_steps",
             "runs",
             "tasks",
@@ -2174,7 +2138,6 @@ macro_rules! define_store {
             "tasks",
             "runs",
             "run_steps",
-            "notes",
             "notification_channels",
             "notification_actions",
             "plugins",
@@ -2243,7 +2206,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
-const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of FROM runs";
+const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -2362,6 +2325,7 @@ fn run_from_row(row: $row) -> Result<Run> {
         status: row.try_get("status")?,
         http_status: row.try_get("http_status")?,
         error: row.try_get("error")?,
+        log: row.try_get("log")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         created_at: row.try_get("created_at")?,
@@ -2371,16 +2335,6 @@ fn run_from_row(row: $row) -> Result<Run> {
         cancel_requested: row.try_get("cancel_requested")?,
         run_after: row.try_get("run_after")?,
         retry_of: row.try_get("retry_of")?,
-    })
-}
-
-fn note_from_row(row: $row) -> Result<Note> {
-    Ok(Note {
-        id: row.try_get("id")?,
-        title: row.try_get("title")?,
-        content: row.try_get("content")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -2596,17 +2550,16 @@ impl Store {
         pub async fn cancel_run(run_id: i64) -> Result<bool> { run_id };
         pub async fn recover_expired_runs() -> Result<u64> {  };
         pub async fn finish_run(run_id: i64, http_status: Option<u16>, error: Option<&str>) -> Result<()> { run_id, http_status, error };
+        pub async fn record_run_log(run_id: i64, log: &str) -> Result<()> { run_id, log };
+        pub async fn delete_run(run_id: i64) -> Result<bool> { run_id };
+        pub async fn delete_runs_for_owner(owner_id: i64) -> Result<u64> { owner_id };
+        pub async fn delete_all_runs() -> Result<u64> {  };
         pub async fn record_run_step(step: &RunStep) -> Result<()> { step };
         pub async fn list_run_steps(run_id: i64) -> Result<Vec<RunStep>> { run_id };
         pub async fn list_run_steps_for_owner(run_id: i64, owner_id: i64) -> Result<Option<Vec<RunStep>>> { run_id, owner_id };
         pub async fn get_run(id: i64) -> Result<Option<Run>> { id };
         pub async fn list_task_runs(task_id: i64) -> Result<Vec<Run>> { task_id };
         pub async fn list_task_runs_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Vec<Run>>> { task_id, owner_id };
-        pub async fn create_note(owner_id: i64, input: CreateNote) -> Result<Note> { owner_id, input };
-        pub async fn list_notes(owner_id: i64) -> Result<Vec<Note>> { owner_id };
-        pub async fn get_note(id: i64, owner_id: i64) -> Result<Option<Note>> { id, owner_id };
-        pub async fn update_note(id: i64, owner_id: i64, input: UpdateNote) -> Result<Option<Note>> { id, owner_id, input };
-        pub async fn delete_note(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
         pub async fn create_notification_channel(owner_id: i64, input: CreateNotificationChannel) -> Result<NotificationChannel> { owner_id, input };
         pub async fn list_notification_channels(owner_id: i64) -> Result<Vec<NotificationChannel>> { owner_id };
         pub async fn get_notification_channel(id: i64, owner_id: i64) -> Result<Option<NotificationChannel>> { id, owner_id };
@@ -3272,61 +3225,6 @@ mod tests {
         assert_eq!(imported.source_format, "qd_har");
         assert_eq!(imported.qd_har, Some(har));
         assert!(imported.definition.is_none());
-    }
-
-    #[tokio::test]
-    async fn notes_are_owner_scoped_across_crud() {
-        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
-        let alice = store
-            .create_user("alice-notes", "$argon2id$test", "user")
-            .await
-            .unwrap();
-        let bob = store
-            .create_user("bob-notes", "$argon2id$test", "user")
-            .await
-            .unwrap();
-        let note = store
-            .create_note(
-                alice.id,
-                CreateNote {
-                    title: "secret".into(),
-                    content: "alpha".into(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(store.list_notes(alice.id).await.unwrap().len(), 1);
-        assert!(store.get_note(note.id, bob.id).await.unwrap().is_none());
-        assert!(
-            store
-                .update_note(
-                    note.id,
-                    bob.id,
-                    UpdateNote {
-                        title: Some("stolen".into()),
-                        content: None
-                    }
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.delete_note(note.id, bob.id).await.unwrap());
-        let updated = store
-            .update_note(
-                note.id,
-                alice.id,
-                UpdateNote {
-                    title: None,
-                    content: Some("beta".into()),
-                },
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.content, "beta");
-        assert!(store.delete_note(note.id, alice.id).await.unwrap());
-        assert!(store.get_note(note.id, alice.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

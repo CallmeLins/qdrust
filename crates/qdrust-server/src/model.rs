@@ -341,6 +341,10 @@ pub struct Run {
     pub status: String,
     pub http_status: Option<i64>,
     pub error: Option<String>,
+    /// QD-style log line: the final __log__ value extracted by the template
+    /// execution (empty for plain tasks and failed runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub created_at: i64,
@@ -368,28 +372,6 @@ pub struct RunStep {
     pub error: Option<String>,
     pub started_at: i64,
     pub finished_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Note {
-    pub id: i64,
-    pub title: String,
-    pub content: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct CreateNote {
-    pub title: String,
-    #[serde(default)]
-    pub content: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct UpdateNote {
-    pub title: Option<String>,
-    pub content: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -402,11 +402,11 @@ impl QdExecutor {
                 && let Some(post_data) = entry.request.post_data.as_ref()
             {
                 let mime = post_data.mime_type.as_deref().unwrap_or("");
-                if mime.is_empty() || mime.contains("application/x-www-form-urlencoded") {
-                    if let Some(text) = post_data.text.as_ref() {
-                        let body = self.render(text, context)?;
-                        url = merge_form_into_query(&url, &body);
-                    }
+                if (mime.is_empty() || mime.contains("application/x-www-form-urlencoded"))
+                    && let Some(text) = post_data.text.as_ref()
+                {
+                    let body = self.render(text, context)?;
+                    url = merge_form_into_query(&url, &body);
                 }
             }
             let response = self.plugins.call(&url, self.plugin_timeout).await?;
@@ -498,7 +498,8 @@ impl QdExecutor {
             &headers,
             &content,
             context,
-        )?;
+        )
+        .map_err(|cause| anyhow::anyhow!("{cause} (at {url})"))?;
         self.check_rules(
             &entry.failed_asserts,
             false,
@@ -506,7 +507,8 @@ impl QdExecutor {
             &headers,
             &content,
             context,
-        )?;
+        )
+        .map_err(|cause| anyhow::anyhow!("{cause} (at {url})"))?;
         for rule in &entry.extract_variables {
             let pattern = self.render(&rule.rule.re, context)?;
             let source = rule_source(&rule.rule.from, status, &headers, &content);

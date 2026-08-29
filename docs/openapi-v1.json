@@ -283,72 +283,43 @@
         }
       }
     },
-    "/api/v1/notes": {
-      "get": {
-        "operationId": "listNotes",
-        "responses": {
-          "200": {
-            "description": "Note list"
-          }
-        }
-      },
-      "post": {
-        "operationId": "createNote",
-        "requestBody": {
-          "$ref": "#/components/requestBodies/CreateNote"
-        },
-        "responses": {
-          "201": {
-            "description": "Note created"
-          },
-          "422": {
-            "$ref": "#/components/responses/ValidationError"
-          }
-        }
-      }
-    },
-    "/api/v1/notes/{id}": {
+    "/api/v1/runs/{id}": {
       "parameters": [
         {
           "$ref": "#/components/parameters/Id"
         }
       ],
-      "get": {
-        "operationId": "getNote",
-        "responses": {
-          "200": {
-            "description": "Note"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          }
-        }
-      },
-      "put": {
-        "operationId": "updateNote",
-        "requestBody": {
-          "$ref": "#/components/requestBodies/UpdateNote"
-        },
-        "responses": {
-          "200": {
-            "description": "Note updated"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "422": {
-            "$ref": "#/components/responses/ValidationError"
-          }
-        }
-      },
       "delete": {
-        "operationId": "deleteNote",
+        "operationId": "deleteRun",
         "responses": {
           "204": {
-            "description": "Note deleted"
+            "description": "Run deleted"
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/runs": {
+      "delete": {
+        "operationId": "deleteAllRuns",
+        "description": "Clear the run history: admins wipe every run, users wipe the runs of their own tasks",
+        "responses": {
+          "200": {
+            "description": "Number of deleted runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1491,26 +1462,6 @@
           }
         }
       },
-      "CreateNote": {
-        "required": true,
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/CreateNote"
-            }
-          }
-        }
-      },
-      "UpdateNote": {
-        "required": true,
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/UpdateNote"
-            }
-          }
-        }
-      },
       "CreateNotificationChannel": {
         "required": true,
         "content": {
@@ -2180,6 +2131,13 @@
               "null"
             ]
           },
+          "log": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "QD-style log line: the final __log__ value extracted by the template execution"
+          },
           "started_at": {
             "type": [
               "integer",
@@ -2233,68 +2191,6 @@
             ],
             "format": "int64",
             "description": "For retry runs: id of the first (original) run of the retry chain"
-          }
-        }
-      },
-      "Note": {
-        "type": "object",
-        "required": [
-          "id",
-          "title",
-          "content",
-          "created_at",
-          "updated_at"
-        ],
-        "properties": {
-          "id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "title": {
-            "type": "string"
-          },
-          "content": {
-            "type": "string"
-          },
-          "created_at": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "updated_at": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
-      "CreateNote": {
-        "type": "object",
-        "required": [
-          "title"
-        ],
-        "properties": {
-          "title": {
-            "type": "string"
-          },
-          "content": {
-            "type": "string",
-            "default": ""
-          }
-        }
-      },
-      "UpdateNote": {
-        "type": "object",
-        "properties": {
-          "title": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "content": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },

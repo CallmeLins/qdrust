@@ -240,14 +240,17 @@ async fn execute_with_run(
             // Cancel/lease supervision: a background loop cancels the in-flight
             // execution as soon as the API sets cancel_requested and renews the
             // 300s lease every 60 seconds. It is aborted when execution ends.
+            // Cancel/lease supervision: a background loop cancels the in-flight
+            // execution as soon as the API sets cancel_requested and renews the
+            // 300s lease every 60 seconds. It is aborted when execution ends.
             let cancellation = CancellationToken::new();
             let supervisor =
                 spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());
-            let steps =
+            let outcome =
                 execute_template(template.clone(), &cancellation, &variables, request_timeout)
                     .await;
             supervisor.abort();
-            let steps = steps?;
+            let (steps, final_variables) = outcome?;
             let now = Utc::now().timestamp();
             let methods = template_request_methods(&template);
             for (index, step) in steps.iter().enumerate() {
@@ -276,7 +279,17 @@ async fn execute_with_run(
                     error: None,
                 }));
             }
-            return Ok::<_, anyhow::Error>(steps.last().map(|step| step.status).unwrap_or(204));
+            // QD-style log line: the last extraction usually binds __log__ with
+            // the human-readable summary ("...签到：获得N积分...").
+            let log_message = final_variables
+                .get("__log__")
+                .and_then(|value| value.as_str())
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            return Ok::<(u16, Option<String>), anyhow::Error>((
+                steps.last().map(|step| step.status).unwrap_or(204),
+                log_message,
+            ));
         }
         let method = Method::from_bytes(task.method.as_bytes())?;
         let mut request = client
@@ -294,14 +307,17 @@ async fn execute_with_run(
         if let Some(body) = &task.body {
             request = request.body(render_plain(body, &variables).unwrap_or_else(|_| body.clone()));
         }
-        Ok::<_, anyhow::Error>(request.send().await?.status().as_u16())
+        Ok::<(u16, Option<String>), anyhow::Error>((request.send().await?.status().as_u16(), None))
     }
     .await;
     match result {
-        Ok(status) => {
+        Ok((status, log_message)) => {
             info!(task_id = task.id, status, "task completed");
             let _ = store.record_run(task.id, Some(status), None).await;
             let _ = store.finish_run(run.id, Some(status), None).await;
+            if let Some(log) = log_message.as_deref() {
+                let _ = store.record_run_log(run.id, log).await;
+            }
             let _ = run_events.send(Value::from(crate::api::RunEvent {
                 run_id: run.id,
                 kind: "status",
@@ -583,10 +599,10 @@ async fn execute_template(
     cancellation: &CancellationToken,
     variables: &BTreeMap<String, Value>,
     request_timeout: Duration,
-) -> anyhow::Result<Vec<StepResult>> {
+) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
     let executor = QdExecutor::new(request_timeout)?;
     let mut context = ExecutionContext::new(variables.clone());
-    match template.source_format.as_str() {
+    let results = match template.source_format.as_str() {
         "qd_har" => {
             let har = QdHar::parse(
                 template
@@ -599,7 +615,7 @@ async fn execute_template(
                 executor.execute_with_cancellation(&program, &mut context, cancellation),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))?
+            .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))??
         }
         "native_v1" => {
             let definition = template
@@ -614,10 +630,11 @@ async fn execute_template(
                 ),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))?
+            .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))??
         }
         value => anyhow::bail!("unsupported template source format: {value}"),
-    }
+    };
+    Ok((results, context.variables))
 }
 
 #[cfg(test)]
@@ -646,7 +663,7 @@ mod tests {
             updated_at: 0,
             grp: None,
         };
-        let results = execute_template(
+        let (results, _) = execute_template(
             template,
             &CancellationToken::new(),
             &BTreeMap::new(),

@@ -19,7 +19,6 @@ export type RunStep = {
 };
 export type User = components["schemas"]["User"];
 export type Template = components["schemas"]["Template"];
-export type Note = components["schemas"]["Note"];
 export type Plugin = components["schemas"]["Plugin"];
 export type NotificationChannel = components["schemas"]["NotificationChannel"];
 export type NotificationAction = components["schemas"]["NotificationAction"];
@@ -98,12 +97,6 @@ export const api = {
   updateQdHar: (id: number, name: string, description: string, har: unknown) => request<Template>(`/api/v1/templates/${id}/qd-har`, { method: "PUT", body: JSON.stringify({ name, description: description || null, har }) }),
   validateQdHar: (har: unknown) => request<QdHarValidation>("/api/v1/templates/validate-qd-har", { method: "POST", body: JSON.stringify({ har }) }),
 
-  // ---- notes ----
-  notes: () => request<Note[]>("/api/v1/notes"),
-  createNote: (title: string, content: string) => request<Note>("/api/v1/notes", { method: "POST", body: JSON.stringify({ title, content }) }),
-  updateNote: (id: number, title: string, content: string) => request<Note>(`/api/v1/notes/${id}`, { method: "PUT", body: JSON.stringify({ title, content }) }),
-  deleteNote: (id: number) => request<void>(`/api/v1/notes/${id}`, { method: "DELETE" }),
-
   // ---- plugins ----
   plugins: () => request<Plugin[]>("/api/v1/plugins"),
   createPlugin: (name: string, command: string) => request<Plugin>("/api/v1/plugins", { method: "POST", body: JSON.stringify({ name, command, config: {}, enabled: true }) }),
@@ -128,6 +121,7 @@ export const api = {
   runTask: (id: number) => request<unknown>(`/api/v1/tasks/${id}/run`, { method: "POST" }),
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
+  deleteRun: (id: number) => request<void>(`/api/v1/runs/${id}`, { method: "DELETE" }),
   runSteps: (id: number) => request<RunStep[]>(`/api/v1/runs/${id}/steps`),
   batchTasks: (ids: number[], action: "enable" | "disable" | "delete" | "run") => request<BatchTaskResult>("/api/v1/tasks/batch", { method: "POST", body: JSON.stringify({ ids, action }) }),
   taskGroups: () => request<string[]>("/api/v1/task-groups"),

@@ -222,23 +222,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/notes": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["listNotes"];
-        put?: never;
-        post: operations["createNote"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/notes/{id}": {
+    "/api/v1/runs/{id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -247,10 +231,27 @@ export interface paths {
             };
             cookie?: never;
         };
-        get: operations["getNote"];
-        put: operations["updateNote"];
+        get?: never;
+        put?: never;
         post?: never;
-        delete: operations["deleteNote"];
+        delete: operations["deleteRun"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** @description Clear the run history: admins wipe every run, users wipe the runs of their own tasks */
+        delete: operations["deleteAllRuns"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1038,6 +1039,8 @@ export interface components {
             status: string;
             http_status: number | null;
             error: string | null;
+            /** @description QD-style log line: the final __log__ value extracted by the template execution */
+            log?: string | null;
             /** Format: int64 */
             started_at: number | null;
             /** Format: int64 */
@@ -1060,25 +1063,6 @@ export interface components {
              * @description For retry runs: id of the first (original) run of the retry chain
              */
             retry_of?: number | null;
-        };
-        Note: {
-            /** Format: int64 */
-            id: number;
-            title: string;
-            content: string;
-            /** Format: int64 */
-            created_at: number;
-            /** Format: int64 */
-            updated_at: number;
-        };
-        CreateNote: {
-            title: string;
-            /** @default  */
-            content: string;
-        };
-        UpdateNote: {
-            title?: string | null;
-            content?: string | null;
         };
         NotificationChannel: {
             /** Format: int64 */
@@ -1452,16 +1436,6 @@ export interface components {
         UpdateTask: {
             content: {
                 "application/json": components["schemas"]["UpdateTask"];
-            };
-        };
-        CreateNote: {
-            content: {
-                "application/json": components["schemas"]["CreateNote"];
-            };
-        };
-        UpdateNote: {
-            content: {
-                "application/json": components["schemas"]["UpdateNote"];
             };
         };
         CreateNotificationChannel: {
@@ -1906,44 +1880,7 @@ export interface operations {
             409: components["responses"]["Conflict"];
         };
     };
-    listNotes: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Note list */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    createNote: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: components["requestBodies"]["CreateNote"];
-        responses: {
-            /** @description Note created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            422: components["responses"]["ValidationError"];
-        };
-    };
-    getNote: {
+    deleteRun: {
         parameters: {
             query?: never;
             header?: never;
@@ -1954,50 +1891,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Note */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            404: components["responses"]["NotFound"];
-        };
-    };
-    updateNote: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["Id"];
-            };
-            cookie?: never;
-        };
-        requestBody: components["requestBodies"]["UpdateNote"];
-        responses: {
-            /** @description Note updated */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            404: components["responses"]["NotFound"];
-            422: components["responses"]["ValidationError"];
-        };
-    };
-    deleteNote: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["Id"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Note deleted */
+            /** @description Run deleted */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -2005,6 +1899,28 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    deleteAllRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Number of deleted runs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        deleted?: number;
+                    };
+                };
+            };
         };
     };
     listNotificationChannels: {

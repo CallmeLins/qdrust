@@ -15,7 +15,7 @@ use axum::{
         header::{COOKIE, HeaderName, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, delete, get},
 };
 use qdrust_core::plugin::{
     PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, PluginRequest,
@@ -34,11 +34,11 @@ use crate::auth::{hash_password, token_hash, verify_password};
 use crate::{
     model::{
         AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession, BatchTaskOperation,
-        BatchTaskResult, ChangePassword, ClearLogs, CreateNote, CreateNotificationAction,
+        BatchTaskResult, ChangePassword, ClearLogs, CreateNotificationAction,
         CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask,
         CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ForgotPassword,
         ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetSiteSetting, UpdateNote, UpdateNotificationChannel, UpdatePluginManifest,
+        ResetPassword, SetSiteSetting, UpdateNotificationChannel, UpdatePluginManifest,
         UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
         VerifyEmail,
     },
@@ -185,6 +185,8 @@ pub fn router_with_auth(
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
         .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
+        .route("/api/v1/runs/{id}", delete(delete_run))
+        .route("/api/v1/runs", delete(delete_all_runs))
         .route(
             "/api/v1/auth/verify-email",
             axum::routing::post(verify_email),
@@ -243,11 +245,6 @@ pub fn router_with_auth(
         .route(
             "/api/v1/admin/logs",
             axum::routing::delete(admin_clear_logs),
-        )
-        .route("/api/v1/notes", get(list_notes).post(create_note))
-        .route(
-            "/api/v1/notes/{id}",
-            get(get_note).put(update_note).delete(delete_note),
         )
         .route(
             "/api/v1/notification-channels",
@@ -784,6 +781,44 @@ async fn cancel_run(
     }
 }
 
+async fn delete_run(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let Some(run) = store.get_run(id).await? else {
+        return Err(ApiError::NotFound("run_not_found", "Run not found"));
+    };
+    if store
+        .get_for_owner(run.task_id, session.user.id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("run_not_found", "Run not found"));
+    }
+    if store.delete_run(id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound("run_not_found", "Run not found"))
+    }
+}
+
+/// Clear the run history: admins wipe every run, users wipe the runs of their
+/// own tasks.
+async fn delete_all_runs(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let deleted = if session.user.role == "admin" {
+        store.delete_all_runs().await?
+    } else {
+        store.delete_runs_for_owner(session.user.id).await?
+    };
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
 async fn list_run_steps(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -794,68 +829,6 @@ async fn list_run_steps(
         return Err(ApiError::NotFound("run_not_found", "Run not found"));
     };
     Ok(Json(json!(steps)))
-}
-
-async fn list_notes(
-    State(store): State<Store>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    Ok(Json(json!(store.list_notes(session.user.id).await?)))
-}
-async fn create_note(
-    State(store): State<Store>,
-    headers: HeaderMap,
-    ApiJson(input): ApiJson<CreateNote>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!(
-            store
-                .create_note(session.user.id, input)
-                .await
-                .map_err(ApiError::unprocessable)?
-        )),
-    ))
-}
-async fn get_note(
-    State(store): State<Store>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    store
-        .get_note(id, session.user.id)
-        .await?
-        .map(|n| Json(json!(n)))
-        .ok_or(ApiError::NotFound("note_not_found", "Note not found"))
-}
-async fn update_note(
-    State(store): State<Store>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    ApiJson(input): ApiJson<UpdateNote>,
-) -> Result<Json<Value>, ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    store
-        .update_note(id, session.user.id, input)
-        .await
-        .map_err(ApiError::unprocessable)?
-        .map(|n| Json(json!(n)))
-        .ok_or(ApiError::NotFound("note_not_found", "Note not found"))
-}
-async fn delete_note(
-    State(store): State<Store>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    if store.delete_note(id, session.user.id).await? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound("note_not_found", "Note not found"))
-    }
 }
 
 async fn list_notification_channels(
