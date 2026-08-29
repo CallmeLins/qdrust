@@ -121,6 +121,7 @@ export const api = {
   runTask: (id: number) => request<unknown>(`/api/v1/tasks/${id}/run`, { method: "POST" }),
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
+  deleteTaskRuns: (id: number) => request<{ deleted?: number }>(`/api/v1/tasks/${id}/runs`, { method: "DELETE" }),
   deleteRun: (id: number) => request<void>(`/api/v1/runs/${id}`, { method: "DELETE" }),
   runSteps: (id: number) => request<RunStep[]>(`/api/v1/runs/${id}/steps`),
   batchTasks: (ids: number[], action: "enable" | "disable" | "delete" | "run") => request<BatchTaskResult>("/api/v1/tasks/batch", { method: "POST", body: JSON.stringify({ ids, action }) }),

@@ -162,7 +162,7 @@ export interface paths {
         get: operations["listTaskRuns"];
         put?: never;
         post?: never;
-        delete?: never;
+        delete: operations["deleteTaskRuns"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1810,6 +1810,31 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    deleteTaskRuns: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Number of deleted runs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        deleted?: number;
+                    };
+                };
             };
             404: components["responses"]["NotFound"];
         };

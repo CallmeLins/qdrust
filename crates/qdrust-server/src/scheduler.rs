@@ -240,9 +240,6 @@ async fn execute_with_run(
             // Cancel/lease supervision: a background loop cancels the in-flight
             // execution as soon as the API sets cancel_requested and renews the
             // 300s lease every 60 seconds. It is aborted when execution ends.
-            // Cancel/lease supervision: a background loop cancels the in-flight
-            // execution as soon as the API sets cancel_requested and renews the
-            // 300s lease every 60 seconds. It is aborted when execution ends.
             let cancellation = CancellationToken::new();
             let supervisor =
                 spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());

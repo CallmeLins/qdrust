@@ -762,6 +762,16 @@ macro_rules! define_store {
             .rows_affected())
     }
 
+    /// Clear the run history of a single task (ownership is checked at the
+    /// API layer); returns the number of deleted runs.
+    pub async fn delete_runs_for_task(&self, task_id: i64) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM runs WHERE task_id=?")
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
     pub async fn record_run_step(&self, step: &RunStep) -> Result<()> {
         sqlx::query(
             "INSERT INTO run_steps(run_id,step_index,name,status,http_status,body_size,error,started_at,finished_at)
@@ -2554,6 +2564,7 @@ impl Store {
         pub async fn delete_run(run_id: i64) -> Result<bool> { run_id };
         pub async fn delete_runs_for_owner(owner_id: i64) -> Result<u64> { owner_id };
         pub async fn delete_all_runs() -> Result<u64> {  };
+        pub async fn delete_runs_for_task(task_id: i64) -> Result<u64> { task_id };
         pub async fn record_run_step(step: &RunStep) -> Result<()> { step };
         pub async fn list_run_steps(run_id: i64) -> Result<Vec<RunStep>> { run_id };
         pub async fn list_run_steps_for_owner(run_id: i64, owner_id: i64) -> Result<Option<Vec<RunStep>>> { run_id, owner_id };

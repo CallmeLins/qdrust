@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import {
-  Activity, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
+  Activity, ArrowLeft, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
   LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
@@ -35,14 +35,14 @@ const authForm = reactive({ username: "", password: "", email: "", token: "", ne
 const authNotice = ref("");
 const verifyResult = ref<"ok" | "fail" | null>(null);
 const forgotResult = ref<{ sent: boolean; token?: string } | null>(null);
-const view = ref<"tasks" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
 const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
-  tasks: t("tasks"), templates: t("templates"), plugins: t("pluginsTitle"),
+  tasks: t("tasks"), taskRuns: t("runHistory"), templates: t("templates"), plugins: t("pluginsTitle"),
   notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
@@ -54,8 +54,8 @@ const loading = ref(false);
 const search = ref("");
 const groupFilter = ref("");
 const selected = reactive(new Set<number>());
-const expandedTask = ref<number | null>(null);
 const runsByTask = ref<Record<number, Run[]>>({});
+const runHistoryTask = ref<Task | null>(null);
 
 interface TaskForm {
   id: number | null;
@@ -300,25 +300,35 @@ async function loadTaskRuns(taskId: number) {
   try { runsByTask.value[taskId] = await api.taskRuns(taskId); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
-async function toggleTaskRuns(task: Task) {
-  if (expandedTask.value === task.id) {
-    expandedTask.value = null;
-    return;
-  }
-  expandedTask.value = task.id;
+async function openRunHistory(task: Task) {
+  runHistoryTask.value = task;
+  view.value = "taskRuns";
   await loadTaskRuns(task.id);
+}
+function backToTasks() {
+  runHistoryTask.value = null;
+  view.value = "tasks";
 }
 async function cancelRun(run: Run) {
   try {
     await api.cancelRun(run.id);
-    if (expandedTask.value != null) await loadTaskRuns(expandedTask.value);
+    if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeRun(run: Run) {
   if (!window.confirm(t("confirmDeleteRun"))) return;
   try {
     await api.deleteRun(run.id);
-    if (expandedTask.value != null) await loadTaskRuns(expandedTask.value);
+    if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function clearTaskRuns() {
+  const task = runHistoryTask.value;
+  if (task == null) return;
+  if (!window.confirm(fmt("confirmClearRuns", { name: task.name }))) return;
+  try {
+    await api.deleteTaskRuns(task.id);
+    await loadTaskRuns(task.id);
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 function runStatusLabel(status: string): string {
@@ -964,26 +974,47 @@ onMounted(async () => {
                     <td>{{ task.grp ?? '–' }}</td>
                     <td class="row-actions">
                       <button class="icon-button" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
-                      <button class="icon-button" :title="t('runHistory')" @click="toggleTaskRuns(task)"><Activity :size="17" /></button>
+                      <button class="icon-button" :title="t('runHistory')" @click="openRunHistory(task)"><Activity :size="17" /></button>
                       <button class="icon-button" :title="t('editTask')" @click="openEditTask(task)"><Pencil :size="17" /></button>
                       <button class="icon-button" :title="t('deleteTask')" @click="removeTask(task)"><Trash2 :size="17" /></button>
                     </td>
                   </tr>
-                  <tr v-if="expandedTask === task.id" class="run-detail">
-                    <td colspan="7">
-                      <div v-if="!runsByTask[task.id] || runsByTask[task.id].length === 0" class="muted">{{ t('noRuns') }}</div>
-                      <div v-for="run in (runsByTask[task.id] ?? []).slice(0, 10)" :key="run.id" class="run-row">
-                        <span class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</span>
-                        <strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong>
-                        <span class="run-log">{{ runLogText(run) }}</span>
-                        <span class="run-actions">
-                          <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
-                          <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
-                        </span>
-                      </div>
-                    </td>
-                  </tr>
                 </template>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <!-- ===== TASK RUNS ===== -->
+      <div v-else-if="view === 'taskRuns'" class="page">
+        <section class="page-heading">
+          <div><p class="eyebrow">RUN HISTORY</p><h1>{{ t('runHistory') }}</h1><p v-if="runHistoryTask">{{ runHistoryTask.name }}</p></div>
+          <button class="secondary-button" @click="backToTasks"><ArrowLeft :size="16" />{{ t('back') }}</button>
+        </section>
+        <section class="task-section">
+          <div class="toolbar">
+            <span class="run-toolbar">
+              <button class="icon-button" :title="t('refresh')" @click="runHistoryTask && loadTaskRuns(runHistoryTask.id)"><RefreshCw :size="18" /></button>
+              <button class="icon-button" :title="t('clearRuns')" @click="clearTaskRuns"><Trash2 :size="18" /></button>
+            </span>
+          </div>
+          <div v-if="!(runsByTask[runHistoryTask?.id ?? -1]?.length)" class="empty-state"><Activity :size="24" /><h2>{{ t('noRuns') }}</h2></div>
+          <div v-else class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>{{ t('time') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th>{{ t('manage') }}</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="run in runsByTask[runHistoryTask?.id ?? -1]" :key="run.id">
+                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</td>
+                  <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                  <td><span class="run-log">{{ runLogText(run) }}</span></td>
+                  <td class="row-actions">
+                    <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
+                    <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
+                  </td>
+                </tr>
               </tbody>
             </table>
           </div>
