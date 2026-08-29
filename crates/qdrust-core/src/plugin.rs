@@ -533,6 +533,30 @@ impl Plugin for UtilityPlugin {
                         body,
                     })
                 }
+                "urldecode" => {
+                    // QD 兼容（qd web/handlers/util.py UrlDecodeHandler）：content 参数
+                    // 已在 URL 解析层完成一次百分号解码（执行器会把 POST 表单体并入查询串），
+                    // 这里直接按 QD 相同的缩进 JSON 返回，供
+                    // success_asserts 的 "\"状态\": \"200\"" 与 extract_variables 的
+                    // "\"转换后\": \"(.*)\"" 规则按原样匹配。
+                    let content = request
+                        .query
+                        .get("content")
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let value = serde_json::to_string(content)?;
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "content-type".to_string(),
+                        "application/json; charset=UTF-8".to_string(),
+                    );
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers,
+                        body: format!("{{\n    \"转换后\": {value},\n    \"状态\": \"200\"\n}}")
+                            .into_bytes(),
+                    })
+                }
                 action => bail!("plugin action unavailable: util/{action}"),
             }
         })
@@ -595,6 +619,27 @@ mod tests {
                 .call("api://util/delay?seconds=301", Duration::from_secs(1))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn urldecode_returns_qd_compatible_body() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let response = registry
+            .call(
+                "api://util/urldecode?content=%E7%AD%BE%E5%88%B0%E6%88%90%E5%8A%9F%EF%BC%9A%E8%8E%B7%E5%BE%9720%E7%A7%AF%E5%88%86",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert_eq!(
+            body,
+            "{\n    \"转换后\": \"签到成功：获得20积分\",\n    \"状态\": \"200\"\n}"
         );
     }
 }

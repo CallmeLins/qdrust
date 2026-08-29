@@ -394,8 +394,21 @@ impl QdExecutor {
         context.remaining_requests -= 1;
 
         let method = self.render(&entry.request.method, context)?;
-        let url = self.render(&entry.request.url, context)?;
+        let mut url = self.render(&entry.request.url, context)?;
         if url.starts_with("api://") {
+            // QD 兼容：api:// 请求的 POST 表单体（如 util/urldecode 的 content=...）
+            // 并入查询串后交给插件，与 QD 后端 get_argument 同时读取 query 与表单体的行为一致。
+            if method.eq_ignore_ascii_case("POST")
+                && let Some(post_data) = entry.request.post_data.as_ref()
+            {
+                let mime = post_data.mime_type.as_deref().unwrap_or("");
+                if mime.is_empty() || mime.contains("application/x-www-form-urlencoded") {
+                    if let Some(text) = post_data.text.as_ref() {
+                        let body = self.render(text, context)?;
+                        url = merge_form_into_query(&url, &body);
+                    }
+                }
+            }
             let response = self.plugins.call(&url, self.plugin_timeout).await?;
             return self.finish_response(
                 entry,
@@ -701,6 +714,42 @@ fn native_request_entry(
         extract_variables: Vec::new(),
         extensions: serde_json::Map::new(),
     })
+}
+
+/// 表单体值解码（与 Python parse_qsl 一致：先处理 '+'，再做百分号解码）。
+fn form_urldecode(input: &str) -> String {
+    percent_encoding::percent_decode_str(&input.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+/// 解析 application/x-www-form-urlencoded 请求体为键值对（QD 模板的 api:// 调用
+/// 常以 POST 表单体传参，如 `content=...`）。
+fn parse_form_pairs(body: &str) -> Vec<(String, String)> {
+    body.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (name, value) = part.split_once('=').unwrap_or((part, ""));
+            (form_urldecode(name), form_urldecode(value))
+        })
+        .collect()
+}
+
+/// 把表单键值对追加到 api:// URL 的查询串。值会被重新百分号编码，
+/// 插件层 from_api_url 解码后与原值一致。
+fn merge_form_into_query(url: &str, body: &str) -> String {
+    let pairs = parse_form_pairs(body);
+    if pairs.is_empty() {
+        return url.to_string();
+    }
+    let mut merged = url.to_string();
+    for (index, (name, value)) in pairs.iter().enumerate() {
+        merged.push(if index == 0 && !url.contains('?') { '?' } else { '&' });
+        merged.push_str(&percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC).to_string());
+        merged.push('=');
+        merged.push_str(&percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string());
+    }
+    merged
 }
 
 fn rule_source(source: &str, status: u16, headers: &[(String, String)], content: &str) -> String {
@@ -1185,6 +1234,40 @@ mod tests {
         assert_eq!(
             context.variables.get("delay_result"),
             Some(&json!("delayed 0 seconds"))
+        );
+    }
+
+    #[tokio::test]
+    async fn executes_qd_urldecode_with_post_form_body() {
+        // 复刻 QD 模板常见写法：POST api://util/urldecode，content 走表单体，
+        // 断言 "状态": "200" 并用 "转换后": "(.*)" 提取 __log__。
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "comment": "生成日志",
+            "request": {
+                "method": "POST",
+                "url": "api://util/urldecode",
+                "headers": [],
+                "cookies": [],
+                "postData": {"mimeType": "", "text": "content=7li7li签到：获得{{points}}积分{{error}}"}
+            },
+            "success_asserts": [
+                {"re": "200", "from": "status"},
+                {"re": "\"状态\": \"200\"", "from": "content"}
+            ],
+            "extract_variables": [{"name": "__log__", "re": "\"转换后\": \"(.*)\"", "from": "content"}]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = QdExecutor::new(Duration::from_secs(1)).unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::from([("points".into(), json!("20"))]));
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(results[0].status, 200);
+        assert_eq!(
+            context.variables.get("__log__"),
+            Some(&json!("7li7li签到：获得20积分"))
         );
     }
 

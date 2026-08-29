@@ -61,6 +61,8 @@ interface HarRequest {
 }
 interface HarEntry {
   checked: boolean;
+  /** QD 条目备注（原样保留；缺失/空表示无备注，保存时空值不输出） */
+  comment?: string;
   request: HarRequest;
   success_asserts: HarAssert[];
   failed_asserts: HarAssert[];
@@ -143,6 +145,7 @@ function normalizeEntry(raw: unknown): HarEntry | null {
   }
   return {
     checked: r.checked === undefined ? true : asBool(r.checked),
+    comment: asStr(r.comment),
     request,
     success_asserts: normalizeList<HarAssert>(r.success_asserts, (o) => ({
       re: asStr(o.re),
@@ -221,9 +224,11 @@ function normalizeForSave(e: HarEntry): HarEntry {
   if (queryString.length) request.queryString = queryString;
   const postData = normalizePostData(e.request.postData);
   if (postData) request.postData = postData;
+  const comment = asStr(e.comment).trim();
   return {
     checked: asBool(e.checked),
     request,
+    ...(comment ? { comment } : {}),
     success_asserts: normalizeAsserts(e.success_asserts),
     failed_asserts: normalizeAsserts(e.failed_asserts),
     extract_variables: normalizeExtracts(e.extract_variables),
@@ -273,6 +278,7 @@ const FROM_SUGGESTIONS = ["content", "status", "header", "header-location"];
 function makeEntry(): HarEntry {
   return {
     checked: true,
+    comment: "",
     request: { method: "GET", url: "", headers: [], cookies: [], queryString: [] },
     success_asserts: [],
     failed_asserts: [],
@@ -626,12 +632,15 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
               >
                 {{ entryBadge(entry) }}
               </span>
-              <span
-                class="har-url"
-                :class="{ ctrl: isCtrlStatement(entry), empty: !entry.request.url }"
-                :title="entry.request.url"
-              >
-                {{ entry.request.url || t('harEmptyUrl') }}
+              <span class="har-url-wrap">
+                <span
+                  class="har-url"
+                  :class="{ ctrl: isCtrlStatement(entry), empty: !entry.request.url }"
+                  :title="entry.request.url"
+                >
+                  {{ entry.request.url || t('harEmptyUrl') }}
+                </span>
+                <span v-if="entry.comment" class="har-comment" :title="entry.comment">{{ entry.comment }}</span>
               </span>
               <div class="har-item-actions" @click.stop>
                 <button
@@ -693,6 +702,11 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
                 <Trash2 :size="15" />
               </button>
             </div>
+
+            <label class="field">
+              {{ t('harComment') }}
+              <input v-model="selectedEntry.comment" :placeholder="t('harComment')" />
+            </label>
 
             <label class="field">
               {{ t('harUrl') }}
@@ -888,9 +902,11 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   display: flex;
   flex-direction: column;
   gap: 12px;
-  height: 100%;
-  min-height: 400px;
-  max-height: 78vh;
+  /* 弹窗（.modal-har）为限高 flex 列容器：编辑器弹性占满剩余空间并随之收缩。
+     min-height 必须为 0，内容超高时由内部 .har-list / .har-detail 自己滚动，
+     而不是把容器撑开导致区块被裁掉 */
+  flex: 1 1 auto;
+  min-height: 0;
   color: #252a26;
   font-size: 13px;
 }
@@ -990,6 +1006,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .har-list {
   width: 40%;
   min-width: 260px;
+  min-height: 0;
   overflow-y: auto;
   border: 1px solid #e2e5e0;
   border-radius: 8px;
@@ -1053,12 +1070,25 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   color: #6d3fb5;
   background: #efe8fb;
 }
-.har-url {
+.har-url-wrap {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.har-url {
   min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 12px;
   color: #3a403b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.har-comment {
+  font-size: 11px;
+  color: #8f968f;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1104,6 +1134,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .har-detail {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
   border: 1px solid #e2e5e0;
   border-radius: 8px;
@@ -1205,6 +1236,9 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   border: 1px solid #e6e8e4;
   border-radius: 8px;
   overflow: hidden;
+  /* 关键：.sec 自身 overflow:hidden，flex 默认允许把它压缩到任意高度并裁掉内容；
+     必须 flex-shrink:0 保持自然高度，超出部分由 .har-detail 的滚动条处理 */
+  flex-shrink: 0;
 }
 .sec-head {
   display: flex;

@@ -143,7 +143,7 @@ const zh = {
   harCtrlCustomPlaceholder: "自定义，如 {% for i in list %}",
   harCtrlInsert: "插入",
   harJsonPlaceholder: "在此粘贴 / 编辑完整 HAR JSON（切换回可视化或保存时将重新解析）…",
-  harJsonError: "JSON 解析失败：需要合法的 HAR 文档（需包含 log 字段）",
+  harJsonError: "JSON 解析失败：需要合法的模板文件（QD 导出的请求数组，或包含 log 字段的 HAR 文档）",
   harEmptyDoc: "暂无 HAR 文档",
   harEmptyHint: "点击「＋ 添加请求」或「控制语句」创建新条目",
   harEmptyList: "暂无请求条目",
@@ -178,6 +178,9 @@ const zh = {
   harVarName: "变量名",
   harRegexExtractPlaceholder: "正则，如 token=([^&]+)",
   harSelectHint: "从左侧选择一条请求进行编辑",
+  harComment: "备注",
+  harChooseFile: "选择本地文件",
+  harLoaded: "已加载 {name}（{n} 条请求）",
   harMoveUp: "上移",
   harMoveDown: "下移",
   harDuplicate: "复制",
@@ -490,7 +493,7 @@ const en: Record<MessageKey, string> = {
   harCtrlCustomPlaceholder: "Custom, e.g. {% for i in list %}",
   harCtrlInsert: "Insert",
   harJsonPlaceholder: "Paste / edit the full HAR JSON here (re-parsed when switching back or saving)…",
-  harJsonError: "JSON parse failed: need a valid HAR document (must contain a log field)",
+  harJsonError: "JSON parse failed: need a valid template file (a QD-exported request array, or a HAR document with a log field)",
   harEmptyDoc: "No HAR document yet",
   harEmptyHint: "Click “＋ Add request” or “Control” to create the first entry",
   harEmptyList: "No request entries",
@@ -525,6 +528,9 @@ const en: Record<MessageKey, string> = {
   harVarName: "Variable name",
   harRegexExtractPlaceholder: "Regex, e.g. token=([^&]+)",
   harSelectHint: "Select an entry on the left to edit it",
+  harComment: "Comment",
+  harChooseFile: "Choose local file",
+  harLoaded: "Loaded {name} ({n} requests)",
   harMoveUp: "Move up",
   harMoveDown: "Move down",
   harDuplicate: "Duplicate",
@@ -695,5 +701,13 @@ const en: Record<MessageKey, string> = {
   copied: "Copied",
 };
 
-export function t(key: MessageKey): string { return en[locale.value === "zh-CN" ? key : key]; }
-export function toggleLocale(): void { locale.value = locale.value === "zh-CN" ? "en-US" : "zh-CN"; localStorage.setItem("qdrust.locale", locale.value); }
+export function t(key: MessageKey): string { return (locale.value === "zh-CN" ? zh : en)[key]; }
+function applyDocumentLang(): void {
+  if (typeof document !== "undefined") document.documentElement.lang = locale.value;
+}
+applyDocumentLang();
+export function toggleLocale(): void {
+  locale.value = locale.value === "zh-CN" ? "en-US" : "zh-CN";
+  localStorage.setItem("qdrust.locale", locale.value);
+  applyDocumentLang();
+}

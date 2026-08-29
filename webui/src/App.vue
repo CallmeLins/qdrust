@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import {
-  Activity, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2,
+  Activity, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
   LayoutDashboard, ListChecks, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
@@ -380,6 +380,77 @@ function openImportModal(template?: Template) {
   Object.assign(importForm, { name: template?.name ?? "", description: template?.description ?? "" });
   harEditorDoc.value = template?.qd_har ?? { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
   showImport.value = true;
+}
+
+/**
+ * QD 旧版模板数组（[{comment, request:{method,url,headers,cookies,data,mimeType}, rule:{...}}]）
+ * 转 QD HAR 文档，与 QD 前端 utils.tpl2har 行为一致：
+ * request.data → postData.text、mimeType → postData.mimeType、rule.* 平铺到条目上，
+ * headers/cookies/条目一律 checked: true。
+ */
+function qdTplToHar(tpl: unknown[]): object {
+  const entries = tpl.map((item) => {
+    const raw = (item && typeof item === "object" && !Array.isArray(item) ? item : {}) as Record<string, unknown>;
+    const req = (raw.request && typeof raw.request === "object" && !Array.isArray(raw.request) ? raw.request : {}) as Record<string, unknown>;
+    const rule = (raw.rule && typeof raw.rule === "object" && !Array.isArray(raw.rule) ? raw.rule : {}) as Record<string, unknown>;
+    const data = typeof req.data === "string" ? req.data : undefined;
+    const mimeType = typeof req.mimeType === "string" ? req.mimeType : undefined;
+    const entry: Record<string, unknown> = {
+      checked: true,
+      request: {
+        method: typeof req.method === "string" && req.method.trim() ? req.method : "GET",
+        url: typeof req.url === "string" ? req.url : "",
+        headers: Array.isArray(req.headers)
+          ? req.headers.map((h) => ({ name: String((h as Record<string, unknown>)?.name ?? ""), value: String((h as Record<string, unknown>)?.value ?? ""), checked: true }))
+          : [],
+        cookies: Array.isArray(req.cookies)
+          ? req.cookies.map((c) => ({ name: String((c as Record<string, unknown>)?.name ?? ""), value: String((c as Record<string, unknown>)?.value ?? ""), checked: true }))
+          : [],
+        queryString: [],
+        ...(data !== undefined || mimeType !== undefined ? { postData: { mimeType: mimeType ?? "", ...(data !== undefined ? { text: data } : {}) } } : {}),
+      },
+      success_asserts: Array.isArray(rule.success_asserts) ? rule.success_asserts : [],
+      failed_asserts: Array.isArray(rule.failed_asserts) ? rule.failed_asserts : [],
+      extract_variables: Array.isArray(rule.extract_variables) ? rule.extract_variables : [],
+    };
+    if (typeof raw.comment === "string" && raw.comment) entry.comment = raw.comment;
+    return entry;
+  });
+  return { log: { version: "1.2", creator: { name: "binux", version: "QD" }, entries } };
+}
+
+/** 导入本地模板文件：兼容标准 HAR（{log:{entries}}）与 QD 导出的请求数组两种格式 */
+async function onHarFile(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = ""; // 允许重复选择同一文件
+  if (!file) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch {
+    notify(t("harJsonError"), "error");
+    return;
+  }
+  let doc: object | null = null;
+  if (Array.isArray(parsed)) {
+    doc = qdTplToHar(parsed);
+  } else if (parsed && typeof parsed === "object" && (parsed as Record<string, unknown>).log) {
+    // 标准 HAR 文档；后端执行要求 version 1.2，导入时统一归一化
+    const log = ((parsed as Record<string, unknown>).log && typeof (parsed as Record<string, unknown>).log === "object"
+      ? { ...((parsed as Record<string, unknown>).log as Record<string, unknown>) }
+      : {});
+    log.version = "1.2";
+    doc = { log };
+  }
+  if (!doc) {
+    notify(t("harJsonError"), "error");
+    return;
+  }
+  harEditorDoc.value = doc;
+  if (!importForm.name.trim()) importForm.name = file.name.replace(/\.(har|json)$/i, "");
+  const entries = (doc as Record<string, any>).log?.entries;
+  notify(fmt("harLoaded", { name: file.name, n: Array.isArray(entries) ? entries.length : 0 }));
 }
 async function saveHar(doc: object) {
   if (!importForm.name.trim()) { notify(t("templateName"), "error"); return; }
@@ -812,10 +883,10 @@ onMounted(async () => {
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'notes' }]" href="#" @click.prevent="openNotes"><ListChecks :size="18" />{{ t('notes') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
-        <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><BellIcon :size="18" />{{ t('notifications') }}</a>
+        <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
         <a :class="['nav-link', { active: view === 'runs' }]" href="#" @click.prevent="loadAllRuns; view='runs'"><Activity :size="18" />{{ t('runs') }}</a>
         <a :class="['nav-link', { active: view === 'subscriptions' }]" href="#" @click.prevent="openSubscriptions"><RefreshCw :size="18" />{{ t('subscriptions') }}</a>
-        <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><SendIcon :size="18" />{{ t('push') }}</a>
+        <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
         <a :class="['nav-link', { active: view === 'settings' }]" href="#" @click.prevent="view='settings'"><Settings :size="18" />{{ t('settings') }}</a>
       </nav>
@@ -1323,6 +1394,10 @@ onMounted(async () => {
         <div class="har-meta">
           <label>{{ t('templateName') }}<input v-model="importForm.name" required placeholder="my-template" /></label>
           <label>{{ t('description') }}<input v-model="importForm.description" /></label>
+          <label class="secondary-button har-file-pick" :title="t('harChooseFile')">
+            <FileUp :size="15" />{{ t('harChooseFile') }}
+            <input type="file" accept=".har,.json,application/json" @change="onHarFile" />
+          </label>
         </div>
         <HarEditor :model-value="harEditorDoc" @save="saveHar" @cancel="showImport = false" />
       </div>
