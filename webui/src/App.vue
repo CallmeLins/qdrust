@@ -70,6 +70,10 @@ interface TaskForm {
   id: number | null;
   name: string;
   cron: string;
+  scheduleTime: string;
+  scheduleDays: string;
+  scheduleAdvanced: boolean;
+  randomDelay: string;
   method: string;
   url: string;
   headersText: string;
@@ -84,7 +88,7 @@ interface TaskForm {
   timezone: string;
   variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "0 * * * * * *", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
 
@@ -104,6 +108,36 @@ function rowsToVariables(rows: { name: string; value: string }[]): Record<string
 }
 function addVariableRow() { taskForm.variables.push({ name: "", value: "" }); }
 function removeVariableRow(index: number) { taskForm.variables.splice(index, 1); }
+
+/** 可视化定时 → cron（7 段含秒）：每天/每 N 天在指定时刻执行 */
+function buildCron(): string {
+  const parts = taskForm.scheduleTime.split(":").map((x) => String(parseInt(x, 10) || 0));
+  const h = parts[0] ?? "0";
+  const m = parts[1] ?? "0";
+  const s = parts[2] ?? "0";
+  const days = Math.max(1, Math.min(366, Math.floor(Number(taskForm.scheduleDays) || 1)));
+  return `${s} ${m} ${h} */${days} * * *`;
+}
+/** 尝试把 cron 解析回可视化字段（非该模式生成的表达式返回 null，走高级模式） */
+function parseVisualCron(cron: string): { time: string; days: string } | null {
+  const match = cron.match(/^(\d+) (\d+) (\d+) \*\/(\d+) \* \* \*$/);
+  if (!match) return null;
+  const [, s, m, h, d] = match;
+  const pad = (x: string) => x.padStart(2, "0");
+  return { time: `${pad(h)}:${pad(m)}:${pad(s)}`, days: d };
+}
+/** 扫描模板 HAR 中所有 {{变量名}} 引用（qd find_variables 同思路），排除 __log__ 等内部变量 */
+function harVariableNames(har: unknown): string[] {
+  const names = new Set<string>();
+  const walk = (value: unknown) => {
+    if (typeof value === "string") {
+      for (const match of value.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) names.add(match[1]);
+    } else if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  };
+  walk(har);
+  return [...names].filter((name) => !name.startsWith("__"));
+}
 
 const filteredTasks = computed(() => {
   const term = search.value.trim().toLowerCase();
@@ -148,9 +182,10 @@ async function submitTask() {
   if (taskForm.timeoutSeconds && !(Number(taskForm.timeoutSeconds) > 0)) return void notify("timeout must be a positive number", "error");
   if (taskForm.retryInterval && !(Number(taskForm.retryInterval) > 0)) return void notify("retry interval must be a positive number", "error");
   if (taskForm.priority && Number.isNaN(Number(taskForm.priority))) return void notify("priority must be a number", "error");
+  const cron = taskForm.scheduleAdvanced ? taskForm.cron : buildCron();
   const payload: CreateTask = {
     name: taskForm.name,
-    cron: taskForm.cron,
+    cron,
     method: taskForm.method,
     url: taskForm.url,
     headers,
@@ -163,6 +198,7 @@ async function submitTask() {
     retry_interval_seconds: taskForm.retryInterval ? Number(taskForm.retryInterval) : null,
     priority: taskForm.priority ? Number(taskForm.priority) : null,
     timezone: taskForm.timezone || null,
+    random_delay_max_seconds: Number(taskForm.randomDelay) > 0 ? Math.floor(Number(taskForm.randomDelay)) : null,
     variables: taskForm.variables.length ? rowsToVariables(taskForm.variables) : null,
   };
   try {
@@ -186,10 +222,15 @@ function openCreateTask() {
   showCreate.value = true;
 }
 function openEditTask(task: Task) {
+  const visual = parseVisualCron(task.cron);
   Object.assign(taskForm, {
     id: task.id,
     name: task.name,
     cron: task.cron,
+    scheduleTime: visual?.time ?? "08:00:00",
+    scheduleDays: visual?.days ?? "1",
+    scheduleAdvanced: !visual,
+    randomDelay: task.random_delay_max_seconds != null && task.random_delay_max_seconds > 0 ? String(task.random_delay_max_seconds) : "",
     method: task.method,
     url: task.url,
     headersText: task.headers && typeof task.headers === "object" && !Array.isArray(task.headers) ? JSON.stringify(task.headers, null, 2) : "{}",
@@ -357,6 +398,13 @@ function onTemplatePicked() {
   if (!tmpl) return;
   if (!taskForm.name) taskForm.name = tmpl.name;
   if (!taskForm.url) taskForm.url = firstHarUrl(tmpl);
+  // QD 式变量联动：从模板 HAR 提取 {{变量名}} 引用，自动生成填值行（保留已输入的同名值）
+  const names = harVariableNames(tmpl.qd_har);
+  if (names.length) {
+    const existing = new Map(taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value]));
+    taskForm.variables = names.map((name) => ({ name, value: existing.get(name) ?? "" }));
+    notify(fmt("templateVarsFound", { n: names.length }));
+  }
 }
 async function publishTemplate(id: number) {
   try { await api.publishTemplate(id); notify(t("publishDone")); await openTemplates(); }
@@ -1348,8 +1396,17 @@ onMounted(async () => {
         </label>
         <div class="form-row">
           <label>{{ t('method') }}<select v-model="taskForm.method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select><ChevronDown :size="16" /></label>
-          <label>{{ t('cron') }}<input v-model="taskForm.cron" required /></label>
+          <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
         </div>
+        <div class="form-row">
+          <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleTime') }}<input v-model="taskForm.scheduleTime" type="time" step="1" required /></label>
+          <label v-if="taskForm.scheduleAdvanced">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
+          <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
+        </div>
+        <small class="kv-hint">
+          <template v-if="!taskForm.scheduleAdvanced">{{ t('scheduleHint') }}</template>
+          <a href="#" class="text-button" @click.prevent="taskForm.scheduleAdvanced = !taskForm.scheduleAdvanced">{{ taskForm.scheduleAdvanced ? t('scheduleTime') : t('scheduleAdvanced') }}</a>
+        </small>
         <label>{{ t('url') }}<input v-model="taskForm.url" required type="url" placeholder="https://example.com/api/health" /></label>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
@@ -1372,7 +1429,7 @@ onMounted(async () => {
             </span>
             <button class="secondary-button kv-add" type="button" @click="addVariableRow"><Plus :size="14" />{{ t('addVariable') }}</button>
           </span>
-          <small class="kv-hint">{{ t('variablesHint') }}</small>
+          <small class="kv-hint">{{ taskForm.templateId ? t('templateVarsHint') : t('variablesHint') }}</small>
         </label>
         <label>{{ t('requestHeaders') }}<textarea v-model="taskForm.headersText" rows="4" spellcheck="false" /></label>
         <label>{{ t('body') }}<textarea v-model="taskForm.body" rows="3" spellcheck="false" /></label>

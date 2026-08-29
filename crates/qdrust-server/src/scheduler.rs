@@ -7,6 +7,7 @@ use qdrust_core::{
     qd_har::{QdHar, QdProgram},
     template::Step,
 };
+use rand::Rng;
 use reqwest::{Client, Method};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -82,7 +83,18 @@ pub fn spawn(
                 }
             };
             for task in tasks.into_iter().filter(|task| due(task, interval)) {
-                let _ = tick_store.enqueue_run(task.id).await;
+                // QD-style random delay ("当天随机延时区间"): draw the jitter once
+                // at enqueue time and let claim_run honor run_after, so the run
+                // fires within 0..=max seconds of the scheduled moment instead
+                // of hammering the target site at an exact fixed time.
+                let max_delay = task.random_delay_max_seconds.unwrap_or(0);
+                let result = if max_delay > 0 {
+                    let jitter = rand::rng().random_range(0..=max_delay.min(604_800));
+                    tick_store.enqueue_delayed_run(task.id, jitter).await
+                } else {
+                    tick_store.enqueue_run(task.id).await
+                };
+                let _ = result;
             }
         }
     });

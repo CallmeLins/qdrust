@@ -981,6 +981,8 @@ export interface components {
             priority?: number | null;
             /** @description IANA timezone name used for cron scheduling (default UTC) */
             timezone?: string | null;
+            /** @description Random delay before a due run executes, in seconds (0 = disabled); jitter is drawn uniformly from 0..=max at enqueue time */
+            random_delay_max_seconds?: number | null;
             /** @description Seed variables rendered into URLs, headers, bodies and template tasks */
             variables?: {
                 [key: string]: unknown;
@@ -1007,6 +1009,8 @@ export interface components {
             retry_interval_seconds?: number | null;
             priority?: number | null;
             timezone?: string | null;
+            /** @description Set to a number to change, null to clear, omit to leave unchanged */
+            random_delay_max_seconds?: number | null;
             variables?: {
                 [key: string]: unknown;
             } | null;

@@ -84,6 +84,10 @@ pub struct CreateTask {
     /// IANA timezone name used for cron scheduling (default UTC).
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Random delay before a due run executes, in seconds (0 = disabled). The
+    /// actual jitter is drawn uniformly from 0..=max at enqueue time.
+    #[serde(default)]
+    pub random_delay_max_seconds: Option<i64>,
     /// Seed variables rendered into URLs, headers, bodies and template tasks.
     #[serde(default)]
     pub variables: Option<serde_json::Value>,
@@ -105,6 +109,7 @@ pub struct UpdateTask {
     pub retry_interval_seconds: Option<Option<i64>>,
     pub priority: Option<Option<i64>>,
     pub timezone: Option<Option<String>>,
+    pub random_delay_max_seconds: Option<Option<i64>>,
     pub variables: Option<Option<serde_json::Value>>,
 }
 
@@ -136,6 +141,8 @@ pub struct Task {
     pub priority: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random_delay_max_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variables: Option<serde_json::Value>,
 }

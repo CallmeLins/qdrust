@@ -350,8 +350,8 @@ macro_rules! define_store {
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp, timeout_seconds, retry_count, retry_interval_seconds, priority, timezone, variables)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp, timeout_seconds, retry_count, retry_interval_seconds, priority, timezone, random_delay_max_seconds, variables)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(input.name)
         .bind(input.cron)
@@ -370,6 +370,7 @@ macro_rules! define_store {
         .bind(input.retry_interval_seconds)
         .bind(input.priority.unwrap_or(0))
         .bind(input.timezone.as_deref())
+        .bind(input.random_delay_max_seconds.unwrap_or(0))
         .bind(input.variables.map(|v| v.to_string()))
         .execute(&mut *conn)
         .await?;
@@ -470,7 +471,7 @@ macro_rules! define_store {
             None => current.grp,
         };
         sqlx::query(
-            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, timeout_seconds=?, retry_count=?, retry_interval_seconds=?, priority=?, timezone=?, variables=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, timeout_seconds=?, retry_count=?, retry_interval_seconds=?, priority=?, timezone=?, random_delay_max_seconds=?, variables=?, updated_at=? WHERE id=?",
         )
         .bind(name)
         .bind(cron)
@@ -486,6 +487,7 @@ macro_rules! define_store {
         .bind(merge_optional(input.retry_interval_seconds, current.retry_interval_seconds))
         .bind(merge_optional(input.priority, current.priority).unwrap_or(0))
         .bind(merge_optional(input.timezone, current.timezone).as_deref())
+        .bind(merge_optional(input.random_delay_max_seconds, current.random_delay_max_seconds).unwrap_or(0))
         .bind(
             merge_optional(input.variables, current.variables)
                 .map(|v| v.to_string()),
@@ -563,6 +565,34 @@ macro_rules! define_store {
         )
         .bind(task_id)
         .bind(now)
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_run(id).await
+    }
+
+    /// Enqueue a run that only becomes claimable after `delay_seconds` (QD-style
+    /// random delay: the jitter is drawn once at enqueue time and stored in
+    /// `run_after`). The one-active-run-per-task guard is preserved.
+    pub async fn enqueue_delayed_run(&self, task_id: i64, delay_seconds: i64) -> Result<Option<Run>> {
+        let now = Utc::now().timestamp();
+        let run_after = now + delay_seconds.max(0);
+        let mut conn = self.pool.acquire().await?;
+        let result = sqlx::query(
+            "INSERT INTO runs(task_id,status,created_at,run_after,attempt)
+             SELECT ?, 'pending', ?, ?, 0
+             WHERE NOT EXISTS (
+                SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
+             )",
+        )
+        .bind(task_id)
+        .bind(now)
+        .bind(run_after)
         .bind(task_id)
         .execute(&mut *conn)
         .await?;
@@ -2211,7 +2241,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
     })
 }
 
-const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,variables FROM tasks";
+const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
@@ -2269,6 +2299,7 @@ fn task_from_row(row: $row) -> Result<Task> {
         retry_interval_seconds: row.try_get("retry_interval_seconds")?,
         priority: row.try_get("priority")?,
         timezone: row.try_get("timezone")?,
+        random_delay_max_seconds: row.try_get("random_delay_max_seconds")?,
         variables: variables
             .map(|v| serde_json::from_str(&v).context("invalid task variables in database"))
             .transpose()?,
@@ -2556,6 +2587,7 @@ impl Store {
         pub async fn record_run(id: i64, status: Option<u16>, error: Option<&str>) -> Result<()> { id, status, error };
         pub async fn start_run(task_id: i64) -> Result<Run> { task_id };
         pub async fn enqueue_run(task_id: i64) -> Result<Option<Run>> { task_id };
+        pub async fn enqueue_delayed_run(task_id: i64, delay_seconds: i64) -> Result<Option<Run>> { task_id, delay_seconds };
         pub async fn schedule_retry(task_id: i64, retry_of: i64, delay_seconds: i64) -> Result<Option<Run>> { task_id, retry_of, delay_seconds };
         pub async fn count_retries(original_run_id: i64) -> Result<i64> { original_run_id };
         pub async fn claim_run(worker: &str, lease_seconds: i64) -> Result<Option<Run>> { worker, lease_seconds };
@@ -2764,6 +2796,7 @@ mod tests {
             retry_interval_seconds: None,
             priority: None,
             timezone: None,
+            random_delay_max_seconds: None,
             variables: None,
         }
     }
@@ -2811,6 +2844,7 @@ mod tests {
                     retry_interval_seconds: None,
                     priority: None,
                     timezone: None,
+                    random_delay_max_seconds: Some(Some(120)),
                     variables: None,
                 },
             )
@@ -2819,6 +2853,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "renamed");
         assert!(updated.disabled);
+        assert_eq!(updated.random_delay_max_seconds, Some(120));
         assert!(store.delete(created.id).await.unwrap());
         assert!(store.get(created.id).await.unwrap().is_none());
     }
@@ -2894,6 +2929,7 @@ mod tests {
                         retry_interval_seconds: None,
                         priority: None,
                         timezone: None,
+                        random_delay_max_seconds: None,
                         variables: None,
                     },
                 )
@@ -3521,6 +3557,7 @@ mod tests {
                 retry_interval_seconds: None,
                 priority: None,
                 timezone: None,
+                random_delay_max_seconds: None,
                 variables: None,
             })
             .await
@@ -3735,6 +3772,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_enqueue_becomes_claimable_only_after_run_after() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let task = store.create(input("delayed")).await.unwrap();
+        assert_eq!(
+            store
+                .get(task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .random_delay_max_seconds,
+            Some(0)
+        );
+
+        let run = store
+            .enqueue_delayed_run(task.id, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, "pending");
+        assert!(run.run_after.is_some());
+        // The jitter has not elapsed yet: the worker must not claim the run.
+        assert!(store.claim_run("worker", 300).await.unwrap().is_none());
+        // Once run_after passes (simulated), the pending run is claimable.
+        sqlx::query("UPDATE runs SET run_after=0 WHERE id=?")
+            .bind(run.id)
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert!(store.claim_run("worker", 300).await.unwrap().is_some());
+        // The one-active-run guard still applies for delayed enqueues.
+        assert!(
+            store
+                .enqueue_delayed_run(task.id, 60)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn backup_and_restore_round_trips_data() {
         let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
         let user = store
@@ -3759,6 +3836,7 @@ mod tests {
                     retry_interval_seconds: None,
                     priority: None,
                     timezone: None,
+                    random_delay_max_seconds: Some(30),
                     variables: None,
                 },
             )

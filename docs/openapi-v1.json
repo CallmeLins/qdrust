@@ -1951,6 +1951,13 @@
             ],
             "description": "IANA timezone name used for cron scheduling (default UTC)"
           },
+          "random_delay_max_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Random delay before a due run executes, in seconds (0 = disabled); jitter is drawn uniformly from 0..=max at enqueue time"
+          },
           "variables": {
             "type": [
               "object",
@@ -2052,6 +2059,13 @@
               "string",
               "null"
             ]
+          },
+          "random_delay_max_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Set to a number to change, null to clear, omit to leave unchanged"
           },
           "variables": {
             "type": [
