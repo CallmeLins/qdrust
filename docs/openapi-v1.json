@@ -654,9 +654,45 @@
     "/api/v1/templates": {
       "get": {
         "operationId": "listTemplates",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "grp",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "default": 50, "maximum": 200 }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Template list"
+            "description": "Paginated template list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplatePage"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         }
       },
@@ -2585,12 +2621,45 @@
             "type": "object",
             "additionalProperties": true
           },
+          "grp": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Group label (QD _groups equivalent)"
+          },
           "created_at": {
             "type": "integer",
             "format": "int64"
           },
           "updated_at": {
             "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "TemplatePage": {
+        "type": "object",
+        "required": [
+          "items",
+          "has_more",
+          "next_cursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Template"
+            }
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64"
           }
         }

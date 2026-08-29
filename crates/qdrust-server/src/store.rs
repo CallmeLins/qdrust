@@ -1364,6 +1364,89 @@ macro_rules! define_store {
         self.get_user(id).await
     }
 
+    /// Delete a user and everything they own. Most foreign keys cascade, but
+    /// rows are removed explicitly in dependency order (mirroring restore) so
+    /// behaviour is identical on SQLite and MySQL regardless of cascade config
+    /// and so `tasks.template_id ON DELETE RESTRICT` never blocks template
+    /// removal. Audit logs are kept (actor_user_id is SET NULL).
+    pub async fn delete_user(&self, id: i64) -> Result<bool> {
+        if self.get_user(id).await?.is_none() {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM notification_actions WHERE channel_id IN (SELECT id FROM notification_channels WHERE owner_id=?) OR task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM notification_channels WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM notes WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM subscription_syncs WHERE subscription_id IN (SELECT id FROM template_subscriptions WHERE owner_id=?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM template_subscriptions WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM push_requests WHERE owner_id=? OR reviewed_by=?")
+            .bind(id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM run_steps WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=?)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM tasks WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM templates WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM plugins WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM password_reset_tokens WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM email_verification_tokens WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM users WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted > 0)
+    }
+
     // ---- Site settings ----
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<SiteSetting>> {
@@ -1602,6 +1685,17 @@ macro_rules! define_store {
             "SELECT id,owner_id,name,url,enabled,last_synced_at,last_error,created_at,updated_at FROM template_subscriptions WHERE owner_id=? ORDER BY id",
         )
         .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(subscription_from_row).collect()
+    }
+
+    /// All enabled subscriptions across every user, used by the scheduler's
+    /// periodic auto-sync loop.
+    pub async fn list_enabled_subscriptions(&self) -> Result<Vec<TemplateSubscription>> {
+        let rows = sqlx::query(
+            "SELECT id,owner_id,name,url,enabled,last_synced_at,last_error,created_at,updated_at FROM template_subscriptions WHERE enabled=1 ORDER BY id",
+        )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(subscription_from_row).collect()
@@ -1885,6 +1979,12 @@ macro_rules! define_store {
     pub async fn export_data(&self) -> Result<serde_json::Value> {
         use serde_json::{Map, Value as JsonValue};
         let mut out = Map::new();
+        // Metadata so restores can be validated before the destructive import.
+        out.insert("schema_version".to_string(), JsonValue::from(1));
+        out.insert(
+            "exported_at".to_string(),
+            JsonValue::from(Utc::now().timestamp()),
+        );
         let tables = [
             "users",
             "sessions",
@@ -1938,6 +2038,16 @@ macro_rules! define_store {
         let Some(object) = backup.as_object() else {
             anyhow::bail!("backup must be a JSON object of tables");
         };
+        // Destructive full-table import: refuse anything that was not produced
+        // by a matching exporter so a wrong payload cannot wipe the database.
+        let version = object
+            .get("schema_version")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        ensure!(
+            version == 1,
+            "unsupported backup schema_version {version} (expected 1)"
+        );
         let mut tx = self.pool.begin().await?;
         let tables = [
             "push_requests",
@@ -2421,6 +2531,7 @@ impl Store {
         pub async fn search_templates_for_owner(owner_id: i64, query: Option<&str>, grp: Option<&str>, cursor: Option<i64>, limit: i64) -> Result<Vec<Template>> { owner_id, query, grp, cursor, limit };
         pub async fn list_users() -> Result<Vec<User>> {  };
         pub async fn update_user(id: i64, input: &AdminUserUpdate) -> Result<Option<User>> { id, input };
+        pub async fn delete_user(id: i64) -> Result<bool> { id };
         pub async fn get_setting(key: &str) -> Result<Option<SiteSetting>> { key };
         pub async fn set_setting(key: &str, input: &SetSiteSetting) -> Result<SiteSetting> { key, input };
         pub async fn list_settings() -> Result<Vec<SiteSetting>> {  };
@@ -2436,6 +2547,7 @@ impl Store {
         pub async fn rotate_csrf(session_token: &str, new_csrf_hash: &str) -> Result<bool> { session_token, new_csrf_hash };
         pub async fn create_subscription(owner_id: i64, input: CreateTemplateSubscription) -> Result<TemplateSubscription> { owner_id, input };
         pub async fn list_subscriptions(owner_id: i64) -> Result<Vec<TemplateSubscription>> { owner_id };
+        pub async fn list_enabled_subscriptions() -> Result<Vec<TemplateSubscription>> {  };
         pub async fn get_subscription(id: i64, owner_id: i64) -> Result<Option<TemplateSubscription>> { id, owner_id };
         pub async fn update_subscription(id: i64, owner_id: i64, input: UpdateTemplateSubscription) -> Result<Option<TemplateSubscription>> { id, owner_id, input };
         pub async fn delete_subscription(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };

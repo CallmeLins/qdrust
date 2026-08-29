@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, str::FromStr, time::Duration};
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
-    executor::{ExecutionContext, QdExecutor, StepResult},
+    executor::{CancellationToken, ExecutionContext, QdExecutor, StepResult},
     qd_har::{QdHar, QdProgram},
+    template::Step,
 };
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -25,6 +26,7 @@ pub fn spawn(
     run_events: RunEventSender,
     email: EmailClient,
     log_retention_days: u64,
+    subscription_sync_interval: Duration,
 ) {
     let worker_store = store.clone();
     let worker_client = client.clone();
@@ -52,6 +54,7 @@ pub fn spawn(
                             worker_client.clone(),
                             task,
                             run,
+                            &worker,
                             &run_events,
                             &email,
                         )
@@ -114,6 +117,50 @@ pub fn spawn(
             }
         }
     });
+    // Periodic subscription auto-sync: every enabled subscription is re-synced
+    // on the configured interval. sync_subscription records failures in
+    // subscription_syncs and logs them, so a bad source never panics the loop.
+    // Instances are staggered by a per-subscription offset instead of a
+    // distributed lock: syncs are idempotent upserts, so occasional overlap
+    // between instances is harmless (comment explains the tradeoff).
+    let sync_store = store.clone();
+    let sync_client = client.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(subscription_sync_interval);
+        loop {
+            ticker.tick().await;
+            let subscriptions = match sync_store.list_enabled_subscriptions().await {
+                Ok(subscriptions) => subscriptions,
+                Err(err) => {
+                    error!(%err, "cannot load subscriptions for auto-sync");
+                    continue;
+                }
+            };
+            let mut synced = 0_usize;
+            for subscription in &subscriptions {
+                // Stagger each subscription so multiple instances do not hit the
+                // same source at the same instant.
+                let stagger = Duration::from_secs(subscription.id.unsigned_abs() % 60);
+                tokio::time::sleep(stagger).await;
+                if crate::subscriptions::sync_subscription(
+                    &sync_store,
+                    &sync_client,
+                    subscription,
+                    None,
+                )
+                .await
+                .is_ok()
+                {
+                    synced += 1;
+                }
+            }
+            info!(
+                synced,
+                total = subscriptions.len(),
+                "automatic subscription sync pass completed"
+            );
+        }
+    });
 }
 
 fn due(task: &Task, interval: Duration) -> bool {
@@ -139,6 +186,7 @@ async fn execute_with_run(
     client: Client,
     task: Task,
     run: crate::model::Run,
+    worker: &str,
     run_events: &broadcast::Sender<Value>,
     email: &EmailClient,
 ) {
@@ -148,14 +196,27 @@ async fn execute_with_run(
                 .get_template(template_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("task template not found"))?;
-            let steps = execute_template(template).await?;
+            // Cancel/lease supervision: a background loop cancels the in-flight
+            // execution as soon as the API sets cancel_requested and renews the
+            // 300s lease every 60 seconds. It is aborted when execution ends.
+            let cancellation = CancellationToken::new();
+            let supervisor =
+                spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());
+            let steps = execute_template(template.clone(), &cancellation).await;
+            supervisor.abort();
+            let steps = steps?;
             let now = Utc::now().timestamp();
+            let methods = template_request_methods(&template);
             for (index, step) in steps.iter().enumerate() {
+                let name = match methods.get(index) {
+                    Some(method) => truncate_name(&format!("{method} {}", step.url), 200),
+                    None => format!("step-{}", index + 1),
+                };
                 let step_record = RunStep {
                     id: 0,
                     run_id: run.id,
                     step_index: i64::try_from(index)?,
-                    name: format!("step-{}", index + 1),
+                    name,
                     status: "succeeded".into(),
                     http_status: Some(i64::from(step.status)),
                     body_size: i64::try_from(step.body_size)?,
@@ -214,8 +275,22 @@ async fn execute_with_run(
             .await;
         }
         Err(err) => {
-            error!(task_id=task.id, %err, "task failed");
             let message = bounded_error(&err.to_string());
+            if message.contains("execution cancelled") {
+                // The run was cancelled through the API while executing. finish_run
+                // honours cancel_requested and lands the run in 'cancelled'; do not
+                // record a failed step or fire failure notifications.
+                let _ = store.finish_run(run.id, None, None).await;
+                let _ = run_events.send(Value::from(crate::api::RunEvent {
+                    run_id: run.id,
+                    kind: "status",
+                    status: Some("cancelled".into()),
+                    step: None,
+                    error: None,
+                }));
+                return;
+            }
+            error!(task_id=task.id, %err, "task failed");
             let now = Utc::now().timestamp();
             let _ = store
                 .record_run_step(&RunStep {
@@ -345,7 +420,88 @@ fn bounded_error(message: &str) -> String {
     bounded
 }
 
-async fn execute_template(template: Template) -> anyhow::Result<Vec<StepResult>> {
+/// Poll a running run while it executes: cancel the in-flight execution as soon
+/// as `cancel_requested` is set and renew the 300s lease every 60 seconds so
+/// long template runs keep their claim. The caller aborts this task when the
+/// execution finishes (success, failure or cancellation).
+fn spawn_run_supervisor(
+    store: Store,
+    run_id: i64,
+    worker: &str,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let worker = worker.to_string();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut ticks: u64 = 0;
+        loop {
+            ticker.tick().await;
+            ticks += 1;
+            if let Ok(Some(run)) = store.get_run(run_id).await
+                && run.cancel_requested
+            {
+                cancellation.cancel();
+                return;
+            }
+            if ticks.is_multiple_of(60)
+                && let Err(err) = store.renew_run(run_id, &worker, 300).await
+            {
+                error!(%err, run_id, "cannot renew run lease");
+            }
+        }
+    })
+}
+
+/// Best-effort per-step HTTP method hints derived from the template source.
+/// QD HAR / native steps execute in source order for straight-line programs;
+/// loop bodies execute more times than they appear, so the caller falls back to
+/// `step-N` when the hint list is exhausted. Display metadata only.
+fn template_request_methods(template: &Template) -> Vec<String> {
+    let mut methods = Vec::new();
+    if template.source_format == "qd_har" {
+        if let Some(har) = template.qd_har.as_ref()
+            && let Ok(har) = QdHar::parse(har.clone())
+        {
+            for entry in har.entries() {
+                if entry.checked && entry.control().is_none() {
+                    methods.push(entry.request.method.clone());
+                }
+            }
+        }
+    } else if let Some(definition) = template.definition.as_ref() {
+        collect_native_methods(&definition.steps, &mut methods);
+    }
+    methods
+}
+
+fn collect_native_methods(steps: &[Step], methods: &mut Vec<String>) {
+    for step in steps {
+        match step {
+            Step::Request(request) => methods.push(request.method.clone()),
+            Step::If {
+                then, otherwise, ..
+            } => {
+                collect_native_methods(then, methods);
+                collect_native_methods(otherwise, methods);
+            }
+            Step::ForEach { steps, .. } => collect_native_methods(steps, methods),
+            Step::Extract(_) | Step::Delay { .. } => {}
+        }
+    }
+}
+
+fn truncate_name(name: &str, max: usize) -> String {
+    let mut bounded: String = name.chars().take(max).collect();
+    if name.chars().count() > max {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+async fn execute_template(
+    template: Template,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<Vec<StepResult>> {
     let executor = QdExecutor::new(Duration::from_secs(30))?;
     let mut context = ExecutionContext::new(BTreeMap::new());
     match template.source_format.as_str() {
@@ -356,9 +512,12 @@ async fn execute_template(template: Template) -> anyhow::Result<Vec<StepResult>>
                     .ok_or_else(|| anyhow::anyhow!("QD HAR source is missing"))?,
             )?;
             let program = QdProgram::compile(&har)?;
-            executor
-                .execute_with_deadline(&program, &mut context, Duration::from_secs(300))
-                .await
+            tokio::time::timeout(
+                Duration::from_secs(300),
+                executor.execute_with_cancellation(&program, &mut context, cancellation),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))?
         }
         "native_v1" => {
             let definition = template
@@ -366,7 +525,11 @@ async fn execute_template(template: Template) -> anyhow::Result<Vec<StepResult>>
                 .ok_or_else(|| anyhow::anyhow!("native template definition is missing"))?;
             tokio::time::timeout(
                 Duration::from_secs(300),
-                executor.execute_template(&definition, &mut context),
+                executor.execute_template_with_cancellation(
+                    &definition,
+                    &mut context,
+                    cancellation,
+                ),
             )
             .await
             .map_err(|_| anyhow::anyhow!("execution deadline exceeded"))?
@@ -401,7 +564,9 @@ mod tests {
             updated_at: 0,
             grp: None,
         };
-        let results = execute_template(template).await.unwrap();
+        let results = execute_template(template, &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, 200);
     }

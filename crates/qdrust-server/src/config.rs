@@ -20,6 +20,7 @@ pub struct Config {
     pub log_retention_days: u64,
     pub ga_key: Option<String>,
     pub require_email_verification: bool,
+    pub subscription_sync_interval: Duration,
     pub config_file: Option<PathBuf>,
 }
 
@@ -54,6 +55,10 @@ impl Config {
             log_retention_days: parse_env("LOG_RETENTION_DAYS", 0)?,
             ga_key: env::var("GA_KEY").ok().filter(|s| !s.is_empty()),
             require_email_verification: parse_env("REQUIRE_EMAIL_VERIFICATION", false)?,
+            subscription_sync_interval: Duration::from_secs(parse_env(
+                "QDRUST_SUBSCRIPTION_SYNC_INTERVAL_SECONDS",
+                3600,
+            )?),
             config_file: env::var("QDRUST_CONFIG_FILE")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -116,6 +121,10 @@ impl Config {
                 .or(self.ga_key),
             require_email_verification: get_bool("require_email_verification")
                 .unwrap_or(self.require_email_verification),
+            subscription_sync_interval: get_i64("subscription_sync_interval_seconds")
+                .map_or(self.subscription_sync_interval, |v| {
+                    Duration::from_secs(v.max(1) as u64)
+                }),
             config_file: self.config_file,
         })
     }

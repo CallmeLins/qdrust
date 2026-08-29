@@ -1182,10 +1182,18 @@ export interface components {
             qd_har?: {
                 [key: string]: unknown;
             };
+            /** @description Group label (QD _groups equivalent) */
+            grp?: string | null;
             /** Format: int64 */
             created_at: number;
             /** Format: int64 */
             updated_at: number;
+        };
+        TemplatePage: {
+            items: components["schemas"]["Template"][];
+            has_more: boolean;
+            /** Format: int64 */
+            next_cursor: number | null;
         };
         ApiError: {
             code: string;
@@ -2355,20 +2363,28 @@ export interface operations {
     };
     listTemplates: {
         parameters: {
-            query?: never;
+            query?: {
+                q?: string;
+                grp?: string;
+                cursor?: number;
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Template list */
+            /** @description Paginated template list */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["TemplatePage"];
+                };
             };
+            401: components["responses"]["Unauthorized"];
         };
     };
     createTemplate: {

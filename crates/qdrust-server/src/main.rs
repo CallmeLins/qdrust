@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         run_events.clone(),
         email,
         config.log_retention_days,
+        config.subscription_sync_interval,
     );
     let app = api::router_with_auth(
         store,

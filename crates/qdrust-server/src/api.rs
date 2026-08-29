@@ -233,7 +233,7 @@ pub fn router_with_auth(
         .route("/api/v1/admin/users", get(admin_list_users))
         .route(
             "/api/v1/admin/users/{id}",
-            axum::routing::patch(admin_update_user),
+            axum::routing::patch(admin_update_user).delete(admin_delete_user),
         )
         .route("/api/v1/admin/settings", get(admin_list_settings))
         .route(
@@ -1393,8 +1393,27 @@ async fn forgot_password(
     let base_url =
         std::env::var("QDRUST_BASE_URL").unwrap_or_else(|_| "http://localhost:8923".to_string());
     let reset_url = format!("{base_url}/reset-password?token={token}");
-    // Email delivery is best-effort; the token is also returned here for
-    // development/local setups without an SMTP server.
+    // Email delivery is best-effort. When SMTP is configured the token is never
+    // returned in the response (keeps the anti-enumeration contract and does not
+    // leak reset tokens); without SMTP the token is exposed so local development
+    // can complete the flow.
+    let email_config = crate::email::EmailConfig::from_env();
+    let smtp_configured = email_config.enabled();
+    if smtp_configured
+        && let Ok(email_client) = crate::email::EmailClient::new(email_config)
+        && let Some(email) = user.user.email.as_deref()
+        && let Err(err) = email_client.send(
+            email.trim(),
+            None,
+            "[qdrust] Reset your password",
+            &format!(
+                "Hello {},\n\nReset your password by opening this link:\n{}\n\nIf you did not request this, you can ignore this message. The link expires in 1 hour.\n",
+                user.user.username, reset_url
+            ),
+        )
+    {
+        tracing::warn!(%err, user_id = user.user.id, "password reset email delivery failed");
+    }
     state
         .store
         .record_audit(
@@ -1406,12 +1425,18 @@ async fn forgot_password(
             &json!({}),
         )
         .await?;
-    Ok(Json(json!({
-        "sent": true,
-        "expires_at": expires_at,
-        "reset_token": token,
-        "reset_url": reset_url,
-    })))
+    if smtp_configured {
+        Ok(Json(json!({"sent": true})))
+    } else {
+        // Local development fallback: expose the token so the reset flow is
+        // testable without an SMTP server.
+        Ok(Json(json!({
+            "sent": true,
+            "expires_at": expires_at,
+            "reset_token": token,
+            "reset_url": reset_url,
+        })))
+    }
 }
 
 async fn reset_password(
@@ -1563,6 +1588,35 @@ async fn admin_update_user(
         .map_err(ApiError::unprocessable)?
         .map(|user| Json(json!(user)))
         .ok_or(ApiError::NotFound("user_not_found", "User not found"))
+}
+
+async fn admin_delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, admin) = require_admin(&state, &headers).await?;
+    if admin.user.id == id {
+        return Err(ApiError::Forbidden(
+            "cannot_delete_self",
+            "Cannot delete your own account",
+        ));
+    }
+    if !state.store.delete_user(id).await? {
+        return Err(ApiError::NotFound("user_not_found", "User not found"));
+    }
+    state
+        .store
+        .record_audit(
+            Some(admin.user.id),
+            "admin.user_deleted",
+            Some("user"),
+            Some(id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_list_settings(

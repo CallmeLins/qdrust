@@ -88,6 +88,7 @@ impl SessionCache {
             return;
         }
         let key = format!("qdrust:session:{token_hash}");
+        let index_key = format!("qdrust:session:user:{}", session.user.id);
         let cached = CachedSession {
             user: session.user.clone(),
             csrf_token_hash: session.csrf_token_hash.clone(),
@@ -103,6 +104,21 @@ impl SessionCache {
                     .arg(&key)
                     .arg(ttl_seconds.max(1))
                     .arg(raw)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .ok()?;
+                // Keep a per-user index of session keys so revoke-all flows can
+                // remove every cached session without enumerating the database.
+                redis::cmd("SADD")
+                    .arg(&index_key)
+                    .arg(token_hash)
+                    .query_async::<()>(&mut conn)
+                    .await
+                    .ok()?;
+                // Refresh the index TTL so stale members expire with the sessions.
+                redis::cmd("EXPIRE")
+                    .arg(&index_key)
+                    .arg(ttl_seconds.max(1))
                     .query_async::<()>(&mut conn)
                     .await
                     .ok()
@@ -128,7 +144,10 @@ impl SessionCache {
     }
 
     /// Invalidate every cached session for a user (used on password change /
-    /// revoke-all flows). Uses a per-user index key.
+    /// revoke-all flows). Session keys written since the per-user index was
+    /// introduced are tracked in `qdrust:session:user:{user_id}`; each member
+    /// is deleted before the index key itself. The caller-supplied hashes are
+    /// still invalidated too, which covers sessions cached before the index.
     pub async fn invalidate_user(&self, user_id: i64, token_hashes: &[String]) {
         for hash in token_hashes {
             self.invalidate(hash).await;
@@ -136,12 +155,31 @@ impl SessionCache {
         if !self.enabled() {
             return;
         }
-        let key = format!("qdrust:session:user:{user_id}");
+        let index_key = format!("qdrust:session:user:{user_id}");
+        let index_key_a = index_key.clone();
+        let indexed: Vec<String> = self
+            .run(|conn| async move {
+                let mut conn = conn;
+                redis::cmd("SMEMBERS")
+                    .arg(&index_key_a)
+                    .query_async::<Vec<String>>(&mut conn)
+                    .await
+                    .ok()
+            })
+            .await
+            .unwrap_or_default();
         let _ = self
             .run(|conn| async move {
                 let mut conn = conn;
+                if !indexed.is_empty() {
+                    let mut del = redis::cmd("DEL");
+                    for hash in &indexed {
+                        del.arg(format!("qdrust:session:{hash}"));
+                    }
+                    del.query_async::<()>(&mut conn).await.ok()?;
+                }
                 redis::cmd("DEL")
-                    .arg(&key)
+                    .arg(&index_key)
                     .query_async::<()>(&mut conn)
                     .await
                     .ok()
