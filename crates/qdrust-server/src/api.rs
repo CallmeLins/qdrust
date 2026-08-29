@@ -180,7 +180,10 @@ pub fn router_with_auth(
             "/api/v1/tasks/{id}",
             get(get_task).put(update_task).delete(delete_task),
         )
-        .route("/api/v1/tasks/{id}/runs", get(list_task_runs).delete(delete_task_runs))
+        .route(
+            "/api/v1/tasks/{id}/runs",
+            get(list_task_runs).delete(delete_task_runs),
+        )
         .route("/api/v1/tasks/{id}/run", axum::routing::post(run_task))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
@@ -826,9 +829,7 @@ async fn delete_task_runs(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    if session.user.role != "admin"
-        && store.get_for_owner(id, session.user.id).await?.is_none()
-    {
+    if session.user.role != "admin" && store.get_for_owner(id, session.user.id).await?.is_none() {
         return Err(ApiError::NotFound("task_not_found", "Task not found"));
     }
     let deleted = store.delete_runs_for_task(id).await?;

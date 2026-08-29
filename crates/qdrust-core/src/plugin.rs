@@ -557,6 +557,119 @@ impl Plugin for UtilityPlugin {
                             .into_bytes(),
                     })
                 }
+                "gb2312" => {
+                    // QD 兼容（qd web/handlers/util.py GB2312Handler）：把 content
+                    // 按 GB2312 编码后逐字节百分号编码（urllib.parse.quote 语义），
+                    // 返回与 QD 相同的缩进 JSON，供 success_asserts 的
+                    // "\"状态\": \"200\"" 与 extract_variables 匹配。
+                    let content = request
+                        .query
+                        .get("content")
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let (gb_bytes, _, _) = encoding_rs::GBK.encode(content);
+                    let encoded =
+                        percent_encoding::percent_encode(&gb_bytes, GB2312_QUOTE_SET).to_string();
+                    let value = serde_json::to_string(&encoded)?;
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "content-type".to_string(),
+                        "application/json; charset=UTF-8".to_string(),
+                    );
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers,
+                        body: format!("{{\n    \"转换后\": {value},\n    \"状态\": \"200\"\n}}")
+                            .into_bytes(),
+                    })
+                }
+                "rsa" => {
+                    // QD 兼容（qd web/handlers/util.py UtilRSAHandler）：key 支持
+                    // PKCS#1/PKCS#8 公钥或私钥 PEM；f=encode 用公钥做 PKCS1 v1.5
+                    // 加密并输出 Base64，f=decode 用私钥解 Base64 密文。键体中的
+                    // 空格按 QD 的方式还原为 '+'（URL 传输丢失的加号）。
+                    use rsa::pkcs1::DecodeRsaPrivateKey;
+                    use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
+                    let key = request.query.get("key").context("rsa key is required")?;
+                    let data = request.query.get("data").context("rsa data is required")?;
+                    let operation = request
+                        .query
+                        .get("f")
+                        .map(String::as_str)
+                        .unwrap_or("encode");
+                    let pem = normalize_rsa_pem(key)?;
+                    let private_key = rsa::RsaPrivateKey::from_pkcs1_pem(&pem)
+                        .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(&pem))
+                        .ok();
+                    let body = match operation {
+                        f if f.contains("encode") => {
+                            let public_key = match private_key.as_ref() {
+                                Some(private) => rsa::RsaPublicKey::from(private),
+                                None => rsa::RsaPublicKey::from_public_key_pem(&pem).context(
+                                    "证书格式错误: expected a PEM public or private key",
+                                )?,
+                            };
+                            let mut rng = rand::thread_rng();
+                            let encrypted = public_key
+                                .encrypt(&mut rng, rsa::pkcs1v15::Pkcs1v15Encrypt, data.as_bytes())
+                                .context("rsa encryption failed")?;
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                encrypted,
+                            )
+                        }
+                        f if f.contains("decode") => {
+                            let private =
+                                private_key.context("rsa decode requires a PEM private key")?;
+                            let ciphertext = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                data,
+                            )
+                            .context("invalid base64 ciphertext")?;
+                            let decrypted = private
+                                .decrypt(rsa::pkcs1v15::Pkcs1v15Encrypt, &ciphertext)
+                                .context("rsa decryption failed")?;
+                            String::from_utf8(decrypted)
+                                .context("decrypted rsa data is not valid UTF-8")?
+                        }
+                        _ => bail!("功能选择错误: {operation}"),
+                    };
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: body.into_bytes(),
+                    })
+                }
+                "string/replace" => {
+                    // QD 兼容（qd web/handlers/util.py UtilStrReplaceHandler）：s
+                    // 原文，p 正则，t 替换串（\1 形式的组引用自动翻译为 Rust
+                    // regex 的 $1）。r=text 返回 HTML 转义纯文本，否则返回 QD
+                    // 同款缩进 JSON。
+                    let source = request.query.get("s").map(String::as_str).unwrap_or("");
+                    let pattern = request
+                        .query
+                        .get("p")
+                        .context("regex pattern p is required")?;
+                    let replacement = request.query.get("t").map(String::as_str).unwrap_or("");
+                    let re = regex::Regex::new(pattern).context("invalid regex pattern")?;
+                    let processed = re
+                        .replace_all(source, translate_python_replacement(replacement))
+                        .to_string();
+                    let body = if request.query.get("r").map(String::as_str) == Some("text") {
+                        html_escape::encode_text(&processed).to_string()
+                    } else {
+                        let s_json = serde_json::to_string(source)?;
+                        let t_json = serde_json::to_string(&processed)?;
+                        format!(
+                            "{{\n    \"原始字符串\": {s_json},\n    \"处理后字符串\": {t_json},\n    \"状态\": \"OK\"\n}}"
+                        )
+                    };
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: body.into_bytes(),
+                    })
+                }
                 action => bail!("plugin action unavailable: util/{action}"),
             }
         })
@@ -569,6 +682,99 @@ fn valid_plugin_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Percent-encode set matching Python `urllib.parse.quote` defaults: ASCII
+/// letters, digits, `_.-~` and `/` stay literal, everything else (including
+/// all non-ASCII bytes) is percent-encoded.
+const GB2312_QUOTE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'!')
+    .add(b'"')
+    .add(b'#')
+    .add(b'$')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// Normalize an RSA PEM key the way QD does: locate the `-----BEGIN/END...-----`
+/// markers even when all newlines were stripped by URL transport, restore '+'
+/// characters that turned into spaces, and re-wrap the base64 body at 64
+/// columns so PKCS#1/PKCS#8 PEM parsers accept it regardless of formatting.
+fn normalize_rsa_pem(key: &str) -> Result<String> {
+    let header_re = regex::Regex::new(r"-----BEGIN [^-]+-----").expect("valid header regex");
+    let footer_re = regex::Regex::new(r"-----END [^-]+-----").expect("valid footer regex");
+    let text = key.trim();
+    let header = header_re
+        .find(text)
+        .map(|m| m.as_str().to_string())
+        .context("证书格式错误: PEM header/footer is missing")?;
+    let stripped = header_re.replace(text, "");
+    let footer = footer_re
+        .find(&stripped)
+        .map(|m| m.as_str().to_string())
+        .context("证书格式错误: PEM header/footer is missing")?;
+    let body_source = footer_re.replace(&stripped, "").to_string();
+    let body: String = body_source
+        .replace(' ', "+")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    ensure!(!body.is_empty(), "证书格式错误: PEM body is missing");
+    let mut pem = format!("{header}\n");
+    for chunk in body.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).context("key body is not valid UTF-8")?);
+        pem.push('\n');
+    }
+    pem.push_str(&footer);
+    pem.push('\n');
+    Ok(pem)
+}
+
+/// Translate Python `re.sub` replacement syntax (`\1` group references,
+/// `\\` literal backslash) into the Rust regex replacement syntax (`$1`,
+/// `\`) used by `Regex::replace_all`.
+fn translate_python_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some(digit @ '1'..='9') => {
+                out.push('$');
+                out.push(digit);
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -641,5 +847,112 @@ mod tests {
             body,
             "{\n    \"转换后\": \"签到成功：获得20积分\",\n    \"状态\": \"200\"\n}"
         );
+    }
+
+    #[tokio::test]
+    async fn gb2312_encodes_content_with_qd_json_body() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        // "中文" in GBK bytes: D6 D0 CE C4.
+        let response = registry
+            .call(
+                "api://util/gb2312?content=%E4%B8%AD%E6%96%87",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            body.contains("\"转换后\": \"%D6%D0%CE%C4\""),
+            "unexpected body: {body}"
+        );
+        assert!(body.contains("\"状态\": \"200\""));
+    }
+
+    #[tokio::test]
+    async fn string_replace_supports_python_group_references() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        // s="hello world", p="(world)", t="\1!" (percent-encoded).
+        let response = registry
+            .call(
+                "api://util/string/replace?s=hello%20world&p=(world)&t=%5C1%21",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            body.contains("\"处理后字符串\": \"hello world!\""),
+            "unexpected body: {body}"
+        );
+        assert!(body.contains("\"状态\": \"OK\""));
+
+        // r=text returns the HTML-escaped result directly, like QD.
+        // s="acb", p="b", t="<b>&amp;" -> processed "ac<b>&amp;".
+        let response = registry
+            .call(
+                "api://util/string/replace?s=acb&p=b&t=%3Cb%3E%26amp%3B&r=text",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "ac&lt;b&gt;&amp;amp;"
+        );
+    }
+
+    #[tokio::test]
+    async fn rsa_encodes_and_decodes_roundtrip() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::pkcs8::EncodePublicKey;
+
+        let mut rng = rand::thread_rng();
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public = rsa::RsaPublicKey::from(&private);
+        let private_pem = (*private.to_pkcs1_pem(rsa::pkcs8::LineEnding::LF).unwrap()).clone();
+        let public_pem = public
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        // Simulate a key mangled by URL transport: newlines stripped and '+'
+        // turned into spaces; normalize_rsa_pem must restore it.
+        let flattened = public_pem.replace('\n', "").replace('+', " ");
+
+        let plugin = UtilityPlugin::default();
+        let request = PluginRequest {
+            plugin_id: "util".into(),
+            action: "rsa".into(),
+            query: [
+                ("key".to_string(), flattened),
+                ("data".to_string(), "签到 secret 123".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let response = plugin.call(&request).await.unwrap();
+        assert_eq!(response.status, 200);
+        let encrypted = String::from_utf8(response.body).unwrap();
+        assert!(!encrypted.is_empty());
+
+        let request = PluginRequest {
+            plugin_id: "util".into(),
+            action: "rsa".into(),
+            query: [
+                ("key".to_string(), private_pem),
+                ("data".to_string(), encrypted),
+                ("f".to_string(), "decode".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let response = plugin.call(&request).await.unwrap();
+        assert_eq!(String::from_utf8(response.body).unwrap(), "签到 secret 123");
     }
 }

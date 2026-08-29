@@ -432,7 +432,11 @@ async fn send_notifications(
         }
     };
     let payload = serde_json::json!({ "event": event, "task_id": task.id, "task_name": task.name, "run_id": run_id, "http_status": http_status, "error": error_message });
-    let status_word = if event == "success" { "succeeded" } else { "failed" };
+    let status_word = if event == "success" {
+        "succeeded"
+    } else {
+        "failed"
+    };
     let title = format!("[qdrust] Task \"{}\" {status_word}", task.name);
     let body = format!(
         "Task: {}\nEvent: {}\nRun: #{}\nHTTP status: {}\nError: {}\n",
@@ -477,11 +481,24 @@ async fn send_notifications(
                 }
             }
             other if crate::push_channels::is_push_channel(other) => {
-                match crate::push_channels::push_to_channel(client, other, &channel.config, &title, &body)
-                    .await
+                match crate::push_channels::push_to_channel(
+                    client,
+                    other,
+                    &channel.config,
+                    &title,
+                    &body,
+                )
+                .await
                 {
-                    Ok(()) => info!(task_id=task.id, channel_id=channel.id, kind=other, "push notification sent"),
-                    Err(err) => error!(task_id=task.id, channel_id=channel.id, kind=other, %err, "push notification failed"),
+                    Ok(()) => info!(
+                        task_id = task.id,
+                        channel_id = channel.id,
+                        kind = other,
+                        "push notification sent"
+                    ),
+                    Err(err) => {
+                        error!(task_id=task.id, channel_id=channel.id, kind=other, %err, "push notification failed")
+                    }
                 }
             }
             other => {
