@@ -108,24 +108,54 @@ npm --prefix webui run dev
 
 Vite 开发服务器位于 `http://localhost:5173`，并将 API 请求代理到 Rust 服务。
 
-### Docker 部署（生产）
+### Docker 部署（生产，推荐）
 
-使用 Compose 构建并启动：
-
-```powershell
-wsl -d Ubuntu -- bash -lc "cd /mnt/c/UserData/WorkSpace/Learn/qdrust && docker compose up --build -d"
-```
-
-查看日志或停止服务：
+镜像已发布到 GitHub 容器注册表（GHCR），直接拉取运行即可，无需本地构建：
 
 ```powershell
-wsl -d Ubuntu -- bash -lc "cd /mnt/c/UserData/WorkSpace/Learn/qdrust && docker compose logs -f qdrust"
-wsl -d Ubuntu -- bash -lc "cd /mnt/c/UserData/WorkSpace/Learn/qdrust && docker compose down"
+docker pull ghcr.io/callmelins/qdrust:latest
 ```
 
-Compose 使用 `qdrust-data` 命名卷保存数据，容器以 UID/GID `10001` 非 root 用户运行。生产 HTTPS 部署**必须**设置 `COOKIE_SECURE=true`，部署和备份说明见 [运维文档](docs/phase8/OPERATIONS.md)。
+最简启动（数据保存在命名卷 `qdrust-data`，监听 8923）：
 
-> CI 在打 `v*` 标签时向 Docker Hub 与 GHCR 发布 `linux/amd64` 和 `linux/arm64` 镜像，并附带 provenance 与 SBOM 证明，已知 HIGH/CRITICAL 漏洞会阻断发布。
+```powershell
+docker run -d --name qdrust -p 8923:8923 -v qdrust-data:/data ghcr.io/callmelins/qdrust:latest
+```
+
+生产推荐使用 Compose 管理（命名卷 + 健康检查 + 开机自启）：
+
+```yaml
+# docker-compose.yml
+services:
+  qdrust:
+    image: ghcr.io/callmelins/qdrust:latest
+    container_name: qdrust
+    ports:
+      - "8923:8923"
+    volumes:
+      - qdrust-data:/data
+    environment:
+      DATABASE_URL: sqlite:///data/qdrust.db
+      COOKIE_SECURE: "true"        # 走 HTTPS 反向代理后必须开启
+      QDRUST_BASE_URL: "https://your.domain"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8923/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  qdrust-data:
+```
+
+```powershell
+docker compose up -d
+docker compose logs -f qdrust   # 查看日志
+docker compose down             # 停止
+```
+
+> 本地从源码构建（开发者）：仓库自带 `compose.yaml`，执行 `docker compose up --build -d` 会构建本地 `qdrust:local` 镜像，适合贡献代码时自测。
 
 ### 环境变量
 
@@ -243,10 +273,11 @@ qdrust 使用不可变语义版本镜像标签。升级步骤：
 pwsh -File scripts/backup-db.ps1 -Database data/qdrust.db -Output backups/qdrust-$(Get-Date -Format yyyyMMdd-HHmmss).db
 ```
 
-2. 记录当前镜像 digest，拉取目标版本并以相同的 `/data` 卷启动：
+2. 记录当前镜像 digest，拉取目标版本并以相同的数据卷启动：
 
 ```powershell
-wsl -d Ubuntu -- bash -lc "cd /mnt/c/UserData/WorkSpace/Learn/qdrust && docker compose pull && docker compose up -d"
+docker compose pull && docker compose up -d
+# 或锁定到具体版本：docker pull ghcr.io/callmelins/qdrust:v0.1.0
 ```
 
 3. 验证 `/health`、`/ready`、登录与至少一个只读流程。

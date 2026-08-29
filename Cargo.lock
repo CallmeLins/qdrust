@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
