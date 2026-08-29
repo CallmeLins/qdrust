@@ -6,6 +6,7 @@ import {
   Settings, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Note, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LiveRunEvent } from "./api";
+import HarEditor from "./HarEditor.vue";
 import { formatRunTime } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
@@ -76,10 +77,33 @@ interface TaskForm {
   disabled: boolean;
   grp: string;
   templateId: number | null;
+  timeoutSeconds: string;
+  retryCount: string;
+  retryInterval: string;
+  priority: string;
+  timezone: string;
+  variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "0 * * * * * *", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "0 * * * * * *", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
+
+function variablesToRows(value: unknown): { name: string; value: string }[] {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return Object.entries(value as Record<string, unknown>).map(([name, v]) => ({
+      name,
+      value: typeof v === "string" ? v : v == null ? "" : JSON.stringify(v),
+    }));
+  }
+  return [];
+}
+function rowsToVariables(rows: { name: string; value: string }[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const row of rows) if (row.name.trim()) out[row.name.trim()] = row.value;
+  return out;
+}
+function addVariableRow() { taskForm.variables.push({ name: "", value: "" }); }
+function removeVariableRow(index: number) { taskForm.variables.splice(index, 1); }
 
 const filteredTasks = computed(() => {
   const term = search.value.trim().toLowerCase();
@@ -121,6 +145,9 @@ async function submitTask() {
       return;
     }
   }
+  if (taskForm.timeoutSeconds && !(Number(taskForm.timeoutSeconds) > 0)) return void notify("timeout must be a positive number", "error");
+  if (taskForm.retryInterval && !(Number(taskForm.retryInterval) > 0)) return void notify("retry interval must be a positive number", "error");
+  if (taskForm.priority && Number.isNaN(Number(taskForm.priority))) return void notify("priority must be a number", "error");
   const payload: CreateTask = {
     name: taskForm.name,
     cron: taskForm.cron,
@@ -131,6 +158,12 @@ async function submitTask() {
     disabled: taskForm.disabled,
     grp: taskForm.grp || null,
     template_id: taskForm.templateId,
+    timeout_seconds: taskForm.timeoutSeconds ? Number(taskForm.timeoutSeconds) : null,
+    retry_count: taskForm.retryCount ? Number(taskForm.retryCount) : null,
+    retry_interval_seconds: taskForm.retryInterval ? Number(taskForm.retryInterval) : null,
+    priority: taskForm.priority ? Number(taskForm.priority) : null,
+    timezone: taskForm.timezone || null,
+    variables: taskForm.variables.length ? rowsToVariables(taskForm.variables) : null,
   };
   try {
     if (taskForm.id != null) {
@@ -164,6 +197,12 @@ function openEditTask(task: Task) {
     disabled: task.disabled,
     grp: task.grp ?? "",
     templateId: task.template_id ?? null,
+    timeoutSeconds: task.timeout_seconds != null ? String(task.timeout_seconds) : "",
+    retryCount: task.retry_count != null ? String(task.retry_count) : "",
+    retryInterval: task.retry_interval_seconds != null ? String(task.retry_interval_seconds) : "",
+    priority: task.priority != null ? String(task.priority) : "",
+    timezone: task.timezone ?? "",
+    variables: variablesToRows(task.variables),
   });
   showCreate.value = true;
 }
@@ -293,8 +332,8 @@ const templates = ref<Template[]>([]);
 const publicTemplates = ref<Template[]>([]);
 const templateSearch = ref("");
 const editingTemplateId = ref<number | null>(null);
-const importForm = reactive({ name: "", description: "", har: "" });
-const validating = ref(false);
+const importForm = reactive({ name: "", description: "" });
+const harEditorDoc = ref<object | null>(null);
 const filteredTemplates = computed(() => {
   const term = templateSearch.value.trim().toLowerCase();
   return term ? templates.value.filter((x) => `${x.name} ${x.description ?? ""}`.toLowerCase().includes(term)) : templates.value;
@@ -338,30 +377,20 @@ async function removeTemplate(id: number, name: string) {
 }
 function openImportModal(template?: Template) {
   editingTemplateId.value = template?.id ?? null;
-  Object.assign(importForm, template
-    ? { name: template.name, description: template.description ?? "", har: template.qd_har ? JSON.stringify(template.qd_har, null, 2) : "" }
-    : { name: "", description: "", har: "" });
+  Object.assign(importForm, { name: template?.name ?? "", description: template?.description ?? "" });
+  harEditorDoc.value = template?.qd_har ?? { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
   showImport.value = true;
 }
-async function validateHar() {
-  validating.value = true;
+async function saveHar(doc: object) {
+  if (!importForm.name.trim()) { notify(t("templateName"), "error"); return; }
   try {
-    const har = JSON.parse(importForm.har);
-    const result = await api.validateQdHar(har);
-    notify(`${t("validateOk")}（${result.entries} entries / ${result.requests} requests）`);
-  } catch (cause) {
-    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
-  } finally { validating.value = false; }
-}
-async function saveImport() {
-  try {
-    const har = JSON.parse(importForm.har);
-    if (editingTemplateId.value) await api.updateQdHar(editingTemplateId.value, importForm.name, importForm.description, har);
-    else await api.importQdHar(importForm.name, importForm.description, har);
+    if (editingTemplateId.value) await api.updateQdHar(editingTemplateId.value, importForm.name, importForm.description, doc);
+    else await api.importQdHar(importForm.name, importForm.description, doc);
     notify(t("importDone"));
     showImport.value = false;
     editingTemplateId.value = null;
-    Object.assign(importForm, { name: "", description: "", har: "" });
+    Object.assign(importForm, { name: "", description: "" });
+    harEditorDoc.value = null;
     await openTemplates();
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
@@ -1253,6 +1282,27 @@ onMounted(async () => {
         <label>{{ t('url') }}<input v-model="taskForm.url" required type="url" placeholder="https://example.com/api/health" /></label>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
+        <div class="form-row form-row-4">
+          <label>{{ t('timeoutSeconds') }}<input v-model="taskForm.timeoutSeconds" type="number" min="1" placeholder="30" /></label>
+          <label>{{ t('retryCount') }}<input v-model="taskForm.retryCount" type="number" placeholder="0" /></label>
+          <label>{{ t('retryInterval') }}<input v-model="taskForm.retryInterval" type="number" min="1" placeholder="60" /></label>
+          <label>{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
+        </div>
+        <label>{{ t('timezone') }}<input v-model="taskForm.timezone" list="tz-options" placeholder="UTC / Asia/Shanghai" /></label>
+        <datalist id="tz-options">
+          <option v-for="tz in ['UTC','Asia/Shanghai','Asia/Tokyo','Asia/Hong_Kong','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney']" :key="tz" :value="tz" />
+        </datalist>
+        <label class="kv-label">{{ t('variables') }}
+          <span class="kv-rows">
+            <span v-for="(row, i) in taskForm.variables" :key="i" class="kv-row">
+              <input v-model="row.name" :placeholder="t('variableName')" />
+              <input v-model="row.value" :placeholder="t('variableValue')" />
+              <button class="icon-button" type="button" :title="t('delete')" @click="removeVariableRow(i)"><X :size="14" /></button>
+            </span>
+            <button class="secondary-button kv-add" type="button" @click="addVariableRow"><Plus :size="14" />{{ t('addVariable') }}</button>
+          </span>
+          <small class="kv-hint">{{ t('variablesHint') }}</small>
+        </label>
         <label>{{ t('requestHeaders') }}<textarea v-model="taskForm.headersText" rows="4" spellcheck="false" /></label>
         <label>{{ t('body') }}<textarea v-model="taskForm.body" rows="3" spellcheck="false" /></label>
         <label class="checkbox"><input v-model="taskForm.disabled" type="checkbox" />{{ t('createPaused') }}</label>
@@ -1263,22 +1313,19 @@ onMounted(async () => {
       </form>
     </div>
 
-    <!-- ===== IMPORT MODAL ===== -->
-    <div v-if="showImport" class="modal-backdrop" @click.self="showImport = false">
-      <form class="modal modal-wide" @submit.prevent="saveImport">
+    <!-- ===== IMPORT / EDIT HAR MODAL ===== -->
+    <div v-if="showImport" class="modal-backdrop modal-backdrop-wide" @click.self="showImport = false">
+      <div class="modal modal-har">
         <div class="modal-header">
           <div><p class="eyebrow">QD HAR</p><h2>{{ t('importHarTitle') }}</h2></div>
           <button class="icon-button" type="button" :title="t('close')" @click="showImport = false"><X :size="20" /></button>
         </div>
-        <label>{{ t('templateName') }}<input v-model="importForm.name" required /></label>
-        <label>{{ t('description') }}<input v-model="importForm.description" /></label>
-        <label>{{ t('harJson') }}<textarea v-model="importForm.har" required rows="14" spellcheck="false" /></label>
-        <div class="modal-actions">
-          <button class="secondary-button" type="button" @click="showImport = false">{{ t('cancel') }}</button>
-          <button class="secondary-button" type="button" :disabled="validating" @click="validateHar">{{ validating ? t('loading') : t('check') }}</button>
-          <button class="primary-button" type="submit">{{ editingTemplateId ? t('save') : t('import') }}</button>
+        <div class="har-meta">
+          <label>{{ t('templateName') }}<input v-model="importForm.name" required placeholder="my-template" /></label>
+          <label>{{ t('description') }}<input v-model="importForm.description" /></label>
         </div>
-      </form>
+        <HarEditor :model-value="harEditorDoc" @save="saveHar" @cancel="showImport = false" />
+      </div>
     </div>
 
     <!-- ===== HELP MODAL ===== -->

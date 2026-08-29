@@ -346,12 +346,12 @@ macro_rules! define_store {
     }
 
     async fn create_with_owner(&self, owner_id: Option<i64>, input: CreateTask) -> Result<Task> {
-        validate(&input.name, &input.cron, &input.url)?;
+        validate(&input.name, &input.cron, &input.url, input.timezone.as_deref())?;
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp, timeout_seconds, retry_count, retry_interval_seconds, priority, timezone, variables)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(input.name)
         .bind(input.cron)
@@ -365,6 +365,12 @@ macro_rules! define_store {
         .bind(owner_id)
         .bind(input.template_id)
         .bind(input.grp.as_deref())
+        .bind(input.timeout_seconds)
+        .bind(input.retry_count)
+        .bind(input.retry_interval_seconds)
+        .bind(input.priority.unwrap_or(0))
+        .bind(input.timezone.as_deref())
+        .bind(input.variables.map(|v| v.to_string()))
         .execute(&mut *conn)
         .await?;
         let id = self.last_insert_id(&mut conn).await?;
@@ -454,7 +460,7 @@ macro_rules! define_store {
         let name = input.name.unwrap_or(current.name);
         let cron = input.cron.unwrap_or(current.cron);
         let url = input.url.unwrap_or(current.url);
-        validate(&name, &cron, &url)?;
+        validate(&name, &cron, &url, input.timezone.as_ref().and_then(|tz| tz.as_deref()))?;
         let headers = input
             .headers
             .map(serde_json::Value::Object)
@@ -464,7 +470,7 @@ macro_rules! define_store {
             None => current.grp,
         };
         sqlx::query(
-            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, timeout_seconds=?, retry_count=?, retry_interval_seconds=?, priority=?, timezone=?, variables=?, updated_at=? WHERE id=?",
         )
         .bind(name)
         .bind(cron)
@@ -475,6 +481,15 @@ macro_rules! define_store {
         .bind(input.disabled.unwrap_or(current.disabled))
         .bind(input.template_id.or(current.template_id))
         .bind(grp.as_deref())
+        .bind(merge_optional(input.timeout_seconds, current.timeout_seconds))
+        .bind(merge_optional(input.retry_count, current.retry_count))
+        .bind(merge_optional(input.retry_interval_seconds, current.retry_interval_seconds))
+        .bind(merge_optional(input.priority, current.priority).unwrap_or(0))
+        .bind(merge_optional(input.timezone, current.timezone).as_deref())
+        .bind(
+            merge_optional(input.variables, current.variables)
+                .map(|v| v.to_string()),
+        )
         .bind(Utc::now().timestamp())
         .bind(id)
         .execute(&self.pool)
@@ -559,12 +574,63 @@ macro_rules! define_store {
         self.get_run(id).await
     }
 
+    /// Schedule a delayed retry for a failed run. `retry_of` tracks the original
+    /// run so the retry chain can be counted; `run_after` delays the claim.
+    /// The one-active-run-per-task guard is preserved (skips if a new run is
+    /// already active).
+    pub async fn schedule_retry(&self, task_id: i64, retry_of: i64, delay_seconds: i64) -> Result<Option<Run>> {
+        let now = Utc::now().timestamp();
+        let run_after = now + delay_seconds.max(1);
+        let mut conn = self.pool.acquire().await?;
+        let result = sqlx::query(
+            "INSERT INTO runs(task_id,status,created_at,run_after,retry_of,attempt)
+             SELECT ?, 'pending', ?, ?, ?, 0
+             WHERE NOT EXISTS (
+                SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
+             )",
+        )
+        .bind(task_id)
+        .bind(now)
+        .bind(run_after)
+        .bind(retry_of)
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        self.get_run(id).await
+    }
+
+    /// Number of retries already scheduled for a retry chain (runs whose
+    /// retry_of points at the original run).
+    pub async fn count_retries(&self, original_run_id: i64) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS count FROM runs WHERE retry_of=?")
+            .bind(original_run_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>("count")?)
+    }
+
     pub async fn claim_run(&self, worker: &str, lease_seconds: i64) -> Result<Option<Run>> {
         let now = Utc::now().timestamp();
         let expires = now + lease_seconds.max(1);
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT id FROM runs WHERE (status='pending' OR (status IN ('leased','running') AND lease_expires_at<=?)) AND cancel_requested=0 ORDER BY created_at,id LIMIT 1")
-            .bind(now).fetch_optional(&mut *tx).await?;
+        // Claim pending runs (or expired leases). Delayed retry runs (run_after)
+        // become claimable once their delay elapses; higher task priority claims
+        // first.
+        let row = sqlx::query(
+            "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task_id \
+             WHERE r.cancel_requested=0 AND (r.status='pending' OR (r.status IN ('leased','running') AND r.lease_expires_at<=?)) \
+             AND (r.run_after IS NULL OR r.run_after<=?) \
+             ORDER BY COALESCE(t.priority,0) DESC, r.created_at, r.id LIMIT 1",
+        )
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(row) = row else {
             tx.rollback().await?;
             return Ok(None);
@@ -1450,7 +1516,7 @@ macro_rules! define_store {
     // ---- Site settings ----
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<SiteSetting>> {
-        let row = sqlx::query("SELECT key,value,updated_at FROM site_settings WHERE key=?")
+        let row = sqlx::query("SELECT `key`,value,updated_at FROM site_settings WHERE `key`=?")
             .bind(key)
             .fetch_optional(&self.pool)
             .await?;
@@ -1460,7 +1526,7 @@ macro_rules! define_store {
     pub async fn set_setting(&self, key: &str, input: &SetSiteSetting) -> Result<SiteSetting> {
         sqlx::query(
             &format!(
-                "INSERT INTO site_settings(key,value,updated_at) VALUES(?,?,?) {}",
+                "INSERT INTO site_settings(`key`,value,updated_at) VALUES(?,?,?) {}",
                 $setting_upsert
             )
         )
@@ -1473,7 +1539,7 @@ macro_rules! define_store {
     }
 
     pub async fn list_settings(&self) -> Result<Vec<SiteSetting>> {
-        let rows = sqlx::query("SELECT key,value,updated_at FROM site_settings ORDER BY key")
+        let rows = sqlx::query("SELECT `key`,value,updated_at FROM site_settings ORDER BY `key`")
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(setting_from_row).collect()
@@ -2145,9 +2211,9 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
     })
 }
 
-const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp FROM tasks";
+const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
-const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested FROM runs";
+const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -2181,6 +2247,7 @@ fn authenticated_session_from_row(row: &$row) -> Result<AuthenticatedSession> {
 
 fn task_from_row(row: $row) -> Result<Task> {
     let headers: String = row.try_get("headers")?;
+    let variables: Option<String> = row.try_get("variables")?;
     Ok(Task {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
@@ -2197,6 +2264,14 @@ fn task_from_row(row: $row) -> Result<Task> {
         last_error: row.try_get("last_error")?,
         template_id: row.try_get("template_id")?,
         grp: row.try_get("grp")?,
+        timeout_seconds: row.try_get("timeout_seconds")?,
+        retry_count: row.try_get("retry_count")?,
+        retry_interval_seconds: row.try_get("retry_interval_seconds")?,
+        priority: row.try_get("priority")?,
+        timezone: row.try_get("timezone")?,
+        variables: variables
+            .map(|v| serde_json::from_str(&v).context("invalid task variables in database"))
+            .transpose()?,
     })
 }
 
@@ -2263,6 +2338,8 @@ fn run_from_row(row: $row) -> Result<Run> {
         lease_expires_at: row.try_get("lease_expires_at")?,
         attempt: row.try_get("attempt")?,
         cancel_requested: row.try_get("cancel_requested")?,
+        run_after: row.try_get("run_after")?,
+        retry_of: row.try_get("retry_of")?,
     })
 }
 
@@ -2372,7 +2449,7 @@ define_store!(
     mysql_options,
     &MYSQL_MIGRATOR,
     MySqlRow,
-    "SELECT LAST_INSERT_ID()",
+    "SELECT CAST(LAST_INSERT_ID() AS SIGNED)",
     mysql_username_cmp,
     "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
     no_parent_check
@@ -2479,6 +2556,8 @@ impl Store {
         pub async fn record_run(id: i64, status: Option<u16>, error: Option<&str>) -> Result<()> { id, status, error };
         pub async fn start_run(task_id: i64) -> Result<Run> { task_id };
         pub async fn enqueue_run(task_id: i64) -> Result<Option<Run>> { task_id };
+        pub async fn schedule_retry(task_id: i64, retry_of: i64, delay_seconds: i64) -> Result<Option<Run>> { task_id, retry_of, delay_seconds };
+        pub async fn count_retries(original_run_id: i64) -> Result<i64> { original_run_id };
         pub async fn claim_run(worker: &str, lease_seconds: i64) -> Result<Option<Run>> { worker, lease_seconds };
         pub async fn start_leased_run(run_id: i64, worker: &str) -> Result<bool> { run_id, worker };
         pub async fn renew_run(run_id: i64, worker: &str, lease_seconds: i64) -> Result<bool> { run_id, worker, lease_seconds };
@@ -2604,7 +2683,13 @@ fn validate_notification(name: &str, kind: &str, config: &serde_json::Value) -> 
     Ok(())
 }
 
-fn validate(name: &str, schedule: &str, url: &str) -> Result<()> {
+/// Merge an optional update (`Some(v)` = set, `None` = leave unchanged) into
+/// the current value. `v` itself may be `None` to clear the field.
+fn merge_optional<T>(input: Option<Option<T>>, current: Option<T>) -> Option<T> {
+    input.unwrap_or(current)
+}
+
+fn validate(name: &str, schedule: &str, url: &str, timezone: Option<&str>) -> Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("name cannot be empty"));
     }
@@ -2612,6 +2697,11 @@ fn validate(name: &str, schedule: &str, url: &str) -> Result<()> {
         .parse::<cron::Schedule>()
         .context("invalid cron expression")?;
     reqwest::Url::parse(url).context("invalid task URL")?;
+    if let Some(timezone) = timezone.filter(|tz| !tz.trim().is_empty()) {
+        timezone
+            .parse::<chrono_tz::Tz>()
+            .context("invalid timezone")?;
+    }
     Ok(())
 }
 
@@ -2669,6 +2759,12 @@ mod tests {
             disabled: false,
             template_id: None,
             grp: None,
+            timeout_seconds: None,
+            retry_count: None,
+            retry_interval_seconds: None,
+            priority: None,
+            timezone: None,
+            variables: None,
         }
     }
 
@@ -2710,6 +2806,12 @@ mod tests {
                     disabled: Some(true),
                     template_id: None,
                     grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    variables: None,
                 },
             )
             .await
@@ -2787,6 +2889,12 @@ mod tests {
                         disabled: None,
                         template_id: None,
                         grp: None,
+                        timeout_seconds: None,
+                        retry_count: None,
+                        retry_interval_seconds: None,
+                        priority: None,
+                        timezone: None,
+                        variables: None,
                     },
                 )
                 .await
@@ -3408,6 +3516,12 @@ mod tests {
                 disabled: false,
                 template_id: None,
                 grp: None,
+                timeout_seconds: None,
+                retry_count: None,
+                retry_interval_seconds: None,
+                priority: None,
+                timezone: None,
+                variables: None,
             })
             .await
             .unwrap();
@@ -3640,6 +3754,12 @@ mod tests {
                     disabled: false,
                     template_id: None,
                     grp: Some("prod".into()),
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    variables: None,
                 },
             )
             .await

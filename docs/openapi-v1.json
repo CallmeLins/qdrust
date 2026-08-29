@@ -1915,6 +1915,49 @@
               "null"
             ],
             "default": null
+          },
+          "timeout_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Per-request timeout in seconds (overrides the global request timeout)"
+          },
+          "retry_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Retry count after a failed run: 0 = never, -1 = always, N = up to N retries"
+          },
+          "retry_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Delay before each retry, in seconds (default 60)"
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Scheduling priority (higher claims runs first)"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IANA timezone name used for cron scheduling (default UTC)"
+          },
+          "variables": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "Seed variables rendered into URLs, headers, bodies and template tasks"
           }
         }
       },
@@ -1978,6 +2021,44 @@
               "null"
             ],
             "description": "Set to a string to change group, null to clear it, omit to leave unchanged"
+          },
+          "timeout_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Set to a number to change, null to clear, omit to leave unchanged"
+          },
+          "retry_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_interval_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "variables": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
           }
         }
       },
@@ -2122,6 +2203,22 @@
           },
           "cancel_requested": {
             "type": "boolean"
+          },
+          "run_after": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Earliest claim time for delayed (retry) runs; null means immediately claimable"
+          },
+          "retry_of": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "For retry runs: id of the first (original) run of the retry chain"
           }
         }
       },

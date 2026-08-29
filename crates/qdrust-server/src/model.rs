@@ -69,6 +69,24 @@ pub struct CreateTask {
     pub template_id: Option<i64>,
     #[serde(default)]
     pub grp: Option<String>,
+    /// Per-request timeout in seconds (overrides the global request timeout).
+    #[serde(default)]
+    pub timeout_seconds: Option<i64>,
+    /// Retry count after a failed run: 0 = never, -1 = always, N = up to N retries.
+    #[serde(default)]
+    pub retry_count: Option<i64>,
+    /// Delay before each retry, in seconds (default 60).
+    #[serde(default)]
+    pub retry_interval_seconds: Option<i64>,
+    /// Scheduling priority (higher claims runs first).
+    #[serde(default)]
+    pub priority: Option<i64>,
+    /// IANA timezone name used for cron scheduling (default UTC).
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// Seed variables rendered into URLs, headers, bodies and template tasks.
+    #[serde(default)]
+    pub variables: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -82,6 +100,12 @@ pub struct UpdateTask {
     pub disabled: Option<bool>,
     pub template_id: Option<i64>,
     pub grp: Option<Option<String>>,
+    pub timeout_seconds: Option<Option<i64>>,
+    pub retry_count: Option<Option<i64>>,
+    pub retry_interval_seconds: Option<Option<i64>>,
+    pub priority: Option<Option<i64>>,
+    pub timezone: Option<Option<String>>,
+    pub variables: Option<Option<serde_json::Value>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,6 +126,18 @@ pub struct Task {
     pub template_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_interval_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variables: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -305,6 +341,12 @@ pub struct Run {
     pub lease_expires_at: Option<i64>,
     pub attempt: i64,
     pub cancel_requested: bool,
+    /// Earliest claim time for delayed (retry) runs; NULL means immediately claimable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_after: Option<i64>,
+    /// For retry runs: id of the first (original) run of the retry chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_of: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

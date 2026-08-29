@@ -971,6 +971,20 @@ export interface components {
             template_id?: number | null;
             /** @default null */
             grp: string | null;
+            /** @description Per-request timeout in seconds (overrides the global request timeout) */
+            timeout_seconds?: number | null;
+            /** @description Retry count after a failed run: 0 = never, -1 = always, N = up to N retries */
+            retry_count?: number | null;
+            /** @description Delay before each retry, in seconds (default 60) */
+            retry_interval_seconds?: number | null;
+            /** @description Scheduling priority (higher claims runs first) */
+            priority?: number | null;
+            /** @description IANA timezone name used for cron scheduling (default UTC) */
+            timezone?: string | null;
+            /** @description Seed variables rendered into URLs, headers, bodies and template tasks */
+            variables?: {
+                [key: string]: unknown;
+            } | null;
         };
         UpdateTask: {
             name?: string | null;
@@ -987,6 +1001,15 @@ export interface components {
             template_id?: number | null;
             /** @description Set to a string to change group, null to clear it, omit to leave unchanged */
             grp?: string | null;
+            /** @description Set to a number to change, null to clear, omit to leave unchanged */
+            timeout_seconds?: number | null;
+            retry_count?: number | null;
+            retry_interval_seconds?: number | null;
+            priority?: number | null;
+            timezone?: string | null;
+            variables?: {
+                [key: string]: unknown;
+            } | null;
         };
         Task: components["schemas"]["CreateTask"] & {
             /** Format: int64 */
@@ -1023,6 +1046,16 @@ export interface components {
             /** Format: int64 */
             attempt: number;
             cancel_requested: boolean;
+            /**
+             * Format: int64
+             * @description Earliest claim time for delayed (retry) runs; null means immediately claimable
+             */
+            run_after?: number | null;
+            /**
+             * Format: int64
+             * @description For retry runs: id of the first (original) run of the retry chain
+             */
+            retry_of?: number | null;
         };
         Note: {
             /** Format: int64 */

@@ -698,6 +698,15 @@ impl QdExpressionEngine {
         serde_json::to_value(value).context("cannot convert QD expression result")
     }
 
+    /// Render a template string with the full QD function/filter set. Used by
+    /// the server for non-template tasks so `{{ var }}` and qd functions such
+    /// as `{{ md5(x) }}` work in plain task URLs, headers and bodies too.
+    pub fn render(&self, template: &str, variables: &BTreeMap<String, Value>) -> Result<String> {
+        self.environment
+            .render_str(template, variables)
+            .context("cannot render QD template value")
+    }
+
     pub fn evaluate_bool(
         &self,
         expression: &str,

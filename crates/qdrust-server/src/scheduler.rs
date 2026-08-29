@@ -170,14 +170,40 @@ fn due(task: &Task, interval: Duration) -> bool {
     let Ok(schedule) = Schedule::from_str(&task.cron) else {
         return false;
     };
+    let tz: chrono_tz::Tz = task
+        .timezone
+        .as_deref()
+        .and_then(|tz| tz.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    let now = Utc::now().with_timezone(&tz);
     let since = Utc
         .timestamp_opt(task.last_run_at.unwrap_or(0), 0)
         .single()
-        .unwrap_or(Utc::now() - interval);
+        .unwrap_or(Utc::now() - interval)
+        .with_timezone(&tz);
     schedule
         .after(&since)
         .next()
-        .is_some_and(|next| next <= Utc::now())
+        .is_some_and(|next| next <= now)
+}
+
+/// Flatten a task's stored variables object into the BTreeMap the executor
+/// expects. Scalar values (string/number/bool) are kept; null and composite
+/// values are skipped so a broken variable never fails the whole run.
+fn task_variables(task: &Task) -> BTreeMap<String, Value> {
+    let mut variables = BTreeMap::new();
+    if let Some(Value::Object(map)) = task.variables.as_ref() {
+        for (name, value) in map {
+            if let Value::String(s) = value {
+                variables.insert(name.clone(), Value::String(s.clone()));
+            } else if let Value::Number(n) = value {
+                variables.insert(name.clone(), Value::String(n.to_string()));
+            } else if let Value::Bool(b) = value {
+                variables.insert(name.clone(), Value::String(b.to_string()));
+            }
+        }
+    }
+    variables
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,6 +217,9 @@ async fn execute_with_run(
     email: &EmailClient,
 ) {
     let result = async {
+        let variables = task_variables(&task);
+        let request_timeout =
+            Duration::from_secs(task.timeout_seconds.filter(|v| *v > 0).unwrap_or(30) as u64);
         if let Some(template_id) = task.template_id {
             let template = store
                 .get_template(template_id)
@@ -202,7 +231,9 @@ async fn execute_with_run(
             let cancellation = CancellationToken::new();
             let supervisor =
                 spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());
-            let steps = execute_template(template.clone(), &cancellation).await;
+            let steps =
+                execute_template(template.clone(), &cancellation, &variables, request_timeout)
+                    .await;
             supervisor.abort();
             let steps = steps?;
             let now = Utc::now().timestamp();
@@ -236,16 +267,20 @@ async fn execute_with_run(
             return Ok::<_, anyhow::Error>(steps.last().map(|step| step.status).unwrap_or(204));
         }
         let method = Method::from_bytes(task.method.as_bytes())?;
-        let mut request = client.request(method, &task.url);
+        let mut request = client
+            .request(method, &render_plain(&task.url, &variables)?)
+            .timeout(request_timeout);
         if let Some(headers) = task.headers.as_object() {
             for (name, value) in headers {
                 if let Some(value) = value.as_str() {
-                    request = request.header(name, value);
+                    let rendered =
+                        render_plain(value, &variables).unwrap_or_else(|_| value.to_string());
+                    request = request.header(name, rendered);
                 }
             }
         }
         if let Some(body) = &task.body {
-            request = request.body(body.clone());
+            request = request.body(render_plain(body, &variables).unwrap_or_else(|_| body.clone()));
         }
         Ok::<_, anyhow::Error>(request.send().await?.status().as_u16())
     }
@@ -326,6 +361,29 @@ async fn execute_with_run(
                 email,
             )
             .await;
+            // Retry scheduling: enqueue a delayed retry when the task asks for
+            // it and the retry chain has not exceeded retry_count (-1 = always).
+            let retry_count = task.retry_count.unwrap_or(0);
+            if retry_count != 0 {
+                let original = run.retry_of.unwrap_or(run.id);
+                let done = store.count_retries(original).await.unwrap_or(0);
+                let allowed = retry_count == -1 || done < retry_count;
+                if allowed {
+                    let delay = task.retry_interval_seconds.filter(|v| *v > 0).unwrap_or(60);
+                    match store.schedule_retry(task.id, original, delay).await {
+                        Ok(Some(retry)) => {
+                            info!(
+                                task_id = task.id,
+                                retry_run = retry.id,
+                                delay,
+                                "scheduled retry"
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(err) => error!(%err, task_id = task.id, "cannot schedule retry"),
+                    }
+                }
+            }
         }
     }
 }
@@ -498,12 +556,24 @@ fn truncate_name(name: &str, max: usize) -> String {
     bounded
 }
 
+/// Render a plain task field (URL / header / body) with the task's seed
+/// variables and the full QD function set. Unrenderable text is passed through
+/// verbatim so a stray `{{` never breaks a working task.
+fn render_plain(source: &str, variables: &BTreeMap<String, Value>) -> anyhow::Result<String> {
+    if !source.contains("{{") {
+        return Ok(source.to_string());
+    }
+    qdrust_core::expression::QdExpressionEngine::default().render(source, variables)
+}
+
 async fn execute_template(
     template: Template,
     cancellation: &CancellationToken,
+    variables: &BTreeMap<String, Value>,
+    request_timeout: Duration,
 ) -> anyhow::Result<Vec<StepResult>> {
-    let executor = QdExecutor::new(Duration::from_secs(30))?;
-    let mut context = ExecutionContext::new(BTreeMap::new());
+    let executor = QdExecutor::new(request_timeout)?;
+    let mut context = ExecutionContext::new(variables.clone());
     match template.source_format.as_str() {
         "qd_har" => {
             let har = QdHar::parse(
@@ -564,9 +634,14 @@ mod tests {
             updated_at: 0,
             grp: None,
         };
-        let results = execute_template(template, &CancellationToken::new())
-            .await
-            .unwrap();
+        let results = execute_template(
+            template,
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, 200);
     }
