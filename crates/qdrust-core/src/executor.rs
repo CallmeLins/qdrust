@@ -744,10 +744,20 @@ fn merge_form_into_query(url: &str, body: &str) -> String {
     }
     let mut merged = url.to_string();
     for (index, (name, value)) in pairs.iter().enumerate() {
-        merged.push(if index == 0 && !url.contains('?') { '?' } else { '&' });
-        merged.push_str(&percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC).to_string());
+        merged.push(if index == 0 && !url.contains('?') {
+            '?'
+        } else {
+            '&'
+        });
+        merged.push_str(
+            &percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        );
         merged.push('=');
-        merged.push_str(&percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string());
+        merged.push_str(
+            &percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        );
     }
     merged
 }
