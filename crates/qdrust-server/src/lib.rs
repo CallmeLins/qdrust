@@ -4,6 +4,7 @@ pub mod config;
 pub mod email;
 pub mod ga;
 pub mod model;
+pub mod push_channels;
 pub mod redis_cache;
 pub mod scheduler;
 pub mod store;

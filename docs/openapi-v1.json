@@ -2251,7 +2251,15 @@
             "type": "string",
             "enum": [
               "webhook",
-              "email"
+              "email",
+              "bark",
+              "serverchan",
+              "telegram",
+              "dingtalk",
+              "wxpusher",
+              "wxpusher_spt",
+              "wecom_app",
+              "wecom_webhook"
             ]
           },
           "config": {
@@ -2286,7 +2294,15 @@
             "type": "string",
             "enum": [
               "webhook",
-              "email"
+              "email",
+              "bark",
+              "serverchan",
+              "telegram",
+              "dingtalk",
+              "wxpusher",
+              "wxpusher_spt",
+              "wecom_app",
+              "wecom_webhook"
             ]
           },
           "config": {

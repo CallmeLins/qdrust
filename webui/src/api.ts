@@ -106,7 +106,7 @@ export const api = {
 
   // ---- notifications ----
   notificationChannels: () => request<NotificationChannel[]>("/api/v1/notification-channels"),
-  createNotificationChannel: (name: string, kind: "webhook" | "email", config: Record<string, unknown>) => request<NotificationChannel>("/api/v1/notification-channels", { method: "POST", body: JSON.stringify({ name, kind, config, enabled: true }) }),
+  createNotificationChannel: (name: string, kind: NotificationChannel["kind"], config: Record<string, unknown>) => request<NotificationChannel>("/api/v1/notification-channels", { method: "POST", body: JSON.stringify({ name, kind, config, enabled: true }) }),
   updateNotificationChannel: (id: number, enabled: boolean) => request<NotificationChannel>(`/api/v1/notification-channels/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
   deleteNotificationChannel: (id: number) => request<void>(`/api/v1/notification-channels/${id}`, { method: "DELETE" }),
   notificationActions: (taskId: number) => request<NotificationAction[]>(`/api/v1/tasks/${taskId}/notification-actions`),

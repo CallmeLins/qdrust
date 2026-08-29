@@ -432,6 +432,18 @@ async fn send_notifications(
         }
     };
     let payload = serde_json::json!({ "event": event, "task_id": task.id, "task_name": task.name, "run_id": run_id, "http_status": http_status, "error": error_message });
+    let status_word = if event == "success" { "succeeded" } else { "failed" };
+    let title = format!("[qdrust] Task \"{}\" {status_word}", task.name);
+    let body = format!(
+        "Task: {}\nEvent: {}\nRun: #{}\nHTTP status: {}\nError: {}\n",
+        task.name,
+        event,
+        run_id,
+        http_status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".into()),
+        error_message.unwrap_or("-"),
+    );
     for channel in channels {
         match channel.kind.as_str() {
             "webhook" => {
@@ -458,29 +470,18 @@ async fn send_notifications(
                     continue;
                 };
                 let from = channel.config.get("from").and_then(|v| v.as_str());
-                let subject = format!(
-                    "[qdrust] Task \"{}\" {}",
-                    task.name,
-                    if event == "success" {
-                        "succeeded"
-                    } else {
-                        "failed"
-                    }
-                );
-                let body = format!(
-                    "Task: {}\nEvent: {}\nRun: #{}\nHTTP status: {}\nError: {}\n",
-                    task.name,
-                    event,
-                    run_id,
-                    http_status
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    error_message.unwrap_or("-"),
-                );
-                if let Err(err) = email.send(&to, from, &subject, &body) {
+                if let Err(err) = email.send(&to, from, &title, &body) {
                     error!(task_id=task.id, channel_id=channel.id, %err, "email notification failed");
                 } else {
                     info!(task_id=task.id, channel_id=channel.id, %to, "email notification sent");
+                }
+            }
+            other if crate::push_channels::is_push_channel(other) => {
+                match crate::push_channels::push_to_channel(client, other, &channel.config, &title, &body)
+                    .await
+                {
+                    Ok(()) => info!(task_id=task.id, channel_id=channel.id, kind=other, "push notification sent"),
+                    Err(err) => error!(task_id=task.id, channel_id=channel.id, kind=other, %err, "push notification failed"),
                 }
             }
             other => {

@@ -1069,7 +1069,7 @@ export interface components {
             id: number;
             name: string;
             /** @enum {string} */
-            kind: "webhook" | "email";
+            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook";
             config: {
                 [key: string]: unknown;
             };
@@ -1082,7 +1082,7 @@ export interface components {
         CreateNotificationChannel: {
             name: string;
             /** @enum {string} */
-            kind: "webhook" | "email";
+            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook";
             config: {
                 [key: string]: unknown;
             };

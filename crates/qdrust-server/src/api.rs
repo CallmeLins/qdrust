@@ -862,6 +862,24 @@ async fn create_notification_channel(
     ApiJson(input): ApiJson<CreateNotificationChannel>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
+    const CHANNEL_KINDS: [&str; 10] = [
+        "webhook",
+        "email",
+        "bark",
+        "serverchan",
+        "telegram",
+        "dingtalk",
+        "wxpusher",
+        "wxpusher_spt",
+        "wecom_app",
+        "wecom_webhook",
+    ];
+    if !CHANNEL_KINDS.contains(&input.kind.as_str()) {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "unsupported notification channel kind: {}",
+            input.kind
+        )));
+    }
     let channel = store
         .create_notification_channel(session.user.id, input)
         .await

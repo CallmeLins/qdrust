@@ -535,8 +535,39 @@ async function invokePlugin(plugin: Plugin) {
 // ---------- notifications ----------
 const channels = ref<NotificationChannel[]>([]);
 const actions = ref<NotificationAction[]>([]);
-const channelForm = reactive({ name: "", kind: "webhook" as "webhook" | "email", url: "", to: "", subject: "" });
+const channelForm = reactive({
+  name: "", kind: "webhook" as NotificationChannel["kind"],
+  url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "",
+  dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "",
+  secret: "", toUser: "", wecomKey: "", to: "", subject: "",
+});
 const actionForm = reactive({ taskId: 0, channelId: 0, event: "failure" });
+const channelKindLabels: Record<NotificationChannel["kind"], string> = {
+  webhook: t("webhookKind"), email: t("emailKind"), bark: t("barkKind"),
+  serverchan: t("serverchanKind"), telegram: t("telegramKind"), dingtalk: t("dingtalkKind"),
+  wxpusher: t("wxpusherKind"), wxpusher_spt: t("wxpusherSptKind"),
+  wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"),
+};
+function channelKindLabel(kind: string): string {
+  return channelKindLabels[kind as NotificationChannel["kind"]] ?? kind;
+}
+function buildChannelConfig(): Record<string, unknown> {
+  const f = channelForm;
+  const trim = (value: string) => value.trim();
+  const optional = (value: string) => trim(value) || undefined;
+  switch (f.kind) {
+    case "webhook": return { url: trim(f.url) };
+    case "email": return { to: trim(f.to), ...(optional(f.subject) ? { subject: trim(f.subject) } : {}) };
+    case "bark": return { url: trim(f.url), ...(optional(f.sound) ? { sound: trim(f.sound) } : {}), ...(optional(f.group) ? { group: trim(f.group) } : {}) };
+    case "serverchan": return { sendkey: trim(f.sendkey) };
+    case "telegram": return { token: trim(f.tgToken), chat_id: trim(f.tgChatId), ...(optional(f.tgHost) ? { host: trim(f.tgHost) } : {}) };
+    case "dingtalk": return { access_token: trim(f.dingToken) };
+    case "wxpusher": return { app_token: trim(f.wxToken), uid: trim(f.wxUid) };
+    case "wxpusher_spt": return { spt: trim(f.spt) };
+    case "wecom_app": return { corpid: trim(f.corpId), agentid: trim(f.agentId), secret: trim(f.secret), ...(optional(f.toUser) ? { to_user: trim(f.toUser) } : {}) };
+    case "wecom_webhook": return { key: trim(f.wecomKey) };
+  }
+}
 async function openNotifications() {
   view.value = "notifications";
   try {
@@ -548,9 +579,8 @@ async function openNotifications() {
 }
 async function saveChannel() {
   try {
-    const config = channelForm.kind === "webhook" ? { url: channelForm.url } : { to: channelForm.to, ...(channelForm.subject ? { subject: channelForm.subject } : {}) };
-    await api.createNotificationChannel(channelForm.name, channelForm.kind, config);
-    Object.assign(channelForm, { name: "", kind: "webhook", url: "", to: "", subject: "" });
+    await api.createNotificationChannel(channelForm.name, channelForm.kind, buildChannelConfig());
+    Object.assign(channelForm, { name: "", kind: "webhook", url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "", dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "", secret: "", toUser: "", wecomKey: "", to: "", subject: "" });
     await openNotifications();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -1091,21 +1121,61 @@ onMounted(async () => {
               <select v-model="channelForm.kind">
                 <option value="webhook">{{ t('webhookKind') }}</option>
                 <option value="email">{{ t('emailKind') }}</option>
+                <option value="bark">{{ t('barkKind') }}</option>
+                <option value="serverchan">{{ t('serverchanKind') }}</option>
+                <option value="telegram">{{ t('telegramKind') }}</option>
+                <option value="dingtalk">{{ t('dingtalkKind') }}</option>
+                <option value="wxpusher">{{ t('wxpusherKind') }}</option>
+                <option value="wxpusher_spt">{{ t('wxpusherSptKind') }}</option>
+                <option value="wecom_app">{{ t('wecomAppKind') }}</option>
+                <option value="wecom_webhook">{{ t('wecomWebhookKind') }}</option>
               </select>
             </label>
             <template v-if="channelForm.kind === 'webhook'">
               <label>{{ t('webhookUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
             </template>
-            <template v-else>
+            <template v-else-if="channelForm.kind === 'email'">
               <label>{{ t('emailTo') }}<input v-model="channelForm.to" required type="email" /></label>
               <label>{{ t('emailSubject') }}<input v-model="channelForm.subject" /></label>
             </template>
-            <button class="primary-button">{{ channelForm.kind === 'webhook' ? t('createWebhook') : t('createEmailChannel') }}</button>
+            <template v-else-if="channelForm.kind === 'bark'">
+              <label>{{ t('barkUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://api.day.app/yourkey" /></label>
+              <label>{{ t('barkSound') }}<input v-model="channelForm.sound" placeholder="minuet" /></label>
+              <label>{{ t('barkGroup') }}<input v-model="channelForm.group" placeholder="qdrust" /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'serverchan'">
+              <label>{{ t('serverchanKey') }}<input v-model="channelForm.sendkey" required placeholder="SCT..." /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'telegram'">
+              <label>{{ t('telegramToken') }}<input v-model="channelForm.tgToken" required placeholder="123456:ABC-DEF..." /></label>
+              <label>{{ t('telegramChatId') }}<input v-model="channelForm.tgChatId" required placeholder="123456789" /></label>
+              <label>{{ t('telegramHost') }}<input v-model="channelForm.tgHost" placeholder="https://tg.example.com/" /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'dingtalk'">
+              <label>{{ t('dingtalkToken') }}<input v-model="channelForm.dingToken" required /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'wxpusher'">
+              <label>{{ t('wxpusherToken') }}<input v-model="channelForm.wxToken" required /></label>
+              <label>{{ t('wxpusherUid') }}<input v-model="channelForm.wxUid" required /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'wxpusher_spt'">
+              <label>{{ t('wxpusherSpt') }}<input v-model="channelForm.spt" required /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'wecom_app'">
+              <label>{{ t('wecomCorpId') }}<input v-model="channelForm.corpId" required /></label>
+              <label>{{ t('wecomAgentId') }}<input v-model="channelForm.agentId" required /></label>
+              <label>{{ t('wecomSecret') }}<input v-model="channelForm.secret" required /></label>
+              <label>{{ t('wecomToUser') }}<input v-model="channelForm.toUser" placeholder="@all" /></label>
+            </template>
+            <template v-else-if="channelForm.kind === 'wecom_webhook'">
+              <label>{{ t('wecomWebhookKey') }}<input v-model="channelForm.wecomKey" required /></label>
+            </template>
+            <button class="primary-button">{{ t('createChannel') }}</button>
           </form>
           <div v-if="channels.length === 0" class="muted">{{ t('noChannels') }}</div>
           <div v-for="channel in channels" :key="channel.id" class="run-row">
             <strong>{{ channel.name }}</strong>
-            <span class="chip">{{ channel.kind === 'webhook' ? t('webhookKind') : t('emailKind') }}</span>
+            <span class="chip">{{ channelKindLabel(channel.kind) }}</span>
             <button class="secondary-button" @click="toggleChannel(channel)">{{ channel.enabled ? t('disable') : t('enable') }}</button>
             <button class="icon-button" :title="t('deleteChannel')" @click="removeChannel(channel)"><Trash2 :size="16" /></button>
           </div>
