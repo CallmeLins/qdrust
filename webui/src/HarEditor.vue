@@ -907,7 +907,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
      而不是把容器撑开导致区块被裁掉 */
   flex: 1 1 auto;
   min-height: 0;
-  color: #252a26;
+  color: var(--ink-2);
   font-size: 13px;
 }
 
@@ -923,7 +923,8 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   margin: 0;
   font-size: 16px;
   font-weight: 700;
-  color: #242824;
+  color: var(--ink);
+  letter-spacing: -0.2px;
 }
 .har-toolbar-actions {
   display: flex;
@@ -937,7 +938,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   position: relative;
 }
 .ctrl-caret {
-  transition: transform 0.15s ease;
+  transition: transform 0.15s var(--ease);
 }
 .ctrl-caret.open {
   transform: rotate(180deg);
@@ -951,45 +952,48 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   padding: 6px;
   display: grid;
   gap: 2px;
-  background: #fff;
-  border: 1px solid #d9dcd8;
-  border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  background: #151915;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-m);
+  box-shadow: var(--shadow-l);
 }
 .ctrl-item {
   border: 0;
   background: transparent;
   text-align: left;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: #3a403b;
+  color: var(--ink-2);
   padding: 6px 8px;
   border-radius: 5px;
   cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
 }
 .ctrl-item:hover {
-  background: #eef2ea;
-  color: #4f6f44;
+  background: var(--accent-glow);
+  color: var(--accent);
 }
 .ctrl-custom {
   display: flex;
   gap: 6px;
   margin-top: 4px;
   padding-top: 6px;
-  border-top: 1px solid #eceeea;
+  border-top: 1px solid var(--line);
 }
 .ctrl-custom input {
   flex: 1;
   min-width: 0;
   height: 30px;
   padding: 0 8px;
-  border: 1px solid #d9dcd8;
+  border: 1px solid var(--line-strong);
   border-radius: 5px;
   font-size: 12px;
   outline: 0;
+  background: var(--bg-raise);
+  color: var(--ink);
 }
 .ctrl-custom input:focus {
-  border-color: #718169;
+  border-color: rgba(184, 239, 103, 0.55);
 }
 
 /* ---------- 主体布局 ---------- */
@@ -998,7 +1002,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   min-height: 0;
   display: flex;
   gap: 12px;
-  border-top: 1px solid #e4e6e3;
+  border-top: 1px solid var(--line);
   padding-top: 12px;
 }
 
@@ -1008,33 +1012,34 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   min-width: 260px;
   min-height: 0;
   overflow-y: auto;
-  border: 1px solid #e2e5e0;
-  border-radius: 8px;
-  background: #fafbf9;
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  background: var(--surface);
 }
 .har-item {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid #eceeea;
+  border-bottom: 1px solid var(--line);
   cursor: pointer;
+  transition: background var(--t-fast);
 }
 .har-item:last-child {
   border-bottom: 0;
 }
 .har-item:hover {
-  background: #f1f3ef;
+  background: var(--surface-strong);
 }
 .har-item.selected {
-  background: #e9efe4;
-  box-shadow: inset 3px 0 0 #5a7a4f;
+  background: var(--accent-glow);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .har-item input[type="checkbox"] {
   width: 15px;
   height: 15px;
   flex: none;
-  accent-color: #5a7a4f;
+  accent-color: var(--accent);
 }
 .method-badge {
   flex: none;
@@ -1043,32 +1048,40 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0.4px;
-  border-radius: 4px;
+  border-radius: 5px;
   padding: 2px 5px;
+  font-family: var(--font-mono);
+  border: 1px solid transparent;
 }
 .method-badge.get {
-  color: #1d7a3e;
-  background: #e3f3e8;
+  color: var(--ok);
+  background: rgba(159, 232, 112, 0.1);
+  border-color: rgba(159, 232, 112, 0.24);
 }
 .method-badge.post {
-  color: #1c5aa8;
-  background: #e4eefb;
+  color: var(--info);
+  background: rgba(125, 216, 255, 0.1);
+  border-color: rgba(125, 216, 255, 0.24);
 }
 .method-badge.put {
-  color: #96610e;
-  background: #faf0d7;
+  color: var(--warn);
+  background: rgba(255, 200, 97, 0.1);
+  border-color: rgba(255, 200, 97, 0.24);
 }
 .method-badge.del {
-  color: #b03a2e;
-  background: #fbe7e4;
+  color: var(--bad);
+  background: rgba(255, 115, 105, 0.1);
+  border-color: rgba(255, 115, 105, 0.24);
 }
 .method-badge.other {
-  color: #5b615c;
-  background: #eceeec;
+  color: var(--ink-2);
+  background: var(--surface-strong);
+  border-color: var(--line-strong);
 }
 .method-badge.ctrl {
-  color: #6d3fb5;
-  background: #efe8fb;
+  color: var(--violet);
+  background: rgba(195, 155, 255, 0.1);
+  border-color: rgba(195, 155, 255, 0.24);
 }
 .har-url-wrap {
   flex: 1;
@@ -1079,26 +1092,26 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 }
 .har-url {
   min-width: 0;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
-  color: #3a403b;
+  color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .har-comment {
   font-size: 11px;
-  color: #8f968f;
+  color: var(--ink-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .har-url.ctrl {
-  color: #7c4fd0;
+  color: var(--violet);
   font-weight: 600;
 }
 .har-url.empty {
-  color: #9aa09b;
+  color: var(--ink-3);
   font-style: italic;
 }
 .har-item-actions {
@@ -1116,17 +1129,17 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   cursor: not-allowed;
 }
 .icon-button.danger {
-  color: #a0564f;
+  color: var(--bad);
 }
 .icon-button.danger:hover {
-  border-color: #e5c4c1;
-  background: #fdf3f1;
-  color: #a33a33;
+  border-color: rgba(255, 115, 105, 0.4);
+  background: rgba(255, 115, 105, 0.08);
+  color: var(--bad);
 }
 .har-empty-list {
   padding: 18px;
   text-align: center;
-  color: #9aa09b;
+  color: var(--ink-3);
   font-size: 12px;
 }
 
@@ -1136,18 +1149,18 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  border: 1px solid #e2e5e0;
-  border-radius: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 14px;
-  background: #fff;
+  background: var(--surface);
 }
 .har-empty-detail {
   display: grid;
   place-content: center;
-  color: #9aa09b;
+  color: var(--ink-3);
   font-size: 12px;
   text-align: center;
 }
@@ -1161,31 +1174,31 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   width: 130px;
   height: 34px;
   padding: 0 10px;
-  border: 1px solid #d2d6d1;
+  border: 1px solid var(--line-strong);
   border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 700;
   outline: 0;
-  background: #fff;
-  color: #252a26;
+  background: var(--bg-raise);
+  color: var(--ink);
 }
 .method-input:focus {
-  border-color: #718169;
-  box-shadow: 0 0 0 3px #7181691a;
+  border-color: rgba(184, 239, 103, 0.55);
+  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .chk {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 13px;
-  color: #3a403b;
+  color: var(--ink-2);
   cursor: pointer;
 }
 .chk input {
   width: 15px;
   height: 15px;
-  accent-color: #5a7a4f;
+  accent-color: var(--accent);
 }
 .detail-spacer {
   flex: 1;
@@ -1196,24 +1209,25 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   display: grid;
   gap: 6px;
   font-size: 12px;
-  font-weight: 650;
-  color: #4d534e;
+  font-weight: 600;
+  color: var(--ink-2);
 }
 .field textarea,
 .field input,
 .field select {
   width: 100%;
-  border: 1px solid #d2d6d1;
+  border: 1px solid var(--line-strong);
   border-radius: 6px;
   outline: 0;
-  background: #fff;
-  color: #252a26;
+  background: var(--bg-raise);
+  color: var(--ink);
   font-size: 13px;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
 .field textarea {
   padding: 8px 10px;
   resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-family: var(--font-mono);
   line-height: 1.45;
 }
 .field input,
@@ -1224,73 +1238,79 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .field input:focus,
 .field textarea:focus,
 .field select:focus {
-  border-color: #718169;
-  box-shadow: 0 0 0 3px #7181691a;
+  border-color: rgba(184, 239, 103, 0.55);
+  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .field textarea::placeholder {
-  color: #a8ada7;
+  color: var(--ink-3);
 }
 
 /* ---------- 可折叠分区 ---------- */
 .sec {
-  border: 1px solid #e6e8e4;
-  border-radius: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
   overflow: hidden;
   /* 关键：.sec 自身 overflow:hidden，flex 默认允许把它压缩到任意高度并裁掉内容；
      必须 flex-shrink:0 保持自然高度，超出部分由 .har-detail 的滚动条处理 */
   flex-shrink: 0;
+  background: var(--surface);
 }
 .sec-head {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 9px 12px;
-  background: #f7f8f6;
+  background: rgba(255, 255, 255, 0.03);
   cursor: pointer;
   user-select: none;
+  transition: background var(--t-fast);
+}
+.sec-head:hover {
+  background: var(--surface-strong);
 }
 .sec-head h4 {
   margin: 0;
   flex: 1;
   font-size: 13px;
   font-weight: 700;
-  color: #3a403b;
+  color: var(--ink);
 }
 .sec-head .chev {
-  color: #7c837d;
-  transition: transform 0.15s ease;
+  color: var(--ink-3);
+  transition: transform 0.15s var(--ease);
 }
 .sec-head .chev.closed {
   transform: rotate(-90deg);
 }
 .sec-note {
   font-size: 11px;
-  color: #9aa09b;
+  color: var(--ink-3);
   font-weight: 600;
 }
 .add-mini {
   border: 0;
   background: transparent;
-  color: #4f6f44;
+  color: var(--accent);
   font-size: 12px;
   font-weight: 650;
   cursor: pointer;
   padding: 4px 7px;
   border-radius: 5px;
   white-space: nowrap;
+  transition: background var(--t-fast);
 }
 .add-mini:hover {
-  background: #e6efe1;
+  background: var(--accent-glow);
 }
 .sec-body {
   padding: 10px 12px;
   display: grid;
   gap: 8px;
-  border-top: 1px solid #eceeea;
+  border-top: 1px solid var(--line);
 }
 .sec-hint {
   font-size: 12px;
-  color: #9aa09b;
+  color: var(--ink-3);
 }
 .rows {
   display: grid;
@@ -1310,34 +1330,35 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .kv-row input {
   height: 30px;
   padding: 0 8px;
-  border: 1px solid #d9dcd8;
+  border: 1px solid var(--line-strong);
   border-radius: 5px;
   font-size: 12px;
   outline: 0;
-  background: #fff;
-  color: #252a26;
+  background: var(--bg-raise);
+  color: var(--ink);
 }
 .kv-row input:focus {
-  border-color: #718169;
+  border-color: rgba(184, 239, 103, 0.55);
 }
 .kv-row .chk-box {
   width: 16px;
   height: 16px;
   margin: 0 auto;
-  accent-color: #5a7a4f;
+  accent-color: var(--accent);
 }
 .row-del {
   border: 0;
   background: transparent;
-  color: #a0564f;
+  color: var(--bad);
   cursor: pointer;
   padding: 4px;
   border-radius: 5px;
   display: inline-grid;
   place-items: center;
+  transition: background var(--t-fast);
 }
 .row-del:hover {
-  background: #fbeae7;
+  background: rgba(255, 115, 105, 0.1);
 }
 
 /* ---------- 断言 / 提取行 ---------- */
@@ -1357,17 +1378,17 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .extract-row input {
   height: 30px;
   padding: 0 8px;
-  border: 1px solid #d9dcd8;
+  border: 1px solid var(--line-strong);
   border-radius: 5px;
   font-size: 12px;
   outline: 0;
-  background: #fff;
-  color: #252a26;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  background: var(--bg-raise);
+  color: var(--ink);
+  font-family: var(--font-mono);
 }
 .assert-row input:focus,
 .extract-row input:focus {
-  border-color: #718169;
+  border-color: rgba(184, 239, 103, 0.55);
 }
 
 /* ---------- postData ---------- */
@@ -1390,24 +1411,24 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   min-height: 0;
   width: 100%;
   padding: 12px;
-  border: 1px solid #cfd3cd;
-  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-m);
   outline: 0;
-  background: #fbfcfa;
-  color: #252a26;
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  background: var(--bg-raise);
+  color: var(--accent);
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.5;
   resize: none;
 }
 .json-area:focus {
-  border-color: #718169;
-  box-shadow: 0 0 0 3px #7181691a;
+  border-color: rgba(184, 239, 103, 0.55);
+  box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .json-error {
-  color: #a33a33;
-  background: #fdf0ee;
-  border: 1px solid #f0cfcb;
+  color: var(--bad);
+  background: rgba(255, 115, 105, 0.08);
+  border: 1px solid rgba(255, 115, 105, 0.3);
   border-radius: 6px;
   padding: 7px 10px;
   font-size: 12px;
@@ -1421,17 +1442,17 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   place-content: center;
   justify-items: center;
   gap: 8px;
-  color: #8b928c;
+  color: var(--ink-3);
 }
 .har-empty-full p {
   margin: 0;
   font-size: 14px;
   font-weight: 650;
-  color: #5b615c;
+  color: var(--ink-2);
 }
 .har-empty-full .hint {
   font-size: 12px;
-  color: #9aa09b;
+  color: var(--ink-3);
 }
 
 @media (max-width: 640px) {

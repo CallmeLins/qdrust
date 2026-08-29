@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import {
-  Activity, ArrowLeft, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
   LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
@@ -838,6 +838,7 @@ onMounted(async () => {
 <template>
   <!-- ============ AUTH ============ -->
   <main v-if="!authenticated" class="auth-page">
+    <div class="aurora" aria-hidden="true"><i /><i /><i /></div>
     <form class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : t('resetTitle') }}</h1>
@@ -855,7 +856,7 @@ onMounted(async () => {
         <p class="auth-hint">{{ t('forgotHint') }}</p>
         <div v-if="forgotResult?.token" class="dev-token">
           {{ t('forgotDevToken') }}<code>{{ forgotResult.token }}</code>
-          <button type="button" class="secondary-button" @click="authMode = 'reset'">{{ t('resetTitle') }} →</button>
+          <button type="button" class="secondary-button" @click="authMode = 'reset'">{{ t('resetTitle') }}<ArrowRight :size="15" /></button>
         </div>
       </template>
 
@@ -881,6 +882,7 @@ onMounted(async () => {
 
   <!-- ============ APP ============ -->
   <div v-else class="app-shell">
+    <div class="aurora" aria-hidden="true"><i /><i /><i /></div>
     <aside :class="['sidebar', { open: menuOpen }]">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <nav aria-label="主导航">
@@ -903,7 +905,7 @@ onMounted(async () => {
 
     <main class="app-main">
       <header class="topbar">
-        <button class="icon-button mobile-menu" title="☰" @click="menuOpen = true"><Menu :size="20" /></button>
+        <button class="icon-button mobile-menu" :title="t('menu')" @click="menuOpen = true"><Menu :size="20" /></button>
         <div class="breadcrumb">{{ t('workspace') }} <span>/</span> {{ currentViewName }}</div>
         <div class="topbar-right">
           <span v-if="currentUser?.email && !currentUser.email_verified" class="verify-hint" :title="t('emailVerifyBanner')">
@@ -916,6 +918,7 @@ onMounted(async () => {
         </div>
       </header>
 
+      <Transition name="view" mode="out-in">
       <!-- ===== TASKS ===== -->
       <div v-if="view === 'tasks'" class="page">
         <section class="page-heading">
@@ -948,7 +951,7 @@ onMounted(async () => {
             <button class="secondary-button" @click="batchTasks('disable')">{{ t('batchDisable') }}</button>
             <button class="secondary-button" @click="batchTasks('run')">{{ t('batchRun') }}</button>
             <button class="secondary-button danger" @click="batchTasks('delete')">{{ t('batchDelete') }}</button>
-            <button class="icon-button" title="×" @click="selected.clear()"><X :size="16" /></button>
+            <button class="icon-button" :title="t('close')" @click="selected.clear()"><X :size="16" /></button>
           </div>
 
           <div v-if="loading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
@@ -1270,6 +1273,7 @@ onMounted(async () => {
           </div>
         </section>
       </div>
+      </Transition>
     </main>
 
     <!-- ===== CREATE / EDIT TASK MODAL ===== -->

@@ -17,6 +17,7 @@ const zh = {
   // common
   workspace: "工作区",
   refresh: "刷新",
+  menu: "菜单",
   close: "关闭",
   cancel: "取消",
   save: "保存",
@@ -368,6 +369,7 @@ const en: Record<MessageKey, string> = {
   // common
   workspace: "Workspace",
   refresh: "Refresh",
+  menu: "Menu",
   close: "Close",
   cancel: "Cancel",
   save: "Save",
