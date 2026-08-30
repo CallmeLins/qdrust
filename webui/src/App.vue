@@ -2,8 +2,8 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
-  LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
-  Settings, Trash2, Users, X, XCircle, Zap,
+  LayoutDashboard, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
+  Settings, Sun, Trash2, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, type CreateTask, type Task, type Run, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
@@ -25,6 +25,47 @@ function fmt(key: Parameters<typeof t>[0], params?: Record<string, string | numb
   if (params) for (const [k, v] of Object.entries(params)) s = s.replace(`{${k}}`, String(v));
   return s;
 }
+
+// ---------- theme (light / dark / system, mirrors collector) ----------
+type ThemeMode = "light" | "dark" | "system";
+const THEME_STORAGE_KEY = "qdrust-theme-mode";
+const THEME_MODES: ThemeMode[] = ["light", "dark", "system"];
+const SYSTEM_THEME_MEDIA = "(prefers-color-scheme: dark)";
+
+const storedTheme = localStorage.getItem(THEME_STORAGE_KEY) as ThemeMode | null;
+const themeMode = ref<ThemeMode>(THEME_MODES.includes(storedTheme as ThemeMode) ? (storedTheme as ThemeMode) : "system");
+let themeMediaQuery: MediaQueryList | null = null;
+
+function resolveTheme(mode: ThemeMode): "light" | "dark" {
+  if (mode === "system") return themeMediaQuery?.matches ? "dark" : "light";
+  return mode;
+}
+
+function applyTheme(mode: ThemeMode) {
+  const resolved = resolveTheme(mode);
+  document.documentElement.setAttribute("data-theme", resolved);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#121212" : "#f7f7f7");
+}
+
+function setTheme(mode: ThemeMode) {
+  themeMode.value = mode;
+  localStorage.setItem(THEME_STORAGE_KEY, mode);
+  applyTheme(mode);
+}
+
+function handleSystemThemeChange() {
+  if (themeMode.value === "system") applyTheme("system");
+}
+
+onMounted(() => {
+  themeMediaQuery = window.matchMedia(SYSTEM_THEME_MEDIA);
+  applyTheme(themeMode.value);
+  themeMediaQuery.addEventListener("change", handleSystemThemeChange);
+});
+
+onUnmounted(() => {
+  themeMediaQuery?.removeEventListener("change", handleSystemThemeChange);
+});
 
 // ---------- app / auth state ----------
 const ready = ref(false);
@@ -930,7 +971,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 <template>
   <!-- ============ AUTH ============ -->
   <main v-if="!authenticated" class="auth-page">
-    <div class="aurora" aria-hidden="true"><i /><i /><i /></div>
     <form class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : t('resetTitle') }}</h1>
@@ -969,12 +1009,29 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <button v-if="authMode === 'login' || authMode === 'bootstrap' || authMode === 'register'" class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : authMode === 'bootstrap' ? 'register' : 'login'; authNotice=''; verifyResult=null">
         {{ authMode === 'login' ? t('initAdmin') : authMode === 'bootstrap' ? t('needAccount') : t('haveAccount') }}
       </button>
+
+      <div class="surface-theme-switch auth-theme" role="group" :aria-label="t('theme')">
+        <button
+          v-for="mode in THEME_MODES"
+          :key="mode"
+          type="button"
+          class="surface-theme-option"
+          :class="{ 'is-active': themeMode === mode }"
+          :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+          :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+          :aria-pressed="themeMode === mode"
+          @click="setTheme(mode)"
+        >
+          <Sun v-if="mode === 'light'" :size="15" />
+          <Moon v-else-if="mode === 'dark'" :size="15" />
+          <Monitor v-else :size="15" />
+        </button>
+      </div>
     </form>
   </main>
 
   <!-- ============ APP ============ -->
   <div v-else class="app-shell">
-    <div class="aurora" aria-hidden="true"><i /><i /><i /></div>
     <aside :class="['sidebar', { open: menuOpen }]">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <nav aria-label="主导航">
@@ -1004,6 +1061,23 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <Mail :size="14" />{{ t('emailVerifyBanner') }}
             <button class="text-button" @click="resendVerification">{{ t('resendVerify') }}</button>
           </span>
+          <div class="surface-theme-switch" role="group" :aria-label="t('theme')">
+            <button
+              v-for="mode in THEME_MODES"
+              :key="mode"
+              type="button"
+              class="surface-theme-option"
+              :class="{ 'is-active': themeMode === mode }"
+              :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+              :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+              :aria-pressed="themeMode === mode"
+              @click="setTheme(mode)"
+            >
+              <Sun v-if="mode === 'light'" :size="15" />
+              <Moon v-else-if="mode === 'dark'" :size="15" />
+              <Monitor v-else :size="15" />
+            </button>
+          </div>
           <button class="icon-button" :title="locale" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button>
           <span class="account-name">{{ currentUser?.username }} · {{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</span>
           <button class="avatar" :title="t('logout')" @click="logout()">{{ currentUser?.username.slice(0, 2).toUpperCase() }}</button>
@@ -1014,7 +1088,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <!-- ===== TASKS ===== -->
       <div v-if="view === 'tasks'" class="page">
         <section class="page-heading">
-          <div><p class="eyebrow">AUTOMATION</p><h1>{{ t('tasks') }}</h1><p>{{ t('createFirst') }}</p></div>
+          <div><h1>{{ t('tasks') }}</h1><p>{{ t('createFirst') }}</p></div>
           <button class="primary-button" @click="openCreateTask"><Plus :size="17" />{{ t('createTaskShort') }}</button>
         </section>
 
@@ -1084,7 +1158,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <!-- ===== TASK RUNS ===== -->
       <div v-else-if="view === 'taskRuns'" class="page">
         <section class="page-heading">
-          <div><p class="eyebrow">RUN HISTORY</p><h1>{{ t('runHistory') }}</h1><p v-if="runHistoryTask">{{ runHistoryTask.name }}</p></div>
+          <div><h1>{{ t('runHistory') }}</h1><p v-if="runHistoryTask">{{ runHistoryTask.name }}</p></div>
           <button class="secondary-button" @click="backToTasks"><ArrowLeft :size="16" />{{ t('back') }}</button>
         </section>
         <section class="task-section">
@@ -1119,7 +1193,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <!-- ===== TEMPLATES ===== -->
       <div v-else-if="view === 'templates'" class="page">
         <section class="page-heading">
-          <div><p class="eyebrow">TEMPLATES</p><h1>{{ t('templates') }}</h1><p>{{ t('templateHint') }}</p></div>
+          <div><h1>{{ t('templates') }}</h1><p>{{ t('templateHint') }}</p></div>
           <button class="primary-button" @click="openImportModal()"><Plus :size="17" />{{ t('importHar') }}</button>
         </section>
         <section class="task-section">
@@ -1150,7 +1224,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== PLUGINS ===== -->
       <div v-else-if="view === 'plugins'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">PLUGINS</p><h1>{{ t('pluginsTitle') }}</h1></div></section>
+        <section class="page-heading"><div><h1>{{ t('pluginsTitle') }}</h1></div></section>
         <section class="task-section">
           <form class="modal inline-modal" @submit.prevent="savePlugin">
             <label>{{ t('pluginName') }}<input v-model="pluginForm.name" required /></label>
@@ -1175,7 +1249,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== NOTIFICATIONS ===== -->
       <div v-else-if="view === 'notifications'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">NOTIFICATIONS</p><h1>{{ t('notificationsTitle') }}</h1><p>{{ t('notificationsHint') }}</p></div></section>
+        <section class="page-heading"><div><h1>{{ t('notificationsTitle') }}</h1><p>{{ t('notificationsHint') }}</p></div></section>
         <section class="task-section">
           <form class="modal inline-modal" @submit.prevent="saveChannel">
             <label>{{ t('channelName') }}<input v-model="channelForm.name" required /></label>
@@ -1275,7 +1349,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== SUBSCRIPTIONS ===== -->
       <div v-else-if="view === 'subscriptions'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">TEMPLATE SOURCES</p><h1>{{ t('subscriptionsTitle') }}</h1><p>{{ t('subHint') }}</p></div></section>
+        <section class="page-heading"><div><h1>{{ t('subscriptionsTitle') }}</h1><p>{{ t('subHint') }}</p></div></section>
         <section class="task-section">
           <form class="modal inline-modal" @submit.prevent="saveSubscription">
             <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
@@ -1302,7 +1376,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== PUSH ===== -->
       <div v-else-if="view === 'push'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">PUBLISH REVIEW</p><h1>{{ t('pushTitle') }}</h1><p>{{ t('pushHint') }}</p></div></section>
+        <section class="page-heading"><div><h1>{{ t('pushTitle') }}</h1><p>{{ t('pushHint') }}</p></div></section>
         <section class="task-section">
           <h2>{{ t('myRequests') }}</h2>
           <form class="modal inline-modal" @submit.prevent="submitPush">
@@ -1337,7 +1411,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== ADMIN ===== -->
       <div v-else-if="view === 'admin'" class="page">
-        <section class="page-heading"><div><p class="eyebrow">ADMINISTRATION</p><h1>{{ t('adminTitle') }}</h1><p>{{ t('adminHint') }}</p></div></section>
+        <section class="page-heading"><div><h1>{{ t('adminTitle') }}</h1><p>{{ t('adminHint') }}</p></div></section>
         <section class="task-section">
           <h2>{{ t('users') }}</h2>
           <div v-for="user in adminUsers" :key="user.id" class="run-row">
@@ -1376,10 +1450,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== SETTINGS ===== -->
       <div v-else class="page">
-        <section class="page-heading"><div><p class="eyebrow">WORKSPACE</p><h1>{{ t('settingsTitle') }}</h1></div></section>
+        <section class="page-heading"><div><h1>{{ t('settingsTitle') }}</h1></div></section>
         <section class="settings-grid">
           <div class="content-panel">
-            <p class="eyebrow">ACCOUNT</p><h2>{{ t('account') }}</h2>
+            <h2>{{ t('account') }}</h2>
             <dl class="settings-list">
               <div><dt>{{ t('username') }}</dt><dd>{{ currentUser?.username }}</dd></div>
               <div><dt>{{ t('role') }}</dt><dd>{{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</dd></div>
@@ -1396,7 +1470,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </form>
           </div>
           <div class="content-panel">
-            <p class="eyebrow">SERVICE</p><h2>{{ t('service') }}</h2>
+            <h2>{{ t('service') }}</h2>
             <dl class="settings-list">
               <div><dt>{{ t('statusLabel') }}</dt><dd><span class="state-dot online" />{{ ready ? t('serviceOk') : t('connecting') }}</dd></div>
               <div><dt>{{ t('localeLabel') }}</dt><dd><button class="secondary-button" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button></dd></div>
@@ -1412,7 +1486,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <div v-if="showCreate" class="modal-backdrop" @click.self="showCreate = false">
       <form class="modal" @submit.prevent="submitTask">
         <div class="modal-header">
-          <div><p class="eyebrow">{{ taskForm.id ? 'EDIT' : 'NEW' }} AUTOMATION</p><h2>{{ taskForm.id ? t('editTask') : t('newTask') }}</h2></div>
+          <div><h2>{{ taskForm.id ? t('editTask') : t('newTask') }}</h2></div>
           <button class="icon-button" type="button" :title="t('close')" @click="showCreate = false"><X :size="20" /></button>
         </div>
         <label>{{ t('taskName') }}<input v-model="taskForm.name" required maxlength="100" /></label>
@@ -1439,11 +1513,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
         <div class="form-row form-row-4">
-          <label>{{ t('timeoutSeconds') }}<input v-model="taskForm.timeoutSeconds" type="number" min="1" placeholder="30" /></label>
-          <label>{{ t('retryCount') }}<input v-model="taskForm.retryCount" type="number" placeholder="0" /></label>
-          <label>{{ t('retryInterval') }}<input v-model="taskForm.retryInterval" type="number" min="1" placeholder="60" /></label>
-          <label>{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
+          <label :title="t('timeoutSecondsHint')">{{ t('timeoutSeconds') }}<input v-model="taskForm.timeoutSeconds" type="number" min="1" placeholder="30" /></label>
+          <label :title="t('retryCountHint')">{{ t('retryCount') }}<input v-model="taskForm.retryCount" type="number" placeholder="0" /></label>
+          <label :title="t('retryIntervalHint')">{{ t('retryInterval') }}<input v-model="taskForm.retryInterval" type="number" min="1" placeholder="60" /></label>
+          <label :title="t('priorityHint')">{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
         </div>
+        <small class="kv-hint">{{ t('taskNumericHint') }}</small>
         <label>{{ t('timezone') }}<input v-model="taskForm.timezone" list="tz-options" placeholder="UTC / Asia/Shanghai" /></label>
         <datalist id="tz-options">
           <option v-for="tz in ['UTC','Asia/Shanghai','Asia/Tokyo','Asia/Hong_Kong','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney']" :key="tz" :value="tz" />
@@ -1474,7 +1549,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <div v-if="showImport" class="modal-backdrop modal-backdrop-wide" @click.self="showImport = false">
       <div class="modal modal-har">
         <div class="modal-header">
-          <div><p class="eyebrow">QD HAR</p><h2>{{ t('importHarTitle') }}</h2></div>
+          <div><h2>{{ t('importHarTitle') }}</h2></div>
           <button class="icon-button" type="button" :title="t('close')" @click="showImport = false"><X :size="20" /></button>
         </div>
         <div class="har-meta">
@@ -1493,7 +1568,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <div v-if="showHelp" class="modal-backdrop" @click.self="showHelp = false">
       <div class="modal">
         <div class="modal-header">
-          <div><p class="eyebrow">HELP</p><h2>{{ t('helpTitle') }}</h2></div>
+          <div><h2>{{ t('helpTitle') }}</h2></div>
           <button class="icon-button" type="button" :title="t('close')" @click="showHelp = false"><X :size="20" /></button>
         </div>
         <p class="auth-hint">{{ t('helpBody') }}</p>

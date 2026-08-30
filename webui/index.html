@@ -1,10 +1,30 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#151719" />
+    <meta name="theme-color" content="#f7f7f7" />
     <title>qdrust</title>
+    <script>
+      // Resolve the theme before first paint so the page never flashes the
+      // wrong palette. Mirrors the `collector` bootstrap: light / dark / system.
+      (() => {
+        const storageKey = 'qdrust-theme-mode';
+        const storedMode = localStorage.getItem(storageKey);
+        const themeMode = ['light', 'dark', 'system'].includes(storedMode) ? storedMode : 'system';
+        const resolvedTheme =
+          themeMode === 'system'
+            ? window.matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light'
+            : themeMode;
+
+        document.documentElement.setAttribute('data-theme', resolvedTheme);
+
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', resolvedTheme === 'dark' ? '#121212' : '#f7f7f7');
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

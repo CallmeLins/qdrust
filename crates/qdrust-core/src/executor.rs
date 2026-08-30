@@ -2,7 +2,11 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Dura
 
 use anyhow::{Context, Result, bail, ensure};
 use regex::{Regex, RegexBuilder};
-use reqwest::{Client, Method, cookie::{CookieStore, Jar}, redirect::Policy};
+use reqwest::{
+    Client, Method,
+    cookie::{CookieStore, Jar},
+    redirect::Policy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -478,9 +482,10 @@ impl QdExecutor {
             request = request.header(rendered_name, rendered_value);
         }
         if let Some(cookie_header) = rendered_cookie_header {
-            context
-                .variables
-                .insert("__qdrust_cookie_header".into(), Value::String(cookie_header));
+            context.variables.insert(
+                "__qdrust_cookie_header".into(),
+                Value::String(cookie_header),
+            );
         }
         let cookies = entry
             .request
@@ -498,9 +503,10 @@ impl QdExecutor {
         if !cookies.is_empty() {
             let cookie_header = cookies.join("; ");
             request = request.header(reqwest::header::COOKIE, &cookie_header);
-            context
-                .variables
-                .insert("__qdrust_cookie_header".into(), Value::String(cookie_header));
+            context.variables.insert(
+                "__qdrust_cookie_header".into(),
+                Value::String(cookie_header),
+            );
             // HAR files often define cookies only on the first request and rely
             // on the browser jar for subsequent requests. Mirror them into the
             // reqwest jar so later entries inherit the authenticated session.
@@ -508,11 +514,13 @@ impl QdExecutor {
             for cookie in &cookies {
                 // Jar accepts Set-Cookie syntax; HAR stores a Cookie header.
                 let set_cookie = format!("{cookie}; Path=/");
-                let _ = self.cookies.add_cookie_str(&set_cookie, &cookie_url);
+                self.cookies.add_cookie_str(&set_cookie, &cookie_url);
             }
         }
         if !explicit_cookie {
-            if let Some(Value::String(cookie_header)) = context.variables.get("__qdrust_cookie_header") {
+            if let Some(Value::String(cookie_header)) =
+                context.variables.get("__qdrust_cookie_header")
+            {
                 request = request.header(reqwest::header::COOKIE, cookie_header);
             }
             if let Some(value) = self.cookies.cookies(&reqwest::Url::parse(&url)?) {
@@ -583,8 +591,12 @@ impl QdExecutor {
             .collect();
         if debug_requests {
             for (name, value) in &headers {
-                if name.eq_ignore_ascii_case("location") || name.eq_ignore_ascii_case("set-cookie") {
-                    eprintln!("[qdrust:request:response-header] url={} {}={}", url, name, value);
+                if name.eq_ignore_ascii_case("location") || name.eq_ignore_ascii_case("set-cookie")
+                {
+                    eprintln!(
+                        "[qdrust:request:response-header] url={} {}={}",
+                        url, name, value
+                    );
                 }
             }
         }
@@ -898,7 +910,12 @@ fn form_urldecode(input: &str) -> String {
 /// Collapse whitespace and cap a text preview for failure diagnostics.
 fn debug_requests_enabled() -> bool {
     std::env::var("QDRUST_DEBUG_REQUESTS")
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
