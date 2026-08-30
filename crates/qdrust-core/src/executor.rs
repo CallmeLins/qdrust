@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Dura
 
 use anyhow::{Context, Result, bail, ensure};
 use regex::{Regex, RegexBuilder};
-use reqwest::{Client, Method, cookie::Jar, redirect::Policy};
+use reqwest::{Client, Method, cookie::{CookieStore, Jar}, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -454,9 +454,21 @@ impl QdExecutor {
         let request_method = method.clone();
         let mut request = client.request(method, &url);
         let mut rendered_body: Option<String> = None;
+        let mut explicit_cookie = false;
+        let mut rendered_cookie_header: Option<String> = None;
         for header in entry.request.headers.iter().filter(|header| header.checked) {
             let rendered_name = self.render(&header.name, context)?;
             let rendered_value = self.render(&header.value, context)?;
+            // reqwest is built without compression decoders; request identity
+            // responses so extracted content remains readable for all HARs.
+            if rendered_name.eq_ignore_ascii_case("accept-encoding") {
+                request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+                continue;
+            }
+            if rendered_name.eq_ignore_ascii_case("cookie") {
+                explicit_cookie = true;
+                rendered_cookie_header = Some(rendered_value.clone());
+            }
             if debug_requests {
                 eprintln!(
                     "[qdrust:request:header] url={} {}={}",
@@ -464,6 +476,11 @@ impl QdExecutor {
                 );
             }
             request = request.header(rendered_name, rendered_value);
+        }
+        if let Some(cookie_header) = rendered_cookie_header {
+            context
+                .variables
+                .insert("__qdrust_cookie_header".into(), Value::String(cookie_header));
         }
         let cookies = entry
             .request
@@ -479,7 +496,28 @@ impl QdExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         if !cookies.is_empty() {
-            request = request.header(reqwest::header::COOKIE, cookies.join("; "));
+            let cookie_header = cookies.join("; ");
+            request = request.header(reqwest::header::COOKIE, &cookie_header);
+            context
+                .variables
+                .insert("__qdrust_cookie_header".into(), Value::String(cookie_header));
+            // HAR files often define cookies only on the first request and rely
+            // on the browser jar for subsequent requests. Mirror them into the
+            // reqwest jar so later entries inherit the authenticated session.
+            let cookie_url = reqwest::Url::parse(&url).context("invalid cookie URL")?;
+            for cookie in &cookies {
+                // Jar accepts Set-Cookie syntax; HAR stores a Cookie header.
+                let set_cookie = format!("{cookie}; Path=/");
+                let _ = self.cookies.add_cookie_str(&set_cookie, &cookie_url);
+            }
+        }
+        if !explicit_cookie {
+            if let Some(Value::String(cookie_header)) = context.variables.get("__qdrust_cookie_header") {
+                request = request.header(reqwest::header::COOKIE, cookie_header);
+            }
+            if let Some(value) = self.cookies.cookies(&reqwest::Url::parse(&url)?) {
+                request = request.header(reqwest::header::COOKIE, value);
+            }
         }
         if let Some(post_data) = entry.request.post_data.as_ref() {
             let mime_type = post_data.mime_type.as_deref().unwrap_or("");
@@ -533,7 +571,7 @@ impl QdExecutor {
 
         let response = request.send().await?;
         let status = response.status().as_u16();
-        let headers = response
+        let headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -543,6 +581,13 @@ impl QdExecutor {
                 )
             })
             .collect();
+        if debug_requests {
+            for (name, value) in &headers {
+                if name.eq_ignore_ascii_case("location") || name.eq_ignore_ascii_case("set-cookie") {
+                    eprintln!("[qdrust:request:response-header] url={} {}={}", url, name, value);
+                }
+            }
+        }
         let body = response.bytes().await?.to_vec();
         if debug_requests {
             eprintln!(
@@ -616,7 +661,18 @@ impl QdExecutor {
         for rule in &entry.extract_variables {
             let pattern = self.render(&rule.rule.re, context)?;
             let source = rule_source(&rule.rule.from, status, &headers, &content);
-            if let Some(value) = extract(&pattern, &source)? {
+            let extracted = extract(&pattern, &source)?;
+            if debug_requests_enabled() {
+                let preview = extracted
+                    .as_ref()
+                    .map(|value| bounded_preview(&value.to_string()))
+                    .unwrap_or_else(|| "<no-match>".into());
+                eprintln!(
+                    "[qdrust:extract] name={} from={} result={}",
+                    rule.name, rule.rule.from, preview
+                );
+            }
+            if let Some(value) = extracted {
                 context.variables.insert(rule.name.clone(), value);
             }
         }
@@ -840,6 +896,12 @@ fn form_urldecode(input: &str) -> String {
 }
 
 /// Collapse whitespace and cap a text preview for failure diagnostics.
+fn debug_requests_enabled() -> bool {
+    std::env::var("QDRUST_DEBUG_REQUESTS")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn bounded_preview(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut preview: String = collapsed.chars().take(300).collect();
