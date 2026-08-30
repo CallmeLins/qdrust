@@ -1,24 +1,56 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
-  LayoutDashboard, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
-  Settings, Sun, Trash2, Users, X, XCircle, Zap,
+  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, FileJson2, FileUp,
+  LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
+  Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, type CreateTask, type Task, type Run, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
+import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
 import { formatRunTime } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
-const toasts = ref<{ id: number; message: string; kind: "success" | "error" }[]>([]);
+type ToastKind = "success" | "error" | "pending";
+type Toast = {
+  id: number;
+  message: string;
+  kind: ToastKind;
+  /** Optional task name shown above the message */
+  title?: string;
+  /** Secondary line, e.g. "HTTP 200 · 3/3 steps" */
+  meta?: string;
+  /** QD-style log line or error text, shown in a scrollable mono block */
+  detail?: string;
+  /** Enables the "view run history" action when set */
+  taskId?: number;
+  /** Pending toasts stay until they are updated or dismissed */
+  persistent?: boolean;
+};
+const toasts = ref<Toast[]>([]);
 let toastSeq = 0;
-function notify(message: string, kind: "success" | "error" = "success") {
+function dismissToast(id: number) {
+  toasts.value = toasts.value.filter((x) => x.id !== id);
+}
+function scheduleDismiss(id: number, delay = 4000) {
+  setTimeout(() => dismissToast(id), delay);
+}
+function notify(message: string, kind: ToastKind = "success", extra: Partial<Toast> = {}): number {
   const id = ++toastSeq;
-  toasts.value.push({ id, message, kind });
-  setTimeout(() => {
-    toasts.value = toasts.value.filter((x) => x.id !== id);
-  }, 4000);
+  toasts.value.push({ id, message, kind, ...extra });
+  // Long-form toasts (with a log body or an action) need more reading time.
+  const delay = extra.detail || extra.meta ? 9000 : 4000;
+  if (!extra.persistent) scheduleDismiss(id, delay);
+  return id;
+}
+/** Update a toast in place; finishing a pending toast starts its countdown. */
+function updateToast(id: number, patch: Partial<Toast>) {
+  const toast = toasts.value.find((x) => x.id === id);
+  if (!toast) return;
+  Object.assign(toast, patch);
+  if (patch.persistent === false || (patch.kind && patch.kind !== "pending")) {
+    scheduleDismiss(id, toast.detail || toast.meta ? 9000 : 4000);
+  }
 }
 function fmt(key: Parameters<typeof t>[0], params?: Record<string, string | number>): string {
   let s = t(key);
@@ -350,11 +382,58 @@ async function toggleTask(task: Task) {
     await loadTasks();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
+const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled"];
+
+/** Poll the task's runs until the given one reaches a terminal status. */
+async function waitForRun(taskId: number, runId: number): Promise<Run | null> {
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const runs = await api.taskRuns(taskId);
+    const run = runs.find((x) => x.id === runId);
+    if (run && TERMINAL_RUN_STATUSES.includes(run.status)) return run;
+  }
+  return null;
+}
+
 async function runNow(task: Task) {
+  // Keep a pending toast open and fill it with the result once the run settles.
+  const toastId = notify(t("runNowRunning"), "pending", {
+    title: task.name,
+    persistent: true,
+  });
   try {
-    await api.runTask(task.id);
-    notify(t("runNow"));
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+    const queued = await api.runTask(task.id);
+    const run = await waitForRun(task.id, queued.id);
+    if (!run) {
+      updateToast(toastId, { message: t("runNowTimeout"), taskId: task.id, persistent: false });
+      return;
+    }
+    let steps: RunStep[] = [];
+    try { steps = await api.runSteps(run.id); } catch { steps = []; }
+    const done = steps.filter((s) => s.status === "succeeded").length;
+    const meta = [
+      run.http_status != null ? `HTTP ${run.http_status}` : "",
+      steps.length ? fmt("runStepsCount", { done, total: steps.length }) : "",
+    ].filter(Boolean).join(" · ");
+    const log = runLogText(run);
+    updateToast(toastId, {
+      kind: run.status === "succeeded" ? "success" : "error",
+      message: run.status === "succeeded" ? t("runNowSucceeded") : runStatusLabel(run.status),
+      meta: meta || undefined,
+      detail: log && log !== "–" ? log : undefined,
+      taskId: task.id,
+      persistent: false,
+    });
+    await loadTasks();
+    if (runHistoryTask.value?.id === task.id) await loadTaskRuns(task.id);
+  } catch (cause) {
+    updateToast(toastId, {
+      kind: "error",
+      message: cause instanceof Error ? cause.message : t("genericError"),
+      persistent: false,
+    });
+  }
 }
 async function removeTask(task: Task) {
   if (!window.confirm(fmt("deleteTaskConfirm", { name: task.name }))) return;
@@ -394,6 +473,12 @@ async function openRunHistory(task: Task) {
 function backToTasks() {
   runHistoryTask.value = null;
   view.value = "tasks";
+}
+/** "View run history" action on a run-result toast. */
+function openRunHistoryFromToast(toast: Toast) {
+  const task = tasks.value.find((x) => x.id === toast.taskId);
+  dismissToast(toast.id);
+  if (task) void openRunHistory(task);
 }
 async function cancelRun(run: Run) {
   try {
@@ -454,6 +539,8 @@ const filteredTemplates = computed(() => {
   const term = templateSearch.value.trim().toLowerCase();
   return term ? templates.value.filter((x) => `${x.name} ${x.description ?? ""}`.toLowerCase().includes(term)) : templates.value;
 });
+/** The public list is every published template, so it doubles as the publish-state index. */
+const publishedTemplateIds = computed(() => new Set(publicTemplates.value.map((x) => x.id)));
 async function openTemplates() {
   view.value = "templates";
   try {
@@ -1206,18 +1293,24 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <strong>{{ item.name }}</strong>
             <span>{{ item.source_format }}</span>
             <span v-if="item.grp" class="chip">{{ item.grp }}</span>
-            <button v-if="item.source_format === 'qd_har'" class="secondary-button" @click="openImportModal(item)"><Pencil :size="14" />{{ t('editTemplate') }}</button>
-            <button class="secondary-button" @click="publishTemplate(item.id)">{{ t('publish') }}</button>
-            <button class="secondary-button" @click="unpublishTemplate(item.id)">{{ t('unpublish') }}</button>
-            <button class="icon-button" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name)"><Trash2 :size="16" /></button>
+            <span v-if="publishedTemplateIds.has(item.id)" class="chip chip-published">{{ t('published') }}</span>
+            <span v-if="item.description" class="muted row-description">{{ item.description }}</span>
+            <div class="row-actions">
+              <button v-if="item.source_format === 'qd_har'" class="secondary-button" @click="openImportModal(item)"><Pencil :size="14" />{{ t('editTemplate') }}</button>
+              <button v-if="publishedTemplateIds.has(item.id)" class="secondary-button" @click="unpublishTemplate(item.id)"><Undo2 :size="14" />{{ t('unpublish') }}</button>
+              <button v-else class="secondary-button" @click="publishTemplate(item.id)"><Upload :size="14" />{{ t('publish') }}</button>
+              <button class="icon-button danger" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name)"><Trash2 :size="16" /></button>
+            </div>
           </div>
           <h2>{{ t('publicTemplates') }}</h2>
           <div v-if="publicTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
           <div v-for="item in publicTemplates" :key="item.id" class="run-row">
             <strong>{{ item.name }}</strong>
             <span>{{ item.source_format }}</span>
-            <span v-if="item.description" class="muted">{{ item.description }}</span>
-            <button class="secondary-button" @click="copyTemplate(item.id)">{{ t('copy') }}</button>
+            <span v-if="item.description" class="muted row-description">{{ item.description }}</span>
+            <div class="row-actions">
+              <button class="secondary-button" @click="copyTemplate(item.id)"><Copy :size="14" />{{ t('copy') }}</button>
+            </div>
           </div>
         </section>
       </div>
@@ -1579,10 +1672,17 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <!-- ===== TOASTS ===== -->
     <div class="toast-stack" aria-live="polite">
       <div v-for="toast in toasts" :key="toast.id" :class="['toast', toast.kind]">
-        <CheckCircle2 v-if="toast.kind === 'success'" :size="16" />
+        <Loader2 v-if="toast.kind === 'pending'" :size="16" class="toast-spin" />
+        <CheckCircle2 v-else-if="toast.kind === 'success'" :size="16" />
         <XCircle v-else :size="16" />
-        <span>{{ toast.message }}</span>
-        <button class="icon-button" @click="toasts = toasts.filter(x => x.id !== toast.id)"><X :size="14" /></button>
+        <div class="toast-body">
+          <strong v-if="toast.title" class="toast-title">{{ toast.title }}</strong>
+          <span>{{ toast.message }}</span>
+          <span v-if="toast.meta" class="toast-meta">{{ toast.meta }}</span>
+          <pre v-if="toast.detail" class="toast-detail">{{ toast.detail }}</pre>
+          <button v-if="toast.taskId != null" class="text-button toast-action" @click="openRunHistoryFromToast(toast)">{{ t('viewRunHistory') }}</button>
+        </div>
+        <button class="icon-button" :title="t('close')" @click="dismissToast(toast.id)"><X :size="14" /></button>
       </div>
     </div>
   </div>

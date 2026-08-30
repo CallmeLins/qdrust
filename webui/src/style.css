@@ -393,6 +393,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   transform: translateY(-1px);
 }
 .icon-button:disabled { opacity: 0.35; cursor: not-allowed; }
+.icon-button.danger:hover { color: var(--bad); background-color: rgb(220 38 38 / 0.12); }
 
 /* ============================================================
    cards / panels / sections
@@ -567,8 +568,15 @@ code {
 .status-pill.paused { color: var(--ink-2); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); border-color: var(--line-strong); }
 .status-pill.paused span { background: var(--ink-3); box-shadow: none; }
 
-.chip { padding: 3px 10px; border-radius: 999px; color: var(--ink-2); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); border: 1px solid var(--line); font-size: 11px; }
+.chip { padding: 3px 10px; border-radius: 999px; color: var(--ink-2); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); border: 1px solid var(--line); font-size: 11px; white-space: nowrap; }
+.chip-published { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
 .muted { color: var(--ink-3); font-size: 12px; }
+
+/* trailing action group so rows read as "content ... actions" */
+.row-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row-actions .secondary-button { height: 34px; min-height: 34px; padding: 0 12px; font-size: 12.5px; }
+.row-actions .icon-button { width: 34px; height: 34px; }
+.row-description { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 .error-text { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
 .ok-text { color: var(--ok); font-size: 12px; }
 
@@ -690,19 +698,35 @@ code {
    ============================================================ */
 .toast-stack { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: grid; gap: 9px; width: min(360px, calc(100vw - 40px)); }
 .toast {
-  display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px;
   border-radius: var(--r-m); border: 1px solid var(--line-strong);
   background: rgb(var(--card-surface));
   box-shadow: var(--shadow-m); color: var(--ink); font-size: 13px;
   animation: toast-in 0.28s var(--ease);
 }
+/* icon column stays aligned with the first text line */
+.toast > svg { flex: none; margin-top: 1px; }
+.toast-body { display: grid; gap: 3px; min-width: 0; flex: 1; }
+.toast-title { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast-meta { color: var(--ink-3); font-size: 11.5px; }
+.toast-detail {
+  margin: 4px 0 0; max-height: 132px; overflow: auto;
+  padding: 8px 10px; border-radius: var(--r-s);
+  border: 1px solid var(--line); background: rgb(var(--panel-surface));
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.55;
+  color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
+}
+.toast-action { justify-self: start; margin-top: 4px; font-size: 12px; }
+.toast-spin { animation: toast-spin 0.9s linear infinite; }
 .toast.success { border-color: rgb(22 163 74 / 0.35); }
-.toast.success svg { color: var(--ok); }
+.toast.success > svg { color: var(--ok); }
 .toast.error { border-color: rgb(220 38 38 / 0.35); }
-.toast.error svg { color: var(--bad); }
-.toast .icon-button { color: var(--ink-3); width: 28px; height: 28px; }
+.toast.error > svg { color: var(--bad); }
+.toast.pending > svg { color: var(--accent); }
+.toast .icon-button { color: var(--ink-3); width: 28px; height: 28px; flex: none; }
 .toast .icon-button:hover { color: var(--ink); }
 @keyframes toast-in { from { transform: translateY(10px) scale(0.98); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes toast-spin { to { transform: rotate(360deg); } }
 
 /* ============================================================
    auth
