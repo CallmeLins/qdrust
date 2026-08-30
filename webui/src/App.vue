@@ -1389,8 +1389,9 @@ onMounted(async () => {
         <label class="kv-label">{{ t('variables') }}
           <span class="kv-rows">
             <span v-for="(row, i) in taskForm.variables" :key="i" class="kv-row">
-              <input v-model="row.name" :placeholder="t('variableName')" />
-              <input v-model="row.value" :placeholder="t('variableValue')" />
+              <span v-if="row.name === 'username' || row.name === 'password'" class="credential-label">{{ row.name === 'username' ? t('username') : t('password') }}</span>
+              <input v-else v-model="row.name" :placeholder="t('variableName')" />
+              <input v-model="row.value" :type="row.name === 'password' ? 'password' : 'text'" :placeholder="row.name === 'username' ? t('username') : row.name === 'password' ? t('password') : t('variableValue')" :autocomplete="row.name === 'password' ? 'current-password' : 'off'" />
               <button class="icon-button" type="button" :title="t('delete')" @click="removeVariableRow(i)"><X :size="14" /></button>
             </span>
             <button class="secondary-button kv-add" type="button" @click="addVariableRow"><Plus :size="14" />{{ t('addVariable') }}</button>

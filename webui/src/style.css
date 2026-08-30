@@ -408,6 +408,7 @@ code {
 .kv-label { display: grid; gap: 7px; }
 .kv-rows { display: grid; gap: 7px; }
 .kv-row { display: grid; grid-template-columns: 1fr 1fr 36px; gap: 8px; align-items: center; }
+.credential-label { min-width: 86px; color: var(--ink); font-size: 12px; font-weight: 700; }
 .kv-row input { height: 38px; min-height: 0; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r-s); outline: 0; background: var(--bg-raise); color: var(--ink); }
 .kv-add { justify-self: start; }
 .kv-hint { color: var(--ink-3); font-size: 11px; line-height: 1.6; }
