@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use minijinja::Environment;
 use regex::{Regex, RegexBuilder};
 use reqwest::{Client, Method, cookie::Jar, redirect::Policy};
 use serde::{Deserialize, Serialize};
@@ -121,7 +120,6 @@ pub struct QdExecutor {
     cookies: Arc<Jar>,
     timeout: Duration,
     allow_invalid_certificates: bool,
-    templates: Environment<'static>,
     expressions: QdExpressionEngine,
     response_limit: usize,
     allow_private_network: bool,
@@ -155,7 +153,6 @@ impl QdExecutor {
             cookies: Arc::new(Jar::default()),
             timeout: options.timeout,
             allow_invalid_certificates: options.allow_invalid_certificates,
-            templates: Environment::new(),
             expressions: QdExpressionEngine::default(),
             response_limit: options.response_limit,
             allow_private_network: options.allow_private_network,
@@ -244,7 +241,7 @@ impl QdExecutor {
             for step in steps {
                 match step {
                     Step::Request(request) => {
-                        let entry = native_request_entry(request, context, &self.templates)?;
+                        let entry = native_request_entry(request, context, &self.expressions)?;
                         results.push(self.execute_request(&entry, context).await?);
                     }
                     Step::Extract(extract_step) => {
@@ -414,6 +411,7 @@ impl QdExecutor {
                 entry,
                 context,
                 url,
+                &request_digest(&method, None),
                 response.status,
                 response.headers.into_iter().collect(),
                 response.body,
@@ -421,7 +419,9 @@ impl QdExecutor {
         }
         let client = self.client_for_url(&url).await?;
         let method = Method::from_bytes(method.as_bytes()).context("invalid rendered method")?;
+        let request_method = method.clone();
         let mut request = client.request(method, &url);
+        let mut rendered_body: Option<String> = None;
         for header in entry.request.headers.iter().filter(|header| header.checked) {
             request = request.header(
                 self.render(&header.name, context)?,
@@ -452,7 +452,11 @@ impl QdExecutor {
             if is_multipart {
                 request = request.multipart(self.build_multipart(post_data, context)?);
             } else if let Some(text) = post_data.text.as_ref() {
-                request = request.body(self.render(text, context)?);
+                // Render once: the same body goes onto the wire and into the
+                // assertion-failure digest, so log diagnosis sees what was sent.
+                let body = self.render(text, context)?;
+                rendered_body = Some(body.clone());
+                request = request.body(body);
             }
         }
 
@@ -469,14 +473,24 @@ impl QdExecutor {
             })
             .collect();
         let body = response.bytes().await?.to_vec();
-        self.finish_response(entry, context, url, status, headers, body)
+        self.finish_response(
+            entry,
+            context,
+            url,
+            &request_digest(request_method.as_str(), rendered_body.as_deref()),
+            status,
+            headers,
+            body,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_response(
         &self,
         entry: &QdHarEntry,
         context: &mut ExecutionContext,
         url: String,
+        request_digest: &str,
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -491,6 +505,17 @@ impl QdExecutor {
         context.last_headers = headers.clone();
         context.last_body = content.to_string();
 
+        // QD shows the step request and response in the run log; surface both
+        // so site-side rejections (e.g. result:-1 "用户名或密码为空") are
+        // diagnosable from the failure message alone.
+        let response_preview = bounded_preview(&content);
+        let request_digest = request_digest.to_string();
+        let url = url.clone();
+        let with_response = |cause: anyhow::Error| {
+            anyhow::anyhow!(
+                "{cause} (at {url})\nrequest: {request_digest}\nresponse: {response_preview}"
+            )
+        };
         self.check_rules(
             &entry.success_asserts,
             true,
@@ -499,7 +524,7 @@ impl QdExecutor {
             &content,
             context,
         )
-        .map_err(|cause| anyhow::anyhow!("{cause} (at {url})"))?;
+        .map_err(with_response)?;
         self.check_rules(
             &entry.failed_asserts,
             false,
@@ -508,7 +533,7 @@ impl QdExecutor {
             &content,
             context,
         )
-        .map_err(|cause| anyhow::anyhow!("{cause} (at {url})"))?;
+        .map_err(with_response)?;
         for rule in &entry.extract_variables {
             let pattern = self.render(&rule.rule.re, context)?;
             let source = rule_source(&rule.rule.from, status, &headers, &content);
@@ -555,8 +580,10 @@ impl QdExecutor {
     }
 
     fn render(&self, value: &str, context: &ExecutionContext) -> Result<String> {
-        self.templates
-            .render_str(value, &context.variables)
+        // Route through QdExpressionEngine so every QD global function and
+        // filter (urlencode, a2b_base64, ...) is available during rendering.
+        self.expressions
+            .render(value, &context.variables)
             .context("cannot render QD template value")
     }
 
@@ -655,18 +682,18 @@ impl QdExecutor {
 fn native_request_entry(
     request: &RequestStep,
     context: &ExecutionContext,
-    templates: &Environment<'static>,
+    templates: &QdExpressionEngine,
 ) -> Result<QdHarEntry> {
     let mut url = templates
-        .render_str(&request.url, &context.variables)
+        .render(&request.url, &context.variables)
         .context("cannot render template request URL")?;
     let mut parsed = reqwest::Url::parse(&url).context("invalid rendered template URL")?;
     {
         let mut query = parsed.query_pairs_mut();
         for (name, value) in &request.query {
             query.append_pair(
-                &templates.render_str(name, &context.variables)?,
-                &templates.render_str(value, &context.variables)?,
+                &templates.render(name, &context.variables)?,
+                &templates.render(value, &context.variables)?,
             );
         }
     }
@@ -723,6 +750,24 @@ fn form_urldecode(input: &str) -> String {
     percent_encoding::percent_decode_str(&input.replace('+', " "))
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// Collapse whitespace and cap a text preview for failure diagnostics.
+fn bounded_preview(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = collapsed.chars().take(300).collect();
+    if collapsed.chars().count() > 300 {
+        preview.push('…');
+    }
+    preview
+}
+
+/// One-line digest of what a step actually sent, for assertion-failure logs.
+fn request_digest(method: &str, body: Option<&str>) -> String {
+    match body {
+        Some(body) => bounded_preview(&format!("{method} body: {body}")),
+        None => bounded_preview(method),
+    }
 }
 
 /// 解析 application/x-www-form-urlencoded 请求体为键值对（QD 模板的 api:// 调用

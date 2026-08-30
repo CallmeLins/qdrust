@@ -20,7 +20,7 @@ fn parses_and_preserves_every_qd_har_fixture() -> Result<()> {
             .with_context(|| format!("cannot read QD HAR fixture {}", path.display()))?;
         let raw: Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("fixture is not JSON: {}", path.display()))?;
-        let har = QdHar::parse(raw.clone())
+        let har = QdHar::parse_qd(raw.clone())
             .with_context(|| format!("fixture is not compatible: {}", path.display()))?;
         ensure!(har.raw() == &raw, "fixture changed during import");
         QdProgram::compile(&har)

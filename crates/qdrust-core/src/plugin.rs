@@ -238,14 +238,38 @@ impl Plugin for UtilityPlugin {
                     })
                 }
                 "unicode" => {
-                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let decoded = percent_encoding::percent_decode_str(text)
-                        .decode_utf8()
-                        .context("invalid unicode encoding")?;
+                    // QD 兼容（qd web/handlers/util.py UniCodeHandler）：content
+                    // 参数做 unicode_escape 解码（\uXXXX/\xNN → 字符，普通文本
+                    // 原样），返回与 QD 相同的缩进 JSON，供 success_asserts 的
+                    // "\"状态\": \"200\"" 与 extract_variables 的
+                    // "\"转换后\": \"(.*)\"" 规则按原样匹配。
+                    let content = request
+                        .query
+                        .get("content")
+                        .or_else(|| request.query.get("text"))
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let html_unescape = request
+                        .query
+                        .get("html_unescape")
+                        .map(String::as_str)
+                        .map(strtobool)
+                        .unwrap_or(false);
+                    let mut converted = crate::expression::conver2unicode(content);
+                    if html_unescape {
+                        converted = html_escape::decode_html_entities(&converted).to_string();
+                    }
+                    let value = serde_json::to_string(&converted)?;
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "content-type".to_string(),
+                        "application/json; charset=UTF-8".to_string(),
+                    );
                     Ok(PluginResponse {
                         status: 200,
-                        headers: BTreeMap::new(),
-                        body: decoded.into_owned().into_bytes(),
+                        headers,
+                        body: format!("{{\n    \"转换后\": {value},\n    \"状态\": \"200\"\n}}")
+                            .into_bytes(),
                     })
                 }
                 "regex" => {
@@ -717,6 +741,14 @@ const GB2312_QUOTE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROL
     .add(b'|')
     .add(b'}');
 
+/// Python distutils strtobool semantics used by QD util handlers.
+fn strtobool(value: &str) -> bool {
+    matches!(
+        value.to_lowercase().as_str(),
+        "y" | "yes" | "t" | "true" | "on" | "1"
+    )
+}
+
 /// Normalize an RSA PEM key the way QD does: locate the `-----BEGIN/END...-----`
 /// markers even when all newlines were stripped by URL transport, restore '+'
 /// characters that turned into spaces, and re-wrap the base64 body at 64
@@ -870,6 +902,41 @@ mod tests {
             "unexpected body: {body}"
         );
         assert!(body.contains("\"状态\": \"200\""));
+    }
+
+    #[tokio::test]
+    async fn unicode_converts_content_with_qd_json_body() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        // 189天翼云 flow: content is urlencoded ASCII hex - passes through and
+        // lands in the "转换后" field for the "\"转换后\": \"(.*)\"" extractor.
+        let response = registry
+            .call("api://util/unicode?content=ab%20cd", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            body.contains("\"转换后\": \"ab cd\""),
+            "unexpected body: {body}"
+        );
+        assert!(body.contains("\"状态\": \"200\""));
+
+        // Embedded \uXXXX escapes are decoded, matching QD's conver2unicode.
+        let response = registry
+            .call(
+                "api://util/unicode?content=%5Cu79ef%5Cu5206",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            body.contains("\"转换后\": \"积分\""),
+            "unexpected body: {body}"
+        );
     }
 
     #[tokio::test]

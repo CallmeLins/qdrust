@@ -236,7 +236,7 @@ async fn sync_subscription_inner(
             .with_context(|| format!("cannot read body of {name}"))?;
         let har: Value =
             serde_json::from_slice(&bytes).with_context(|| format!("{name} is not valid JSON"))?;
-        QdHar::parse(har.clone()).with_context(|| format!("{name} is not a valid QD HAR"))?;
+        QdHar::parse_qd(har.clone()).with_context(|| format!("{name} is not a valid QD HAR"))?;
         upsert_subscription_template(store, subscription.owner_id, name, har, source).await?;
         imported += 1;
     }

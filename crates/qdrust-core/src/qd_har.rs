@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Clone, Debug)]
 pub struct QdHar {
@@ -12,6 +12,22 @@ impl QdHar {
     pub fn parse(raw: Value) -> Result<Self> {
         let document: HarDocument =
             serde_json::from_value(raw.clone()).context("invalid QD HAR document")?;
+        Self::finish_parse(raw, document)
+    }
+
+    /// Parse a QD-exported template, normalizing the shapes QD tolerates but
+    /// the HAR reader does not: a bare entry array without the `log` wrapper,
+    /// `request.data` string bodies, request-level `mimeType`, nested `rule`
+    /// objects, missing `checked` flags, and missing HAR versions. The
+    /// original input is preserved in `raw()`.
+    pub fn parse_qd(raw: Value) -> Result<Self> {
+        let normalized = normalize_qd_document(raw.clone());
+        let document: HarDocument =
+            serde_json::from_value(normalized).context("invalid QD HAR document")?;
+        Self::finish_parse(raw, document)
+    }
+
+    fn finish_parse(raw: Value, document: HarDocument) -> Result<Self> {
         ensure!(document.log.version == "1.2", "unsupported HAR version");
         ensure!(
             !document.log.entries.is_empty(),
@@ -247,6 +263,117 @@ fn consume_end(entries: &[QdHarEntry], cursor: &mut usize, expected: &str) -> Re
     Ok(())
 }
 
+/// Normalize the shapes QD exports and its template library tolerate:
+/// - a bare JSON array of entries without the `{"log": ...}` wrapper;
+/// - `request.data` string bodies and request-level `mimeType` (QD template
+///   format) mapped onto standard HAR `postData`;
+/// - `postData.params` turned into a form body when `text` is absent;
+/// - a missing HAR version defaulted to 1.2.
+fn normalize_qd_document(raw: Value) -> Value {
+    let entries = match &raw {
+        Value::Array(items) => items.clone(),
+        Value::Object(object) => match object.get("log") {
+            Some(Value::Object(log)) => match log.get("entries") {
+                Some(Value::Array(items)) => items.clone(),
+                _ => return raw,
+            },
+            _ => return raw,
+        },
+        _ => return raw,
+    };
+    let mut entries = entries;
+    for entry in entries.iter_mut().filter_map(Value::as_object_mut) {
+        // QD exports omit `checked`; every exported entry is enabled.
+        entry.entry("checked").or_insert_with(|| Value::Bool(true));
+        // QD nests the rules under `rule`; hoist them to the entry top level
+        // where the reader expects them, so extraction and asserts survive
+        // subscription/library imports that skip the UI flattening.
+        if let Some(rule) = entry.remove("rule")
+            && let Some(rule) = rule.as_object()
+        {
+            for key in ["success_asserts", "failed_asserts", "extract_variables"] {
+                if let Some(value) = rule.get(key)
+                    && !entry.contains_key(key)
+                {
+                    entry.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        let Some(request) = entry.get_mut("request").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let data = request
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mime_type = request
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let has_params = request
+            .get("postData")
+            .and_then(|post| post.get("params"))
+            .is_some_and(Value::is_array);
+        if data.is_none() && mime_type.is_none() && !has_params {
+            continue;
+        }
+        let post_data = request
+            .entry("postData")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(post_object) = post_data.as_object_mut() {
+            if let Some(text) = data
+                && !post_object.contains_key("text")
+            {
+                post_object.insert("text".to_string(), Value::String(text));
+            }
+            if let Some(mime_type) = mime_type
+                && !post_object.contains_key("mimeType")
+            {
+                post_object.insert("mimeType".to_string(), Value::String(mime_type));
+            }
+            // Standard HAR exports carry form bodies as a params array; turn
+            // them into the raw text the executor sends verbatim.
+            if !post_object.contains_key("text")
+                && let Some(Value::Array(params)) = post_object.get("params")
+            {
+                let body = params
+                    .iter()
+                    .filter_map(|param| {
+                        let object = param.as_object()?;
+                        let name = object.get("name")?.as_str()?;
+                        let value = object.get("value").and_then(Value::as_str).unwrap_or("");
+                        Some((name, value))
+                    })
+                    .map(|(name, value)| format!("{name}={}", form_url_encode(value)))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                post_object.insert("text".to_string(), Value::String(body));
+            }
+        }
+    }
+    json!({
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "qdrust", "version": "1.0"},
+            "entries": entries,
+        }
+    })
+}
+
+/// Percent-encode a form value (RFC 3986 unreserved characters stay literal).
+fn form_url_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QdHarRequest {
     pub method: String,
@@ -306,6 +433,102 @@ pub struct QdExtractRule {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_qd_hoists_nested_rule_and_defaults_checked() {
+        // QD template-library exports: nested `rule` object, no `checked`.
+        let raw = json!([
+            {
+                "comment": "登录",
+                "request": {
+                    "method": "GET",
+                    "url": "https://example.invalid/start",
+                    "headers": [],
+                    "cookies": []
+                },
+                "rule": {
+                    "success_asserts": [{"re": "302", "from": "status"}],
+                    "failed_asserts": [],
+                    "extract_variables": [{"name": "token", "re": "token=(.+)", "from": "content"}]
+                }
+            }
+        ]);
+        let har = QdHar::parse_qd(raw).expect("QD template-library export must parse");
+        let entry = &har.entries()[0];
+        assert!(entry.checked, "entries without checked are enabled");
+        assert_eq!(entry.success_asserts.len(), 1);
+        assert_eq!(entry.extract_variables.len(), 1);
+        assert_eq!(entry.extract_variables[0].name, "token");
+    }
+
+    #[test]
+    fn parse_qd_normalizes_bare_array_with_data_bodies() {
+        // Exactly the 189天翼云 shape: QD exports a bare entry array whose
+        // POST bodies live in request.data and mimeType sits at request level.
+        let raw = json!([
+            {
+                "checked": true,
+                "comment": "登录",
+                "request": {
+                    "method": "POST",
+                    "url": "https://open.e.189.cn/api/logbox/oauth2/loginSubmit.do",
+                    "headers": [],
+                    "cookies": [],
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "data": "version=v2.0&userName={{userkey}}"
+                }
+            },
+            {
+                "checked": true,
+                "request": {
+                    "method": "POST",
+                    "url": "https://open.e.189.cn/api/logbox/oauth2/needcaptcha.do",
+                    "headers": [],
+                    "data": "accountType=01"
+                }
+            }
+        ]);
+        let har = QdHar::parse_qd(raw.clone()).expect("bare-array QD tpl must parse");
+        let requests = har
+            .entries()
+            .iter()
+            .map(|entry| &entry.request)
+            .collect::<Vec<_>>();
+        assert_eq!(har.raw(), &raw, "original document must be preserved");
+        assert_eq!(requests.len(), 2);
+        let login = &requests[0];
+        assert_eq!(
+            login.post_data.as_ref().unwrap().mime_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(
+            login.post_data.as_ref().unwrap().text.as_deref(),
+            Some("version=v2.0&userName={{userkey}}")
+        );
+        let captcha = &requests[1];
+        assert_eq!(
+            captcha.post_data.as_ref().unwrap().text.as_deref(),
+            Some("accountType=01")
+        );
+    }
+
+    #[test]
+    fn parse_qd_synthesizes_text_from_post_params() {
+        let raw = json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {
+                "method": "POST",
+                "url": "https://example.invalid/form",
+                "postData": {"params": [
+                    {"name": "user", "value": "a b&c"},
+                    {"name": "flag", "value": "1"}
+                ]}
+            }
+        }]}});
+        let har = QdHar::parse_qd(raw).unwrap();
+        let post_data = har.entries()[0].request.post_data.as_ref().unwrap();
+        assert_eq!(post_data.text.as_deref(), Some("user=a%20b%26c&flag=1"));
+    }
 
     #[test]
     fn parses_qd_extensions_and_preserves_raw_document() {

@@ -1236,7 +1236,7 @@ async fn import_qd_har(
 async fn validate_qd_har(
     ApiJson(input): ApiJson<ValidateQdHar>,
 ) -> Result<Json<QdHarValidation>, ApiError> {
-    let har = QdHar::parse(input.har).map_err(ApiError::unprocessable)?;
+    let har = QdHar::parse_qd(input.har).map_err(ApiError::unprocessable)?;
     QdProgram::compile(&har).map_err(ApiError::unprocessable)?;
     let enabled = har.enabled_entries().count();
     let controls = har

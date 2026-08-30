@@ -335,7 +335,9 @@ async fn execute_with_run(
             .await;
         }
         Err(err) => {
-            let message = bounded_error(&err.to_string());
+            // Include the anyhow cause chain so render errors surface their root
+            // cause (e.g. "unknown function a2b_base64") in the run log.
+            let message = bounded_error(&format!("{err:#}"));
             if message.contains("execution cancelled") {
                 // The run was cancelled through the API while executing. finish_run
                 // honours cancel_requested and lands the run in 'cancelled'; do not

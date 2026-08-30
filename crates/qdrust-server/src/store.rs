@@ -1094,7 +1094,7 @@ macro_rules! define_store {
         input: ImportQdHarTemplate,
     ) -> Result<Template> {
         validate_template_name(&input.name)?;
-        QdHar::parse(input.har.clone())?;
+        QdHar::parse_qd(input.har.clone())?;
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
@@ -1123,7 +1123,7 @@ macro_rules! define_store {
         input: UpdateQdHarTemplate,
     ) -> Result<Option<Template>> {
         validate_template_name(&input.name)?;
-        QdHar::parse(input.har.clone())?;
+        QdHar::parse_qd(input.har.clone())?;
         let changed=sqlx::query("UPDATE templates SET name=?,description=?,source=?,updated_at=? WHERE id=? AND owner_id=? AND source_format='qd_har'").bind(input.name).bind(input.description).bind(serde_json::to_string(&input.har)?).bind(Utc::now().timestamp()).bind(id).bind(owner_id).execute(&self.pool).await?.rows_affected();
         if changed == 0 {
             return Ok(None);

@@ -6,7 +6,10 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+aes = "0.8"
 base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+ecb = { version = "0.1", features = ["alloc", "block-padding"] }
 chrono = "0.4"
 hex = "0.4"
 html-escape = "0.2"
