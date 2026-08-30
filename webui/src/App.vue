@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
   LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
@@ -123,10 +123,33 @@ function harVariableNames(har: unknown): string[] {
   const walk = (value: unknown) => {
     if (typeof value === "string") {
       for (const match of value.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) names.add(match[1]);
+      // QD templates commonly apply filters/functions, e.g. {{username|urlencode}}
+      // or {{rsa(password)}}. The simple identifier form above does not catch
+      // those, so explicitly retain credential inputs wherever they occur in
+      // a Jinja expression.
+      if (/\{\{[\s\S]*?\busername\b[\s\S]*?\}\}/.test(value)) names.add("username");
+      if (/\{\{[\s\S]*?\bpassword\b[\s\S]*?\}\}/.test(value)) names.add("password");
     } else if (Array.isArray(value)) value.forEach(walk);
     else if (value && typeof value === "object") Object.values(value).forEach(walk);
   };
   walk(har);
+  // QD also exposes cookie values as task-level inputs. Cookie names are not
+  // written as {{name}} in many exported HAR files, so discover empty or
+  // templated cookie values explicitly and create an input for each one.
+  const entries = (har as Record<string, unknown>)?.log && typeof har === "object"
+    ? ((har as Record<string, unknown>).log as Record<string, unknown>)?.entries
+    : Array.isArray(har) ? har : null;
+  if (Array.isArray(entries)) for (const entry of entries) {
+    const cookies = (entry as Record<string, unknown>)?.request && typeof (entry as Record<string, unknown>).request === "object"
+      ? ((entry as Record<string, unknown>).request as Record<string, unknown>).cookies : null;
+    if (Array.isArray(cookies)) for (const cookie of cookies) {
+      if (!cookie || typeof cookie !== "object") continue;
+      const item = cookie as Record<string, unknown>;
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      const value = typeof item.value === "string" ? item.value : "";
+      if (name && (!value || /\{\{/.test(value))) names.add(name);
+    }
+  }
   return [...names].filter((name) => !name.startsWith("__"));
 }
 
@@ -230,6 +253,7 @@ async function submitTask() {
 function openCreateTask() {
   Object.assign(taskForm, blankTaskForm());
   showCreate.value = true;
+  if (!templates.value.length) void openTemplates();
 }
 function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
@@ -389,6 +413,9 @@ function onTemplatePicked() {
     notify(fmt("templateVarsFound", { n: names.length }));
   }
 }
+watch(() => taskForm.templateId, (id, previous) => {
+  if (id != null && id !== previous) onTemplatePicked();
+});
 async function publishTemplate(id: number) {
   try { await api.publishTemplate(id); notify(t("publishDone")); await openTemplates(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }

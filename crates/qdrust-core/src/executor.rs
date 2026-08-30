@@ -392,6 +392,27 @@ impl QdExecutor {
 
         let method = self.render(&entry.request.method, context)?;
         let mut url = self.render(&entry.request.url, context)?;
+        let debug_requests = std::env::var("QDRUST_DEBUG_REQUESTS")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        if debug_requests {
+            eprintln!(
+                "[qdrust:request:start] method={} url={} variables={}",
+                method,
+                url,
+                context
+                    .variables
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
         if url.starts_with("api://") {
             // QD 兼容：api:// 请求的 POST 表单体（如 util/urldecode 的 content=...）
             // 并入查询串后交给插件，与 QD 后端 get_argument 同时读取 query 与表单体的行为一致。
@@ -403,10 +424,21 @@ impl QdExecutor {
                     && let Some(text) = post_data.text.as_ref()
                 {
                     let body = self.render(text, context)?;
+                    if debug_requests {
+                        eprintln!("[qdrust:request:api-body] url={} body={}", url, body);
+                    }
                     url = merge_form_into_query(&url, &body);
                 }
             }
             let response = self.plugins.call(&url, self.plugin_timeout).await?;
+            if debug_requests {
+                eprintln!(
+                    "[qdrust:request:api-response] url={} status={} body={}",
+                    url,
+                    response.status,
+                    bounded_preview(&String::from_utf8_lossy(&response.body))
+                );
+            }
             return self.finish_response(
                 entry,
                 context,
@@ -455,6 +487,14 @@ impl QdExecutor {
                 // Render once: the same body goes onto the wire and into the
                 // assertion-failure digest, so log diagnosis sees what was sent.
                 let body = self.render(text, context)?;
+                if debug_requests {
+                    eprintln!(
+                        "[qdrust:request:body] url={} content_type={} body={}",
+                        url,
+                        post_data.mime_type.as_deref().unwrap_or(""),
+                        body
+                    );
+                }
                 rendered_body = Some(body.clone());
                 request = request.body(body);
             }
@@ -473,6 +513,14 @@ impl QdExecutor {
             })
             .collect();
         let body = response.bytes().await?.to_vec();
+        if debug_requests {
+            eprintln!(
+                "[qdrust:request:response] url={} status={} body={}",
+                url,
+                status,
+                bounded_preview(&String::from_utf8_lossy(&body))
+            );
+        }
         self.finish_response(
             entry,
             context,
