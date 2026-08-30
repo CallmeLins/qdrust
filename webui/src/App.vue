@@ -361,7 +361,10 @@ function runStatusLabel(status: string): string {
 }
 /** QD 式日志列：成功显示 __log__ 摘要，失败显示错误详情 */
 function runLogText(run: Run): string {
-  if (run.log) return run.log;
+  if (run.log) {
+    // HAR logs may contain escaped newline sequences; decode them for display only.
+    return run.log.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+  }
   if (run.error) return run.error;
   if (run.http_status) return `HTTP ${run.http_status}`;
   return "–";
