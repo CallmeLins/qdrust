@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, FileJson2, FileUp,
   LayoutDashboard, Mail, Menu, Pencil, Play, Plus, RefreshCw, Search, Send,
@@ -199,6 +199,23 @@ async function loadTasks() {
     loading.value = false;
   }
 }
+async function refreshTaskStatuses() {
+  if (!tasks.value.length) return;
+  try {
+    const latest = await api.tasks();
+    const byId = new Map(latest.map((task) => [task.id, task]));
+    for (const task of tasks.value) {
+      const fresh = byId.get(task.id);
+      if (fresh) {
+        task.disabled = fresh.disabled;
+        task.last_status = fresh.last_status;
+        task.last_run_at = fresh.last_run_at;
+      }
+    }
+  } catch {
+    // Background status refresh is best-effort; keep the current table intact.
+  }
+}
 
 async function submitTask() {
   let headers: Record<string, unknown> = {};
@@ -253,7 +270,11 @@ async function submitTask() {
 function openCreateTask() {
   Object.assign(taskForm, blankTaskForm());
   showCreate.value = true;
-  if (!templates.value.length) void openTemplates();
+  if (!templates.value.length) {
+    void api.templates(undefined, undefined, 200)
+      .then((items) => { templates.value = items; })
+      .catch((cause) => notify(cause instanceof Error ? cause.message : t("genericError"), "error"));
+  }
 }
 function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
@@ -358,6 +379,11 @@ async function clearTaskRuns() {
 function runStatusLabel(status: string): string {
   const key = ({ succeeded: "runStSucceeded", failed: "runStFailed", running: "runStRunning", leased: "runStRunning", pending: "runStPending", cancelled: "runStCancelled" } as Record<string, Parameters<typeof t>[0]>)[status];
   return key ? t(key) : status;
+}
+function taskStatusLabel(task: Task): string {
+  if (task.disabled) return "禁用";
+  if (task.last_status == null) return "正常";
+  return task.last_status < 400 ? "正常" : "失败";
 }
 /** QD 式日志列：成功显示 __log__ 摘要，失败显示错误详情 */
 function runLogText(run: Run): string {
@@ -893,6 +919,12 @@ onMounted(async () => {
     ready.value = true;
   }
 });
+const refreshTimer = window.setInterval(() => {
+  if (!authenticated.value) return;
+  void refreshTaskStatuses();
+  if (runHistoryTask.value != null) void loadTaskRuns(runHistoryTask.value.id);
+}, 5000);
+onUnmounted(() => window.clearInterval(refreshTimer));
 </script>
 
 <template>
@@ -1033,7 +1065,7 @@ onMounted(async () => {
                     <td><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
                     <td><code>{{ task.cron }}</code></td>
                     <td>{{ formatRunTime(task.last_run_at) }}</td>
-                    <td><button :class="['status-pill', { paused: task.disabled }]" @click="toggleTask(task)"><span />{{ task.disabled ? t('paused') : t('running') }}</button></td>
+                    <td><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
                     <td>{{ task.grp ?? '–' }}</td>
                     <td class="row-actions">
                       <button class="icon-button" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
