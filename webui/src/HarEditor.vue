@@ -249,6 +249,7 @@ function buildDocument(): HarDocument {
 const doc = ref<HarDocument>(freshDoc());
 const entries = computed(() => doc.value.log.entries);
 const selectedIndex = ref(-1);
+const detailTab = ref<"request" | "response" | "test" | "preview">("request");
 const selectedEntry = computed<HarEntry | null>(() =>
   selectedIndex.value >= 0 ? (entries.value[selectedIndex.value] ?? null) : null
 );
@@ -673,6 +674,20 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 
           <!-- 右侧详细编辑面板 -->
           <div v-if="selectedEntry" class="har-detail">
+            <div class="detail-tabs" role="tablist">
+              <button type="button" :class="{ active: detailTab === 'request' }" @click="detailTab = 'request'">请求 / Request</button>
+              <button type="button" :class="{ active: detailTab === 'response' }" @click="detailTab = 'response'">响应 / Response</button>
+              <button type="button" :class="{ active: detailTab === 'test' }" @click="detailTab = 'test'">测试 / Test</button>
+              <button type="button" :class="{ active: detailTab === 'preview' }" @click="detailTab = 'preview'">预览 / Preview</button>
+            </div>
+            <div v-if="detailTab === 'response'" class="tab-placeholder"><h3>响应 / Response</h3><p>保存模板后运行任务，响应状态、响应头和响应体会显示在运行记录中。</p></div>
+            <div v-else-if="detailTab === 'preview'" class="tab-placeholder"><h3>预览 / Preview</h3><dl class="preview-list"><div><dt>方法</dt><dd>{{ selectedEntry.request.method }}</dd></div><div><dt>URL</dt><dd>{{ selectedEntry.request.url || '未设置' }}</dd></div><div><dt>成功断言</dt><dd>{{ selectedEntry.success_asserts.length }} 条</dd></div><div><dt>变量提取</dt><dd>{{ selectedEntry.extract_variables.length }} 条</dd></div></dl></div>
+            <div v-else-if="detailTab === 'test'" class="test-panel">
+              <section class="test-section"><div class="test-section-head"><h3>Variables</h3><button type="button" class="add-mini" @click="addExtractVar">ADD</button></div><div v-if="selectedEntry.extract_variables.length" class="test-items"><div v-for="(item, i) in selectedEntry.extract_variables" :key="i" class="test-item"><span>{{ i }}:</span><code>{{ item.name || '[object Object]' }}</code><button type="button" class="row-del" @click="removeExtractVar(i)"><Trash2 :size="13" /></button></div></div><p v-else class="sec-hint">暂无变量</p></section>
+              <section class="test-section"><div class="test-section-head"><h3>Cookies</h3><button type="button" class="add-mini" @click="addCookie">CLEAR</button></div><div v-if="selectedEntry.request.cookies.length" class="test-items"><div v-for="(cookie, i) in selectedEntry.request.cookies" :key="i" class="test-item"><span>{{ cookie.name }}</span><code>{{ cookie.value }}</code><button type="button" class="row-del" @click="removeCookie(i)"><Trash2 :size="13" /></button></div></div><p v-else class="sec-hint">暂无 Cookie</p></section>
+              <div class="test-insert">在 <button type="button" class="secondary-button">前面</button><button type="button" class="secondary-button">后面</button> 插入一个请求</div>
+            </div>
+            <template v-else-if="detailTab === 'request'">
             <div class="detail-head">
               <input
                 list="har-methods"
@@ -887,6 +902,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
                 </div>
               </div>
             </section>
+            </template>
           </div>
 
           <!-- 有列表但未选中条目 -->
@@ -898,6 +914,15 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 </template>
 
 <style scoped>
+.detail-tabs { display: flex; gap: 4px; padding: 0 0 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px; flex-wrap: wrap; }
+.detail-tabs button { min-height: 38px; border: 1px solid var(--accent); border-radius: 5px; padding: 0 14px; color: var(--ink-2); background: var(--bg-raise); font-weight: 600; cursor: pointer; }
+.detail-tabs button:hover { background: var(--accent-glow); color: var(--ink); }
+.detail-tabs button.active { color: #000; background: var(--accent); border-color: var(--accent); }
+.test-panel { display: grid; gap: 18px; min-height: 280px; }.test-section { padding: 16px; border: 1px solid var(--line); border-radius: var(--r-s); background: var(--bg-raise); }.test-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }.test-section h3 { margin: 0; color: var(--ink); font-size: 15px; }.test-items { display: grid; gap: 7px; }.test-item { display: grid; grid-template-columns: 34px 1fr 32px; gap: 8px; align-items: center; }.test-item span { color: var(--ink-2); }.test-item code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.test-insert { color: var(--ink-2); font-size: 13px; }.test-insert .secondary-button { min-height: 30px; padding: 0 9px; margin: 0 3px; }
+.tab-placeholder { min-height: 280px; padding: 22px; border: 1px solid var(--line); border-radius: var(--r-s); background: var(--bg-raise); }
+.tab-placeholder h3 { margin: 0 0 10px; color: var(--ink); font-size: 16px; }
+.tab-placeholder p { margin: 0; color: var(--ink-2); line-height: 1.6; }
+.preview-list { margin: 18px 0 0; }.preview-list div { display: flex; gap: 18px; padding: 10px 0; border-top: 1px solid var(--line); }.preview-list dt { width: 90px; color: var(--ink-2); }.preview-list dd { margin: 0; color: var(--ink); word-break: break-all; }
 .har-editor {
   display: flex;
   flex-direction: column;
