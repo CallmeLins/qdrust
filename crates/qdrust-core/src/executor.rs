@@ -455,10 +455,15 @@ impl QdExecutor {
         let mut request = client.request(method, &url);
         let mut rendered_body: Option<String> = None;
         for header in entry.request.headers.iter().filter(|header| header.checked) {
-            request = request.header(
-                self.render(&header.name, context)?,
-                self.render(&header.value, context)?,
-            );
+            let rendered_name = self.render(&header.name, context)?;
+            let rendered_value = self.render(&header.value, context)?;
+            if debug_requests {
+                eprintln!(
+                    "[qdrust:request:header] url={} {}={}",
+                    url, rendered_name, rendered_value
+                );
+            }
+            request = request.header(rendered_name, rendered_value);
         }
         let cookies = entry
             .request
@@ -477,6 +482,24 @@ impl QdExecutor {
             request = request.header(reqwest::header::COOKIE, cookies.join("; "));
         }
         if let Some(post_data) = entry.request.post_data.as_ref() {
+            let mime_type = post_data.mime_type.as_deref().unwrap_or("");
+            let has_content_type = entry
+                .request
+                .headers
+                .iter()
+                .filter(|header| header.checked)
+                .any(|header| header.name.eq_ignore_ascii_case("content-type"));
+            if !mime_type.is_empty() && !has_content_type {
+                // Browsers add this header when submitting a form even when
+                // older QD HAR exports omit it (notably loginSubmit.do).
+                request = request.header(reqwest::header::CONTENT_TYPE, mime_type);
+                if debug_requests {
+                    eprintln!(
+                        "[qdrust:request:header:auto] url={} Content-Type={}",
+                        url, mime_type
+                    );
+                }
+            }
             let is_multipart = post_data
                 .mime_type
                 .as_deref()
@@ -486,7 +509,15 @@ impl QdExecutor {
             } else if let Some(text) = post_data.text.as_ref() {
                 // Render once: the same body goes onto the wire and into the
                 // assertion-failure digest, so log diagnosis sees what was sent.
-                let body = self.render(text, context)?;
+                let rendered = self.render(text, context)?;
+                let body = if post_data.mime_type.as_deref().is_some_and(|mime| {
+                    mime.to_ascii_lowercase()
+                        .contains("application/x-www-form-urlencoded")
+                }) {
+                    encode_form_body(&rendered)
+                } else {
+                    rendered
+                };
                 if debug_requests {
                     eprintln!(
                         "[qdrust:request:body] url={} content_type={} body={}",
@@ -588,6 +619,14 @@ impl QdExecutor {
             if let Some(value) = extract(&pattern, &source)? {
                 context.variables.insert(rule.name.clone(), value);
             }
+        }
+
+        // The 189.cn login flow returns HTTP 200 even when appConf cannot
+        // produce the required parameters. Stop here with a useful message
+        // instead of allowing a later loginSubmit request to report the
+        // misleading "用户名或密码为空" error.
+        if url.contains("/oauth2/appConf.do") && content.contains("\"data\":{}") {
+            bail!("QD appConf returned empty data (check reqid, lt and referer headers)");
         }
 
         Ok(StepResult {
@@ -829,6 +868,33 @@ fn parse_form_pairs(body: &str) -> Vec<(String, String)> {
         })
         .collect()
 }
+
+/// Encode rendered form fields without allowing '&' or '=' inside a value to
+/// become new fields. Existing percent escapes are decoded first so values are
+/// not double-encoded (important for QD's chained urlencode expressions).
+fn encode_form_body(body: &str) -> String {
+    body.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (name, value) = part.split_once('=').unwrap_or((part, ""));
+            let encode = |value: &str| {
+                percent_encoding::utf8_percent_encode(&form_urldecode(value), FORM_VALUE_ENCODE_SET)
+                    .to_string()
+            };
+            format!("{}={}", encode(name), encode(value))
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+const FORM_VALUE_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b'&')
+    .add(b'=')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%')
+    .add(b'+')
+    .add(b' ');
 
 /// 把表单键值对追加到 api:// URL 的查询串。值会被重新百分号编码，
 /// 插件层 from_api_url 解码后与原值一致。
