@@ -1366,6 +1366,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <template v-else-if="channelForm.kind === 'email'">
               <label>{{ t('emailTo') }}<input v-model="channelForm.to" required type="email" /></label>
               <label>{{ t('emailSubject') }}<input v-model="channelForm.subject" /></label>
+              <small class="kv-hint">{{ t('emailFromHint') }}</small>
             </template>
             <template v-else-if="channelForm.kind === 'bark'">
               <label>{{ t('barkUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://api.day.app/yourkey" /></label>

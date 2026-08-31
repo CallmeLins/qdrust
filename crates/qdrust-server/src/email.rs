@@ -65,9 +65,12 @@ impl EmailClient {
     }
 
     pub fn send(&self, to: &str, from: Option<&str>, subject: &str, body: &str) -> Result<()> {
-        if !self.enabled() {
-            return Ok(());
-        }
+        // Failing loudly (instead of silently succeeding) lets callers such as
+        // the notification dispatcher log that the channel cannot deliver.
+        ensure!(
+            self.enabled(),
+            "SMTP is not configured (set QDRUST_SMTP_HOST)"
+        );
         let from = from.unwrap_or_else(|| self.config.from.as_deref().unwrap());
         let sender: Mailbox = from.parse().context("invalid from email address")?;
         let recipient: Mailbox = to.parse().context("invalid to email address")?;
