@@ -667,9 +667,6 @@ code {
    ============================================================ */
 .steps-panel { margin: 10px 0 14px; border: 1px solid var(--line); border-radius: var(--r-m); background: rgb(var(--card-surface)); padding: 14px; }
 .steps-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; color: var(--ink-2); font-size: 13px; font-weight: 600; }
-.steps-table { min-width: 100%; }
-.steps-table th, .steps-table td { height: auto; padding: 7px 10px; font-size: 12px; }
-.steps-table code { white-space: nowrap; max-width: 420px; display: inline-block; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 .live-badge { display: inline-flex; align-items: center; gap: 6px; color: var(--warn); font-size: 11px; font-weight: 700; }
 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
