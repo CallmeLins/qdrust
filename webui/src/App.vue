@@ -152,7 +152,7 @@ interface TaskForm {
   timezone: string;
   variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "Asia/Shanghai", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
 
@@ -1612,7 +1612,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <label :title="t('priorityHint')">{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
         </div>
         <small class="kv-hint">{{ t('taskNumericHint') }}</small>
-        <label>{{ t('timezone') }}<input v-model="taskForm.timezone" list="tz-options" placeholder="UTC / Asia/Shanghai" /></label>
+        <label>{{ t('timezone') }}<input v-model="taskForm.timezone" list="tz-options" :title="t('timezoneHint')" placeholder="Asia/Shanghai" /></label>
         <datalist id="tz-options">
           <option v-for="tz in ['UTC','Asia/Shanghai','Asia/Tokyo','Asia/Hong_Kong','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney']" :key="tz" :value="tz" />
         </datalist>

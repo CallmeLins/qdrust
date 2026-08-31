@@ -188,10 +188,14 @@ fn due(task: &Task, interval: Duration) -> bool {
         .and_then(|tz| tz.parse().ok())
         .unwrap_or(chrono_tz::UTC);
     let now = Utc::now().with_timezone(&tz);
-    let since = Utc
-        .timestamp_opt(task.last_run_at.unwrap_or(0), 0)
-        .single()
-        .unwrap_or(Utc::now() - interval)
+    // A task that has never run must wait for its *next* scheduled moment.
+    // Anchoring "since" at now - interval (instead of epoch 0) prevents a new
+    // task from firing immediately on the first scheduler tick after creation.
+    let since = task
+        .last_run_at
+        .filter(|seconds| *seconds > 0)
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+        .unwrap_or_else(|| Utc::now() - interval)
         .with_timezone(&tz);
     schedule
         .after(&since)
@@ -708,5 +712,70 @@ mod tests {
             Some("ops@example.com".into())
         );
         assert_eq!(normalize_recipient("not an address"), None);
+    }
+
+    fn due_probe_task(cron: &str, last_run_at: Option<i64>, timezone: Option<&str>) -> Task {
+        Task {
+            id: 1,
+            name: "probe".into(),
+            cron: cron.into(),
+            method: "GET".into(),
+            url: "api://util/delay".into(),
+            headers: serde_json::json!({}),
+            body: None,
+            disabled: false,
+            created_at: 0,
+            updated_at: 0,
+            last_run_at,
+            last_status: None,
+            last_error: None,
+            template_id: None,
+            grp: None,
+            timeout_seconds: None,
+            retry_count: None,
+            retry_interval_seconds: None,
+            priority: None,
+            timezone: timezone.map(str::to_string),
+            random_delay_max_seconds: None,
+            variables: None,
+        }
+    }
+
+    #[test]
+    fn never_run_task_is_not_due_until_scheduled_time() {
+        // A task created moments ago (last_run_at = None) must not fire on the
+        // next tick just because the schedule had occurrences in the past.
+        let task = due_probe_task("0 0 8 * * *", None, Some("Asia/Shanghai"));
+        assert!(!due(&task, Duration::from_secs(15)));
+
+        // Same after an explicit epoch-ish sentinel.
+        let task = due_probe_task("0 0 8 * * *", Some(0), Some("Asia/Shanghai"));
+        assert!(!due(&task, Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn task_becomes_due_once_scheduled_time_passes() {
+        // Simulate: last ran at the previous 08:00 local, now is past the next
+        // 08:00 local -> due. We fake this by picking a cron that fires every
+        // minute and pretending the last run was 2 intervals ago via a stored
+        // timestamp; use UTC directly to keep the assertion deterministic.
+        let last_run = (Utc::now() - Duration::from_secs(120)).timestamp();
+        let task = due_probe_task("0 * * * * *", Some(last_run), None);
+        assert!(due(&task, Duration::from_secs(15)));
+
+        // Last ran a few seconds ago on a daily schedule -> not due yet.
+        let last_run = (Utc::now() - Duration::from_secs(30)).timestamp();
+        let task = due_probe_task("0 0 8 * * *", Some(last_run), None);
+        assert!(!due(&task, Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn unparsable_cron_and_disabled_tasks_are_never_due() {
+        let task = due_probe_task("not a cron", None, None);
+        assert!(!due(&task, Duration::from_secs(15)));
+
+        let mut task = due_probe_task("0 * * * * *", None, None);
+        task.disabled = true;
+        assert!(!due(&task, Duration::from_secs(15)));
     }
 }
