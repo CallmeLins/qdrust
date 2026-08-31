@@ -1217,17 +1217,17 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <table>
               <thead><tr>
                 <th class="col-check"><input type="checkbox" :checked="filteredTasks.length > 0 && filteredTasks.every(x => selected.has(x.id))" :title="t('selectAll')" @change="selectAllVisible" /></th>
-                <th>{{ t('name') }}</th><th>{{ t('schedule') }}</th><th>{{ t('lastRunAt') }}</th><th>{{ t('status') }}</th><th>{{ t('group') }}</th><th><span class="sr-only">{{ t('more') }}</span></th>
+                <th>{{ t('name') }}</th><th class="col-schedule">{{ t('schedule') }}</th><th>{{ t('lastRunAt') }}</th><th>{{ t('status') }}</th><th class="col-group">{{ t('group') }}</th><th><span class="sr-only">{{ t('more') }}</span></th>
               </tr></thead>
               <tbody>
                 <template v-for="task in filteredTasks" :key="task.id">
                   <tr>
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
                     <td><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
-                    <td><code>{{ task.cron }}</code></td>
+                    <td class="col-schedule"><code>{{ task.cron }}</code></td>
                     <td>{{ formatRunTime(task.last_run_at) }}</td>
                     <td><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
-                    <td>{{ task.grp ?? '–' }}</td>
+                    <td class="col-group">{{ task.grp ?? '–' }}</td>
                     <td class="row-actions">
                       <button class="icon-button" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
                       <button class="icon-button" :title="t('runHistory')" @click="openRunHistory(task)"><Activity :size="17" /></button>
@@ -1265,7 +1265,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <tr v-for="run in runsByTask[runHistoryTask?.id ?? -1]" :key="run.id">
                   <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</td>
                   <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
-                  <td><span class="run-log">{{ runLogText(run) }}</span></td>
+                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
                   <td class="row-actions">
                     <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
                     <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
