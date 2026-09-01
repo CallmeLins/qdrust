@@ -31,7 +31,7 @@ ENV BIND=0.0.0.0 \
     DATABASE_URL=sqlite:///data/qdrust.db \
     DATABASE_MIN_CONNECTIONS=1 \
     DATABASE_MAX_CONNECTIONS=8 \
-    RUST_LOG=qdrust_server=info,tower_http=info
+    RUST_LOG=qdrust_server=info,qdrust_core=info,tower_http=info
 VOLUME ["/data"]
 EXPOSE 8923
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

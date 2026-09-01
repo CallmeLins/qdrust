@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     expression::QdExpressionEngine,
-    plugin::{PluginRegistry, UtilityPlugin},
+    plugin::{Plugin, PluginRegistry, UtilityPlugin},
     qd_har::{QdBlock, QdHarEntry, QdHarRequest, QdNameValue, QdPostData, QdProgram, QdRule},
     template::{RequestBody, RequestStep, Step, TemplateDefinition},
 };
@@ -166,6 +166,19 @@ impl QdExecutor {
             loop_limit: options.loop_limit,
             proxy,
         })
+    }
+
+    /// Wire a plugin into this executor. Templates reach it through
+    /// `api://<plugin-id>/<action>` and its response flows through the normal
+    /// success/failed assertions and `extract_variables`, exactly like the
+    /// built-in `util` plugin. Registering nothing keeps today's behaviour.
+    pub fn register_plugin(&mut self, plugin: Arc<dyn Plugin>) -> Result<()> {
+        self.plugins.register(plugin)
+    }
+
+    /// Ids of every registered plugin, for run-log diagnostics.
+    pub fn plugin_ids(&self) -> Vec<String> {
+        self.plugins.ids()
     }
 
     pub async fn execute(
@@ -1189,7 +1202,10 @@ mod tests {
     use axum::{Router, http::HeaderMap, response::IntoResponse, routing::get};
     use serde_json::json;
 
-    use crate::qd_har::{QdHar, QdProgram};
+    use crate::{
+        plugin::{PLUGIN_API_VERSION, PluginManifest, PluginRequest, PluginResponse},
+        qd_har::{QdHar, QdProgram},
+    };
 
     fn local_executor() -> QdExecutor {
         QdExecutor::with_options(ExecutorOptions {
@@ -1485,6 +1501,114 @@ mod tests {
             context.variables.get("delay_result"),
             Some(&json!("delayed 0 seconds"))
         );
+    }
+
+    /// Minimal in-process plugin: proves the executor wires custom plugins
+    /// end to end (request -> assertions -> extract_variables) without having
+    /// to spawn a subprocess in a unit test.
+    struct MockPlugin {
+        manifest: PluginManifest,
+    }
+
+    impl Default for MockPlugin {
+        fn default() -> Self {
+            Self {
+                manifest: PluginManifest {
+                    api_version: PLUGIN_API_VERSION,
+                    id: "mock".into(),
+                    name: "Mock echo".into(),
+                    version: "1.0.0".into(),
+                    capabilities: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl Plugin for MockPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn call<'a>(
+            &'a self,
+            request: &'a PluginRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<PluginResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                let text = request.query.get("text").map(String::as_str).unwrap_or("");
+                Ok(PluginResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: format!("echo:{text}").into_bytes(),
+                })
+            })
+        }
+    }
+
+    fn mock_echo_har() -> QdHar {
+        QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": "api://mock/echo?text=hello"},
+            "success_asserts": [{"re": "200", "from": "status"}],
+            "extract_variables": [{"name": "echoed", "re": "echo:(.+)", "from": "content"}]
+        }]}}))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registered_plugin_body_feeds_extract_variables() {
+        let mut executor = local_executor();
+        executor
+            .register_plugin(Arc::new(MockPlugin::default()))
+            .unwrap();
+        assert!(executor.plugin_ids().contains(&"mock".to_string()));
+        let program = QdProgram::compile(&mock_echo_har()).unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(results[0].status, 200);
+        assert_eq!(context.variables.get("echoed"), Some(&json!("hello")));
+    }
+
+    #[tokio::test]
+    async fn without_registration_the_same_failure_stays_diagnosable() {
+        // Regression guard: an empty registry behaves exactly as before, only
+        // the message now names the plugin, the action and what is registered.
+        let executor = local_executor();
+        let program = QdProgram::compile(&mock_echo_har()).unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let error = executor
+            .execute(&program, &mut context)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("plugin unavailable: mock/echo"), "{error}");
+        assert!(error.contains("registered: util"), "{error}");
+
+        // The built-in plugin is untouched by the new registration path.
+        let delay = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": "api://util/delay?seconds=0"},
+            "success_asserts": [{"re": "200", "from": "status"}]
+        }]}}))
+        .unwrap();
+        let results = executor
+            .execute(&QdProgram::compile(&delay).unwrap(), &mut context)
+            .await
+            .unwrap();
+        assert_eq!(results[0].status, 200);
+    }
+
+    #[test]
+    fn refuses_to_register_a_duplicate_plugin_id() {
+        let mut executor = local_executor();
+        let error = executor
+            .register_plugin(Arc::new(UtilityPlugin::default()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already registered"), "{error}");
     }
 
     #[tokio::test]

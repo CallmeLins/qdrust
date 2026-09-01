@@ -1,9 +1,10 @@
-use std::{collections::BTreeMap, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
     executor::{CancellationToken, ExecutionContext, QdExecutor, StepResult},
+    plugin::{PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, SubprocessPlugin},
     qd_har::{QdHar, QdProgram},
     template::Step,
 };
@@ -11,12 +12,12 @@ use rand::Rng;
 use reqwest::{Client, Method};
 use serde_json::Value;
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     api::RunEventSender,
     email::{EmailClient, normalize_recipient},
-    model::{RunStep, Task, Template},
+    model::{PluginManifest, RunStep, Task, Template},
     store::Store,
 };
 
@@ -247,9 +248,17 @@ async fn execute_with_run(
             let cancellation = CancellationToken::new();
             let supervisor =
                 spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());
-            let outcome =
-                execute_template(template.clone(), &cancellation, &variables, request_timeout)
-                    .await;
+            // Plugins are resolved per run so an edit or a disable takes effect
+            // on the next execution without a restart.
+            let plugins = load_plugins(&store, task.id).await;
+            let outcome = execute_template(
+                template.clone(),
+                &cancellation,
+                &variables,
+                request_timeout,
+                &plugins,
+            )
+            .await;
             supervisor.abort();
             let (steps, final_variables) = outcome?;
             let now = Utc::now().timestamp();
@@ -615,13 +624,80 @@ fn render_plain(source: &str, variables: &BTreeMap<String, Value>) -> anyhow::Re
     qdrust_core::expression::QdExpressionEngine::default().render(source, variables)
 }
 
+/// Load the task owner's enabled plugins as executor-ready plugins.
+///
+/// A plugin with an unusable command is skipped with a warning instead of
+/// failing the run: one broken plugin must not take down every template that
+/// never calls it. A task with no owner (pre multi-user data) simply gets none.
+async fn load_plugins(store: &Store, task_id: i64) -> Vec<Arc<dyn Plugin>> {
+    let owner = match store.task_owner_id(task_id).await {
+        Ok(owner) => owner,
+        Err(err) => {
+            warn!(task_id, %err, "cannot resolve task owner for plugin loading");
+            None
+        }
+    };
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
+    let manifests = match store.list_enabled_plugins(owner).await {
+        Ok(manifests) => manifests,
+        Err(err) => {
+            warn!(task_id, %err, "cannot load plugins for task");
+            return Vec::new();
+        }
+    };
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        // Same id as the ad-hoc /api/v1/plugins/{id}/invoke route, so the API
+        // and a template address a plugin the same way: api://plugin-<id>/<action>.
+        let plugin_id = format!("plugin-{}", manifest.id);
+        match build_plugin(&manifest, &plugin_id) {
+            Ok(plugin) => plugins.push(plugin),
+            Err(err) => warn!(task_id, plugin_id = %plugin_id, %err, "skipping plugin"),
+        }
+    }
+    plugins
+}
+
+fn build_plugin(manifest: &PluginManifest, plugin_id: &str) -> anyhow::Result<Arc<dyn Plugin>> {
+    let capabilities =
+        crate::model::plugin_capabilities(&manifest.config).map_err(|err| anyhow::anyhow!(err))?;
+    let core_manifest = CorePluginManifest {
+        api_version: PLUGIN_API_VERSION,
+        id: plugin_id.to_string(),
+        name: manifest.name.clone(),
+        version: "1".into(),
+        capabilities,
+    };
+    Ok(Arc::new(SubprocessPlugin::from_command(
+        core_manifest,
+        &manifest.command,
+    )?))
+}
+
 async fn execute_template(
     template: Template,
     cancellation: &CancellationToken,
     variables: &BTreeMap<String, Value>,
     request_timeout: Duration,
+    plugins: &[Arc<dyn Plugin>],
 ) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
-    let executor = QdExecutor::new(request_timeout)?;
+    let mut executor = QdExecutor::new(request_timeout)?;
+    for plugin in plugins {
+        let plugin_id = plugin.manifest().id.clone();
+        if let Err(err) = executor.register_plugin(plugin.clone()) {
+            // Duplicated ids and invalid manifests are configuration errors;
+            // report them and keep going so the run still executes.
+            warn!(plugin_id = %plugin_id, %err, "cannot register plugin for this run");
+        }
+    }
+    if !plugins.is_empty() {
+        info!(
+            plugins = executor.plugin_ids().join(","),
+            "registered plugins for run"
+        );
+    }
     let mut context = ExecutionContext::new(variables.clone());
     let results = match template.source_format.as_str() {
         "qd_har" => {
@@ -661,6 +737,7 @@ async fn execute_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn executes_qd_template_through_core() {
@@ -689,11 +766,239 @@ mod tests {
             &CancellationToken::new(),
             &BTreeMap::new(),
             Duration::from_secs(30),
+            &[],
         )
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, 200);
+    }
+
+    /// In-process plugin used to exercise the whole wiring path (store -> load
+    /// -> executor registry -> template assertions -> extracted variables)
+    /// without depending on an external executable.
+    struct MockPlugin {
+        manifest: CorePluginManifest,
+    }
+
+    impl Default for MockPlugin {
+        fn default() -> Self {
+            Self {
+                manifest: CorePluginManifest {
+                    api_version: PLUGIN_API_VERSION,
+                    id: "mock".into(),
+                    name: "Mock echo".into(),
+                    version: "1.0.0".into(),
+                    capabilities: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl Plugin for MockPlugin {
+        fn manifest(&self) -> &CorePluginManifest {
+            &self.manifest
+        }
+
+        fn call<'a>(
+            &'a self,
+            request: &'a qdrust_core::plugin::PluginRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = anyhow::Result<qdrust_core::plugin::PluginResponse>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let text = request
+                    .query
+                    .get("text")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                Ok(qdrust_core::plugin::PluginResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: format!("echo:{text}").into_bytes(),
+                })
+            })
+        }
+    }
+
+    fn mock_template() -> Template {
+        Template {
+            id: 1,
+            name: "plugin echo".into(),
+            description: None,
+            schema_version: 1,
+            source_format: "qd_har".into(),
+            definition: None,
+            qd_har: Some(serde_json::json!({
+                "log": {
+                    "version": "1.2",
+                    "entries": [{
+                        "checked": true,
+                        "request": {"method": "GET", "url": "api://mock/echo?text=hello"},
+                        "success_asserts": [{"re": "200", "from": "status"}],
+                        "extract_variables": [
+                            {"name": "echoed", "re": "echo:(.+)", "from": "content"}
+                        ]
+                    }]
+                }
+            })),
+            created_at: 0,
+            updated_at: 0,
+            grp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_qd_har_template_through_a_registered_plugin() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(MockPlugin::default())];
+        let (results, variables) = execute_template(
+            mock_template(),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            &plugins,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, 200);
+        // The plugin response flowed through extract_variables, so downstream
+        // steps (and the __log__ summary) can consume it like any HTTP body.
+        assert_eq!(variables.get("echoed"), Some(&json!("hello")));
+    }
+
+    #[tokio::test]
+    async fn without_plugins_a_plugin_template_fails_with_a_named_plugin() {
+        // Regression guard: registering nothing keeps today's behaviour; the
+        // only difference is a failure message that names plugin and action.
+        let error = execute_template(
+            mock_template(),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(30),
+            &[],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("plugin unavailable: mock/echo"), "{error}");
+        assert!(error.contains("registered: util"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn loads_only_enabled_plugins_of_the_task_owner() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        let owner = store
+            .create_user(
+                "sched-owner",
+                &crate::auth::hash_password("correct horse battery staple").unwrap(),
+                "user",
+            )
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(
+                owner.id,
+                crate::model::CreateTask {
+                    name: "plugin-task".into(),
+                    cron: "0 * * * * *".into(),
+                    method: Some("GET".into()),
+                    url: "https://example.com/health".into(),
+                    headers: serde_json::Map::new(),
+                    body: None,
+                    disabled: false,
+                    template_id: None,
+                    grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    random_delay_max_seconds: None,
+                    variables: None,
+                },
+            )
+            .await
+            .unwrap();
+        let enabled = store
+            .create_plugin(
+                owner.id,
+                crate::model::CreatePluginManifest {
+                    name: "on".into(),
+                    command: "plugin-runner --flag".into(),
+                    config: serde_json::json!({}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create_plugin(
+                owner.id,
+                crate::model::CreatePluginManifest {
+                    name: "off".into(),
+                    command: "plugin-runner".into(),
+                    config: serde_json::json!({}),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let plugins = load_plugins(&store, task.id).await;
+        let ids = plugins
+            .iter()
+            .map(|plugin| plugin.manifest().id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![format!("plugin-{}", enabled.id)]);
+
+        // Unknown tasks and legacy owner-less tasks load nothing.
+        assert!(load_plugins(&store, 999_999).await.is_empty());
+    }
+
+    #[test]
+    fn build_plugin_reads_declared_capabilities_from_config() {
+        let manifest = PluginManifest {
+            id: 7,
+            name: "echo".into(),
+            command: "plugin-runner --flag".into(),
+            config: serde_json::json!({"capabilities": ["network"]}),
+            enabled: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let plugin = build_plugin(&manifest, "plugin-7").unwrap();
+        assert_eq!(
+            plugin.manifest().capabilities,
+            vec![qdrust_core::plugin::PluginCapability::Network]
+        );
+
+        // A missing key declares nothing (today's behaviour) and an unknown
+        // name refuses to build, which load_plugins turns into a warning.
+        let plain = PluginManifest {
+            config: serde_json::json!({}),
+            ..manifest.clone()
+        };
+        assert!(
+            build_plugin(&plain, "plugin-8")
+                .unwrap()
+                .manifest()
+                .capabilities
+                .is_empty()
+        );
+        let typo = PluginManifest {
+            config: serde_json::json!({"capabilities": ["netwrok"]}),
+            ..manifest
+        };
+        assert!(build_plugin(&typo, "plugin-9").is_err());
     }
 
     #[test]

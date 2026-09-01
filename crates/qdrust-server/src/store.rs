@@ -994,6 +994,26 @@ macro_rules! define_store {
         let rows=sqlx::query("SELECT id,name,command,config,enabled,created_at,updated_at FROM plugins WHERE owner_id=? ORDER BY id").bind(owner_id).fetch_all(&self.pool).await?;
         rows.into_iter().map(plugin_from_row).collect()
     }
+    /// Enabled plugins owned by `owner_id`. The scheduler wires these into the
+    /// executor so a template can call `api://plugin-<id>/<action>`; disabled
+    /// plugins stay invisible to task runs.
+    pub async fn list_enabled_plugins(&self, owner_id: i64) -> Result<Vec<PluginManifest>> {
+        let rows=sqlx::query("SELECT id,name,command,config,enabled,created_at,updated_at FROM plugins WHERE owner_id=? AND enabled=1 ORDER BY id").bind(owner_id).fetch_all(&self.pool).await?;
+        rows.into_iter().map(plugin_from_row).collect()
+    }
+    /// Owner of a task. Tasks created before multi-user support have a NULL
+    /// owner, in which case plugin loading is skipped.
+    pub async fn task_owner_id(&self, task_id: i64) -> Result<Option<i64>> {
+        // Decode as Option<i64>: the column is nullable and the SQLite driver
+        // reads a NULL integer as 0 when decoded straight into i64.
+        Ok(
+            sqlx::query_scalar::<_, Option<i64>>("SELECT owner_id FROM tasks WHERE id=?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
     pub async fn get_plugin(&self, id: i64, owner_id: i64) -> Result<Option<PluginManifest>> {
         let row=sqlx::query("SELECT id,name,command,config,enabled,created_at,updated_at FROM plugins WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?;
         row.map(plugin_from_row).transpose()
@@ -2582,6 +2602,8 @@ impl Store {
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationChannel>> { task_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
+        pub async fn list_enabled_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
+        pub async fn task_owner_id(task_id: i64) -> Result<Option<i64>> { task_id };
         pub async fn get_plugin(id: i64, owner_id: i64) -> Result<Option<PluginManifest>> { id, owner_id };
         pub async fn update_plugin(id: i64, owner_id: i64, input: UpdatePluginManifest) -> Result<Option<PluginManifest>> { id, owner_id, input };
         pub async fn delete_plugin(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
@@ -2652,6 +2674,10 @@ fn validate_plugin(name: &str, command: &str, config: &serde_json::Value) -> Res
         "plugin command must not contain shell operators"
     );
     ensure!(config.is_object(), "plugin config must be an object");
+    // Reject unknown capability names here so a typo fails at save time; the
+    // scheduler and the invoke route would otherwise reject every
+    // capability-reporting call at run time.
+    crate::model::plugin_capabilities(config).map_err(|err| anyhow!(err))?;
     Ok(())
 }
 
@@ -2779,6 +2805,82 @@ mod tests {
                 body: None,
             })],
         }
+    }
+
+    #[tokio::test]
+    async fn lists_enabled_plugins_for_the_task_owner_only() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let owner = store
+            .create_user("plugin-owner", &password_hash, "user")
+            .await
+            .unwrap();
+        let other = store
+            .create_user("plugin-other", &password_hash, "user")
+            .await
+            .unwrap();
+        let enabled = store
+            .create_plugin(
+                owner.id,
+                CreatePluginManifest {
+                    name: "on".into(),
+                    command: "plugin-runner".into(),
+                    config: serde_json::json!({}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let disabled = store
+            .create_plugin(
+                owner.id,
+                CreatePluginManifest {
+                    name: "off".into(),
+                    command: "plugin-runner".into(),
+                    config: serde_json::json!({}),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        // A different owner's enabled plugin must never reach another user's run.
+        store
+            .create_plugin(
+                other.id,
+                CreatePluginManifest {
+                    name: "foreign".into(),
+                    command: "plugin-runner".into(),
+                    config: serde_json::json!({}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ids = store
+            .list_enabled_plugins(owner.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|plugin| plugin.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![enabled.id]);
+        assert!(!ids.contains(&disabled.id));
+        // list_plugins (admin surface) still sees everything the owner has.
+        assert_eq!(store.list_plugins(owner.id).await.unwrap().len(), 2);
+
+        // task_owner_id is how the scheduler scopes plugin loading.
+        let task = store
+            .create_for_owner(owner.id, input("plugin-scoped"))
+            .await
+            .unwrap();
+        assert_eq!(store.task_owner_id(task.id).await.unwrap(), Some(owner.id));
+        // Tasks without an owner (created before multi-user support) yield no
+        // plugins instead of an error.
+        let legacy = store.create(input("legacy")).await.unwrap();
+        assert_eq!(store.task_owner_id(legacy.id).await.unwrap(), None);
+        assert_eq!(store.task_owner_id(424_242).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -3344,6 +3446,22 @@ mod tests {
                         name: "bad".into(),
                         command: "echo | sh".into(),
                         config: serde_json::json!({}),
+                        enabled: true
+                    }
+                )
+                .await
+                .is_err()
+        );
+        // Unknown capability names are rejected at save time so typos surface
+        // immediately instead of failing every capability-reporting call later.
+        assert!(
+            store
+                .create_plugin(
+                    alice.id,
+                    CreatePluginManifest {
+                        name: "typo".into(),
+                        command: "qdrust-plugin-echo".into(),
+                        config: serde_json::json!({"capabilities": ["netwrok"]}),
                         enabled: true
                     }
                 )

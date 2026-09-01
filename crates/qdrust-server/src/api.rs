@@ -1156,16 +1156,20 @@ async fn invoke_plugin(
             "plugin action cannot be empty"
         )));
     }
-    let runner = SubprocessPlugin::new(
+    // Capabilities declared in the plugin's config gate what the plugin may
+    // report as used; `SubprocessPlugin::call` rejects anything undeclared, so
+    // this ad-hoc route enforces the same contract as template execution.
+    let capabilities = crate::model::plugin_capabilities(&plugin.config)
+        .map_err(|err| ApiError::unprocessable(anyhow::anyhow!(err)))?;
+    let runner = SubprocessPlugin::from_command(
         CorePluginManifest {
             api_version: PLUGIN_API_VERSION,
             id: format!("plugin-{id}"),
             name: plugin.name.clone(),
             version: "1".into(),
-            capabilities: vec![],
+            capabilities,
         },
         &plugin.command,
-        vec![],
     )
     .map_err(ApiError::unprocessable)?;
     let result = tokio::time::timeout(

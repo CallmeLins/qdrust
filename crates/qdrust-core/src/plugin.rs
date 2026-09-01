@@ -5,12 +5,13 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 pub const PLUGIN_API_VERSION: u32 = 1;
 
@@ -46,6 +47,19 @@ pub enum PluginCapability {
     Environment,
 }
 
+impl PluginCapability {
+    /// Wire name of the capability, matching the serde `snake_case` encoding
+    /// used in manifests, configs and responses.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::ReadFile => "read_file",
+            Self::WriteFile => "write_file",
+            Self::Environment => "environment",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PluginRequest {
     pub plugin_id: String,
@@ -76,6 +90,25 @@ pub struct PluginResponse {
     pub body: Vec<u8>,
 }
 
+/// Wire envelope a subprocess plugin writes to stdout. `capabilities_used`
+/// reports which capabilities the call exercised so the host can enforce
+/// ADR-0006 ("未声明 capability 的调用在宿主层拒绝"): anything reported but
+/// not declared in the manifest rejects the whole call. The field is optional
+/// on the wire - plugins written before capability reporting keep working and
+/// simply report nothing.
+///
+/// The report is cooperative: a hostile plugin can lie about what it did, so
+/// OS-level sandboxing remains the real boundary. This envelope keeps honest
+/// plugins inside their declaration and makes violations fail loudly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginCallResponse {
+    #[serde(flatten)]
+    pub response: PluginResponse,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities_used: Vec<PluginCapability>,
+}
+
+#[derive(Debug)]
 pub struct SubprocessPlugin {
     manifest: PluginManifest,
     executable: PathBuf,
@@ -96,6 +129,46 @@ impl SubprocessPlugin {
             arguments,
             output_limit: 1024 * 1024,
         })
+    }
+
+    /// Build a plugin from a single stored command string, split on whitespace
+    /// into a program plus its arguments. No shell is involved, so a program
+    /// path containing spaces cannot be quoted - the stored command is
+    /// validated to reject shell operators before it reaches the database.
+    /// A command without whitespace keeps today's "command is the executable"
+    /// behaviour.
+    pub fn from_command(manifest: PluginManifest, command: &str) -> Result<Self> {
+        let mut parts = command.split_whitespace();
+        let program = parts.next().context("plugin command is empty")?;
+        Self::new(manifest, program, parts.map(str::to_string).collect())
+    }
+
+    #[cfg(test)]
+    fn command_parts(&self) -> (&Path, &[String]) {
+        (&self.executable, &self.arguments)
+    }
+
+    /// Host-side enforcement of ADR-0006: a subprocess plugin reports the
+    /// capabilities each call exercised via `capabilities_used`, and anything
+    /// not declared in the manifest rejects the whole call. Both call paths -
+    /// template execution through the registry and the ad-hoc
+    /// `/api/v1/plugins/{id}/invoke` route - go through this check.
+    fn ensure_declared_capabilities(
+        &self,
+        request: &PluginRequest,
+        used: &[PluginCapability],
+    ) -> Result<()> {
+        for capability in used {
+            ensure!(
+                self.manifest.capabilities.contains(capability),
+                "plugin {}/{} used undeclared capability: {} (declared: {})",
+                request.plugin_id,
+                request.action,
+                capability.as_str(),
+                capability_list(&self.manifest.capabilities),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -133,7 +206,10 @@ impl Plugin for SubprocessPlugin {
                 output.stdout.len() <= self.output_limit,
                 "plugin output limit exceeded"
             );
-            serde_json::from_slice(&output.stdout).context("invalid plugin response")
+            let envelope: PluginCallResponse =
+                serde_json::from_slice(&output.stdout).context("invalid plugin response")?;
+            self.ensure_declared_capabilities(request, &envelope.capabilities_used)?;
+            Ok(envelope.response)
         })
     }
 }
@@ -164,16 +240,75 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Ids of every registered plugin, in a stable (sorted) order. Used to make
+    /// "plugin unavailable" failures self-explanatory: the message lists what
+    /// *was* wired into the run.
+    pub fn ids(&self) -> Vec<String> {
+        self.plugins.keys().cloned().collect()
+    }
+
     pub async fn call(&self, value: &str, timeout: Duration) -> Result<PluginResponse> {
         let request = PluginRequest::from_api_url(value)?;
-        let plugin = self
-            .plugins
-            .get(&request.plugin_id)
-            .with_context(|| format!("plugin unavailable: {}", request.plugin_id))?;
-        tokio::time::timeout(timeout, plugin.call(&request))
-            .await
-            .context("plugin call timed out")?
+        let plugin = self.plugins.get(&request.plugin_id).with_context(|| {
+            format!(
+                "plugin unavailable: {}/{} (registered: {})",
+                request.plugin_id,
+                request.action,
+                join_ids(&self.ids())
+            )
+        })?;
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(timeout, plugin.call(&request)).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (plugin_id, action) = (request.plugin_id.as_str(), request.action.as_str());
+        // Name the plugin and action in every failure: "plugin unavailable" or
+        // "plugin call timed out" alone does not say which step broke.
+        let result = match outcome {
+            Err(_) => bail!("plugin call timed out: {plugin_id}/{action} after {elapsed_ms} ms"),
+            Ok(outcome) => {
+                outcome.with_context(|| format!("plugin call failed: {plugin_id}/{action}"))
+            }
+        };
+        match &result {
+            Ok(response) => info!(
+                plugin_id,
+                action,
+                status = response.status,
+                elapsed_ms,
+                "plugin call finished"
+            ),
+            Err(err) => info!(
+                plugin_id,
+                action,
+                error = %err,
+                elapsed_ms,
+                "plugin call failed"
+            ),
+        }
+        result
     }
+}
+
+/// Render the registered plugin ids for diagnostics; `<none>` keeps the empty
+/// registry case readable instead of showing a bare comma list.
+fn join_ids(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "<none>".to_string();
+    }
+    ids.join(",")
+}
+
+/// Render declared capabilities for diagnostics; `<none>` keeps the
+/// nothing-declared case readable instead of showing a bare comma list.
+fn capability_list(capabilities: &[PluginCapability]) -> String {
+    if capabilities.is_empty() {
+        return "<none>".to_string();
+    }
+    capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub struct UtilityPlugin {
@@ -812,6 +947,137 @@ fn translate_python_replacement(replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn echo_manifest() -> PluginManifest {
+        PluginManifest {
+            api_version: PLUGIN_API_VERSION,
+            id: "echo".into(),
+            name: "Echo".into(),
+            version: "1.0.0".into(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn capability_as_str_matches_wire_names() {
+        assert_eq!(PluginCapability::Network.as_str(), "network");
+        assert_eq!(PluginCapability::ReadFile.as_str(), "read_file");
+        assert_eq!(PluginCapability::WriteFile.as_str(), "write_file");
+        assert_eq!(PluginCapability::Environment.as_str(), "environment");
+    }
+
+    #[test]
+    fn response_envelope_without_capabilities_stays_compatible() {
+        // Plugins written before capability reporting reply with a bare
+        // PluginResponse; the envelope must still deserialize (wire format is
+        // additive, api_version stays 1).
+        let envelope: PluginCallResponse =
+            serde_json::from_str(r#"{"status":200,"headers":{},"body":[104,105]}"#).unwrap();
+        assert!(envelope.capabilities_used.is_empty());
+        assert_eq!(envelope.response.body, b"hi");
+    }
+
+    #[test]
+    fn undeclared_capability_is_rejected_with_plugin_context() {
+        let mut manifest = echo_manifest();
+        manifest.capabilities = vec![PluginCapability::ReadFile];
+        let plugin = SubprocessPlugin::from_command(manifest, "echo-plugin").unwrap();
+        let request = PluginRequest {
+            plugin_id: "echo".into(),
+            action: "fetch".into(),
+            query: BTreeMap::new(),
+        };
+
+        let error = plugin
+            .ensure_declared_capabilities(&request, &[PluginCapability::Network])
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("plugin echo/fetch used undeclared capability: network"),
+            "{message}"
+        );
+        assert!(message.contains("declared: read_file"), "{message}");
+
+        // A declared capability passes untouched.
+        plugin
+            .ensure_declared_capabilities(&request, &[PluginCapability::ReadFile])
+            .unwrap();
+    }
+
+    #[test]
+    fn from_command_splits_program_and_arguments() {
+        let plugin =
+            SubprocessPlugin::from_command(echo_manifest(), "  /opt/bin/echo   --flag 1  ")
+                .unwrap();
+        let (program, arguments) = plugin.command_parts();
+        assert_eq!(program, Path::new("/opt/bin/echo"));
+        assert_eq!(
+            arguments.to_vec(),
+            vec!["--flag".to_string(), "1".to_string()]
+        );
+
+        // A bare executable stays the program with no arguments, i.e. today's
+        // behaviour for commands stored before arguments were supported.
+        let bare = SubprocessPlugin::from_command(echo_manifest(), "echo-plugin").unwrap();
+        let (program, arguments) = bare.command_parts();
+        assert_eq!(program, Path::new("echo-plugin"));
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn from_command_rejects_blank_command() {
+        assert!(
+            SubprocessPlugin::from_command(echo_manifest(), "   ")
+                .unwrap_err()
+                .to_string()
+                .contains("plugin command is empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_names_plugin_id_action_and_registry() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        assert_eq!(registry.ids(), vec!["util".to_string()]);
+
+        let error = registry
+            .call("api://mock/echo", Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("plugin unavailable: mock/echo"), "{error}");
+        assert!(error.contains("registered: util"), "{error}");
+
+        // An action the plugin does not implement keeps the id/action prefix.
+        let error = registry
+            .call("api://util/nope", Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("plugin call failed: util/nope"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn times_out_with_plugin_id_and_action() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let error = registry
+            .call("api://util/delay?seconds=1", Duration::from_millis(10))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("plugin call timed out: util/delay"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn parses_qd_api_url() {

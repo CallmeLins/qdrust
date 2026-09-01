@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use qdrust_core::plugin::PluginCapability;
 use qdrust_core::template::TemplateDefinition;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -454,4 +455,17 @@ pub struct InvokePlugin {
     pub action: String,
     #[serde(default)]
     pub query: std::collections::BTreeMap<String, String>,
+}
+
+/// Capabilities a plugin declares in its `config` JSON
+/// (`{"capabilities": ["network", ...]}`). A missing key means no capabilities
+/// are declared. Unknown names are errors so a typo fails at save time instead
+/// of silently degrading to "nothing declared", which would make every
+/// capability-reporting call fail at run time.
+pub fn plugin_capabilities(config: &serde_json::Value) -> Result<Vec<PluginCapability>, String> {
+    match config.get("capabilities") {
+        None => Ok(Vec::new()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|err| format!("invalid plugin capabilities: {err}")),
+    }
 }

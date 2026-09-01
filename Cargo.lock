@@ -1661,7 +1661,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes",
  "anyhow",
@@ -1698,12 +1698,13 @@ dependencies = [
  "sha1",
  "sha2",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "qdrust-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "argon2",

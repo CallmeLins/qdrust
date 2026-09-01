@@ -7,7 +7,9 @@ services:
       - "8923:8923"
     environment:
       DATABASE_URL: sqlite:///data/qdrust.db
-      RUST_LOG: qdrust_server=info,tower_http=info
+      # qdrust_core=info enables the per-plugin call timing emitted by the
+      # executor's plugin registry.
+      RUST_LOG: qdrust_server=info,qdrust_core=info,tower_http=info
     volumes:
       - qdrust-data:/data
     restart: unless-stopped
