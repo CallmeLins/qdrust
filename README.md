@@ -23,6 +23,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 - **双后端数据库**：SQLite（开箱即用）与 MySQL（按 `DATABASE_URL` 自动选择）。
 - **完整通知体系**：Webhook + Email + 8 种推送渠道，共 **10 种**。
 - **模板表达式**：26 个 Jinja2 过滤器 + 38 个表达式函数，以及 `api://util/*` 内置工具（时间 / 编码 / 哈希 / 正则 / JSON / RSA / OCR）。
+- **无头浏览器插件**（可选）：`api://browser/*` 通过 CDP 驱动远程无头浏览器，补齐"生成签名 / 过验证码 / 渲染 JS"这类纯 HTTP 做不了的一步，结果可提取成变量回填到后续请求（详见 [浏览器插件](#浏览器插件无头浏览器签到)）。
 - **任务调度**：分组、批量操作、可视化调度器（含随机延迟）、模板变量预填。
 - **运行可观测**：QD 风格运行日志、按任务查看运行历史、WebSocket 实时步骤流。
 - **安全与多租户**：开放注册 / 忘记密码 / 邮箱验证 / CSRF 轮换；所有用户资源均做服务端归属校验。
@@ -70,11 +71,119 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 
   外部插件二进制（带 manifest、API 版本校验与能力声明 network / read_file / write_file / environment）通过子进程 JSON 协议调用，WebUI 提供插件管理页。
 
-- **`api://browser/*` 浏览器插件（可选）**：通过 CDP 驱动远程无头浏览器，处理"生成签名 / 过验证码 / 渲染 JS"这类纯 HTTP 步骤做不了的一步。配置 `QDRUST_BROWSER_URL` 即可启用（无需在插件管理页新建条目），三个 action：
-  - `api://browser/content?url=<地址>` — 渲染后返回页面 HTML（JS 已执行）
-  - `api://browser/eval?url=<地址>&expr=<JS表达式>` — 求值并返回结果 JSON（可拿 cookie、token、页面状态）
-  - `api://browser/screenshot?url=<地址>[&full_page=1][&format=png|jpeg][&width=&height=][&wait=<ms>]` — 截图，返回 `{"mimeType","data"}`（data 为 base64）
-  - 端点支持三后端：本地 Chromium/obscura（`http://localhost:9222`）、Browserless 自托管（`ws://localhost:3000`）、Browserless 云端（`wss://chrome.browserless.io?token=...`）。浏览器二进制随 Docker 镜像内置，无需额外安装。建议"混合"用法：只有需要浏览器的一步走 `api://browser/*`，其余仍走 HTTP。
+- **`api://browser/*` 浏览器插件（可选）**：通过 CDP 驱动远程无头浏览器，处理"生成签名 / 过验证码 / 渲染 JS"这类纯 HTTP 步骤做不了的一步。配置 `QDRUST_BROWSER_URL` 即可启用（无需在插件管理页新建条目），三个 action 见 [浏览器插件（无头浏览器签到）](#浏览器插件无头浏览器签到)。
+
+---
+
+## 浏览器插件（无头浏览器签到）
+
+qdrust 的签到任务**以 HAR 为主流程**（HTTP 请求，fetcher 直接渲染执行），无头浏览器只用来补上纯 HTTP 做不了的那一步。因此推荐**混合用法**：只有真正需要浏览器的一步走 `api://browser/*`，其余步骤仍走普通 HTTP 请求。这是刻意的最小设计——浏览器只在"生成签名 / 过验证码 / 渲染 JS"三类场景介入。
+
+配置 `QDRUST_BROWSER_URL` 后插件自动启用（无需在插件管理页新建条目），模板里直接写 `api://browser/<action>` 即可。三个 action：
+
+| Action | 用途 | 参数 | 返回体 |
+|---|---|---|---|
+| `content` | 渲染后取页面 HTML（JS 已执行，适合 SPA / 动态加载） | `url` 必填 | 页面 HTML 文本 |
+| `eval` | 在页面里执行 JS，取 token / 签名 / cookie / 页面状态 | `url` 必填，`expr` 必填 | 求值结果的 JSON |
+| `screenshot` | 截图（过验证码给人看 / 留档） | `url` 必填，可选 `full_page=1`、`format=png\|jpeg`、`width`/`height`（视口）、`wait=<ms>`（截图前等待，让异步渲染完成） | `{"mimeType": ..., "data": <base64>}` |
+
+端点支持三后端：
+
+- **Browserless 自托管**：`ws://localhost:3000`（推荐，`compose.yaml` 里已备好注释掉的 `browserless` 服务，取消注释并设置 `QDRUST_BROWSER_URL: ws://browserless:3000` 即可）。
+- **本地 Chromium / obscura**：`http://localhost:9222`（带 `--remote-debugging-port=9222` 启动的 Chrome）。
+- **Browserless 云端**：`wss://chrome.browserless.io?token=...`。
+
+浏览器二进制随 Docker 镜像内置，无需额外安装。
+
+### 部署启用（三步）
+
+1. 准备一个无头浏览器端点（上面三选一）。
+2. 给服务设置 `QDRUST_BROWSER_URL`（Docker 部署在 `compose.yaml` 的 environment 里，见下方示例）。
+3. 重启服务。之后模板里就能用 `api://browser/*`，无需在 WebUI 插件管理页新建条目。
+
+`compose.yaml` 中与 Browserless 一起启用的最小配置：
+
+```yaml
+services:
+  qdrust:
+    # ...
+    environment:
+      QDRUST_BROWSER_URL: ws://browserless:3000
+      # 若用自定义二进制路径可指定：QDRUST_BROWSER_PLUGIN_BIN: /path/to/qdrust-plugin-browser
+  browserless:
+    image: ghcr.io/browserless/chromium:latest
+    environment:
+      TOKEN: change-me
+      CONCURRENT: 5
+    restart: unless-stopped
+```
+
+### 混合签到：模板怎么写
+
+核心思路：**普通 HTTP 步骤用 HAR 原样请求；需要浏览器的一步插入 `api://browser/*`，把它的返回体用 `extract_variables` 提取成变量，供后续 HAR 步骤用 `{{var}}` 填充。**
+
+#### 例 1：`eval` 取签名 / token，回填到后续 HTTP 请求
+
+浏览器执行 JS 拿到 `window.__sig()` 的结果（返回体是 JSON，如 `"a1b2c3"`），再用正则提出来，填进真正的签到请求：
+
+```jsonc
+{
+  "entries": [
+    {
+      // 浏览器步骤：登录页里执行 JS 取签名
+      "request": { "method": "GET", "url": "api://browser/eval?url=https://example.com/signin&expr=window.__sig()" },
+      "extract_variables": [
+        { "name": "sig", "re": "\"([a-zA-Z0-9_-]+)\"", "from": "content" }
+      ]
+    },
+    {
+      // 真正的签到请求：把签名回填进 body
+      "request": {
+        "method": "POST",
+        "url": "https://example.com/api/checkin",
+        "postData": { "mimeType": "application/json", "text": "{\"sig\":\"{{sig}}\"}" }
+      }
+    }
+  ]
+}
+```
+
+> `extract_variables` 的 `re` 是对整个返回体文本做正则匹配。`eval` 返回的是 JSON（字符串值带引号），所以取字符串时要带上引号转义：`"([a-zA-Z0-9_-]+)"`；数字/布尔值则不带引号。
+
+#### 例 2：`content` 抓渲染后的页面，正则提取变量
+
+SPA 页面内容由 JS 动态生成，普通 HTTP 拿到的是空壳。用 `content` 拿渲染后的 HTML，再提取：
+
+```jsonc
+{
+  "request": { "method": "GET", "url": "api://browser/content?url=https://example.com/dashboard" },
+  "extract_variables": [
+    { "name": "nickname", "re": "nickname[^>]*>([^<]+)<", "from": "content" }
+  ]
+}
+```
+
+#### 例 3：`screenshot` 过验证码 / 留档
+
+截图把当前页面状态打给人看（返回 `data` 为 base64）。适合无法自动破解的验证码场景——人工看图后把答案填进下一步的变量，或单纯用于失败时留档排查：
+
+```jsonc
+{
+  "request": {
+    "method": "GET",
+    "url": "api://browser/screenshot?url=https://example.com/captcha&wait=2000&format=png"
+  },
+  "extract_variables": [
+    { "name": "captcha_img", "re": "\"data\":\"([A-Za-z0-9+/=]+)\"", "from": "content" }
+  ]
+}
+```
+
+### 行为与限制
+
+- **一次性会话**：每次调用都是新子进程 + 新浏览器连接，用完即关，**不跨步骤复用会话**。因此"多步页面交互"（进页面 → 点按钮 → 等结果）目前不支持；需要多步会话的场景可用浏览器插件扩展（当前未做）。
+- **超时**：单次浏览器操作硬超时 30 秒，宿主侧还有 `plugin_timeout` 兜底，异常端点不会挂死子进程。
+- **错误处理**：未配置 `QDRUST_BROWSER_URL` 或连接失败时返回 502 信封，可用 `success_asserts` / `failed_asserts` 感知，不会静默降级。
 
 ---
 
@@ -319,6 +428,12 @@ A：单实例基于 SQLite 事务 + 租约保证不重复执行；多实例共�
 
 **Q：插件 / `api://util` 工具不全？**
 A：`api://util/*` 已对齐 QD 的核心工具（时间 / 编码 / 哈希 / 正则 / JSON / RSA / GB2312 / 字符串替换 / OCR）， toolbox 与 notepad 属 Web 工具箱页面，不在模板 API 范围内，未移植。
+
+**Q：站点要 JS 生成签名 / 过验证码，纯 HAR 跑不了怎么办？**
+A：用 `api://browser/*` 无头浏览器插件。配置 `QDRUST_BROWSER_URL` 后启用，模板里插入 `api://browser/eval`（执行 JS 取 token/签名）、`api://browser/content`（抓渲染后 HTML）、或 `api://browser/screenshot`（截图），再用 `extract_variables` 把结果提成变量回填。详见 [浏览器插件（无头浏览器签到）](#浏览器插件无头浏览器签到)。
+
+**Q：浏览器插件能自动跑多步页面交互（点按钮、填表单）吗？**
+A：目前不支持。每次 `api://browser/*` 调用是独立的一次性会话，用完即关，不跨步骤复用浏览器。需要多步会话态的场景是后续扩展方向，当前刻意未做。
 
 ---
 
