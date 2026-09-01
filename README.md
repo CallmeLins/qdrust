@@ -70,6 +70,12 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 
   外部插件二进制（带 manifest、API 版本校验与能力声明 network / read_file / write_file / environment）通过子进程 JSON 协议调用，WebUI 提供插件管理页。
 
+- **`api://browser/*` 浏览器插件（可选）**：通过 CDP 驱动远程无头浏览器，处理"生成签名 / 过验证码 / 渲染 JS"这类纯 HTTP 步骤做不了的一步。配置 `QDRUST_BROWSER_URL` 即可启用（无需在插件管理页新建条目），三个 action：
+  - `api://browser/content?url=<地址>` — 渲染后返回页面 HTML（JS 已执行）
+  - `api://browser/eval?url=<地址>&expr=<JS表达式>` — 求值并返回结果 JSON（可拿 cookie、token、页面状态）
+  - `api://browser/screenshot?url=<地址>[&full_page=1][&format=png|jpeg][&width=&height=][&wait=<ms>]` — 截图，返回 `{"mimeType","data"}`（data 为 base64）
+  - 端点支持三后端：本地 Chromium/obscura（`http://localhost:9222`）、Browserless 自托管（`ws://localhost:3000`）、Browserless 云端（`wss://chrome.browserless.io?token=...`）。浏览器二进制随 Docker 镜像内置，无需额外安装。建议"混合"用法：只有需要浏览器的一步走 `api://browser/*`，其余仍走 HTTP。
+
 ---
 
 ## 部署
@@ -178,6 +184,8 @@ docker compose down             # 停止
 | `GA_KEY` | 空 | 注入 WebUI 的 Google Analytics 密钥 |
 | `REDIS_URL` | 空 | 可选 Redis 会话缓存 |
 | `QDRUST_CONFIG_FILE` | 空 | 运行时可调配置的 JSON 文件路径（热更新站点设置） |
+| `QDRUST_BROWSER_URL` | 空 | 浏览器插件端点，配置后启用 `api://browser/*`（CDP：`http://localhost:9222` / `ws://localhost:3000` / `wss://chrome.browserless.io?token=...`） |
+| `QDRUST_BROWSER_PLUGIN_BIN` | `qdrust-plugin-browser` | 浏览器插件的子进程二进制路径（Docker 镜像已内置） |
 
 ### 数据库
 

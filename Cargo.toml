@@ -3,6 +3,7 @@ members = [
     "crates/qdrust-core",
     "crates/qdrust-cli",
     "crates/qdrust-server",
+    "crates/qdrust-plugin-browser",
 ]
 default-members = ["crates/qdrust-server"]
 resolver = "3"

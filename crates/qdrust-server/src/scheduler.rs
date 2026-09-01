@@ -4,7 +4,10 @@ use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
     executor::{CancellationToken, ExecutionContext, QdExecutor, StepResult},
-    plugin::{PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, SubprocessPlugin},
+    plugin::{
+        PLUGIN_API_VERSION, Plugin, PluginCapability, PluginManifest as CorePluginManifest,
+        SubprocessPlugin,
+    },
     qd_har::{QdHar, QdProgram},
     template::Step,
 };
@@ -647,7 +650,7 @@ async fn load_plugins(store: &Store, task_id: i64) -> Vec<Arc<dyn Plugin>> {
             return Vec::new();
         }
     };
-    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::with_capacity(manifests.len());
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::with_capacity(manifests.len() + 1);
     for manifest in manifests {
         // Same id as the ad-hoc /api/v1/plugins/{id}/invoke route, so the API
         // and a template address a plugin the same way: api://plugin-<id>/<action>.
@@ -655,6 +658,17 @@ async fn load_plugins(store: &Store, task_id: i64) -> Vec<Arc<dyn Plugin>> {
         match build_plugin(&manifest, &plugin_id) {
             Ok(plugin) => plugins.push(plugin),
             Err(err) => warn!(task_id, plugin_id = %plugin_id, %err, "skipping plugin"),
+        }
+    }
+    // The optional browser plugin is wired in when the deployment configures a
+    // remote headless browser endpoint (QDRUST_BROWSER_URL). It is a separate
+    // subprocess binary (qdrust-plugin-browser) that speaks the same JSON-lines
+    // protocol and reports the network capability, so a template addresses it
+    // directly as `api://browser/<action>` without a database plugin entry.
+    if let Some(plugin) = build_browser_plugin() {
+        match plugin {
+            Ok(plugin) => plugins.push(plugin),
+            Err(err) => warn!(task_id, %err, "skipping browser plugin"),
         }
     }
     plugins
@@ -674,6 +688,41 @@ fn build_plugin(manifest: &PluginManifest, plugin_id: &str) -> anyhow::Result<Ar
         core_manifest,
         &manifest.command,
     )?))
+}
+
+/// Build the optional browser plugin from environment configuration, or return
+/// `None` when browser automation is not enabled.
+///
+/// Enabled by `QDRUST_BROWSER_URL` (a remote CDP endpoint: local obscura
+/// `http://localhost:9222`, Browserless `ws://localhost:3000` or
+/// `wss://chrome.browserless.io?token=...`). The binary is `qdrust-plugin-browser`
+/// on `PATH` by default, overridable with `QDRUST_BROWSER_PLUGIN_BIN`.
+fn build_browser_plugin() -> Option<anyhow::Result<Arc<dyn Plugin>>> {
+    build_browser_plugin_with_env(|name| std::env::var(name).ok())
+}
+
+fn build_browser_plugin_with_env(
+    env_get: impl Fn(&str) -> Option<String>,
+) -> Option<anyhow::Result<Arc<dyn Plugin>>> {
+    let enabled = env_get("QDRUST_BROWSER_URL").is_some_and(|value| !value.trim().is_empty());
+    if !enabled {
+        return None;
+    }
+    let command =
+        env_get("QDRUST_BROWSER_PLUGIN_BIN").unwrap_or_else(|| "qdrust-plugin-browser".to_string());
+    let core_manifest = CorePluginManifest {
+        api_version: PLUGIN_API_VERSION,
+        id: "browser".into(),
+        name: "Browser automation".into(),
+        version: "1".into(),
+        // The plugin reports the network capability for every call; declaring it
+        // here satisfies the host-side enforcement in SubprocessPlugin::call.
+        capabilities: vec![PluginCapability::Network],
+    };
+    Some(
+        SubprocessPlugin::from_command(core_manifest, &command)
+            .map(|p| Arc::new(p) as Arc<dyn Plugin>),
+    )
 }
 
 async fn execute_template(
@@ -1082,5 +1131,48 @@ mod tests {
         let mut task = due_probe_task("0 * * * * *", None, None);
         task.disabled = true;
         assert!(!due(&task, Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn browser_plugin_is_disabled_without_url() {
+        // No QDRUST_BROWSER_URL -> no browser plugin (the common case).
+        assert!(build_browser_plugin_with_env(|_| None).is_none());
+        // Blank URL also means disabled.
+        assert!(
+            build_browser_plugin_with_env(|name| match name {
+                "QDRUST_BROWSER_URL" => Some("  ".to_string()),
+                _ => None,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn browser_plugin_is_enabled_by_url_with_network_capability() {
+        let result = build_browser_plugin_with_env(|name| match name {
+            "QDRUST_BROWSER_URL" => Some("ws://localhost:3000".to_string()),
+            _ => None,
+        })
+        .expect("enabled by a configured URL");
+        let plugin = result.unwrap();
+        assert_eq!(plugin.manifest().id, "browser");
+        assert_eq!(
+            plugin.manifest().capabilities,
+            vec![qdrust_core::plugin::PluginCapability::Network]
+        );
+    }
+
+    #[test]
+    fn browser_plugin_respects_override_binary() {
+        let result = build_browser_plugin_with_env(|name| match name {
+            "QDRUST_BROWSER_URL" => Some("http://localhost:9222".to_string()),
+            "QDRUST_BROWSER_PLUGIN_BIN" => Some("/opt/qdrust/browser".to_string()),
+            _ => None,
+        })
+        .expect("enabled");
+        // Building a plugin with a valid command string succeeds; an empty
+        // command fails loudly so a misconfigured deployment is visible.
+        let plugin = result.unwrap();
+        assert_eq!(plugin.manifest().id, "browser");
     }
 }

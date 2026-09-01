@@ -10,6 +10,9 @@ services:
       # qdrust_core=info enables the per-plugin call timing emitted by the
       # executor's plugin registry.
       RUST_LOG: qdrust_server=info,qdrust_core=info,tower_http=info
+      # Enable the browser plugin (api://browser/<action>): uncomment and point
+      # at the browserless service below, or a self-hosted/cloud CDP endpoint.
+      # QDRUST_BROWSER_URL: ws://browserless:3000
     volumes:
       - qdrust-data:/data
     restart: unless-stopped
@@ -19,6 +22,16 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  # Optional headless browser for the browser plugin. Uncomment to run a
+  # self-hosted Browserless alongside qdrust (qdrust itself never touches the
+  # Docker daemon). Set a strong TOKEN and uncomment QDRUST_BROWSER_URL above.
+  # browserless:
+  #   image: ghcr.io/browserless/chromium:latest
+  #   environment:
+  #     TOKEN: change-me
+  #     CONCURRENT: 5
+  #   restart: unless-stopped
 
 volumes:
   qdrust-data:

@@ -13,7 +13,7 @@ COPY crates crates
 COPY migrations migrations
 COPY migrations-mysql migrations-mysql
 COPY docs/openapi-v1.json docs/openapi-v1.json
-RUN cargo build --locked --release -p qdrust-server
+RUN cargo build --locked --release -p qdrust-server -p qdrust-plugin-browser
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -23,6 +23,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid qdrust --no-create-home --shell /usr/sbin/nologin qdrust
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/qdrust-server /usr/local/bin/qdrust-server
+COPY --from=rust-builder /build/target/release/qdrust-plugin-browser /usr/local/bin/qdrust-plugin-browser
 COPY --from=web-builder /build/webui/dist webui/dist
 RUN mkdir -p /data && chown qdrust:qdrust /data
 USER qdrust:qdrust
