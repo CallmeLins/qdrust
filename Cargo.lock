@@ -1812,6 +1812,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1830,6 +1832,7 @@ dependencies = [
  "http-body-util",
  "lettre",
  "qdrust-core",
+ "qdrust-plugin-browser",
  "rand 0.9.5",
  "redis",
  "reqwest 0.12.28",

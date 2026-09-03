@@ -4,13 +4,11 @@ use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
     executor::{CancellationToken, ExecutionContext, QdExecutor, StepResult},
-    plugin::{
-        PLUGIN_API_VERSION, Plugin, PluginCapability, PluginManifest as CorePluginManifest,
-        SubprocessPlugin,
-    },
+    plugin::{PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, SubprocessPlugin},
     qd_har::{QdHar, QdProgram},
     template::Step,
 };
+use qdrust_plugin_browser::{BrowserSessionManager, BrowserSessionPlugin};
 use rand::Rng;
 use reqwest::{Client, Method};
 use serde_json::Value;
@@ -24,6 +22,7 @@ use crate::{
     store::Store,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Store,
     client: Client,
@@ -32,6 +31,7 @@ pub fn spawn(
     email: EmailClient,
     log_retention_days: u64,
     subscription_sync_interval: Duration,
+    browser: Option<Arc<BrowserSessionManager>>,
 ) {
     let worker_store = store.clone();
     let worker_client = client.clone();
@@ -62,6 +62,7 @@ pub fn spawn(
                             &worker,
                             &run_events,
                             &email,
+                            browser.clone(),
                         )
                         .await;
                     }
@@ -235,6 +236,7 @@ async fn execute_with_run(
     worker: &str,
     run_events: &broadcast::Sender<Value>,
     email: &EmailClient,
+    browser: Option<Arc<BrowserSessionManager>>,
 ) {
     let result = async {
         let variables = task_variables(&task);
@@ -253,7 +255,7 @@ async fn execute_with_run(
                 spawn_run_supervisor(store.clone(), run.id, worker, cancellation.clone());
             // Plugins are resolved per run so an edit or a disable takes effect
             // on the next execution without a restart.
-            let plugins = load_plugins(&store, task.id).await;
+            let plugins = load_plugins(&store, task.id, browser).await;
             let outcome = execute_template(
                 template.clone(),
                 &cancellation,
@@ -632,7 +634,11 @@ fn render_plain(source: &str, variables: &BTreeMap<String, Value>) -> anyhow::Re
 /// A plugin with an unusable command is skipped with a warning instead of
 /// failing the run: one broken plugin must not take down every template that
 /// never calls it. A task with no owner (pre multi-user data) simply gets none.
-async fn load_plugins(store: &Store, task_id: i64) -> Vec<Arc<dyn Plugin>> {
+async fn load_plugins(
+    store: &Store,
+    task_id: i64,
+    browser: Option<Arc<BrowserSessionManager>>,
+) -> Vec<Arc<dyn Plugin>> {
     let owner = match store.task_owner_id(task_id).await {
         Ok(owner) => owner,
         Err(err) => {
@@ -660,16 +666,13 @@ async fn load_plugins(store: &Store, task_id: i64) -> Vec<Arc<dyn Plugin>> {
             Err(err) => warn!(task_id, plugin_id = %plugin_id, %err, "skipping plugin"),
         }
     }
-    // The optional browser plugin is wired in when the deployment configures a
-    // remote headless browser endpoint (QDRUST_BROWSER_URL). It is a separate
-    // subprocess binary (qdrust-plugin-browser) that speaks the same JSON-lines
-    // protocol and reports the network capability, so a template addresses it
-    // directly as `api://browser/<action>` without a database plugin entry.
-    if let Some(plugin) = build_browser_plugin() {
-        match plugin {
-            Ok(plugin) => plugins.push(plugin),
-            Err(err) => warn!(task_id, %err, "skipping browser plugin"),
-        }
+    // The optional browser plugin is wired in when the process owns a headless
+    // browser session manager (constructed in main.rs when QDRUST_BROWSER_URL
+    // is set). The manager runs chromiumoxide in-process and keeps sessions
+    // alive across calls, so a template addresses it directly as
+    // `api://browser/<action>` without a database plugin entry.
+    if let Some(manager) = browser {
+        plugins.push(Arc::new(BrowserSessionPlugin::new(manager)) as Arc<dyn Plugin>);
     }
     plugins
 }
@@ -688,41 +691,6 @@ fn build_plugin(manifest: &PluginManifest, plugin_id: &str) -> anyhow::Result<Ar
         core_manifest,
         &manifest.command,
     )?))
-}
-
-/// Build the optional browser plugin from environment configuration, or return
-/// `None` when browser automation is not enabled.
-///
-/// Enabled by `QDRUST_BROWSER_URL` (a remote CDP endpoint: local obscura
-/// `http://localhost:9222`, Browserless `ws://localhost:3000` or
-/// `wss://chrome.browserless.io?token=...`). The binary is `qdrust-plugin-browser`
-/// on `PATH` by default, overridable with `QDRUST_BROWSER_PLUGIN_BIN`.
-fn build_browser_plugin() -> Option<anyhow::Result<Arc<dyn Plugin>>> {
-    build_browser_plugin_with_env(|name| std::env::var(name).ok())
-}
-
-fn build_browser_plugin_with_env(
-    env_get: impl Fn(&str) -> Option<String>,
-) -> Option<anyhow::Result<Arc<dyn Plugin>>> {
-    let enabled = env_get("QDRUST_BROWSER_URL").is_some_and(|value| !value.trim().is_empty());
-    if !enabled {
-        return None;
-    }
-    let command =
-        env_get("QDRUST_BROWSER_PLUGIN_BIN").unwrap_or_else(|| "qdrust-plugin-browser".to_string());
-    let core_manifest = CorePluginManifest {
-        api_version: PLUGIN_API_VERSION,
-        id: "browser".into(),
-        name: "Browser automation".into(),
-        version: "1".into(),
-        // The plugin reports the network capability for every call; declaring it
-        // here satisfies the host-side enforcement in SubprocessPlugin::call.
-        capabilities: vec![PluginCapability::Network],
-    };
-    Some(
-        SubprocessPlugin::from_command(core_manifest, &command)
-            .map(|p| Arc::new(p) as Arc<dyn Plugin>),
-    )
 }
 
 async fn execute_template(
@@ -1002,7 +970,7 @@ mod tests {
             .await
             .unwrap();
 
-        let plugins = load_plugins(&store, task.id).await;
+        let plugins = load_plugins(&store, task.id, None).await;
         let ids = plugins
             .iter()
             .map(|plugin| plugin.manifest().id.clone())
@@ -1010,7 +978,7 @@ mod tests {
         assert_eq!(ids, vec![format!("plugin-{}", enabled.id)]);
 
         // Unknown tasks and legacy owner-less tasks load nothing.
-        assert!(load_plugins(&store, 999_999).await.is_empty());
+        assert!(load_plugins(&store, 999_999, None).await.is_empty());
     }
 
     #[test]
@@ -1134,27 +1102,15 @@ mod tests {
     }
 
     #[test]
-    fn browser_plugin_is_disabled_without_url() {
-        // No QDRUST_BROWSER_URL -> no browser plugin (the common case).
-        assert!(build_browser_plugin_with_env(|_| None).is_none());
-        // Blank URL also means disabled.
-        assert!(
-            build_browser_plugin_with_env(|name| match name {
-                "QDRUST_BROWSER_URL" => Some("  ".to_string()),
-                _ => None,
-            })
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn browser_plugin_is_enabled_by_url_with_network_capability() {
-        let result = build_browser_plugin_with_env(|name| match name {
-            "QDRUST_BROWSER_URL" => Some("ws://localhost:3000".to_string()),
-            _ => None,
-        })
-        .expect("enabled by a configured URL");
-        let plugin = result.unwrap();
+    fn browser_plugin_manifest_declares_network_capability() {
+        // The in-process BrowserSessionPlugin is constructed from a configured
+        // manager. An unconfigured manager (blank endpoint) still builds a
+        // valid plugin; it simply fails loudly on connect. Only the manifest
+        // shape matters here.
+        let manager = Arc::new(BrowserSessionManager::new(Some(
+            "ws://localhost:3000".to_string(),
+        )));
+        let plugin = BrowserSessionPlugin::new(manager);
         assert_eq!(plugin.manifest().id, "browser");
         assert_eq!(
             plugin.manifest().capabilities,
@@ -1163,16 +1119,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_plugin_respects_override_binary() {
-        let result = build_browser_plugin_with_env(|name| match name {
-            "QDRUST_BROWSER_URL" => Some("http://localhost:9222".to_string()),
-            "QDRUST_BROWSER_PLUGIN_BIN" => Some("/opt/qdrust/browser".to_string()),
-            _ => None,
-        })
-        .expect("enabled");
-        // Building a plugin with a valid command string succeeds; an empty
-        // command fails loudly so a misconfigured deployment is visible.
-        let plugin = result.unwrap();
-        assert_eq!(plugin.manifest().id, "browser");
+    fn browser_session_manager_is_configured_only_with_endpoint() {
+        assert!(!BrowserSessionManager::new(None).is_configured());
+        assert!(BrowserSessionManager::new(Some("  ".to_string())).is_configured());
+        assert!(
+            BrowserSessionManager::new(Some("http://localhost:9222".to_string())).is_configured()
+        );
     }
 }

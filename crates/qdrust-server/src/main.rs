@@ -39,6 +39,14 @@ async fn main() -> Result<()> {
     }
     let config_file = config.config_file.clone();
     spawn_settings_watcher(store.clone(), settings.clone(), config_file);
+    // The headless browser session manager is optional and process-wide: it is
+    // created once when QDRUST_BROWSER_URL is configured and shared by every
+    // run so sessions (a login page, a captcha awaiting a human) survive across
+    // separate plugin calls. chromiumoxide runs in-process here.
+    let browser = qdrust_plugin_browser::BrowserSessionManager::from_env().map(std::sync::Arc::new);
+    if let Some(manager) = &browser {
+        tracing::info!(endpoint = %manager.endpoint(), "browser session manager enabled");
+    }
     scheduler::spawn(
         store.clone(),
         client.clone(),
@@ -47,6 +55,7 @@ async fn main() -> Result<()> {
         email,
         config.log_retention_days,
         config.subscription_sync_interval,
+        browser,
     );
     let app = api::router_with_auth(
         store,

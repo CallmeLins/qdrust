@@ -13,7 +13,9 @@ COPY crates crates
 COPY migrations migrations
 COPY migrations-mysql migrations-mysql
 COPY docs/openapi-v1.json docs/openapi-v1.json
-RUN cargo build --locked --release -p qdrust-server -p qdrust-plugin-browser
+# Build the server. The browser plugin (chromiumoxide/CDP) is compiled in as a
+# library dependency, so only qdrust-server needs to be produced.
+RUN cargo build --locked --release -p qdrust-server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -23,7 +25,6 @@ RUN apt-get update \
     && useradd --uid 10001 --gid qdrust --no-create-home --shell /usr/sbin/nologin qdrust
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/qdrust-server /usr/local/bin/qdrust-server
-COPY --from=rust-builder /build/target/release/qdrust-plugin-browser /usr/local/bin/qdrust-plugin-browser
 COPY --from=web-builder /build/webui/dist webui/dist
 RUN mkdir -p /data && chown qdrust:qdrust /data
 USER qdrust:qdrust
