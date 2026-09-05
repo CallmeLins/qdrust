@@ -331,6 +331,39 @@ docker compose down             # 停止
 
 > 本地从源码构建（开发者）：仓库自带 `compose.yaml`，执行 `docker compose up --build -d` 会构建本地 `qdrust:local` 镜像，适合贡献代码时自测。
 
+### 反向代理到二级目录（sub-path）
+
+站点默认伺服在根路径（适合**二级域名** `https://qd.your.domain` 或裸域名）。若想反代到**二级目录**（如 `https://your.domain/qd`，少一条 DNS 记录、且路径对中间人不可见）：
+
+- **前端自适应（无需重建）**：WebUI 以**相对 base** 构建，API 前缀在**运行时**从当前页面 URL 推导（见 `webui/src/api.ts` 的 `detectUrlPrefix`）。因此**同一份镜像**既能在根路径用，也能在任意二级目录用——不需要为每个前缀重新构建前端。
+- **后端设置前缀**：将 `QDRUST_BASE_PATH` 设为实际反代前缀，使后端在该目录下伺服静态资源与 SPA。`/health`、`/ready` 探针仍留在根路径，供健康检查。
+- **反向代理原样转发**（**不要**剥离前缀），例如 nginx：
+
+```nginx
+location /qd/ {
+    proxy_pass http://127.0.0.1:8923;   # 不剥离 /qd
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+配置示例（`https://your.domain/qd`）：
+
+```
+# 后端
+QDRUST_BASE_PATH=/qd
+
+# nginx：location /qd/ 原样转发到 8923（见上）
+```
+
+访问 `https://your.domain/qd/`（末尾斜杠）即可；浏览器按相对路径自动解析静态资源与 API 请求。
+
+> **默认**：置空 `QDRUST_BASE_PATH` 即伺服在根路径（二级域名 / 裸域名场景不受影响）。
+>
+> **旧用法（可选，编译期固定）**：若偏好把前缀在构建时写死，可用 `VITE_BASE_PATH=/qd npm run build`（Docker 用 `--build-arg VITE_BASE_PATH=/qd`）得到绝对 base 的 UI，仍受支持。
+>
+> **不支持的形态**：剥离前缀式反代（`proxy_pass .../;` + URL 改写）与本运行时方案不兼容——请用"原样转发"。
+
 ### 环境变量
 
 复制 `.env.example` 为 `.env` 后按需修改。关键变量：
@@ -346,6 +379,8 @@ docker compose down             # 停止
 | `COOKIE_SECURE` | `false` | **HTTPS 下必须设为 `true`** |
 | `LOGIN_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `5` / `60` | 登录限流 |
 | `LOG_RETENTION_DAYS` | `0` | 已完成运行记录保留天数（`0` = 永久） |
+| `QDRUST_DEFAULT_TIMEZONE` | `Asia/Shanghai` | 未显式设时区的任务按其 cron 调度的 IANA 时区（DST 感知）。欧美部署可设如 `America/New_York` |
+| `QDRUST_BASE_PATH` | 空 | 反代到二级目录时设为该前缀（如 `/qd`，伺服 `https://host/qd`）。WebUI 以相对 base 构建、运行时自适应，**无需**为每个前缀重建。置空=根路径。可选编译期固定见 `VITE_BASE_PATH` |
 | `QDRUST_SMTP_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD` / `_FROM` | 空 | 邮件发送（重置密码 / 邮箱验证 / Email 渠道） |
 | `QDRUST_BASE_URL` | `http://localhost:8923` | 密码重置 / 邮箱验证邮件中的链接基址 |
 | `REQUIRE_EMAIL_VERIFICATION` | `false` | 新用户登录前必须验证邮箱 |
@@ -394,6 +429,10 @@ WebUI 提供可视化编辑器，可直接增删改请求、设置请求头 / �
 ### 调度与随机延迟
 
 可视化调度器支持固定间隔与 cron；「随机延迟」可让同一任务的多次执行在时间上打散，避免被目标站点识别为固定节奏。模板变量支持在创建任务时**预填**默认值。
+
+#### 时区与夏令时
+
+cron 按每个任务各自的 IANA 时区（`timezone` 字段）求值，**DST 感知**：设 `America/New_York` 的任务，`0 9 * * *` 会全年在当地 09:00 触发，无需为冬令/夏令手改 cron。任务未设 `timezone` 时使用服务端 `QDRUST_DEFAULT_TIMEZONE`（默认 `Asia/Shanghai`）。WebUI 中任务列表与运行历史的「上次运行/开始时间」也按该任务时区展示（未设时区则用查看者浏览器本地时区）。
 
 ### 运行日志与历史
 

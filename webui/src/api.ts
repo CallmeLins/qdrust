@@ -49,8 +49,52 @@ function csrfToken(): string | undefined {
   return document.cookie.split("; ").find((value) => value.startsWith("qd_csrf="))?.split("=")[1];
 }
 
+// The UI is built with a RELATIVE base (or an explicit VITE_BASE_PATH), so the
+// actual URL prefix is only known at runtime. Derive it from the current page
+// path so ONE image works at the bare root "/" or any reverse-proxied
+// sub-directory such as /qd — no rebuild needed.
+//
+// The SPA has no vue-router: the backend serves index.html for the root and the
+// email deep-link paths (`/verify-email`, `/reset-password`, see App.vue) under
+// any prefix. Everything else that loads the app is one of those, so stripping
+// the trailing "/" and an optional auth deep-link segment leaves exactly the
+// reverse-proxy prefix.
+const PAGE_TAIL = ["/verify-email", "/reset-password"];
+
+/** Pure helper: turn a full page pathname into the reverse-proxy prefix.
+ *  e.g. "/" -> "", "/qd/" -> "/qd", "/qd/verify?..." -> "/qd", "" -> "". */
+export function prefixFromPathname(pathname: string): string {
+  let path = pathname.replace(/\/+$/, "");
+  for (const tail of PAGE_TAIL) {
+    if (path.endsWith(tail)) {
+      path = path.slice(0, -tail.length).replace(/\/+$/, "");
+      break;
+    }
+  }
+  // Keep the leading slash of a real prefix ("/qd"), but never bare "/".
+  return path === "/" ? "" : path;
+}
+
+/** Derive the current reverse-proxy prefix from window.location, e.g. "" for a
+ *  bare-root deployment or "/qd" when served under /qd. Returns "" when no
+ *  browser context is available (e.g. unit tests / non-DOM). */
+export function detectUrlPrefix(): string {
+  if (typeof window === "undefined") return "";
+  return prefixFromPathname(window.location.pathname);
+}
+
+/** Prefix an API path with the reverse-proxy base. Liveness/readiness probes
+ *  are intentionally left at the bare root (the backend keeps them un-nested).
+ *  `prefix` is injectable for tests and defaults to the runtime-derived one. */
+export function apiPath(path: string, prefix: string = detectUrlPrefix()): string {
+  if (!prefix || path.startsWith("/health") || path.startsWith("/ready")) {
+    return path;
+  }
+  return prefix + path;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const response = await fetch(apiPath(path), {
     ...init,
     credentials: "same-origin",
     headers: { "content-type": "application/json", ...(csrfToken() ? { "x-csrf-token": decodeURIComponent(csrfToken()!) } : {}), ...init?.headers }

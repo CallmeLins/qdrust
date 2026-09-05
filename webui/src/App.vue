@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
+import { api, apiPath, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
 import { formatRunTime } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
@@ -1225,7 +1225,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
                     <td><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
                     <td class="col-schedule"><code>{{ task.cron }}</code></td>
-                    <td>{{ formatRunTime(task.last_run_at) }}</td>
+                    <td>{{ formatRunTime(task.last_run_at, undefined, task.timezone || undefined) }}</td>
                     <td><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
                     <td class="col-group">{{ task.grp ?? '–' }}</td>
                     <td class="row-actions">
@@ -1263,7 +1263,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tr></thead>
               <tbody>
                 <tr v-for="run in runsByTask[runHistoryTask?.id ?? -1]" :key="run.id">
-                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</td>
+                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, runHistoryTask?.timezone || undefined) }}</td>
                   <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
                   <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
                   <td class="row-actions">
@@ -1568,7 +1568,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <dl class="settings-list">
               <div><dt>{{ t('statusLabel') }}</dt><dd><span class="state-dot online" />{{ ready ? t('serviceOk') : t('connecting') }}</dd></div>
               <div><dt>{{ t('localeLabel') }}</dt><dd><button class="secondary-button" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button></dd></div>
-              <div><dt>{{ t('apiDocs') }}</dt><dd><a href="/api/v1/openapi.json" target="_blank">{{ t('openapi') }}</a></dd></div>
+              <div><dt>{{ t('apiDocs') }}</dt><dd><a :href="apiPath('/api/v1/openapi.json')" target="_blank">{{ t('openapi') }}</a></dd></div>
             </dl>
           </div>
         </section>

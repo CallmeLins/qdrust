@@ -32,6 +32,7 @@ pub fn spawn(
     log_retention_days: u64,
     subscription_sync_interval: Duration,
     browser: Option<Arc<BrowserSessionManager>>,
+    default_tz: chrono_tz::Tz,
 ) {
     let worker_store = store.clone();
     let worker_client = client.clone();
@@ -87,7 +88,10 @@ pub fn spawn(
                     continue;
                 }
             };
-            for task in tasks.into_iter().filter(|task| due(task, interval)) {
+            for task in tasks
+                .into_iter()
+                .filter(|task| due(task, interval, default_tz))
+            {
                 // QD-style random delay ("当天随机延时区间"): draw the jitter once
                 // at enqueue time and let claim_run honor run_after, so the run
                 // fires within 0..=max seconds of the scheduled moment instead
@@ -180,7 +184,10 @@ pub fn spawn(
     });
 }
 
-fn due(task: &Task, interval: Duration) -> bool {
+/// Whether `task` should fire on this scheduler tick, evaluated in the task's
+/// own IANA timezone when set, otherwise the server-wide `default_tz` (from
+/// `QDRUST_DEFAULT_TIMEZONE`, itself defaulting to `Asia/Shanghai`).
+fn due(task: &Task, interval: Duration, default_tz: chrono_tz::Tz) -> bool {
     if task.disabled {
         return false;
     }
@@ -191,7 +198,7 @@ fn due(task: &Task, interval: Duration) -> bool {
         .timezone
         .as_deref()
         .and_then(|tz| tz.parse().ok())
-        .unwrap_or(chrono_tz::UTC);
+        .unwrap_or(default_tz);
     let now = Utc::now().with_timezone(&tz);
     // A task that has never run must wait for its *next* scheduled moment.
     // Anchoring "since" at now - interval (instead of epoch 0) prevents a new
@@ -1068,11 +1075,19 @@ mod tests {
         // A task created moments ago (last_run_at = None) must not fire on the
         // next tick just because the schedule had occurrences in the past.
         let task = due_probe_task("0 0 8 * * *", None, Some("Asia/Shanghai"));
-        assert!(!due(&task, Duration::from_secs(15)));
+        assert!(!due(
+            &task,
+            Duration::from_secs(15),
+            chrono_tz::Asia::Shanghai
+        ));
 
         // Same after an explicit epoch-ish sentinel.
         let task = due_probe_task("0 0 8 * * *", Some(0), Some("Asia/Shanghai"));
-        assert!(!due(&task, Duration::from_secs(15)));
+        assert!(!due(
+            &task,
+            Duration::from_secs(15),
+            chrono_tz::Asia::Shanghai
+        ));
     }
 
     #[test]
@@ -1083,22 +1098,22 @@ mod tests {
         // timestamp; use UTC directly to keep the assertion deterministic.
         let last_run = (Utc::now() - Duration::from_secs(120)).timestamp();
         let task = due_probe_task("0 * * * * *", Some(last_run), None);
-        assert!(due(&task, Duration::from_secs(15)));
+        assert!(due(&task, Duration::from_secs(15), chrono_tz::UTC));
 
         // Last ran a few seconds ago on a daily schedule -> not due yet.
         let last_run = (Utc::now() - Duration::from_secs(30)).timestamp();
         let task = due_probe_task("0 0 8 * * *", Some(last_run), None);
-        assert!(!due(&task, Duration::from_secs(15)));
+        assert!(!due(&task, Duration::from_secs(15), chrono_tz::UTC));
     }
 
     #[test]
     fn unparsable_cron_and_disabled_tasks_are_never_due() {
         let task = due_probe_task("not a cron", None, None);
-        assert!(!due(&task, Duration::from_secs(15)));
+        assert!(!due(&task, Duration::from_secs(15), chrono_tz::UTC));
 
         let mut task = due_probe_task("0 * * * * *", None, None);
         task.disabled = true;
-        assert!(!due(&task, Duration::from_secs(15)));
+        assert!(!due(&task, Duration::from_secs(15), chrono_tz::UTC));
     }
 
     #[test]

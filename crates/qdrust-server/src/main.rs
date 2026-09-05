@@ -47,6 +47,15 @@ async fn main() -> Result<()> {
     if let Some(manager) = &browser {
         tracing::info!(endpoint = %manager.endpoint(), "browser session manager enabled");
     }
+    // Server-wide default IANA timezone for cron scheduling of tasks that do
+    // not carry their own timezone (QDRUST_DEFAULT_TIMEZONE, default
+    // Asia/Shanghai). Validated at Config parse time.
+    let default_tz: chrono_tz::Tz = config
+        .default_timezone
+        .parse()
+        .unwrap_or(chrono_tz::Asia::Shanghai);
+    tracing::info!(tz = %default_tz, "scheduler default timezone");
+    let base_path = config.base_path.clone();
     scheduler::spawn(
         store.clone(),
         client.clone(),
@@ -56,6 +65,7 @@ async fn main() -> Result<()> {
         config.log_retention_days,
         config.subscription_sync_interval,
         browser,
+        default_tz,
     );
     let app = api::router_with_auth(
         store,
@@ -70,6 +80,7 @@ async fn main() -> Result<()> {
         settings.clone(),
         client,
         qdrust_server::redis_cache::SessionCache::from_env()?,
+        &base_path,
     )
     .layer(qdrust_server::ga::InjectGaLayer::new(settings))
     .layer(TraceLayer::new_for_http());

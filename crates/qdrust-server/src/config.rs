@@ -21,6 +21,14 @@ pub struct Config {
     pub ga_key: Option<String>,
     pub require_email_verification: bool,
     pub subscription_sync_interval: Duration,
+    /// IANA timezone applied to cron scheduling when a task does not set its
+    /// own `timezone`. Defaults to `Asia/Shanghai` to match a China-first
+    /// deployment. Empty means UTC (the previous hardcoded fallback).
+    pub default_timezone: String,
+    /// URL sub-path the whole site (API + SPA assets) is served under, e.g.
+    /// `/qd` when reverse-proxied at `https://host/qd`. Empty means root `/`
+    /// (current behaviour, compatible with subdomain or bare deploys).
+    pub base_path: String,
     pub config_file: Option<PathBuf>,
 }
 
@@ -59,6 +67,11 @@ impl Config {
                 "QDRUST_SUBSCRIPTION_SYNC_INTERVAL_SECONDS",
                 3600,
             )?),
+            default_timezone: env::var("QDRUST_DEFAULT_TIMEZONE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
+            base_path: normalize_base_path(&env::var("QDRUST_BASE_PATH").unwrap_or_default()),
             config_file: env::var("QDRUST_CONFIG_FILE")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -125,6 +138,23 @@ impl Config {
                 .map_or(self.subscription_sync_interval, |v| {
                     Duration::from_secs(v.max(1) as u64)
                 }),
+            default_timezone: {
+                // Config file is only a fallback; env already won above.
+                let file = get("default_timezone").unwrap_or("");
+                if !self.default_timezone.is_empty() {
+                    self.default_timezone.clone()
+                } else {
+                    file.to_string()
+                }
+            },
+            base_path: {
+                let file = get("base_path").unwrap_or("");
+                if self.base_path.is_empty() {
+                    normalize_base_path(file)
+                } else {
+                    self.base_path.clone()
+                }
+            },
             config_file: self.config_file,
         })
     }
@@ -155,7 +185,22 @@ impl Config {
             !self.login_rate_limit_window.is_zero(),
             "login rate limit window cannot be zero"
         );
-        Ok(self)
+        // Default timezone: an unset env + no config-file value falls back to
+        // Asia/Shanghai (matches China-first deployments and the WebUI default).
+        let default_timezone = if self.default_timezone.trim().is_empty() {
+            "Asia/Shanghai".to_string()
+        } else {
+            self.default_timezone.trim().to_string()
+        };
+        default_timezone
+            .parse::<chrono_tz::Tz>()
+            .context("default_timezone must be a valid IANA timezone name")?;
+        let base_path = normalize_base_path(&self.base_path);
+        Ok(Self {
+            default_timezone,
+            base_path,
+            ..self
+        })
     }
 }
 
@@ -167,4 +212,98 @@ where
     env::var(name).map_or(Ok(default), |value| {
         value.parse().with_context(|| format!("invalid {name}"))
     })
+}
+
+/// Normalise a configured base path into the form the router expects: either
+/// empty (serve at root `/`) or a single leading-slash path with no trailing
+/// slash, e.g. `/qd`. Inputs like `/qd/`, `qd`, or `qd/` are all accepted.
+fn normalize_base_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return String::new();
+    }
+    let mut s = trimmed.trim_end_matches('/').to_string();
+    if !s.starts_with('/') {
+        s.insert(0, '/');
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_path_is_normalized() {
+        // Empty / "/" / "."-style inputs mean root (no prefix).
+        assert_eq!(normalize_base_path(""), "");
+        assert_eq!(normalize_base_path("/"), "");
+        assert_eq!(normalize_base_path("   "), "");
+        // Leading slash preserved, trailing slash stripped.
+        assert_eq!(normalize_base_path("/qd"), "/qd");
+        assert_eq!(normalize_base_path("/qd/"), "/qd");
+        assert_eq!(normalize_base_path("qd"), "/qd");
+        assert_eq!(normalize_base_path("qd/"), "/qd");
+        // Deep paths are kept.
+        assert_eq!(normalize_base_path("/qd/app/"), "/qd/app");
+    }
+
+    #[test]
+    fn env_parse_defaults_timezone_and_base_path() {
+        // Without any env, from_env yields Asia/Shanghai and empty base_path.
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            config_file: None,
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(cfg.default_timezone, "Asia/Shanghai");
+        assert_eq!(cfg.base_path, "");
+    }
+
+    #[test]
+    fn invalid_default_timezone_is_rejected() {
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: "Not/A_Zone".into(),
+            base_path: String::new(),
+            config_file: None,
+        }
+        .validate();
+        assert!(cfg.is_err());
+    }
 }

@@ -15,7 +15,7 @@ use axum::{
         header::{COOKIE, HeaderName, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{any, delete, get},
+    routing::{any, delete, get, get_service},
 };
 use qdrust_core::plugin::{
     PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, PluginRequest,
@@ -133,6 +133,7 @@ pub fn router(store: Store) -> Router {
         runtime_settings(),
         reqwest::Client::new(),
         crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+        "",
     )
 }
 
@@ -140,6 +141,7 @@ pub fn subscription_event_channel() -> (broadcast::Sender<Value>, broadcast::Rec
     broadcast::channel(256)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn router_with_auth(
     store: Store,
     auth: AuthConfig,
@@ -148,13 +150,12 @@ pub fn router_with_auth(
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
+    base_path: &str,
 ) -> Router {
     let login_limiter =
         LoginRateLimiter::new(auth.login_rate_limit_attempts, auth.login_rate_limit_window)
             .expect("login rate limit configuration must be valid");
-    Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
+    let inner = Router::new()
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
         .route("/api/v1/auth/register", axum::routing::post(register))
@@ -308,19 +309,47 @@ pub fn router_with_auth(
                 .delete(delete_template),
         )
         .route("/api/{*path}", any(api_not_found))
+        // SPA serving. Serve index.html at the router root and fall back to it
+        // for any path that is not a real file under dist (deep links, email
+        // verify/reset URLs). `.fallback` (NOT `.not_found_service`) is
+        // essential: the latter forces every miss to HTTP 404, whereas the SPA
+        // must serve index.html with 200 so the browser renders it.
+        .route("/", get_service(ServeFile::new("webui/dist/index.html")))
         .fallback_service(
-            ServeDir::new("webui/dist").not_found_service(ServeFile::new("webui/dist/index.html")),
-        )
-        .with_state(AppState {
-            store,
-            auth,
-            login_limiter,
-            run_events,
-            subscription_events,
-            settings,
-            http_client,
-            session_cache,
-        })
+            ServeDir::new("webui/dist").fallback(ServeFile::new("webui/dist/index.html")),
+        );
+
+    let state = AppState {
+        store,
+        auth,
+        login_limiter,
+        run_events,
+        subscription_events,
+        settings,
+        http_client,
+        session_cache,
+    };
+
+    // Keep liveness/readiness probes at the root (external health checks and
+    // the Docker HEALTHCHECK hit `/health`/`/ready` regardless of sub-path).
+    let mut root = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready));
+    if base_path.trim().is_empty() {
+        // Bare-root deployment: `inner` already serves API + SPA (with its own
+        // fallback). Nesting would duplicate the fallback, so use it directly.
+        root = root.merge(inner);
+    } else {
+        let nested = Router::new().nest(base_path.trim_end_matches('/'), inner);
+        // Outer fallback serves the SPA index for anything still unmatched. This
+        // is what catches the trailing-slash nested root `<base>/` (e.g. `/qd/`),
+        // which axum's `Router::nest` does not match itself, plus stray paths.
+        // `/health`/`/ready` and the nested `/qd/...` tree are matched first.
+        root = root
+            .merge(nested)
+            .fallback_service(ServeFile::new("webui/dist/index.html"));
+    }
+    root.with_state(state)
 }
 
 async fn health() -> Json<Value> {
@@ -2239,6 +2268,118 @@ mod tests {
     async fn test_app() -> Router {
         let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
         router(store)
+    }
+
+    async fn test_app_at(base_path: &str) -> Router {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        router_with_auth(
+            store,
+            AuthConfig::default(),
+            run_event_channel().0,
+            subscription_event_channel().0,
+            runtime_settings(),
+            reqwest::Client::new(),
+            crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+            base_path,
+        )
+    }
+
+    #[tokio::test]
+    async fn health_and_ready_stay_at_root_when_nested() {
+        // When served under a sub-path, liveness/readiness probes must remain
+        // reachable at the bare root (Docker HEALTHCHECK / orchestrators).
+        let app = test_app_at("/qd").await;
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_is_served_under_base_path_not_at_root() {
+        let app = test_app_at("/qd").await;
+        // Under the sub-path, an unknown API route returns the API's JSON 404
+        // contract (routing reached the API, not the SPA fallback).
+        let nested = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/qd/api/v1/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = response_json(nested).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "api_endpoint_not_found");
+
+        // At the bare root the same API path is NOT routed to the API handler:
+        // the `/api/{*path}` catch-all lives only inside the nested sub-tree,
+        // so a bare request must not yield the API's JSON error contract.
+        let bare = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bare_body = to_bytes(bare.into_body(), 1024).await.unwrap();
+        // The bare response must not carry the API 404 contract (`code`). It may
+        // be non-JSON (empty / HTML), which is fine: it just isn't the API.
+        if let Ok(value) = serde_json::from_slice::<Value>(&bare_body) {
+            assert_ne!(value["code"], "api_endpoint_not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_root_trailing_slash_is_served_like_the_bare_prefix() {
+        // Regression: `Router::nest("/qd", ...)` does not itself match `/qd/`
+        // (the trailing-slash root a browser/nginx sends). An outer SPA fallback
+        // must catch it so the root-with-slash is served identically to `/qd`.
+        // We assert the two forms return the same status and are both HTML-like
+        // (SPA handling) rather than one being an empty axum 404. Whether the
+        // on-disk index.html is reachable depends on the test cwd, so compare
+        // relative behaviour instead of pinning a concrete status.
+        let app = test_app_at("/qd").await;
+        let bare_prefix = app
+            .clone()
+            .oneshot(Request::builder().uri("/qd").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let trailing_slash = app
+            .oneshot(Request::builder().uri("/qd/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bare_prefix.status(), trailing_slash.status());
+        // Neither may carry the API 404 contract (i.e. they are served by the
+        // SPA path, not leaked through the API catch-all).
+        for res in [bare_prefix, trailing_slash] {
+            let body = to_bytes(res.into_body(), 1024).await.unwrap();
+            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                assert_ne!(value["code"], "api_endpoint_not_found");
+            }
+        }
     }
 
     async fn response_json(response: Response) -> (StatusCode, HeaderValue, Value) {

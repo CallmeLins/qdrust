@@ -1,10 +1,17 @@
+# Sub-path support. The WebUI is built with a RELATIVE base by default, so this
+# image serves correctly at the bare root OR any reverse-proxied sub-directory
+# (e.g. https://host/qd) without rebuilding — set QDRUST_BASE_PATH=/qd at
+# runtime to match the proxy prefix. VITE_BASE_PATH below is only for the
+# legacy absolute-base mode (build-time pinning); leave it empty for the
+# runtime-adaptive default.
+ARG VITE_BASE_PATH=
 FROM node:24-bookworm-slim AS web-builder
 WORKDIR /build
 COPY docs/openapi-v1.json docs/openapi-v1.json
 COPY webui/package.json webui/package-lock.json webui/
 RUN npm --prefix webui ci
 COPY webui webui
-RUN npm --prefix webui run generate:api && npm --prefix webui run build
+RUN npm --prefix webui run generate:api && VITE_BASE_PATH="$VITE_BASE_PATH" npm --prefix webui run build
 
 FROM rust:1.97-bookworm AS rust-builder
 WORKDIR /build
@@ -33,7 +40,9 @@ ENV BIND=0.0.0.0 \
     DATABASE_URL=sqlite:///data/qdrust.db \
     DATABASE_MIN_CONNECTIONS=1 \
     DATABASE_MAX_CONNECTIONS=8 \
-    RUST_LOG=qdrust_server=info,qdrust_core=info,tower_http=info
+    RUST_LOG=qdrust_server=info,qdrust_core=info,tower_http=info \
+    QDRUST_DEFAULT_TIMEZONE=Asia/Shanghai \
+    QDRUST_BASE_PATH=
 VOLUME ["/data"]
 EXPOSE 8923
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
