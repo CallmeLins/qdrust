@@ -19,15 +19,29 @@ use axum::http::{HeaderMap, Uri};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use openidconnect::{
-    ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope,
+    ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl,
+    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
-    reqwest::async_http_client,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::config::OidcConfig;
+
+/// A [`CoreClient`] built from OIDC discovery metadata: the authorization
+/// endpoint is always present (`EndpointSet`), the token and user-info
+/// endpoints may or may not be advertised (`EndpointMaybeSet`), and the
+/// device/introspection/revocation endpoints are not used. This concrete type is
+/// what `CoreClient::from_provider_metadata` + `set_redirect_uri` yields, so the
+/// authorization-code flow can call the fallible `exchange_code`.
+pub type OidcClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
 
 /// Cookie carrying the raw `state` back from the IdP on the top-level redirect.
 /// Must be `SameSite=Lax` so it is sent on the cross-site navigation back from
@@ -172,13 +186,28 @@ pub fn derive_redirect_uri(base_path: &str, headers: &HeaderMap, uri: &Uri) -> S
     format!("{scheme}://{host}{base}{OIDC_CALLBACK_PATH}")
 }
 
-/// Discover the provider metadata and build a [`CoreClient`] configured with the
-/// redirect_uri. Uses the async reqwest backend so it can run inside the tokio
-/// runtime without blocking a worker thread.
-pub async fn build_client(oidc: &OidcConfig, redirect_uri: &str) -> anyhow::Result<CoreClient> {
+/// Result of [`build_client`]: the discovery-configured [`OidcClient`] plus the
+/// stateful `reqwest::Client` used to reach the provider. The HTTP client must be
+/// retained because openidconnect 4.x `request_async` takes an `AsyncHttpClient`
+/// by reference (it cannot be reconstructed from just the `OidcClient`).
+pub struct BuiltClient {
+    pub client: OidcClient,
+    pub http: reqwest::Client,
+}
+
+/// Discover the provider metadata and build a [`OidcClient`] configured with the
+/// redirect_uri, returning the shared stateful HTTP client alongside it.
+///
+/// Redirect-following is disabled on the HTTP client (openidconnect 4.x SSRF
+/// guidance); discovery + JWKS fetch + the later token exchange all reuse it.
+pub async fn build_client(oidc: &OidcConfig, redirect_uri: &str) -> anyhow::Result<BuiltClient> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build OIDC http client: {e}"))?;
     let issuer_url = IssuerUrl::new(oidc.issuer.clone())
         .map_err(|e| anyhow::anyhow!("invalid OIDC issuer URL: {e}"))?;
-    let metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
+    let metadata = CoreProviderMetadata::discover_async(issuer_url, &http)
         .await
         .map_err(|e| anyhow::anyhow!("OIDC discovery failed: {e}"))?;
     let client = CoreClient::from_provider_metadata(
@@ -190,13 +219,13 @@ pub async fn build_client(oidc: &OidcConfig, redirect_uri: &str) -> anyhow::Resu
         RedirectUrl::new(redirect_uri.to_string())
             .map_err(|e| anyhow::anyhow!("invalid OIDC redirect URI: {e}"))?,
     );
-    Ok(client)
+    Ok(BuiltClient { client, http })
 }
 
 /// Build the provider authorization URL, installing our deterministic
 /// `state`/`nonce` and the PKCE S256 challenge derived from `verifier`.
 pub fn build_authorize_url(
-    client: &CoreClient,
+    client: &OidcClient,
     raw_state: &str,
     nonce: &str,
     verifier: &str,

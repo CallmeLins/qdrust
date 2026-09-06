@@ -47,7 +47,7 @@ use crate::{
     },
     store::Store,
 };
-use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier, reqwest::async_http_client};
+use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier};
 
 const SESSION_COOKIE: &str = "qd_session";
 const CSRF_COOKIE: &str = "qd_csrf";
@@ -452,7 +452,8 @@ async fn oidc_login_start(
     }
 
     let redirect_uri = oidc::derive_redirect_uri(&state.base_path, &headers, &uri);
-    let client = oidc::build_client(oidc, &redirect_uri).await?;
+    let built = oidc::build_client(oidc, &redirect_uri).await?;
+    let client = &built.client;
 
     let raw_state = oidc::generate_state();
     let verifier = oidc::derive_pkce_verifier(&raw_state, &oidc.client_secret);
@@ -462,7 +463,7 @@ async fn oidc_login_start(
     let verifier_h = oidc::verifier_hash(&verifier);
     let scopes = oidc::parse_scopes(&oidc.scopes);
 
-    let authorize_url = oidc::build_authorize_url(&client, &raw_state, &nonce, &verifier, &scopes);
+    let authorize_url = oidc::build_authorize_url(client, &raw_state, &nonce, &verifier, &scopes);
 
     let expires_at = chrono::Utc::now().timestamp() + oidc::OIDC_STATE_TTL_SECS;
     state
@@ -563,12 +564,22 @@ async fn oidc_login_callback(
         ));
     }
 
-    let client = oidc::build_client(oidc, &redirect_uri).await?;
+    let built = oidc::build_client(oidc, &redirect_uri).await?;
     let verifier_obj = PkceCodeVerifier::new(verifier);
-    let token = client
+    // openidconnect 4.x: a discovery-built client has a possibly-set token
+    // endpoint, so exchange_code is fallible (ConfigurationError if the IdP
+    // omitted the token endpoint).
+    let token_req = built
+        .client
         .exchange_code(AuthorizationCode::new(code.clone()))
-        .set_pkce_verifier(verifier_obj)
-        .request_async(async_http_client)
+        .map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!(
+                "oidc: provider metadata has no token endpoint: {e}"
+            ))
+        })?
+        .set_pkce_verifier(verifier_obj);
+    let token = token_req
+        .request_async(&built.http)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("oidc token exchange failed: {e}")))?;
 
@@ -579,7 +590,7 @@ async fn oidc_login_callback(
     })?;
     let nonce_obj = Nonce::new(nonce);
     let claims = id_token
-        .claims(&client.id_token_verifier(), &nonce_obj)
+        .claims(&built.client.id_token_verifier(), &nonce_obj)
         .map_err(|e| {
             ApiError::Internal(anyhow::anyhow!("oidc id_token verification failed: {e}"))
         })?;

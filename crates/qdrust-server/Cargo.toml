@@ -1,6 +1,6 @@
 [package]
 name = "qdrust-server"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "MIT"
 
@@ -13,7 +13,7 @@ chrono-tz = "0.10"
 cron = "0.15"
 dotenvy = "0.15"
 futures-util = "0.3"
-qdrust-core = { path = "../qdrust-core", version = "0.1.4" }
+qdrust-core = { path = "../qdrust-core", version = "0.1.5" }
 qdrust-plugin-browser = { path = "../qdrust-plugin-browser", version = "0.1.0" }
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -32,9 +32,11 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 http-body-util = "0.1"
 redis = { version = "0.27", features = ["tokio-comp"] }
 futures = "0.3"
-# OIDC / OpenID Connect client (PKCE S256, discovery). Backed by reqwest for
-# outgoing HTTP (shared rustls stack). We never hand-roll JWT/JWKS validation.
-openidconnect = { version = "3", default-features = false, features = ["reqwest"] }
+# OIDC / OpenID Connect client (PKCE S256, discovery). Backed by reqwest 0.12
+# (hyper 1 / h2 0.4) for outgoing HTTP (shared rustls stack), avoiding the
+# oauth2-4/reqwest-0.11 chain that pulls the vulnerable h2 0.3.x (RUSTSEC-2026-0258).
+# We never hand-roll JWT/JWKS validation.
+openidconnect = { version = "4", default-features = false, features = ["reqwest"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

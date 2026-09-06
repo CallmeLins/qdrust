@@ -342,7 +342,7 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 
 ### Phase 1：OIDC discovery + Authorization Code + PKCE
 
-- [x] `Cargo.toml`：加 `openidconnect` 3.5.0（PKCE S256 强制，reqwest 后端）
+- [x] `Cargo.toml`：加 `openidconnect`（原 3.5.0，**Phase 6 升级到 4.0.1**，见下；PKCE S256 强制，reqwest 后端）
 - [x] `config.rs`：`OidcConfig`（issuer/client_id/secret/redirect/scopes/auto_create/default_role/admin_groups）
       + validate 强校验（oidc_enabled 时 issuer+client_id+client_secret 必填）
 - [x] `oidc.rs`：discovery（`discover_async`）、确定性 PKCE verifier/nonce（`b64url(sha256(state‖secret))`，
@@ -418,6 +418,18 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       否则落 `default_role`（store `groups_overlap` 逻辑复用，已测试）。
 - [x] 调度器维护循环接入 `purge_expired_oidc_login_states()`（小时级清理，与
       `purge_expired_sessions` 等并列）。
+- [x] **升级 openidconnect 3.5.0 → 4.0.1**（修复 cargo-deny RUSTSEC-2026-0258，h2 0.3.27）：
+      3.5.0 → oauth2 4.4.2 硬钉 reqwest 0.11 → hyper 0.14 → h2 0.3.27（该 0.3 线无修复版，
+      补丁仅在 h2 0.4.16）。4.0.1 → oauth2 5.0.0 → reqwest 0.12（hyper 1/h2 0.4 已修复），
+      直接删掉整条旧链（lockfile 中 h2 0.3.27/reqwest 0.11/hyper 0.14/http 0.2 全部消失）。
+      迁移点：typestate `Client`（`CoreClient` 增 6 个 `EndpointState` 泛型）——
+      discovery 建的 client 为 auth=Set/token=MaybeSet/userinfo=MaybeSet，故
+      `OidcClient` 别名 = `CoreClient<Set,NotSet,NotSet,NotSet,MaybeSet,MaybeSet>`；
+      `exchange_code` 变**可失败**（返回 `Result<_, ConfigurationError>`，须 `?`）；
+      HTTP 客户端从 `async_http_client()` 自由函数改为**状态化 `reqwest::Client` 实现
+      `AsyncHttpClient`**（`discover_async(issuer, &http)` 与 `request_async(&http)` 传引用，
+      禁跟随重定向防 SSRF）。`build_client` 改返回 `BuiltClient{client,http}` 结构。
+      `groups_from_id_token` 依赖的 `IdToken::to_string()` 在 4.x 仍在，无需改动。
 
 ---
 
