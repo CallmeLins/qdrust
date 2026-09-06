@@ -10,11 +10,13 @@
 > **rev 记录**：v1 初稿 → 用户评审提出 10 点工程修正 → 修正版（默认 `auth_mode=local`、
 > 哨兵哈希、state 持久化、`ConnectInfo` 启动改造等已并入）。
 >
-> **进度**：Phase 0 + **Phase 1(OIDC)** 已基本完成（server lib 73 passed、clippy/fmt 干净）：
-> AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档）+
-> OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、确定性 verifier/nonce、
-> ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）。
-> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 2+（Header Auth、前端、文档）。
+> **进度**：Phase 0 + **Phase 1(OIDC)** + **Phase 2(映射/冲突/审计)** 已基本完成
+> （server lib 全绿、clippy/fmt 干净）：
+> AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档，
+> role 首登写死不随组刷新）+ OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、
+> 确定性 verifier/nonce、ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）
+> + 外部登录审计（`auth.external_user_created`/`auth.external_login`/`auth.external_refused`）。
+> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 3+（前端、Header Auth、文档）。
 
 ---
 
@@ -350,11 +352,16 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 
 ### Phase 2：外部用户映射 + 冲突策略 + 角色组映射
 
-- [ ] `find_or_create_external_user` auto_create（哨兵 hash）
-- [ ] 同 sub 不重复建档；email 变化不建新用户
-- [ ] 组→admin 映射（默认首登写死）
-- [ ] 冲突审计日志
-- [ ] 测试
+- [x] `find_or_create_external_user` auto_create（哨兵 hash）
+      （实为 `resolve_external_identity` + `provision_external_user`，Phase 0 已落地并测试）
+- [x] 同 sub 不重复建档；email 变化不建新用户
+- [x] 组→admin 映射（默认首登写死）——role 仅在首次建档时由 `groups_overlap` 决定；
+      后续登录**不刷新角色**（已补注释 + 测试 `external_role_is_pinned_at_first_login_not_refreshed_by_later_groups` 固化）
+- [x] 冲突审计日志——handler 层落 `auth.external_refused`（actor=None，details 含冲突邮箱）；
+      成功建档/复用落 `auth.external_user_created` / `auth.external_login`
+      （helper `record_external_login_audit` + api 测试 `external_login_writes_created_and_reused_audit` /
+      `external_conflict_writes_refused_audit_with_claimed_email`）
+- [x] 测试
 
 ### Phase 3：前端登录策略
 
@@ -397,6 +404,9 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 | 用户 disabled 后 OIDC 登录 | 拒 |
 | 相同 sub 重复登录 | 复用同用户 |
 | email 变化 | 不建新用户 |
+| 组→admin（首登） | role 首登由组决定；**后续登录不刷新角色**（写死语义，见 Phase 2） |
+| 外部登录成功（新建/复用） | 审计 `auth.external_user_created` / `auth.external_login` |
+| 外部登录拒绝（冲突/禁用/auto_create 关） | 审计 `auth.external_refused`（actor=None，details 含 reason+claimed email） |
 | **subject 绑 A 但 email 对 B** | **拒自动合并 + 审计 + 管理员处理**（Phase 0 定义） |
 | Header 非可信来源 | 403 |
 | **无可信代理配置时开 Header Auth** | **启动失败** |

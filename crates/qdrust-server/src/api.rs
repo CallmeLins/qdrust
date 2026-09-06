@@ -592,6 +592,8 @@ async fn oidc_login_callback(
 
     match resolution.user {
         Some(user) => {
+            let was_created = resolution.created;
+            record_external_login_audit(&state.store, &claim, was_created, &user).await?;
             // Reuse the normal session issuance, then convert the JSON response
             // into a top-level redirect carrying the same session cookies.
             let session_response = issue_session_response(&state, user).await?;
@@ -604,11 +606,62 @@ async fn oidc_login_callback(
         None => {
             let reason = resolution
                 .refusal
+                .clone()
                 .unwrap_or_else(|| "oidc_refused".to_string());
             tracing::warn!(reason = %reason, "oidc login refused by identity resolution");
+            // Persistent audit trail for refused external logins. There is no
+            // local user to pin the mapping to, so actor is left None and the
+            // claimed identity is captured in `details` for an admin to review.
+            state
+                .store
+                .record_audit(
+                    None,
+                    "auth.external_refused",
+                    None,
+                    None,
+                    None,
+                    &json!({
+                        "reason": reason,
+                        "provider": claim.provider,
+                        "issuer": claim.issuer,
+                        "subject": claim.subject,
+                        "email": claim.email,
+                    }),
+                )
+                .await?;
             Ok(oidc_callback_redirect(&state, Some(&reason)))
         }
     }
+}
+
+/// Persist an audit trail entry for a *successful* external (OIDC / future
+/// header) login. `was_created` distinguishes a brand-new provisioned external
+/// user (whose role was pinned from group membership at first login) from an
+/// existing user being reused. See EXTERNAL_IDP_PLAN.md Phase 2.
+async fn record_external_login_audit(
+    store: &Store,
+    claim: &ExternalIdentityClaim,
+    was_created: bool,
+    user: &crate::model::User,
+) -> anyhow::Result<()> {
+    store
+        .record_audit(
+            Some(user.id),
+            if was_created {
+                "auth.external_user_created"
+            } else {
+                "auth.external_login"
+            },
+            Some("user"),
+            Some(user.id),
+            None,
+            &json!({
+                "provider": claim.provider,
+                "issuer": claim.issuer,
+                "subject": claim.subject,
+            }),
+        )
+        .await
 }
 
 /// Build the full-page redirect the browser ends up on after the OIDC callback.
@@ -3124,5 +3177,125 @@ mod tests {
         assert_eq!(result["requests"], 2);
         assert_eq!(result["controls"], 2);
         assert_eq!(result["extract_variables"], 1);
+    }
+
+    // --- External identity login audit trail (EXTERNAL_IDP_PLAN.md Phase 2) ---
+
+    fn external_claim(subject: &str, email: Option<&str>) -> ExternalIdentityClaim {
+        ExternalIdentityClaim {
+            provider: "oidc".into(),
+            issuer: "https://issuer.example".into(),
+            subject: subject.into(),
+            email: email.map(Into::into),
+            username_hint: Some(subject.into()),
+            groups: vec![],
+        }
+    }
+
+    async fn audit_actions_for(store: &crate::store::Store, actor: Option<i64>) -> Vec<String> {
+        let pool = store.sqlite_pool();
+        let rows: Vec<String> = if let Some(id) = actor {
+            sqlx::query_scalar("SELECT action FROM audit_logs WHERE actor_user_id=? ORDER BY id")
+                .bind(id)
+                .fetch_all(pool)
+                .await
+                .unwrap()
+        } else {
+            sqlx::query_scalar(
+                "SELECT action FROM audit_logs WHERE actor_user_id IS NULL ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        };
+        rows
+    }
+
+    #[tokio::test]
+    async fn external_login_writes_created_and_reused_audit() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let claim = external_claim("audit-sub", Some("audit@example.com"));
+
+        // First login provisions a new user -> created audit action.
+        let resolution = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        let user = resolution.user.as_ref().unwrap();
+        assert!(resolution.created);
+        record_external_login_audit(&store, &claim, true, user)
+            .await
+            .unwrap();
+        let actions = audit_actions_for(&store, Some(user.id)).await;
+        assert_eq!(actions, vec!["auth.external_user_created"]);
+
+        // Re-login reuses the same user -> plain external_login action.
+        let again = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(!again.created);
+        record_external_login_audit(&store, &claim, false, again.user.as_ref().unwrap())
+            .await
+            .unwrap();
+        let actions = audit_actions_for(&store, Some(user.id)).await;
+        assert_eq!(
+            actions,
+            vec!["auth.external_user_created", "auth.external_login"]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_conflict_writes_refused_audit_with_claimed_email() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        // A local user owns the claimed email.
+        let owner = store
+            .create_user(
+                "owner",
+                &crate::auth::hash_password("correct horse battery").unwrap(),
+                "user",
+            )
+            .await
+            .unwrap();
+        store
+            .set_user_email(owner.id, "claimed@example.com")
+            .await
+            .unwrap();
+
+        // A brand-new external subject claiming that email is refused.
+        let claim = external_claim("attacker-sub", Some("claimed@example.com"));
+        let resolution = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(resolution.user.is_none());
+        assert_eq!(
+            resolution.refusal.as_deref(),
+            Some("external_identity_conflict")
+        );
+
+        // Mirror the refused audit the handler writes (actor None + details).
+        store
+            .record_audit(
+                None,
+                "auth.external_refused",
+                None,
+                None,
+                None,
+                &json!({
+                    "reason": "external_identity_conflict",
+                    "provider": claim.provider,
+                    "issuer": claim.issuer,
+                    "subject": claim.subject,
+                    "email": claim.email,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let refused = audit_actions_for(&store, None).await;
+        assert!(refused.contains(&"auth.external_refused".to_string()));
+        // No extra local user row was created for the external subject.
+        assert_eq!(store.list_users().await.unwrap().len(), 1);
     }
 }

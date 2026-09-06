@@ -295,6 +295,11 @@ macro_rules! define_store {
                     refusal: Some("user_disabled".into()),
                 });
             }
+            // Role is pinned at first login (the "group -> admin" mapping is
+            // evaluated only when provisioning). Later changes to the IdP group
+            // membership do NOT silently promote/demote an existing external
+            // user — an admin must adjust the role explicitly. See
+            // EXTERNAL_IDP_PLAN.md Phase 2 item 3 ("默认首登写死").
             self.touch_external_identity(identity.id).await?;
             return Ok(ExternalLoginResolution {
                 user: Some(user),
@@ -4363,6 +4368,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolution.user.unwrap().role, "user");
+    }
+
+    #[tokio::test]
+    async fn external_role_is_pinned_at_first_login_not_refreshed_by_later_groups() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        // First login provisions with the default (non-admin) role.
+        let claim = oidc_claim("sub-groupshift", None);
+        let first = store
+            .resolve_external_identity(&claim, true, "user", &["qdrust-admins"])
+            .await
+            .unwrap();
+        let user = first.user.unwrap();
+        assert_eq!(user.role, "user");
+
+        // On a later login the IdP now reports the user inside the admin group.
+        // Phase 2 semantics ("role pinned at first login") mean we must NOT
+        // silently promote the existing user — an admin decides role changes.
+        let mut promoted = oidc_claim("sub-groupshift", None);
+        promoted.groups = vec!["qdrust-admins".into()];
+        let again = store
+            .resolve_external_identity(&promoted, true, "user", &["qdrust-admins"])
+            .await
+            .unwrap();
+        assert!(!again.created);
+        let user_after = again.user.unwrap();
+        assert_eq!(user_after.id, user.id);
+        assert_eq!(
+            user_after.role, "user",
+            "role must stay pinned at first login"
+        );
     }
 
     #[tokio::test]
