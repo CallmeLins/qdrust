@@ -405,6 +405,73 @@ QDRUST_BASE_PATH=/qd
 2. 首次打开会引导创建**初始管理员账号**；之后其他用户走开放注册流程。
 3. 管理员可在「设置 / 管理员」中管理用户、站点设置、日志清理、备份与恢复。
 
+### 第三方登录（OIDC / 反向代理 Header）
+
+自托管部署可选择通过外部身份提供方（IdP）登录，本地账号密码能力**始终保留**。
+
+**认证模式与开关**（默认 `local`，严格后向兼容）：
+
+- `QDRUST_AUTH_MODE`：`local` | `hybrid` | `oidc`。`oidc` 模式下本地登录入口默认关闭；
+  若想保留一个本地管理员应急入口，同时设 `QDRUST_LOCAL_LOGIN_ENABLED=true`。
+- 外部提供方通过**独立开关**叠加：`QDRUST_OIDC_ENABLED` / `QDRUST_HEADER_AUTH_ENABLED`。
+
+**OIDC（Authorization Code + PKCE）** —— 对接 authentik / authelia / keycloak / pocket-id：
+
+```
+QDRUST_AUTH_MODE=hybrid          # 或 oidc（纯 IdP，关本地入口）
+QDRUST_OIDC_ENABLED=true
+QDRUST_OIDC_PROVIDER_NAME=Authentik   # SSO 按钮上显示的名称（来自显式配置）
+QDRUST_OIDC_ISSUER=https://auth.example.com/application/o/qdrust/
+QDRUST_OIDC_CLIENT_ID=qdrust
+QDRUST_OIDC_CLIENT_SECRET=...
+# QDRUST_OIDC_REDIRECT_URI 留空则由服务端在请求时按反代前缀推导
+QDRUST_OIDC_SCOPES="openid profile email"
+QDRUST_OIDC_AUTO_CREATE_USERS=true    # 首登自动建档（哨兵口令，本地无法登录该外部账号）
+QDRUST_OIDC_DEFAULT_ROLE=user         # 未命中 admin 组的建档角色
+QDRUST_OIDC_ADMIN_GROUPS=qdrust-admins # 命中则首次建档为 admin
+```
+
+在 IdP 侧把回调地址登记为
+`https://你的域名[/<base_path>]/api/v1/auth/oidc/callback`。
+
+**反向代理 Header 认证（forward-auth）** —— 对接 nginx `auth_request` / authelia forward-auth /
+authentik proxy：反代在**每个请求**注入身份头，服务端仅在源 IP 属于可信代理时才信任：
+
+```
+QDRUST_HEADER_AUTH_ENABLED=true
+QDRUST_HEADER_TRUSTED_PROXIES=127.0.0.1,10.0.0.1   # 必须显式配置
+QDRUST_HEADER_TRUSTED_PROXY_REQUIRED=true           # 默认 true：无可信代理则拒绝启动
+QDRUST_HEADER_USER_HEADER=Remote-User
+QDRUST_HEADER_EMAIL_HEADER=Remote-Email
+QDRUST_HEADER_GROUPS_HEADER=Remote-Groups
+QDRUST_HEADER_GROUPS_SEPARATOR=,
+QDRUST_HEADER_AUTO_CREATE_USERS=false               # 默认 false：仅已建档用户可登录
+QDRUST_HEADER_DEFAULT_ROLE=user
+QDRUST_HEADER_ADMIN_GROUPS=qdrust-admins
+```
+
+Header 认证**不每次建会话**：仅当无有效会话、或头身份与会话用户不一致时才会建/刷新
+（身份漂移会撤销旧会话）。登出只清除 qdrust 自身会话。被隔离到 `/api/v1/auth/*` 之外的
+普通 API 与 SPA 均由该中间件兜底。
+
+反代需放行真实源 IP（Header 认证要读 `ConnectInfo` 源地址），示例 nginx（在 `location /`
+里把已认证的用户身份注入并转发给 8923）：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8923;
+    proxy_set_header Host $host;
+    # authelia/authentik 校验通过后注入；务必去掉客户端可能伪造的同名头
+    proxy_set_header Remote-User   $remote_user;     # 或取自 auth_request 变量
+    proxy_set_header Remote-Email  $upstream_http_remote_email;
+    proxy_set_header Remote-Groups $upstream_http_remote_groups;
+}
+```
+
+> 注：Header 认证的 `groups -> admin` 角色在**首次建档时写死**，后续组变化不会自动升/降权，
+> 需管理员显式调整。OIDC 路径的 `admin_groups` 当前在未映射 groups claim 时对所有首登统一落
+> `default_role`；组到角色的精细同步留待后续按需扩展。
+
 ### 导入 QD HAR 模板
 
 - 在 WebUI 的模板页点击导入，选择从旧 QD 导出的 `*.har.json`。

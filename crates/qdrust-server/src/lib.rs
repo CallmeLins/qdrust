@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod email;
 pub mod ga;
+pub mod header_auth;
 pub mod model;
 pub mod oidc;
 pub mod push_channels;

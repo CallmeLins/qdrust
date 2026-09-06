@@ -1,11 +1,12 @@
 use anyhow::Result;
 use qdrust_server::{
     api,
-    config::Config,
+    config::{Config, HeaderAuthConfig},
     email::{EmailClient, EmailConfig},
     scheduler,
     store::Store,
 };
+use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -83,15 +84,39 @@ async fn main() -> Result<()> {
         client,
         qdrust_server::redis_cache::SessionCache::from_env()?,
         &base_path,
+        // Header auth is only active when explicitly enabled (backward
+        // compatible). When disabled we pass `None` and the middleware is a
+        // transparent pass-through.
+        if config.header_auth_enabled {
+            Some(Arc::new(HeaderAuthConfig {
+                user_header: config.header.user_header.clone(),
+                email_header: config.header.email_header.clone(),
+                groups_header: config.header.groups_header.clone(),
+                groups_separator: config.header.groups_separator.clone(),
+                trusted_proxies: config.header.trusted_proxies.clone(),
+                trusted_proxy_required: config.header.trusted_proxy_required,
+                auto_create_users: config.header.auto_create_users,
+                default_role: config.header.default_role.clone(),
+                admin_groups: config.header.admin_groups.clone(),
+            }))
+        } else {
+            None
+        },
     )
     .layer(qdrust_server::ga::InjectGaLayer::new(settings))
     .layer(TraceLayer::new_for_http());
     let address = (config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(address = %listener.local_addr()?, "qdrust started");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    // Serve with `ConnectInfo<SocketAddr>` so handlers/middleware can read the
+    // real source IP — required for trusted reverse-proxy header validation
+    // (Phase 4). Without this, `ConnectInfo` is never populated.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -7,13 +8,14 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        FromRef, FromRequest, OriginalUri, Path, Query, Request as AxumRequest, State,
+        ConnectInfo, FromRef, FromRequest, OriginalUri, Path, Query, Request as AxumRequest, State,
         WebSocketUpgrade, rejection::JsonRejection, ws::Message,
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{COOKIE, HeaderName, SET_COOKIE},
     },
+    middleware::Next,
     response::{IntoResponse, Redirect, Response},
     routing::{any, delete, get, get_service},
 };
@@ -115,6 +117,9 @@ struct AppState {
     /// The URL sub-path the site is served under (e.g. "/qd" or ""). Threaded
     /// into handlers so OIDC redirect URIs can be derived consistently.
     base_path: String,
+    /// Trusted reverse-proxy header auth config. `None` (the default) means
+    /// header auth is disabled and the middleware is a no-op pass-through.
+    header_auth: Option<std::sync::Arc<crate::config::HeaderAuthConfig>>,
 }
 
 impl FromRef<AppState> for Store {
@@ -160,6 +165,7 @@ pub fn router(store: Store) -> Router {
         reqwest::Client::new(),
         crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
         "",
+        None,
     )
 }
 
@@ -177,6 +183,7 @@ pub fn router_with_auth(
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
     base_path: &str,
+    header_auth: Option<std::sync::Arc<crate::config::HeaderAuthConfig>>,
 ) -> Router {
     let login_limiter =
         LoginRateLimiter::new(auth.login_rate_limit_attempts, auth.login_rate_limit_window)
@@ -358,7 +365,17 @@ pub fn router_with_auth(
         http_client,
         session_cache,
         base_path: base_path.to_string(),
+        header_auth,
     };
+
+    // Header authentication middleware (Phase 4). It runs for every API request
+    // (and the SPA fallback) so a trusted reverse proxy can establish a qdrust
+    // session from injected identity headers. Auth-management endpoints opt out
+    // (see `header_auth_middleware`) so they keep their own session/CSRF flows.
+    let inner = inner.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        header_auth_middleware,
+    ));
 
     // Keep liveness/readiness probes at the root (external health checks and
     // the Docker HEALTHCHECK hit `/health`/`/ready` regardless of sub-path).
@@ -638,7 +655,7 @@ async fn oidc_login_callback(
 /// header) login. `was_created` distinguishes a brand-new provisioned external
 /// user (whose role was pinned from group membership at first login) from an
 /// existing user being reused. See EXTERNAL_IDP_PLAN.md Phase 2.
-async fn record_external_login_audit(
+pub(crate) async fn record_external_login_audit(
     store: &Store,
     claim: &ExternalIdentityClaim,
     was_created: bool,
@@ -1023,6 +1040,202 @@ fn append_clear_cookies(headers: &mut HeaderMap, secure: bool) {
             HeaderValue::from_str(&cookie).expect("static cookie attributes are valid"),
         );
     }
+}
+
+/// Axum middleware implementing trusted reverse-proxy header authentication
+/// (Phase 4, forward-auth). Returns a `Response` directly; on refusal it
+/// short-circuits with 403 and an audit entry. See EXTERNAL_IDP_PLAN.md Phase 4.
+async fn header_auth_middleware(
+    State(state): State<AppState>,
+    mut request: AxumRequest,
+    next: Next,
+) -> Response {
+    // Header auth disabled -> transparent pass-through.
+    let Some(cfg) = state.header_auth.clone() else {
+        return next.run(request).await;
+    };
+    // Auth-management endpoints own their session/CSRF flows; never auto-login
+    // through them (avoids double session creation on /auth/login, CSRF issues
+    // on /auth/logout, and clobbering the OIDC callback).
+    if request.uri().path().starts_with("/api/v1/auth") {
+        return next.run(request).await;
+    }
+
+    let headers = request.headers().clone();
+    let Some(identity) = crate::header_auth::extract_header_identity(&headers, &cfg) else {
+        // No identity headers -> leave normal cookie-based auth to the handlers.
+        return next.run(request).await;
+    };
+
+    // Source-IP trust comes from `ConnectInfo`, populated by
+    // `into_make_service_with_connect_info` at startup. If it is missing (e.g. a
+    // direct oneshot test without an injected extension) we treat the source as
+    // untrusted rather than risk trusting spoofed headers.
+    let trusted = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| crate::header_auth::source_is_trusted(ci.0.ip(), &cfg.trusted_proxies))
+        .unwrap_or(false);
+
+    if !trusted {
+        // Injection safety: never let client-supplied copies of these headers
+        // reach application logic.
+        crate::header_auth::strip_identity_headers(&mut request, &cfg);
+        if cfg.trusted_proxy_required {
+            let _ = record_header_refused(&state, &identity, "untrusted_source").await;
+            return ApiError::Forbidden(
+                "untrusted_proxy_header",
+                "Identity headers from an untrusted source are not accepted",
+            )
+            .into_response();
+        }
+        // Not required -> ignore the (stripped) headers and continue normally.
+        return next.run(request).await;
+    }
+
+    // Trusted source: resolve the external identity against the DB.
+    let existing = require_session(&state, &headers).await.ok();
+    let claim = ExternalIdentityClaim {
+        provider: "header".into(),
+        issuer: "header".into(),
+        subject: identity.username.clone(),
+        email: identity.email.clone(),
+        username_hint: Some(identity.username.clone()),
+        groups: identity.groups.clone(),
+    };
+    let admin_groups: Vec<&str> = cfg.admin_groups.iter().map(String::as_str).collect();
+    let resolution = match state
+        .store
+        .resolve_external_identity(
+            &claim,
+            cfg.auto_create_users,
+            &cfg.default_role,
+            &admin_groups,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%e, "header auth identity resolution failed");
+            return ApiError::Internal(anyhow::anyhow!("header auth resolution failed"))
+                .into_response();
+        }
+    };
+
+    match resolution.user {
+        Some(user) => {
+            // Reuse: an existing valid session already belongs to this user.
+            if let Some((_, sess)) = &existing
+                && sess.user.id == user.id
+            {
+                return next.run(request).await;
+            }
+            // Establish (or refresh on identity drift) a session for the user.
+            let old_token = existing.as_ref().map(|(token, _)| token.clone());
+            match establish_header_session(&state, &user, old_token.as_deref()).await {
+                Ok(issued) => {
+                    inject_session_cookies(&mut request, &issued, &state.auth);
+                    let mut response = next.run(request).await;
+                    let _ = append_session_cookies(response.headers_mut(), &issued, &state.auth);
+                    let _ = record_external_login_audit(
+                        &state.store,
+                        &claim,
+                        resolution.created,
+                        &user,
+                    )
+                    .await;
+                    response
+                }
+                Err(e) => {
+                    tracing::error!(?e, "header auth session creation failed");
+                    ApiError::Internal(anyhow::anyhow!("header auth session creation failed"))
+                        .into_response()
+                }
+            }
+        }
+        None => {
+            // Refusal. If we already have a valid session (e.g. a transient
+            // header glitch on an established session) keep it rather than
+            // locking the user out; otherwise refuse the login.
+            if existing.is_some() {
+                return next.run(request).await;
+            }
+            let reason = resolution
+                .refusal
+                .clone()
+                .unwrap_or_else(|| "header_identity_refused".into());
+            let _ = record_header_refused(&state, &identity, &reason).await;
+            ApiError::Forbidden(
+                "header_identity_refused",
+                "Header identity could not be resolved to a local user",
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Mint a fresh qdrust session for a header-resolved user. When a previous
+/// session exists for a *different* user (identity drift) the old one is revoked
+/// so sessions do not accumulate across drift events.
+async fn establish_header_session(
+    state: &AppState,
+    user: &crate::model::User,
+    old_token: Option<&str>,
+) -> anyhow::Result<crate::model::IssuedSession> {
+    if let Some(old) = old_token {
+        let _ = state.store.revoke_session(old).await;
+    }
+    let issued = state
+        .store
+        .create_session(user.id, state.auth.session_ttl)
+        .await?;
+    Ok(issued)
+}
+
+/// Inject the just-created session cookies into the *request* so the handler
+/// invoked in the same call sees an authenticated session (otherwise the very
+/// first request after a header login would 401 before the browser persists the
+/// `Set-Cookie`). The caller also sets them on the response for persistence.
+fn inject_session_cookies(
+    request: &mut AxumRequest,
+    issued: &crate::model::IssuedSession,
+    _auth: &AuthConfig,
+) {
+    let session_cookie = format!("{SESSION_COOKIE}={}", issued.session_token);
+    let csrf_cookie = format!("{CSRF_COOKIE}={}", issued.csrf_token);
+    let combined = format!("{session_cookie}; {csrf_cookie}");
+    let merged = match request.headers().get(COOKIE).and_then(|v| v.to_str().ok()) {
+        Some(existing) if !existing.is_empty() => format!("{existing}; {combined}"),
+        _ => combined,
+    };
+    if let Ok(value) = HeaderValue::from_str(&merged) {
+        request.headers_mut().insert(COOKIE, value);
+    }
+}
+
+/// Audit a refused header login (untrusted source or unresolved identity).
+async fn record_header_refused(
+    state: &AppState,
+    identity: &crate::header_auth::HeaderIdentity,
+    reason: &str,
+) -> anyhow::Result<()> {
+    state
+        .store
+        .record_audit(
+            None,
+            "auth.external_refused",
+            None,
+            None,
+            None,
+            &json!({
+                "reason": reason,
+                "provider": "header",
+                "issuer": "header",
+                "subject": identity.username,
+                "email": identity.email,
+            }),
+        )
+        .await
 }
 async fn list_tasks(
     State(store): State<Store>,
@@ -2587,7 +2800,8 @@ impl IntoResponse for ApiError {
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::Request,
+        extract::ConnectInfo,
+        http::{Request, header::SET_COOKIE},
     };
     use tower::ServiceExt;
 
@@ -2609,6 +2823,7 @@ mod tests {
             reqwest::Client::new(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             base_path,
+            None,
         )
     }
 
@@ -2640,6 +2855,7 @@ mod tests {
             reqwest::Client::new(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             "",
+            None,
         )
     }
 
@@ -2647,6 +2863,7 @@ mod tests {
     async fn auth_config_exposes_only_public_fields() {
         let app = test_app_with_public(public("oidc", true, false)).await;
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/auth/config")
@@ -2675,6 +2892,7 @@ mod tests {
     async fn auth_config_defaults_to_local_with_login_enabled() {
         let app = test_app().await; // AuthConfig::default()
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/auth/config")
@@ -2730,6 +2948,7 @@ mod tests {
         assert_eq!(register.status(), StatusCode::FORBIDDEN);
 
         let forgot = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2748,6 +2967,7 @@ mod tests {
         // oidc-mode but local force-enabled (emergency backdoor).
         let app = test_app_with_public(public("oidc", true, true)).await;
         let login = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2780,6 +3000,7 @@ mod tests {
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
         let ready = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/ready")
@@ -2847,6 +3068,7 @@ mod tests {
             .await
             .unwrap();
         let trailing_slash = app
+            .clone()
             .oneshot(Request::builder().uri("/qd/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -3061,6 +3283,7 @@ mod tests {
         assert_eq!(body["code"], "invalid_credentials");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3079,6 +3302,7 @@ mod tests {
         let app = test_app().await;
         let cookie = test_auth_cookie(&app).await;
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3109,6 +3333,7 @@ mod tests {
         let app = test_app().await;
         let cookie = test_auth_cookie(&app).await;
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3297,5 +3522,298 @@ mod tests {
         assert!(refused.contains(&"auth.external_refused".to_string()));
         // No extra local user row was created for the external subject.
         assert_eq!(store.list_users().await.unwrap().len(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Header Auth (Phase 4) tests
+    // ---------------------------------------------------------------------
+
+    async fn header_auth_test_app(cfg: crate::config::HeaderAuthConfig) -> Router {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        router_with_auth(
+            store,
+            AuthConfig::default(),
+            run_event_channel().0,
+            subscription_event_channel().0,
+            runtime_settings(),
+            reqwest::Client::new(),
+            crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+            "",
+            Some(std::sync::Arc::new(cfg)),
+        )
+    }
+
+    /// Build a GET request carrying the given identity headers and (optionally) a
+    /// trusted-source `ConnectInfo`. Without an address the middleware treats the
+    /// source as untrusted (mirrors a real oneshot request with no make-service).
+    fn header_request(
+        path: &str,
+        headers: &[(&str, &str)],
+        addr: Option<std::net::SocketAddr>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().uri(path).method("GET");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        if let Some(a) = addr {
+            req.extensions_mut().insert(ConnectInfo(a));
+        }
+        req
+    }
+
+    fn cookie_from_response(response: &Response, name: &str) -> Option<String> {
+        for value in response.headers().get_all(SET_COOKIE).iter() {
+            let Ok(s) = value.to_str() else { continue };
+            if let Some(rest) = s.strip_prefix(&format!("{name}=")) {
+                return Some(rest.split(';').next().unwrap().to_string());
+            }
+        }
+        None
+    }
+
+    fn trusted_addr() -> std::net::SocketAddr {
+        "127.0.0.1:54321".parse().unwrap()
+    }
+
+    fn untrusted_addr() -> std::net::SocketAddr {
+        "10.0.0.9:54321".parse().unwrap()
+    }
+
+    fn header_cfg(trusted: bool) -> crate::config::HeaderAuthConfig {
+        crate::config::HeaderAuthConfig {
+            trusted_proxies: if trusted {
+                vec!["127.0.0.1".parse().unwrap()]
+            } else {
+                vec![]
+            },
+            trusted_proxy_required: true,
+            auto_create_users: true,
+            ..crate::config::HeaderAuthConfig::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn header_auth_disabled_is_transparent_without_session() {
+        // Header auth is None (default router()); identity headers + trusted
+        // source must NOT establish a session.
+        let app = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice"), ("Remote-Email", "a@x.com")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn untrusted_source_with_headers_is_403() {
+        let app = header_auth_test_app(header_cfg(true)).await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice")],
+                Some(untrusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn untrusted_source_when_not_required_is_ignored() {
+        let mut cfg = header_cfg(true);
+        cfg.trusted_proxy_required = false;
+        let app = header_auth_test_app(cfg).await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice")],
+                Some(untrusted_addr()),
+            ))
+            .await
+            .unwrap();
+        // No session established -> normal auth still applies (401, not 403).
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_username_header_establishes_no_session() {
+        let app = header_auth_test_app(header_cfg(true)).await;
+        // Only email present -> no usable identity -> no session.
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-Email", "a@x.com")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trusted_source_establishes_session_then_cookie_authenticates() {
+        let app = header_auth_test_app(header_cfg(true)).await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice"), ("Remote-Email", "alice@x.com")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let token = cookie_from_response(&resp, "qd_session");
+        assert!(token.is_some(), "a session cookie must be issued");
+
+        // Subsequent request carrying the cookie (no headers) is authenticated.
+        let cookie = format!("qd_session={}", token.unwrap());
+        let resp2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .header("Cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auto_create_off_unknown_user_is_refused() {
+        let mut cfg = header_cfg(true);
+        cfg.auto_create_users = false;
+        let app = header_auth_test_app(cfg).await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "ghost")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn existing_session_is_reused_not_recreated() {
+        let app = header_auth_test_app(header_cfg(true)).await;
+        // First request establishes the session.
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let token = cookie_from_response(&resp, "qd_session").unwrap();
+        let cookie = format!("qd_session={token}");
+
+        // Second request: same trusted source, same header, AND the cookie.
+        // The middleware must reuse the session (no new Set-Cookie issued).
+        let mut req2 = Request::builder()
+            .uri("/api/v1/tasks")
+            .header("Cookie", &cookie)
+            .header("Remote-User", "alice")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(trusted_addr()));
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert!(
+            cookie_from_response(&resp2, "qd_session").is_none(),
+            "reused session must not mint a new qd_session cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_email_claimed_by_another_user_is_refused() {
+        let (app, store) = {
+            let s = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+            let app = router_with_auth(
+                s.clone(),
+                AuthConfig::default(),
+                run_event_channel().0,
+                subscription_event_channel().0,
+                runtime_settings(),
+                reqwest::Client::new(),
+                crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+                "",
+                Some(std::sync::Arc::new(header_cfg(true))),
+            );
+            (app, s)
+        };
+        // A pre-existing local user owns alice@x.com.
+        let hash = crate::auth::hash_password("local-pass-123").unwrap();
+        store.create_user("localuser", &hash, "user").await.unwrap();
+        store.set_user_email(1, "alice@x.com").await.unwrap();
+
+        // A header identity for "bob" claiming that email must be refused
+        // (never auto-merge into the existing account).
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "bob"), ("Remote-Email", "alice@x.com")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // No external user was provisioned.
+        assert_eq!(store.list_users().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn header_session_logout_clears_only_qdrust_session() {
+        let app = header_auth_test_app(header_cfg(true)).await;
+        let resp = app
+            .clone()
+            .oneshot(header_request(
+                "/api/v1/tasks",
+                &[("Remote-User", "alice")],
+                Some(trusted_addr()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let token = cookie_from_response(&resp, "qd_session").unwrap();
+        let csrf = cookie_from_response(&resp, "qd_csrf").unwrap();
+
+        // Logout (POST /api/v1/auth/logout) carries the session + csrf.
+        let logout = Request::builder()
+            .uri("/api/v1/auth/logout")
+            .method("POST")
+            .header("Cookie", format!("qd_session={token}; qd_csrf={csrf}"))
+            .header("x-csrf-token", &csrf)
+            .body(Body::empty())
+            .unwrap();
+        let logout_resp = app.clone().oneshot(logout).await.unwrap();
+        assert_eq!(logout_resp.status(), StatusCode::NO_CONTENT);
+
+        // The revoked token no longer authenticates.
+        let after = Request::builder()
+            .uri("/api/v1/tasks")
+            .header("Cookie", format!("qd_session={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let after_resp = app.clone().oneshot(after).await.unwrap();
+        assert_eq!(after_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

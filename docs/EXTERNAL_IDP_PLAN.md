@@ -10,13 +10,15 @@
 > **rev 记录**：v1 初稿 → 用户评审提出 10 点工程修正 → 修正版（默认 `auth_mode=local`、
 > 哨兵哈希、state 持久化、`ConnectInfo` 启动改造等已并入）。
 >
-> **进度**：Phase 0 + **Phase 1(OIDC)** + **Phase 2(映射/冲突/审计)** + **Phase 3(前端登录策略)** 已基本完成
-> （server lib 全绿、clippy/fmt 干净；webui vue-tsc/vitest/build 全绿）：
+> **进度**：Phase 0–5 **全部完成**
+> （server lib 91 passed、clippy/fmt 干净；webui vue-tsc/vitest 16 passed/build 通过）：
 > AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档，
 > role 首登写死不随组刷新）+ OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、
 > 确定性 verifier/nonce、ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）
-> + 外部登录审计（`auth.external_user_created`/`auth.external_login`/`auth.external_refused`）
-> + 登录页按 auth_mode 渲染（SSO 按钮/oidc 模式无本地框/`?login_error` 友好提示）。
+> + 外部登录审计 + 登录页按 auth_mode 渲染 + **Header Auth**（ConnectInfo 可信代理、
+> 头注入防护、会话复用不膨胀、缺可信代理启动失败）+ **部署文档**（README/.env.example/反代示例）。
+> 待办（收尾）：真实 IdP 端到端人工验证、OIDC state 过期定时清理接线、OIDC groups claim 映射。
+
 > 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 4+（Header Auth、文档）。
 
 ---
@@ -376,25 +378,32 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 
 ### Phase 4：Header Auth + ConnectInfo + 可信代理校验（修正项 5）
 
-- [ ] **启动改造**：`main.rs` 改为
+- [x] **启动改造**：`main.rs` 改为
       `axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())`，
-      否则 handler 拿不到真实源 IP（当前代码为裸 `axum::serve`）
-- [ ] 中间件：基于 `ConnectInfo<SocketAddr>` 判源 IP ∈ `header_auth_trusted_proxies`
-- [ ] `header_auth_trusted_proxy_required=true`（默认）：无可信代理配置 → **Header Auth 启动失败**，
-      而非运行时静默接受 header
-- [ ] 读取 user/email/groups header；**覆盖/清理外部同名 header**
-- [ ] **不每次请求建会话**（修正项 7）：仅当
-      无有效 qdrust session / header 身份与 session 用户不一致 / 外部身份变化时才建或刷新；
-      否则复用既有 session，避免会话膨胀与审计噪音
-- [ ] `find_or_create_external_user`（auto_create 默认 false）
-- [ ] 登出只清 qdrust session
-- [ ] 测试：不可信源 403、缺用户名拒、缺可信代理配置启动失败、session 复用不膨胀、同名冲突策略
+      否则 handler 拿不到真实源 IP（原代码为裸 `axum::serve`）
+- [x] 中间件：`header_auth_middleware` 基于 `ConnectInfo<SocketAddr>` 扩展判源 IP ∈ `header.trusted_proxies`
+      （`src/header_auth.rs` 纯逻辑 `source_is_trusted` + `extract_header_identity` + `strip_identity_headers`）
+- [x] `header.trusted_proxy_required=true`（默认）：`config.rs` `validate()` 在
+      header auth 开启且无可信代理时 **启动失败**（fail-fast，非运行时静默接受）
+- [x] 读取 user/email/groups header（可配 `Remote-User`/`Remote-Email`/`Remote-Groups`，
+      分隔符可配默认逗号）；**不可信来源剥离外部同名 header**（防伪造）
+- [x] **不每次请求建会话**：仅当无有效 qd_session / header 身份与 session 用户不一致
+      （身份漂移 revoke 旧 session 后重建）才建/刷；否则复用既有 session，避免会话膨胀与审计噪音
+- [x] `resolve_external_identity`（auto_create 默认 false；enabled 时才开）
+- [x] 登出只清 qdrust session（logout 走既有 revoke_session）
+- [x] 测试：不可信源 403、trusted_proxy_required=false 忽略、缺用户名拒、可信源建档+下次带 cookie 认证、
+      auto_create off 拒、session 复用不膨胀、同名 email 冲突拒并、登出仅清 qdrust session、
+      config 缺可信代理启动失败（server lib 91 passed）
 
 ### Phase 5：应急本地管理员入口 + 文档
 
-- [ ] `QDRUST_LOCAL_LOGIN_ENABLED` / bootstrap 兜底（§6/§7.5）
-- [ ] README / .env.example / Dockerfile / compose / 反代示例
-- [ ] 全量回归
+- [x] `QDRUST_LOCAL_LOGIN_ENABLED` / bootstrap 兜底（§6/§7.5）
+      （`auth_mode=oidc` + `QDRUST_LOCAL_LOGIN_ENABLED=true` 保留本地入口；
+      bootstrap 在无管理员时始终可用；config 测试 `oidc_mode_keeps_local_entry_only_when_forced` 已固化）
+- [x] README / .env.example / 反代示例
+      （README 新增「第三方登录」小节：auth_mode/local 开关、OIDC env、Header Auth env、
+      nginx forward-auth 示例与安全注记；`.env.example` 补齐全部 `QDRUST_*` 认证变量注释）
+- [x] 全量回归（server lib 91 passed、clippy -D warnings 干净、fmt 干净；webui 16 passed、build 通过）
 
 ---
 

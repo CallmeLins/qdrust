@@ -85,6 +85,59 @@ impl Default for OidcConfig {
     }
 }
 
+/// Trusted reverse-proxy header authentication (forward-auth) settings
+/// (Phase 4). A reverse proxy that has already authenticated the user injects
+/// identity headers on every request; the server only honours them when the
+/// request originates from a configured trusted proxy IP. Header auth is OFF
+/// unless `header_auth_enabled` is set, keeping strict backward compatibility.
+#[derive(Clone, Debug)]
+pub struct HeaderAuthConfig {
+    /// Header carrying the username/subject (e.g. `Remote-User`).
+    pub user_header: String,
+    /// Header carrying the email (e.g. `Remote-Email`).
+    pub email_header: String,
+    /// Header carrying group membership (e.g. `Remote-Groups`).
+    pub groups_header: String,
+    /// Fixed separator used to split the groups header (default `,`).
+    pub groups_separator: String,
+    /// Source IPs permitted to set identity headers.
+    pub trusted_proxies: Vec<IpAddr>,
+    /// When true (default) and no trusted proxies are configured while header
+    /// auth is enabled, startup fails rather than silently trusting headers.
+    pub trusted_proxy_required: bool,
+    /// Auto-provision a local user on first header login (default false).
+    pub auto_create_users: bool,
+    /// Role for auto-provisioned users not in an admin group.
+    pub default_role: String,
+    /// Groups that map to the `admin` role.
+    pub admin_groups: Vec<String>,
+}
+
+impl HeaderAuthConfig {
+    /// Build the default config (used by `Default` and when disabled).
+    pub fn new() -> Self {
+        Self {
+            user_header: "Remote-User".into(),
+            email_header: "Remote-Email".into(),
+            groups_header: "Remote-Groups".into(),
+            groups_separator: ",".into(),
+            trusted_proxies: Vec::new(),
+            trusted_proxy_required: true,
+            auto_create_users: false,
+            default_role: "user".into(),
+            admin_groups: Vec::new(),
+        }
+    }
+}
+
+/// `Default` yields the same sane defaults as [`HeaderAuthConfig::new`] (a
+/// derived `Default` would leave `default_role` empty and fail `validate`).
+impl Default for HeaderAuthConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: IpAddr,
@@ -125,6 +178,8 @@ pub struct Config {
     pub header_auth_enabled: bool,
     /// Deep OIDC provider settings for the code+PKCE flow.
     pub oidc: OidcConfig,
+    /// Trusted reverse-proxy header authentication settings (Phase 4).
+    pub header: HeaderAuthConfig,
     pub config_file: Option<PathBuf>,
 }
 
@@ -231,6 +286,45 @@ impl Config {
             header_auth_enabled: env::var("QDRUST_HEADER_AUTH_ENABLED")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            header: HeaderAuthConfig {
+                user_header: env::var("QDRUST_HEADER_USER_HEADER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "Remote-User".into()),
+                email_header: env::var("QDRUST_HEADER_EMAIL_HEADER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "Remote-Email".into()),
+                groups_header: env::var("QDRUST_HEADER_GROUPS_HEADER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "Remote-Groups".into()),
+                groups_separator: env::var("QDRUST_HEADER_GROUPS_SEPARATOR")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| ",".into()),
+                trusted_proxies: match env::var("QDRUST_HEADER_TRUSTED_PROXIES") {
+                    Ok(raw) => raw
+                        .split(',')
+                        .map(|s| s.trim().parse::<IpAddr>())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .context(
+                            "QDRUST_HEADER_TRUSTED_PROXIES must be comma-separated IP addresses",
+                        )?,
+                    Err(_) => Vec::new(),
+                },
+                trusted_proxy_required: env::var("QDRUST_HEADER_TRUSTED_PROXY_REQUIRED")
+                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(true),
+                auto_create_users: env::var("QDRUST_HEADER_AUTO_CREATE_USERS")
+                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                default_role: env::var("QDRUST_HEADER_DEFAULT_ROLE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "user".into()),
+                admin_groups: csv_env("QDRUST_HEADER_ADMIN_GROUPS"),
+            },
             config_file: env::var("QDRUST_CONFIG_FILE")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -400,6 +494,86 @@ impl Config {
             },
             header_auth_enabled: get_bool("header_auth_enabled")
                 .unwrap_or(self.header_auth_enabled),
+            header: {
+                // Config-file values only apply when the env value is still the
+                // default/empty, matching the "env wins, file is fallback" rule.
+                let h = json
+                    .get("header")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let file_get = |key: &str| -> String {
+                    h.get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let parse_ips = |key: &str| -> Vec<IpAddr> {
+                    h.get(key)
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                HeaderAuthConfig {
+                    user_header: if self.header.user_header.is_empty() {
+                        file_get("user_header")
+                    } else {
+                        self.header.user_header.clone()
+                    },
+                    email_header: if self.header.email_header.is_empty() {
+                        file_get("email_header")
+                    } else {
+                        self.header.email_header.clone()
+                    },
+                    groups_header: if self.header.groups_header.is_empty() {
+                        file_get("groups_header")
+                    } else {
+                        self.header.groups_header.clone()
+                    },
+                    groups_separator: if self.header.groups_separator.is_empty() {
+                        let s = file_get("groups_separator");
+                        if s.is_empty() { ",".into() } else { s }
+                    } else {
+                        self.header.groups_separator.clone()
+                    },
+                    trusted_proxies: if self.header.trusted_proxies.is_empty() {
+                        parse_ips("trusted_proxies")
+                    } else {
+                        self.header.trusted_proxies.clone()
+                    },
+                    trusted_proxy_required: h
+                        .get("trusted_proxy_required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(self.header.trusted_proxy_required),
+                    auto_create_users: h
+                        .get("auto_create_users")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(self.header.auto_create_users),
+                    default_role: if self.header.default_role.is_empty() {
+                        let s = file_get("default_role");
+                        if s.is_empty() { "user".into() } else { s }
+                    } else {
+                        self.header.default_role.clone()
+                    },
+                    admin_groups: if self.header.admin_groups.is_empty() {
+                        h.get("admin_groups")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        self.header.admin_groups.clone()
+                    },
+                }
+            },
             config_file: self.config_file,
         })
     }
@@ -470,6 +644,23 @@ impl Config {
         anyhow::ensure!(
             matches!(self.oidc.default_role.as_str(), "admin" | "user"),
             "QDRUST_OIDC_DEFAULT_ROLE must be admin or user"
+        );
+        // Header Auth (Phase 4): a trusted proxy is the *only* thing that makes
+        // identity headers trustworthy. Refuse to start if header auth is on but
+        // the deployer forgot to configure any trusted proxy — silently accepting
+        // client-supplied headers would be a critical auth bypass.
+        if self.header_auth_enabled
+            && self.header.trusted_proxy_required
+            && self.header.trusted_proxies.is_empty()
+        {
+            anyhow::bail!(
+                "header auth is enabled with trusted_proxy_required=true but no trusted \
+                 proxies are configured (set QDRUST_HEADER_TRUSTED_PROXIES)"
+            );
+        }
+        anyhow::ensure!(
+            matches!(self.header.default_role.as_str(), "admin" | "user"),
+            "QDRUST_HEADER_DEFAULT_ROLE must be admin or user"
         );
         Ok(Self {
             default_timezone,
@@ -565,6 +756,7 @@ mod tests {
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
             oidc: OidcConfig::default(),
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate()
@@ -601,6 +793,7 @@ mod tests {
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
             oidc: OidcConfig::default(),
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate();
@@ -645,6 +838,7 @@ mod tests {
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
             oidc: OidcConfig::default(),
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate()
@@ -690,6 +884,7 @@ mod tests {
                 client_secret: "secret".into(),
                 ..OidcConfig::default()
             },
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate()
@@ -729,6 +924,7 @@ mod tests {
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
             oidc: OidcConfig::default(),
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate();
@@ -769,6 +965,7 @@ mod tests {
                 client_secret: "secret".into(),
                 ..OidcConfig::default()
             },
+            header: HeaderAuthConfig::default(),
             config_file: None,
         }
         .validate()
@@ -778,5 +975,58 @@ mod tests {
         assert!(pub_cfg.local_login_enabled);
         assert!(pub_cfg.oidc_enabled);
         assert_eq!(pub_cfg.oidc_provider_name, "Keycloak");
+    }
+
+    #[test]
+    fn header_auth_requires_trusted_proxy_when_required() {
+        let base = |header_auth_enabled: bool,
+                    trusted_proxies: Vec<IpAddr>,
+                    trusted_proxy_required: bool| Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Local,
+            local_login_enabled: false,
+            oidc_enabled: false,
+            oidc_provider_name: String::new(),
+            header_auth_enabled,
+            oidc: OidcConfig::default(),
+            header: HeaderAuthConfig {
+                trusted_proxies,
+                trusted_proxy_required,
+                ..HeaderAuthConfig::default()
+            },
+            config_file: None,
+        };
+
+        // Enabled + required + no trusted proxy -> refuse to start (fail fast
+        // rather than silently trusting client headers).
+        assert!(base(true, vec![], true).validate().is_err());
+        // Enabled + required + a trusted proxy -> OK.
+        assert!(
+            base(true, vec!["127.0.0.1".parse().unwrap()], true)
+                .validate()
+                .is_ok()
+        );
+        // Enabled + NOT required (deployer opted out) -> OK even without a proxy.
+        assert!(base(true, vec![], false).validate().is_ok());
+        // Disabled header auth is always fine.
+        assert!(base(false, vec![], true).validate().is_ok());
     }
 }
