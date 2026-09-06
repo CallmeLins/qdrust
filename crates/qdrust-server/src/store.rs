@@ -12,16 +12,26 @@ use crate::auth::{new_token, token_hash};
 use crate::model::{
     AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNotificationAction,
     CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
-    CreateTemplateSubscription, DecidePushRequest, ImportQdHarTemplate, IssuedSession,
-    NotificationAction, NotificationChannel, PluginManifest, PushRequest, Run, RunStep,
-    SetSiteSetting, SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription,
-    UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
+    CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim,
+    ExternalLoginResolution, ImportQdHarTemplate, IssuedSession, NotificationAction,
+    NotificationChannel, OidcLoginState, PluginManifest, PushRequest, Run, RunStep, SetSiteSetting,
+    SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription, UpdateNotificationChannel,
+    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+    UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations-mysql");
+
+/// Sentinel `password_hash` written to externally-provisioned users (OIDC /
+/// Header). It keeps the `users.password_hash` column NON-NULL so the local
+/// credential path is untouched, yet any local password attempt against it
+/// fails. `verify_password` returns false for hashes it cannot parse, so this
+/// literal (an argon2-looking but unusable value) guarantees local login can
+/// never succeed for a pure-external user. It is never used for real hashing.
+const UNUSABLE_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=0,t=0,p=0$unusable-sentinel$unusable-sentinel-external-user";
 
 fn sqlite_options(url: &str) -> Result<SqliteConnectOptions> {
     Ok(SqliteConnectOptions::from_str(url)?
@@ -190,6 +200,319 @@ macro_rules! define_store {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(credentials_from_row).transpose()
+    }
+
+    // ---------------------------------------------------------------------
+    // External identity login (OIDC / Header Auth). See EXTERNAL_IDP_PLAN.md.
+    // These are backend-agnostic; the macro generates the same impl for both
+    // SQLite and MySQL. Security policy (no email auto-merge, conservative
+    // role assignment) lives here so it is unit-testable.
+    // ---------------------------------------------------------------------
+
+    /// Look up an `external_identities` row by its (provider, issuer, subject)
+    /// mapping key.
+    pub async fn external_identity_for(
+        &self,
+        provider: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<ExternalIdentity>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, provider, issuer, subject, email, created_at, last_login_at
+             FROM external_identities
+             WHERE provider = ? AND issuer = ? AND subject = ?",
+        )
+        .bind(provider.trim())
+        .bind(issuer.trim())
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(external_identity_from_row).transpose()
+    }
+
+    /// Find an existing local user by email. Email is stored trimmed and
+    /// lowercased by `set_user_email`, so lookups compare the same way.
+    async fn user_id_by_email(&self, email: &str) -> Result<Option<i64>> {
+        let normalized = email.trim().to_lowercase();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM users WHERE email = ? LIMIT 1",
+        )
+        .bind(&normalized)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Map an external identity claim to a local user, provisioning a new
+    /// `users` row when needed. Encapsulates the conflict policy from
+    /// EXTERNAL_IDP_PLAN.md §4.3.
+    ///
+    /// Returns an `ExternalLoginResolution`:
+    /// - matched/provisioned user (caller then issues a session), or
+    /// - `refusal` with a machine reason: `external_identity_conflict`
+    ///   (subject not yet linked, but the claimed email already belongs to a
+    ///   different local user -> refuse, never auto-merge), `user_disabled`,
+    ///   or `provisioning_disabled`.
+    pub async fn resolve_external_identity(
+        &self,
+        claim: &ExternalIdentityClaim,
+        auto_create: bool,
+        default_role: &str,
+        admin_groups: &[&str],
+    ) -> Result<ExternalLoginResolution> {
+        ensure!(
+            matches!(default_role, "admin" | "user"),
+            "invalid default role"
+        );
+
+        // 1. Known mapping -> reuse the linked user.
+        if let Some(identity) = self
+            .external_identity_for(&claim.provider, &claim.issuer, &claim.subject)
+            .await?
+        {
+            let user = match self.get_user(identity.user_id).await? {
+                Some(u) => u,
+                None => {
+                    // Mapping points at a deleted user; treat as first login
+                    // (the ON DELETE CASCADE should have removed the row, so
+                    // this is defensive only).
+                    return self
+                        .provision_external_user(
+                            claim,
+                            auto_create,
+                            default_role,
+                            admin_groups,
+                        )
+                        .await;
+                }
+            };
+            if user.disabled {
+                return Ok(ExternalLoginResolution {
+                    user: None,
+                    created: false,
+                    refusal: Some("user_disabled".into()),
+                });
+            }
+            self.touch_external_identity(identity.id).await?;
+            return Ok(ExternalLoginResolution {
+                user: Some(user),
+                created: false,
+                refusal: None,
+            });
+        }
+
+        // 2. Not yet linked. Refuse to attach an email that already belongs to
+        //    another local account (account-takeover guard, EXTERNAL_IDP_PLAN §4.3).
+        if let Some(email) = claim.email.as_deref() {
+            if self.user_id_by_email(email).await?.is_some() {
+                return Ok(ExternalLoginResolution {
+                    user: None,
+                    created: false,
+                    refusal: Some("external_identity_conflict".into()),
+                });
+            }
+        }
+
+        // 3. No conflict -> provision if allowed, else refuse.
+        self.provision_external_user(claim, auto_create, default_role, admin_groups)
+            .await
+    }
+
+    async fn provision_external_user(
+        &self,
+        claim: &ExternalIdentityClaim,
+        auto_create: bool,
+        default_role: &str,
+        admin_groups: &[&str],
+    ) -> Result<ExternalLoginResolution> {
+        if !auto_create {
+            return Ok(ExternalLoginResolution {
+                user: None,
+                created: false,
+                refusal: Some("provisioning_disabled".into()),
+            });
+        }
+
+        let role = if groups_overlap(&claim.groups, admin_groups) {
+            "admin"
+        } else {
+            default_role
+        };
+        let username = self
+            .unique_external_username(claim.username_hint.as_deref(), &claim.subject)
+            .await?;
+        let email = claim.email.as_deref().map(|e| e.trim().to_lowercase());
+
+        let now = Utc::now().timestamp();
+        // Create the user and link its external identity in one transaction so
+        // a crash between the two cannot leave an orphan mapping.
+        let mut conn = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO users(username, password_hash, role, email, email_verified, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(&username)
+        .bind(UNUSABLE_PASSWORD_HASH)
+        .bind(role)
+        .bind(&email)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| anyhow!("failed to provision external user: {err}"))?;
+        let user_id = self.last_insert_id(&mut conn).await?;
+        sqlx::query(
+            "INSERT INTO external_identities(user_id, provider, issuer, subject, email, created_at, last_login_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(claim.provider.trim())
+        .bind(claim.issuer.trim())
+        .bind(&claim.subject)
+        .bind(&email)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| anyhow!("failed to link external identity: {err}"))?;
+        conn.commit().await?;
+
+        let user = self
+            .get_user(user_id)
+            .await?
+            .context("provisioned user disappeared")?;
+        Ok(ExternalLoginResolution {
+            user: Some(user),
+            created: true,
+            refusal: None,
+        })
+    }
+
+    /// Bump `last_login_at` on an existing external-identity row.
+    async fn touch_external_identity(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE external_identities SET last_login_at=? WHERE id=?")
+            .bind(Utc::now().timestamp())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Derive a unique, valid username for an externally-provisioned user.
+    /// Prefers `username_hint` (the IdP `preferred_username`), else sanitizes
+    /// the subject; appends a numeric suffix until it is free.
+    async fn unique_external_username(
+        &self,
+        username_hint: Option<&str>,
+        subject: &str,
+    ) -> Result<String> {
+        let sanitized: String = username_hint
+            .or(Some(subject))
+            .unwrap_or("user")
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect::<String>()
+            .trim_matches(|c| c == '_' || c == '-')
+            .to_string();
+        let base = if sanitized.len() >= 3 {
+            sanitized[..sanitized.len().min(48)].to_string()
+        } else {
+            format!("user_{}", if sanitized.is_empty() { "ext".to_string() } else { sanitized })
+        };
+        if self
+            .username_exists(&base)
+            .await?
+        {
+            for suffix in 2..10_000_i32 {
+                let candidate = format!("{base}{suffix}");
+                if !self.username_exists(&candidate).await? {
+                    return Ok(candidate);
+                }
+            }
+            anyhow::bail!("unable to allocate a unique external username");
+        }
+        Ok(base)
+    }
+
+    async fn username_exists(&self, username: &str) -> Result<bool> {
+        let found: Option<i64> =
+            sqlx::query_scalar(&format!("SELECT id FROM users WHERE {}", $username_cmp()))
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
+    // --- OIDC authorization-state storage (DB fallback; Redis preferred) ---
+
+    /// Persist an OIDC authorization state so a browser callback can be
+    /// matched on any replica/restart. State/nonce are stored hashed;
+    /// the PKCE verifier is stored encrypted (never plaintext).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_oidc_login_state(
+        &self,
+        state_hash: &str,
+        nonce_hash: &str,
+        pkce_verifier_encrypted: &str,
+        redirect_uri: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO oidc_login_states(state_hash, nonce_hash, pkce_verifier_encrypted, redirect_uri, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(state_hash)
+        .bind(nonce_hash)
+        .bind(pkce_verifier_encrypted)
+        .bind(redirect_uri)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch a still-valid OIDC state row, deleting it atomically so a state
+    /// can only ever be redeemed once (single-use). Returns None if absent,
+    /// expired, or already consumed.
+    pub async fn take_oidc_login_state(&self, state_hash: &str) -> Result<Option<OidcLoginState>> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT state_hash, nonce_hash, pkce_verifier_encrypted, redirect_uri, created_at, expires_at
+             FROM oidc_login_states WHERE state_hash = ?",
+        )
+        .bind(state_hash)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(row) = row else {
+            transaction.rollback().await?;
+            return Ok(None);
+        };
+        let state = oidc_login_state_from_row(row)?;
+        // Consume regardless (expired or not) to keep the table from filling up
+        // with dead single-use entries.
+        sqlx::query("DELETE FROM oidc_login_states WHERE state_hash = ?")
+            .bind(state_hash)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        if state.expires_at <= Utc::now().timestamp() {
+            return Ok(None);
+        }
+        Ok(Some(state))
+    }
+
+    /// Remove expired OIDC state rows (maintenance; run on a schedule).
+    pub async fn purge_expired_oidc_login_states(&self) -> Result<u64> {
+        Ok(sqlx::query("DELETE FROM oidc_login_states WHERE expires_at <= ?")
+            .bind(Utc::now().timestamp())
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
     }
 
     pub async fn create_session(&self, user_id: i64, ttl: Duration) -> Result<IssuedSession> {
@@ -2268,6 +2591,39 @@ fn authenticated_session_from_row(row: &$row) -> Result<AuthenticatedSession> {
     })
 }
 
+fn external_identity_from_row(row: $row) -> Result<ExternalIdentity> {
+    Ok(ExternalIdentity {
+        id: row.try_get("id")?,
+        user_id: row.try_get("user_id")?,
+        provider: row.try_get("provider")?,
+        issuer: row.try_get("issuer")?,
+        subject: row.try_get("subject")?,
+        email: row.try_get("email")?,
+        created_at: row.try_get("created_at")?,
+        last_login_at: row.try_get("last_login_at")?,
+    })
+}
+
+fn oidc_login_state_from_row(row: $row) -> Result<OidcLoginState> {
+    Ok(OidcLoginState {
+        state_hash: row.try_get("state_hash")?,
+        nonce_hash: row.try_get("nonce_hash")?,
+        pkce_verifier_encrypted: row.try_get("pkce_verifier_encrypted")?,
+        redirect_uri: row.try_get("redirect_uri")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+    })
+}
+
+/// True when any of `claim_groups` appears in `admin_groups` (both compared
+/// case-sensitively after trimming). Empty `admin_groups` never grants admin.
+fn groups_overlap(claim_groups: &[String], admin_groups: &[&str]) -> bool {
+    admin_groups.iter().any(|wanted| {
+        let wanted = wanted.trim();
+        !wanted.is_empty() && claim_groups.iter().any(|g| g.trim() == wanted)
+    })
+}
+
 fn task_from_row(row: $row) -> Result<Task> {
     let headers: String = row.try_get("headers")?;
     let variables: Option<String> = row.try_get("variables")?;
@@ -2550,6 +2906,11 @@ impl Store {
         pub async fn create_first_admin(username: &str, password_hash: &str) -> Result<Option<User>> { username, password_hash };
         pub async fn get_user(id: i64) -> Result<Option<User>> { id };
         pub async fn credentials_by_username(username: &str) -> Result<Option<UserCredentials>> { username };
+        pub async fn external_identity_for(provider: &str, issuer: &str, subject: &str) -> Result<Option<ExternalIdentity>> { provider, issuer, subject };
+        pub async fn resolve_external_identity(claim: &ExternalIdentityClaim, auto_create: bool, default_role: &str, admin_groups: &[&str]) -> Result<ExternalLoginResolution> { claim, auto_create, default_role, admin_groups };
+        pub async fn insert_oidc_login_state(state_hash: &str, nonce_hash: &str, pkce_verifier_encrypted: &str, redirect_uri: &str, expires_at: i64) -> Result<()> { state_hash, nonce_hash, pkce_verifier_encrypted, redirect_uri, expires_at };
+        pub async fn take_oidc_login_state(state_hash: &str) -> Result<Option<OidcLoginState>> { state_hash };
+        pub async fn purge_expired_oidc_login_states() -> Result<u64> {  };
         pub async fn create_session(user_id: i64, ttl: Duration) -> Result<IssuedSession> { user_id, ttl };
         pub async fn authenticate_session(session_token: &str) -> Result<Option<AuthenticatedSession>> { session_token };
         pub async fn revoke_session(session_token: &str) -> Result<bool> { session_token };
@@ -3884,5 +4245,203 @@ mod tests {
         assert_eq!(restored.grp.as_deref(), Some("prod"));
         assert_eq!(target.list().await.unwrap().len(), 1);
         assert_eq!(target.list_users().await.unwrap().len(), 1);
+    }
+
+    fn oidc_claim(subject: &str, email: Option<&str>) -> ExternalIdentityClaim {
+        ExternalIdentityClaim {
+            provider: "oidc".into(),
+            issuer: "https://issuer.example".into(),
+            subject: subject.into(),
+            email: email.map(Into::into),
+            username_hint: Some(subject.into()),
+            groups: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn external_first_login_provisions_user_with_sentinel_hash() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let claim = oidc_claim("sub-abc", Some("a@example.com"));
+        let resolution = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(resolution.created);
+        let user = resolution.user.unwrap();
+        assert_eq!(user.username, "sub-abc");
+        assert_eq!(user.role, "user");
+        assert_eq!(user.email.as_deref(), Some("a@example.com"));
+        assert!(!user.disabled);
+
+        // Re-login reuses the same user (no duplicate), even if email changes.
+        let changed = oidc_claim("sub-abc", Some("a@example.com"));
+        let again = store
+            .resolve_external_identity(&changed, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(!again.created);
+        assert_eq!(again.user.unwrap().id, user.id);
+
+        // The external user has an unusable (sentinel) password: local login
+        // must fail against it.
+        let creds = store
+            .credentials_by_username("sub-abc")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!crate::auth::verify_password(
+            "whatever",
+            &creds.password_hash
+        ));
+        // The stored hash is the sentinel, never a real argon2 derivation.
+        assert_eq!(creds.password_hash, UNUSABLE_PASSWORD_HASH);
+    }
+
+    #[tokio::test]
+    async fn external_identity_email_conflict_is_refused_not_merged() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        // A local user owns a@example.com.
+        let owner = store
+            .create_user(
+                "localowner",
+                &hash_password("correct horse battery").unwrap(),
+                "user",
+            )
+            .await
+            .unwrap();
+        store
+            .set_user_email(owner.id, "a@example.com")
+            .await
+            .unwrap();
+
+        // A brand-new external subject claims the same email -> refuse, never
+        // attach to the local account (account-takeover guard).
+        let claim = oidc_claim("ext-new", Some("a@example.com"));
+        let resolution = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(resolution.user.is_none());
+        assert_eq!(
+            resolution.refusal.as_deref(),
+            Some("external_identity_conflict")
+        );
+        // And no user was created.
+        assert_eq!(store.list_users().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn external_provisioning_respects_auto_create_off_and_admin_groups() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        // auto_create=false -> refusal, no user.
+        let claim = oidc_claim("sub-noauto", None);
+        let resolution = store
+            .resolve_external_identity(&claim, false, "user", &[])
+            .await
+            .unwrap();
+        assert!(resolution.user.is_none());
+        assert_eq!(resolution.refusal.as_deref(), Some("provisioning_disabled"));
+        assert_eq!(store.list_users().await.unwrap().len(), 0);
+
+        // admin group membership -> role admin (case-sensitive exact match).
+        let mut admin_claim = oidc_claim("sub-admin", None);
+        admin_claim.groups = vec!["qdrust-admins".into()];
+        let resolution = store
+            .resolve_external_identity(&admin_claim, true, "user", &["qdrust-admins"])
+            .await
+            .unwrap();
+        assert_eq!(resolution.user.unwrap().role, "admin");
+
+        // Non-member with default role user.
+        let resolution = store
+            .resolve_external_identity(
+                &oidc_claim("sub-user", None),
+                true,
+                "user",
+                &["qdrust-admins"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolution.user.unwrap().role, "user");
+    }
+
+    #[tokio::test]
+    async fn disabled_external_user_is_refused() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let claim = oidc_claim("sub-disabled", None);
+        let user = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        store
+            .update_user(
+                user.id,
+                &AdminUserUpdate {
+                    disabled: Some(true),
+                    role: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let resolution = store
+            .resolve_external_identity(&claim, true, "user", &[])
+            .await
+            .unwrap();
+        assert!(resolution.user.is_none());
+        assert_eq!(resolution.refusal.as_deref(), Some("user_disabled"));
+    }
+
+    #[tokio::test]
+    async fn oidc_login_states_are_single_use_and_expire() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        store
+            .insert_oidc_login_state(
+                "state-hash-1",
+                "nonce-hash-1",
+                "encrypted-verifier",
+                "https://qd.example/api/v1/auth/oidc/callback",
+                now + 300,
+            )
+            .await
+            .unwrap();
+        // First take returns the row.
+        let state = store
+            .take_oidc_login_state("state-hash-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.nonce_hash, "nonce-hash-1");
+        // Second take is None (single use).
+        assert!(
+            store
+                .take_oidc_login_state("state-hash-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Expired state -> take returns None and purges.
+        store
+            .insert_oidc_login_state("state-hash-2", "n2", "v2", "https://qd.example/cb", now - 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .take_oidc_login_state("state-hash-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // purge removes nothing now since take already consumed; add a stale row.
+        store
+            .insert_oidc_login_state("state-hash-3", "n3", "v3", "https://qd.example/cb", now - 5)
+            .await
+            .unwrap();
+        let purged = store.purge_expired_oidc_login_states().await.unwrap();
+        assert_eq!(purged, 1);
     }
 }

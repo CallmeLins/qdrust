@@ -66,6 +66,9 @@ pub struct AuthConfig {
     pub cookie_secure: bool,
     pub login_rate_limit_attempts: u32,
     pub login_rate_limit_window: Duration,
+    /// Public login-policy snapshot (no secrets), surfaced by
+    /// `GET /api/v1/auth/config` and used to gate local entry points.
+    pub public: crate::config::PublicAuthConfig,
 }
 
 impl Default for AuthConfig {
@@ -75,7 +78,22 @@ impl Default for AuthConfig {
             cookie_secure: false,
             login_rate_limit_attempts: 5,
             login_rate_limit_window: Duration::from_secs(60),
+            public: crate::config::PublicAuthConfig {
+                auth_mode: "local",
+                local_login_enabled: true,
+                oidc_enabled: false,
+                oidc_provider_name: String::new(),
+                header_auth_enabled: false,
+            },
         }
+    }
+}
+
+impl AuthConfig {
+    /// Whether local username/password entry points may be used. True for
+    /// local/hybrid; only closed when oidc-mode unless force-switched on.
+    pub fn local_login_enabled(&self) -> bool {
+        self.public.local_login_enabled
     }
 }
 
@@ -157,6 +175,7 @@ pub fn router_with_auth(
             .expect("login rate limit configuration must be valid");
     let inner = Router::new()
         .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/auth/config", get(auth_config))
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
         .route("/api/v1/auth/register", axum::routing::post(register))
         .route("/api/v1/auth/login", axum::routing::post(login))
@@ -369,6 +388,20 @@ async fn api_not_found() -> ApiError {
     ApiError::NotFound("api_endpoint_not_found", "API endpoint not found")
 }
 
+/// Public login-policy endpoint consumed by the WebUI to decide what to render
+/// on the login page (local form, SSO button, or auto-redirect). Returns only
+/// non-secret values — never client_secret/issuer internals.
+async fn auth_config(State(state): State<AppState>) -> Json<Value> {
+    let public = &state.auth.public;
+    Json(json!({
+        "auth_mode": public.auth_mode,
+        "local_login_enabled": public.local_login_enabled,
+        "oidc_enabled": public.oidc_enabled,
+        "oidc_provider_name": public.oidc_provider_name,
+        "header_auth_enabled": public.header_auth_enabled,
+    }))
+}
+
 async fn bootstrap(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<AuthCredentials>,
@@ -399,10 +432,25 @@ async fn bootstrap(
     issue_session_response(&state, user).await
 }
 
+/// Reject username/password entry points when the deployment has closed local
+/// login (e.g. oidc-mode). Does not affect existing sessions or password/token
+/// flows that act on an already-known user.
+fn ensure_local_login_allowed(state: &AppState) -> Result<(), ApiError> {
+    if state.auth.local_login_enabled() {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "local_login_disabled",
+            "Local username/password login is disabled on this deployment",
+        ))
+    }
+}
+
 async fn login(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<AuthCredentials>,
 ) -> Result<Response, ApiError> {
+    ensure_local_login_allowed(&state)?;
     let rate_key = input.username.trim().to_ascii_lowercase();
     if !state.login_limiter.allowed(&rate_key).await {
         return Err(ApiError::TooManyRequests(
@@ -1362,6 +1410,7 @@ async fn register(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<RegisterUser>,
 ) -> Result<Response, ApiError> {
+    ensure_local_login_allowed(&state)?;
     let password = input.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
@@ -1416,6 +1465,7 @@ async fn forgot_password(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<ForgotPassword>,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_local_login_allowed(&state)?;
     // Uniform response so username enumeration is not possible.
     let Ok(Some(user)) = state
         .store
@@ -2282,6 +2332,157 @@ mod tests {
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             base_path,
         )
+    }
+
+    fn public(auth_mode: &'static str, oidc: bool, local: bool) -> crate::config::PublicAuthConfig {
+        crate::config::PublicAuthConfig {
+            auth_mode,
+            local_login_enabled: local,
+            oidc_enabled: oidc,
+            oidc_provider_name: if oidc {
+                "Authentik".to_string()
+            } else {
+                String::new()
+            },
+            header_auth_enabled: false,
+        }
+    }
+
+    async fn test_app_with_public(public: crate::config::PublicAuthConfig) -> Router {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        router_with_auth(
+            store,
+            AuthConfig {
+                public,
+                ..AuthConfig::default()
+            },
+            run_event_channel().0,
+            subscription_event_channel().0,
+            runtime_settings(),
+            reqwest::Client::new(),
+            crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+            "",
+        )
+    }
+
+    #[tokio::test]
+    async fn auth_config_exposes_only_public_fields() {
+        let app = test_app_with_public(public("oidc", true, false)).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["auth_mode"], "oidc");
+        assert_eq!(value["local_login_enabled"], false);
+        assert_eq!(value["oidc_enabled"], true);
+        assert_eq!(value["oidc_provider_name"], "Authentik");
+        assert_eq!(value["header_auth_enabled"], false);
+        // No secret material may ever appear in this response.
+        assert!(!text.to_lowercase().contains("secret"));
+        assert!(!text.to_lowercase().contains("client_id"));
+    }
+
+    #[tokio::test]
+    async fn auth_config_defaults_to_local_with_login_enabled() {
+        let app = test_app().await; // AuthConfig::default()
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["auth_mode"], "local");
+        assert_eq!(value["local_login_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn local_login_disabled_rejects_entry_points_but_keeps_session_api() {
+        // oidc-mode: local entry closed.
+        let app = test_app_with_public(public("oidc", true, false)).await;
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"a","password":"b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(login.into_body(), 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("local_login_disabled"));
+
+        let register = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"newbie","password":"passw0rd!","email":null}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::FORBIDDEN);
+
+        let forgot = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/forgot-password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"nobody"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forgot.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn local_login_disabled_forced_back_on_allows_login_endpoint() {
+        // oidc-mode but local force-enabled (emergency backdoor).
+        let app = test_app_with_public(public("oidc", true, true)).await;
+        let login = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"a","password":"b"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Guard passes (local enabled) -> normal login flow runs, which for a
+        // missing user returns a generic 401/400, NOT the disable 403.
+        assert_ne!(login.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

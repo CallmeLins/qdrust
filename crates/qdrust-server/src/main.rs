@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             cookie_secure: config.cookie_secure,
             login_rate_limit_attempts: config.login_rate_limit_attempts,
             login_rate_limit_window: config.login_rate_limit_window,
+            public: config.public_auth_config(),
         },
         run_events,
         subscription_events,

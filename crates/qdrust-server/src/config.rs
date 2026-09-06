@@ -2,6 +2,52 @@ use std::{env, net::IpAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 
+/// Effective authentication mode. Always defaults to `local` so an existing
+/// deployment keeps its exact login behaviour after an upgrade; external
+/// providers only join once the deployer explicitly enables them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Local username/password only (today's behaviour).
+    Local,
+    /// Local + whatever external providers are enabled.
+    Hybrid,
+    /// IdP-only: local login entry points are closed (mechanism/data remain).
+    Oidc,
+}
+
+impl AuthMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            // Empty env means "unset" -> strict backward-compatible default.
+            "" | "local" => Ok(Self::Local),
+            "hybrid" => Ok(Self::Hybrid),
+            "oidc" => Ok(Self::Oidc),
+            other => anyhow::bail!("invalid auth_mode: {other:?} (expected local|hybrid|oidc)"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hybrid => "hybrid",
+            Self::Oidc => "oidc",
+        }
+    }
+}
+
+/// Public (safe to expose to the browser) snapshot of the login policy.
+/// Deliberately contains no secrets such as OIDC client_secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicAuthConfig {
+    pub auth_mode: &'static str,
+    /// Whether username/password login entry points are reachable.
+    pub local_login_enabled: bool,
+    pub oidc_enabled: bool,
+    /// Display name shown on the SSO button. Empty unless OIDC is enabled.
+    pub oidc_provider_name: String,
+    pub header_auth_enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: IpAddr,
@@ -29,7 +75,36 @@ pub struct Config {
     /// `/qd` when reverse-proxied at `https://host/qd`. Empty means root `/`
     /// (current behaviour, compatible with subdomain or bare deploys).
     pub base_path: String,
+    /// Login policy. Defaults to `local` for strict backward compatibility.
+    pub auth_mode: AuthMode,
+    /// Independent force-switch for the local username/password entry points
+    /// (overrides the `auth_mode` derivation). Lets a deployer keep one local
+    /// admin backdoor while otherwise going IdP-only.
+    pub local_login_enabled: bool,
+    pub oidc_enabled: bool,
+    /// Display name for the SSO button / `/auth/config`. Explicit public
+    /// config (never inferred from the issuer URL). Empty unless OIDC enabled.
+    pub oidc_provider_name: String,
+    pub header_auth_enabled: bool,
     pub config_file: Option<PathBuf>,
+}
+
+impl Config {
+    /// Derive the public login-policy snapshot returned by `/api/v1/auth/config`.
+    /// No secrets here by construction.
+    pub fn public_auth_config(&self) -> PublicAuthConfig {
+        let local_login_enabled = match self.auth_mode {
+            AuthMode::Oidc => self.local_login_enabled, // false unless forced on
+            AuthMode::Local | AuthMode::Hybrid => true,
+        };
+        PublicAuthConfig {
+            auth_mode: self.auth_mode.as_str(),
+            local_login_enabled,
+            oidc_enabled: self.oidc_enabled,
+            oidc_provider_name: self.oidc_provider_name.clone(),
+            header_auth_enabled: self.header_auth_enabled,
+        }
+    }
 }
 
 impl Config {
@@ -72,6 +147,21 @@ impl Config {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_default(),
             base_path: normalize_base_path(&env::var("QDRUST_BASE_PATH").unwrap_or_default()),
+            auth_mode: AuthMode::parse(&env::var("QDRUST_AUTH_MODE").unwrap_or_default())
+                .context("QDRUST_AUTH_MODE")?,
+            local_login_enabled: env::var("QDRUST_LOCAL_LOGIN_ENABLED")
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            oidc_enabled: env::var("QDRUST_OIDC_ENABLED")
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            oidc_provider_name: env::var("QDRUST_OIDC_PROVIDER_NAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
+            header_auth_enabled: env::var("QDRUST_HEADER_AUTH_ENABLED")
+                .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             config_file: env::var("QDRUST_CONFIG_FILE")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -155,6 +245,26 @@ impl Config {
                     self.base_path.clone()
                 }
             },
+            auth_mode: {
+                // Env (when non-default) wins; otherwise honour the file, else local.
+                let file = get("auth_mode").unwrap_or("");
+                if self.auth_mode != AuthMode::Local && file.is_empty() {
+                    self.auth_mode
+                } else if !file.is_empty() {
+                    AuthMode::parse(file).context("invalid config-file auth_mode")?
+                } else {
+                    self.auth_mode
+                }
+            },
+            local_login_enabled: get_bool("local_login_enabled")
+                .unwrap_or(self.local_login_enabled),
+            oidc_enabled: get_bool("oidc_enabled").unwrap_or(self.oidc_enabled),
+            oidc_provider_name: get("oidc_provider_name")
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.oidc_provider_name.clone()),
+            header_auth_enabled: get_bool("header_auth_enabled")
+                .unwrap_or(self.header_auth_enabled),
             config_file: self.config_file,
         })
     }
@@ -196,9 +306,20 @@ impl Config {
             .parse::<chrono_tz::Tz>()
             .context("default_timezone must be a valid IANA timezone name")?;
         let base_path = normalize_base_path(&self.base_path);
+        // A mode that leans on external providers must actually have one
+        // enabled; otherwise refuse loudly rather than silently degrade.
+        let oidc_enabled = self.oidc_enabled;
+        if !oidc_enabled && matches!(self.auth_mode, AuthMode::Oidc | AuthMode::Hybrid) {
+            anyhow::bail!(
+                "auth_mode={} requires an external provider enabled \
+                 (set QDRUST_OIDC_ENABLED=true and its config)",
+                self.auth_mode.as_str()
+            );
+        }
         Ok(Self {
             default_timezone,
             base_path,
+            oidc_enabled,
             ..self
         })
     }
@@ -271,6 +392,11 @@ mod tests {
             subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
+            auth_mode: AuthMode::Local,
+            local_login_enabled: false,
+            oidc_enabled: false,
+            oidc_provider_name: String::new(),
+            header_auth_enabled: false,
             config_file: None,
         }
         .validate()
@@ -301,9 +427,173 @@ mod tests {
             subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: "Not/A_Zone".into(),
             base_path: String::new(),
+            auth_mode: AuthMode::Local,
+            local_login_enabled: false,
+            oidc_enabled: false,
+            oidc_provider_name: String::new(),
+            header_auth_enabled: false,
             config_file: None,
         }
         .validate();
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn auth_mode_empty_unset_env_parses_to_local() {
+        assert_eq!(AuthMode::parse("").unwrap(), AuthMode::Local);
+        assert_eq!(AuthMode::parse("local").unwrap(), AuthMode::Local);
+        assert_eq!(AuthMode::parse("LOCAL").unwrap(), AuthMode::Local);
+        assert_eq!(AuthMode::parse("hybrid").unwrap(), AuthMode::Hybrid);
+        assert_eq!(AuthMode::parse("oidc").unwrap(), AuthMode::Oidc);
+        assert!(AuthMode::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn auth_mode_defaults_to_local_and_public_config_is_safe() {
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Local,
+            local_login_enabled: false,
+            oidc_enabled: false,
+            oidc_provider_name: String::new(),
+            header_auth_enabled: false,
+            config_file: None,
+        }
+        .validate()
+        .unwrap();
+        let pub_cfg = cfg.public_auth_config();
+        assert_eq!(pub_cfg.auth_mode, "local");
+        assert!(pub_cfg.local_login_enabled);
+        assert!(!pub_cfg.oidc_enabled);
+        assert!(!pub_cfg.header_auth_enabled);
+        assert_eq!(pub_cfg.oidc_provider_name, "");
+    }
+
+    #[test]
+    fn oidc_mode_keeps_local_entry_only_when_forced_and_public_config_reflects_provider() {
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Oidc,
+            local_login_enabled: false,
+            oidc_enabled: true,
+            oidc_provider_name: "Authentik".to_string(),
+            header_auth_enabled: false,
+            config_file: None,
+        }
+        .validate()
+        .unwrap();
+        let pub_cfg = cfg.public_auth_config();
+        assert_eq!(pub_cfg.auth_mode, "oidc");
+        assert!(!pub_cfg.local_login_enabled); // closed unless forced
+        assert!(pub_cfg.oidc_enabled);
+        assert_eq!(pub_cfg.oidc_provider_name, "Authentik");
+    }
+
+    #[test]
+    fn hybrid_without_provider_is_rejected() {
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Hybrid,
+            local_login_enabled: false,
+            oidc_enabled: false,
+            oidc_provider_name: String::new(),
+            header_auth_enabled: false,
+            config_file: None,
+        }
+        .validate();
+        assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn hybrid_force_local_login_and_emergency_oidc_mode() {
+        // hybrid + explicit oidc_enabled + force local back on -> both visible
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Hybrid,
+            local_login_enabled: true,
+            oidc_enabled: true,
+            oidc_provider_name: "Keycloak".to_string(),
+            header_auth_enabled: false,
+            config_file: None,
+        }
+        .validate()
+        .unwrap();
+        let pub_cfg = cfg.public_auth_config();
+        assert_eq!(pub_cfg.auth_mode, "hybrid");
+        assert!(pub_cfg.local_login_enabled);
+        assert!(pub_cfg.oidc_enabled);
+        assert_eq!(pub_cfg.oidc_provider_name, "Keycloak");
     }
 }

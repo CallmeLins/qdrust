@@ -469,3 +469,54 @@ pub fn plugin_capabilities(config: &serde_json::Value) -> Result<Vec<PluginCapab
             .map_err(|err| format!("invalid plugin capabilities: {err}")),
     }
 }
+
+/// A link between an external identity (provider + issuer + subject) and a
+/// local `users` row. See docs/EXTERNAL_IDP_PLAN.md §3.2.
+#[derive(Clone, Debug)]
+pub struct ExternalIdentity {
+    pub id: i64,
+    pub user_id: i64,
+    pub provider: String,
+    pub issuer: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub created_at: i64,
+    pub last_login_at: i64,
+}
+
+/// The resolved, provider-independent identity handed to the shared
+/// "external login" layer. Business handlers never see provider internals.
+#[derive(Clone, Debug)]
+pub struct ExternalIdentityClaim {
+    pub provider: String,
+    pub issuer: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub username_hint: Option<String>,
+    pub groups: Vec<String>,
+}
+
+/// Result of the external-identity -> local-user resolution step.
+#[derive(Clone, Debug)]
+pub struct ExternalLoginResolution {
+    /// The local user matched or provisioned, if login should proceed.
+    pub user: Option<User>,
+    /// True when this call created a brand-new external user row.
+    pub created: bool,
+    /// A machine-readable reason when `user` is None due to a conflict or
+    /// policy refusal (e.g. `"external_identity_conflict"`, `"user_disabled"`,
+    /// `"provisioning_disabled"`). Populated only on refusal.
+    pub refusal: Option<String>,
+}
+
+/// One row of the `oidc_login_states` table (DB fallback for the OIDC
+/// authorization state; Redis is preferred when configured).
+#[derive(Clone, Debug)]
+pub struct OidcLoginState {
+    pub state_hash: String,
+    pub nonce_hash: String,
+    pub pkce_verifier_encrypted: String,
+    pub redirect_uri: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
