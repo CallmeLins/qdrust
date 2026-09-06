@@ -429,10 +429,17 @@ QDRUST_OIDC_SCOPES="openid profile email"
 QDRUST_OIDC_AUTO_CREATE_USERS=true    # 首登自动建档（哨兵口令，本地无法登录该外部账号）
 QDRUST_OIDC_DEFAULT_ROLE=user         # 未命中 admin 组的建档角色
 QDRUST_OIDC_ADMIN_GROUPS=qdrust-admins # 命中则首次建档为 admin
+QDRUST_OIDC_GROUPS_CLAIM=groups       # ID token 中携带组成员身份的 claim 名（默认 groups）
 ```
 
 在 IdP 侧把回调地址登记为
 `https://你的域名[/<base_path>]/api/v1/auth/oidc/callback`。
+
+OIDC 首登按 **ID token 里的 `groups` claim**（可通过 `QDRUST_OIDC_GROUPS_CLAIM` 换成
+IdP 实际使用的 claim 名，如某些 Keycloak 映射后的 `roles`）解析角色：claim 命中
+`QDRUST_OIDC_ADMIN_GROUPS` 中任一成员则建档为 `admin`，否则落 `QDRUST_OIDC_DEFAULT_ROLE`。
+若 IdP 不在 ID token 内下发组（部分 IdP 只在 userinfo 返回），则保持 claim 缺失、统一落
+`default_role`，再让管理员手动调整。
 
 **反向代理 Header 认证（forward-auth）** —— 对接 nginx `auth_request` / authelia forward-auth /
 authentik proxy：反代在**每个请求**注入身份头，服务端仅在源 IP 属于可信代理时才信任：
@@ -468,9 +475,10 @@ location / {
 }
 ```
 
-> 注：Header 认证的 `groups -> admin` 角色在**首次建档时写死**，后续组变化不会自动升/降权，
-> 需管理员显式调整。OIDC 路径的 `admin_groups` 当前在未映射 groups claim 时对所有首登统一落
-> `default_role`；组到角色的精细同步留待后续按需扩展。
+> 注：Header 与 OIDC 两种外部认证的 `groups -> admin` 角色都在**首次建档时写死**，后续组变化
+> 不会自动升/降权，需管理员显式调整。OIDC 从 ID token 的 `groups` claim（可配置）取组；
+> 若 IdP 不把组放进 ID token（仅在 userinfo），该 claim 缺失，首登统一落 `default_role`。
+> 组到角色的精细实时同步留待后续按需扩展。
 
 ### 导入 QD HAR 模板
 

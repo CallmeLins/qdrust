@@ -117,6 +117,9 @@ pub fn spawn(
             let _ = maint_store.purge_expired_sessions().await;
             let _ = maint_store.purge_expired_reset_tokens().await;
             let _ = maint_store.purge_expired_email_tokens().await;
+            // OIDC single-use login states (OIDC_STATE_TTL_SECS) that were never
+            // consumed (user aborted mid-flow) are garbage-collected here too.
+            let _ = maint_store.purge_expired_oidc_login_states().await;
             // Log retention can be tuned at runtime through the site_settings
             // table (admin API) or the config file; the static env value is the fallback.
             let retention = match maint_store

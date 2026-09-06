@@ -16,10 +16,13 @@
 > role 首登写死不随组刷新）+ OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、
 > 确定性 verifier/nonce、ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）
 > + 外部登录审计 + 登录页按 auth_mode 渲染 + **Header Auth**（ConnectInfo 可信代理、
-> 头注入防护、会话复用不膨胀、缺可信代理启动失败）+ **部署文档**（README/.env.example/反代示例）。
-> 待办（收尾）：真实 IdP 端到端人工验证、OIDC state 过期定时清理接线、OIDC groups claim 映射。
+> 头注入防护、会话复用不膨胀、缺可信代理启动失败）+ **部署文档**（README/.env.example/反代示例）
+> + **OIDC groups claim 映射**（`oidc.groups_claim` 默认 `groups`，从已验签 ID token 提取
+> 组成员并喂入首登角色解析，命中 `admin_groups` → admin）
+> + **OIDC state 过期定时清理**（已接入调度器小时级维护）。
+> 待办（收尾）：真实 IdP 端到端人工验证。
 
-> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 4+（Header Auth、文档）。
+> 待办：真实 IdP 端到端验证。
 
 ---
 
@@ -405,6 +408,17 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       nginx forward-auth 示例与安全注记；`.env.example` 补齐全部 `QDRUST_*` 认证变量注释）
 - [x] 全量回归（server lib 91 passed、clippy -D warnings 干净、fmt 干净；webui 16 passed、build 通过）
 
+### Phase 6：OIDC groups claim 映射 + state 过期清理接线
+
+- [x] `OidcConfig.groups_claim`（默认 `groups`，env `QDRUST_OIDC_GROUPS_CLAIM` / config-file `groups_claim`）
+- [x] `oidc::groups_from_id_token`：从**已验签** ID token 提取组成员（数组或逗号串；缺失/畸形 → 空）
+      —— openidconnect 把 token 绑到 `EmptyAdditionalClaims`，非标准 claim 在反序列化即被丢弃，
+      故验签后重解 payload（`IdToken::to_string()` 还原 compact JWT）读取，安全性不变。
+- [x] OIDC 回调 `claim.groups` 由真实 claim 填充 → 首登命中 `admin_groups` 即为 admin，
+      否则落 `default_role`（store `groups_overlap` 逻辑复用，已测试）。
+- [x] 调度器维护循环接入 `purge_expired_oidc_login_states()`（小时级清理，与
+      `purge_expired_sessions` 等并列）。
+
 ---
 
 ## 8. 测试映射与安全清单
@@ -432,6 +446,7 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 | discovery / IdP 不可达 | 优雅降级，不锁死已登录用户 |
 | `/auth/config` | 不含 secret；provider_name 来自显式配置 |
 | **OIDC state 过期清理** | 定期清理 `oidc_login_states` 过期行 |
+| **OIDC groups→admin** | 从已验签 ID token 读 `groups_claim`（默认 groups，数组或逗号串），首登命中 `admin_groups` → admin；claim 缺失统一落 default_role |
 
 ---
 

@@ -588,13 +588,20 @@ async fn oidc_login_callback(
     let email = claims.email().map(|e| e.as_str().to_string());
     let username_hint = claims.preferred_username().map(|u| u.as_str().to_string());
 
+    // Group membership drives group->admin promotion via `oidc.admin_groups`.
+    // The ID token was cryptographically verified by `id_token.claims()` above;
+    // re-decode its payload (see `oidc::groups_from_id_token`) to read the
+    // IdP-specific `groups_claim` (default "groups"). Absent/empty groups make
+    // `resolve_external_identity` fall back to `default_role`.
+    let groups = oidc::groups_from_id_token(&id_token.to_string(), &oidc.groups_claim);
+
     let claim = ExternalIdentityClaim {
         provider: "oidc".to_string(),
         issuer: oidc.issuer.clone(),
         subject,
         email,
         username_hint,
-        groups: vec![],
+        groups,
     };
     let admin_groups: Vec<&str> = oidc.admin_groups.iter().map(|s| s.as_str()).collect();
     let resolution = state

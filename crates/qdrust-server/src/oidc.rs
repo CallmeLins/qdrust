@@ -105,6 +105,51 @@ pub fn parse_scopes(scopes: &str) -> Vec<Scope> {
         .collect()
 }
 
+/// Extract a group-membership claim from an already-verified compact ID token.
+///
+/// The openidconnect crate binds the parsed ID token to `EmptyAdditionalClaims`,
+/// so non-standard claims such as `groups` are dropped at deserialization time.
+/// Because the token has already passed signature/nonce verification before this
+/// is called (`IdToken::claims` succeeds first), re-decoding its base64url payload
+/// here is safe: we are only reading group membership off a JWT whose integrity
+/// was just confirmed, never trusting an unverified payload.
+///
+/// Supports the common shapes IdPs emit for the claim:
+///   * a JSON array of strings: `{"groups": ["qdrust-admins", "users"]}`
+///   * a single string:         `{"groups": "qdrust-admins,users"}`
+///
+/// Anything else (absent claim, not an array of strings, non-string) yields an
+/// empty vec so the caller falls back to `default_role`.
+pub fn groups_from_id_token(id_token: &str, claim: &str) -> Vec<String> {
+    let payload_b64 = match id_token.split('.').collect::<Vec<_>>().as_slice() {
+        [_, payload, _] => *payload,
+        _ => return Vec::new(),
+    };
+    let payload_bytes = match URL_SAFE_NO_PAD.decode(payload_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    match payload.get(claim) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Compute the redirect_uri handed to the IdP.
 ///
 /// Prefers `X-Forwarded-Proto` / `X-Forwarded-Host` (trusted reverse-proxy
@@ -254,5 +299,49 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    /// Build a compact JWT string whose payload is `payload_json`, for testing
+    /// the payload-only extraction helper. Signature/header are dummy bytes.
+    fn fake_id_token(payload_json: serde_json::Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+        let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\"}");
+        let sig = URL_SAFE_NO_PAD.encode(b"sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
+    #[test]
+    fn groups_extracted_from_array_claim() {
+        let token = fake_id_token(serde_json::json!({
+            "sub": "abc",
+            "groups": ["qdrust-admins", " users ", "qdrust-dev"]
+        }));
+        let groups = groups_from_id_token(&token, "groups");
+        assert_eq!(groups, vec!["qdrust-admins", "users", "qdrust-dev"]);
+    }
+
+    #[test]
+    fn groups_extracted_from_comma_string_claim() {
+        let token = fake_id_token(serde_json::json!({
+            "groups": "qdrust-admins, qdrust-dev"
+        }));
+        assert_eq!(
+            groups_from_id_token(&token, "groups"),
+            vec!["qdrust-admins", "qdrust-dev"]
+        );
+    }
+
+    #[test]
+    fn missing_claim_or_bad_payload_yields_empty() {
+        // No groups claim at all -> empty (falls back to default_role).
+        let token = fake_id_token(serde_json::json!({ "sub": "abc" }));
+        assert!(groups_from_id_token(&token, "groups").is_empty());
+        // Wrong claim name -> empty.
+        assert!(groups_from_id_token(&token, "roles").is_empty());
+        // Malformed JWT / non-object -> empty.
+        assert!(groups_from_id_token("not-a-jwt", "groups").is_empty());
+        // Groups present but not strings -> empty.
+        let bad = fake_id_token(serde_json::json!({ "groups": 42 }));
+        assert!(groups_from_id_token(&bad, "groups").is_empty());
     }
 }

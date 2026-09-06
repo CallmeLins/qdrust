@@ -68,6 +68,10 @@ pub struct OidcConfig {
     pub default_role: String,
     /// Comma-separated groups that map to the `admin` role.
     pub admin_groups: Vec<String>,
+    /// Claim name carrying group membership in the (verified) ID token. IdP
+    /// specific (authentik: `groups`; Keycloak often requires a mapper; many
+    /// Issuer return it in userinfo instead). Defaults to `groups`.
+    pub groups_claim: String,
 }
 
 impl Default for OidcConfig {
@@ -81,6 +85,7 @@ impl Default for OidcConfig {
             auto_create_users: true,
             default_role: "user".into(),
             admin_groups: Vec::new(),
+            groups_claim: "groups".into(),
         }
     }
 }
@@ -282,6 +287,10 @@ impl Config {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "user".into()),
                 admin_groups: csv_env("QDRUST_OIDC_ADMIN_GROUPS"),
+                groups_claim: env::var("QDRUST_OIDC_GROUPS_CLAIM")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "groups".into()),
             },
             header_auth_enabled: env::var("QDRUST_HEADER_AUTH_ENABLED")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -489,6 +498,12 @@ impl Config {
                             .unwrap_or_default()
                     } else {
                         self.oidc.admin_groups.clone()
+                    },
+                    groups_claim: if self.oidc.groups_claim.is_empty() {
+                        let s = file_get("groups_claim");
+                        if s.is_empty() { "groups".into() } else { s }
+                    } else {
+                        self.oidc.groups_claim.clone()
                     },
                 }
             },
@@ -725,6 +740,51 @@ mod tests {
         assert_eq!(normalize_base_path("qd/"), "/qd");
         // Deep paths are kept.
         assert_eq!(normalize_base_path("/qd/app/"), "/qd/app");
+    }
+
+    #[test]
+    fn oidc_groups_claim_defaults_to_groups_and_is_retained() {
+        // Default claim name is `groups` so a bare OidcConfig keeps working.
+        assert_eq!(OidcConfig::default().groups_claim, "groups");
+        // A non-default claim set in code/config survives validate.
+        let cfg = Config {
+            bind: "0.0.0.0".parse().unwrap(),
+            port: 8923,
+            database_url: "sqlite://:memory:".into(),
+            database_min_connections: 1,
+            database_max_connections: 4,
+            scheduler_interval: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
+            session_ttl: Duration::from_secs(60),
+            cookie_secure: false,
+            database_acquire_timeout: Duration::from_secs(30),
+            database_idle_timeout: Duration::from_secs(600),
+            login_rate_limit_attempts: 5,
+            login_rate_limit_window: Duration::from_secs(60),
+            log_retention_days: 0,
+            ga_key: None,
+            require_email_verification: false,
+            subscription_sync_interval: Duration::from_secs(3600),
+            default_timezone: String::new(),
+            base_path: String::new(),
+            auth_mode: AuthMode::Oidc,
+            local_login_enabled: false,
+            oidc_enabled: true,
+            oidc_provider_name: "Keycloak".to_string(),
+            header_auth_enabled: false,
+            oidc: OidcConfig {
+                issuer: "https://auth.example.com/realms/qdrust".into(),
+                client_id: "qdrust".into(),
+                client_secret: "secret".into(),
+                groups_claim: "roles".into(),
+                ..OidcConfig::default()
+            },
+            header: HeaderAuthConfig::default(),
+            config_file: None,
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(cfg.oidc.groups_claim, "roles");
     }
 
     #[test]
