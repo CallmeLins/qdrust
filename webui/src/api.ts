@@ -36,6 +36,16 @@ export interface TemplatePage {
   next_cursor: number | null;
 }
 
+/** Public authentication policy exposed by GET /api/v1/auth/config.
+ *  Never contains secrets; mirrors the server `PublicAuthConfig`. */
+export interface AuthConfig {
+  auth_mode: "local" | "hybrid" | "oidc";
+  local_login_enabled: boolean;
+  oidc_enabled: boolean;
+  oidc_provider_name: string;
+  header_auth_enabled: boolean;
+}
+
 /** Live run-step WebSocket event */
 export interface LiveRunEvent {
   run_id: number;
@@ -93,6 +103,14 @@ export function apiPath(path: string, prefix: string = detectUrlPrefix()): strin
   return prefix + path;
 }
 
+/** Full (already reverse-proxy-prefixed) URL the browser should be sent to in
+ *  order to start the OIDC Authorization Code flow. Navigating here performs a
+ *  top-level redirect to the IdP, so it must be a real `window.location` jump
+ *  rather than a `fetch`. `prefix` is injectable for tests. */
+export function oidcStartUrl(prefix: string = detectUrlPrefix()): string {
+  return apiPath("/api/v1/auth/oidc/start", prefix);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiPath(path), {
     ...init,
@@ -109,6 +127,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   // ---- auth ----
+  authConfig: () => request<AuthConfig>("/api/v1/auth/config"),
   session: () => request<{ user: User; expires_at: number }>("/api/v1/auth/session"),
   bootstrap: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/bootstrap", { method: "POST", body: JSON.stringify({ username, password }) }),
   register: (username: string, password: string, email?: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/register", { method: "POST", body: JSON.stringify({ username, password, ...(email ? { email } : {}) }) }),

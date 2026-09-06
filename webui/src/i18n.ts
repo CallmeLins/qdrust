@@ -72,6 +72,16 @@ const zh = {
   verifySent: "验证邮件已发送",
   verifyDone: "邮箱验证成功",
   verifyFail: "验证链接无效或已过期",
+  // external IdP / SSO
+  ssoAction: "单点登录（SSO）",
+  ssoOrLocal: "或使用账号密码",
+  ssoHint: "此部署使用企业身份提供方登录",
+  ssoProviderError: "身份提供方返回了错误，请重试",
+  ssoStateError: "登录状态校验失败，请重新发起登录",
+  ssoConflict: "该邮箱已属于其他账号，为避免接管已拒绝合并，请联系管理员处理",
+  ssoDisabled: "该账号已被禁用，无法登录",
+  ssoProvisioningDisabled: "自动开通账号已关闭，请联系管理员创建账号",
+  ssoNotConfigured: "OIDC 登录尚未配置",
   csrfRotate: "轮换 CSRF 令牌",
   csrfRotated: "CSRF 令牌已轮换",
   // stats
@@ -466,6 +476,16 @@ const en: Record<MessageKey, string> = {
   verifySent: "Verification email sent",
   verifyDone: "Email verified successfully",
   verifyFail: "Verification link is invalid or expired",
+  // external IdP / SSO
+  ssoAction: "Sign in with SSO",
+  ssoOrLocal: "or use username and password",
+  ssoHint: "This deployment signs in through an external identity provider",
+  ssoProviderError: "The identity provider returned an error, please try again",
+  ssoStateError: "Login state verification failed, please start sign-in again",
+  ssoConflict: "This email already belongs to another account; auto-merge was refused to prevent account takeover. Contact an administrator.",
+  ssoDisabled: "This account is disabled and cannot sign in",
+  ssoProvisioningDisabled: "Automatic account provisioning is off; contact an administrator",
+  ssoNotConfigured: "OIDC sign-in is not configured",
   csrfRotate: "Rotate CSRF token",
   csrfRotated: "CSRF token rotated",
   // stats

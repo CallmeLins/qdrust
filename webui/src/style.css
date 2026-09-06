@@ -768,6 +768,19 @@ code {
   padding: 4px 10px; border-radius: 999px; font-size: 12px;
 }
 
+/* SSO affordance on the sign-in page (EXTERNAL_IDP_PLAN.md Phase 3). */
+.auth-panel .sso-button { width: 100%; }
+.auth-panel .sso-button .sso-label { overflow: hidden; text-overflow: ellipsis; }
+.auth-error { border-color: rgb(220 38 38 / 0.4); color: var(--bad); background: rgb(220 38 38 / 0.08); }
+.auth-divider {
+  display: flex; align-items: center; gap: 10px;
+  color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  margin: 2px 0;
+}
+.auth-divider::before, .auth-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--line);
+}
+
 /* ============================================================
    misc
    ============================================================ */

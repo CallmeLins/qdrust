@@ -10,13 +10,14 @@
 > **rev 记录**：v1 初稿 → 用户评审提出 10 点工程修正 → 修正版（默认 `auth_mode=local`、
 > 哨兵哈希、state 持久化、`ConnectInfo` 启动改造等已并入）。
 >
-> **进度**：Phase 0 + **Phase 1(OIDC)** + **Phase 2(映射/冲突/审计)** 已基本完成
-> （server lib 全绿、clippy/fmt 干净）：
+> **进度**：Phase 0 + **Phase 1(OIDC)** + **Phase 2(映射/冲突/审计)** + **Phase 3(前端登录策略)** 已基本完成
+> （server lib 全绿、clippy/fmt 干净；webui vue-tsc/vitest/build 全绿）：
 > AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档，
 > role 首登写死不随组刷新）+ OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、
 > 确定性 verifier/nonce、ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）
-> + 外部登录审计（`auth.external_user_created`/`auth.external_login`/`auth.external_refused`）。
-> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 3+（前端、Header Auth、文档）。
+> + 外部登录审计（`auth.external_user_created`/`auth.external_login`/`auth.external_refused`）
+> + 登录页按 auth_mode 渲染（SSO 按钮/oidc 模式无本地框/`?login_error` 友好提示）。
+> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 4+（Header Auth、文档）。
 
 ---
 
@@ -365,10 +366,13 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 
 ### Phase 3：前端登录策略
 
-- [ ] 登录页读 `/auth/config`；按 auth_mode 渲染
-- [ ] SSO 按钮 → `/auth/oidc/start`；oidc 模式无本地框
-- [ ] 回调错误/成功落地页（回到 sub-path）
-- [ ] vitest
+- [x] 登录页读 `/auth/config`；按 auth_mode 渲染
+      （`api.authConfig()` + App.vue `authPolicy`；工具 `ssoAvailable/ssoOnly/localLoginAvailable`）
+- [x] SSO 按钮 → `/auth/oidc/start`；oidc 模式无本地框
+      （`oidcStartUrl()` 运行时前缀；纯 OIDC 渲染 SSO-only 面板；local_login_enabled=false 隐藏本地表单）
+- [x] 回调错误/成功落地页（回到 sub-path）
+      （读 `?login_error=<code>` → 友好文案映射；成功由服务端 307 回 `{base}/` 后 session 检测登录）
+- [x] vitest（utils 策略 3 + oidcStartUrl 2；webui 16 passed、vue-tsc 干净、build 通过）
 
 ### Phase 4：Header Auth + ConnectInfo + 可信代理校验（修正项 5）
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { apiPath, prefixFromPathname } from "./api";
+import { apiPath, oidcStartUrl, prefixFromPathname } from "./api";
 
 describe("prefixFromPathname (runtime sub-path detection)", () => {
   it("detects no prefix at the bare root", () => {
@@ -46,5 +46,16 @@ describe("apiPath (runtime prefix support)", () => {
 
   it("defaults to no prefix outside a DOM (unit-test environment)", () => {
     expect(apiPath("/api/v1/tasks")).toBe("/api/v1/tasks");
+  });
+});
+
+describe("oidcStartUrl (SSO entry point)", () => {
+  it("points at the OIDC start endpoint at the bare root", () => {
+    expect(oidcStartUrl("")).toBe("/api/v1/auth/oidc/start");
+  });
+
+  it("prefixes the OIDC start endpoint under a sub-path", () => {
+    expect(oidcStartUrl("/qd")).toBe("/qd/api/v1/auth/oidc/start");
+    expect(oidcStartUrl("/tools/qdrust")).toBe("/tools/qdrust/api/v1/auth/oidc/start");
   });
 });

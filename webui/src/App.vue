@@ -5,9 +5,9 @@ import {
   LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
+import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
-import { formatRunTime } from "./utils";
+import { formatRunTime, localLoginAvailable, ssoAvailable, ssoOnly } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -106,8 +106,26 @@ const currentUser = ref<User | null>(null);
 const authMode = ref<"login" | "bootstrap" | "register" | "forgot" | "reset">("login");
 const authForm = reactive({ username: "", password: "", email: "", token: "", newPassword: "" });
 const authNotice = ref("");
+const authPolicy = ref<AuthConfig | null>(null);
+const ssoError = ref("");
 const verifyResult = ref<"ok" | "fail" | null>(null);
 const forgotResult = ref<{ sent: boolean; token?: string } | null>(null);
+
+// External-IdP policy affordances (EXTERNAL_IDP_PLAN.md Phase 3).
+const showSso = computed(() => ssoAvailable(authPolicy.value));
+const ssoProviderName = computed(() => authPolicy.value?.oidc_provider_name?.trim() || "SSO");
+const localAuthAvailable = computed(() => localLoginAvailable(authPolicy.value));
+// In pure-OIDC mode we do not show the username/password form at all.
+const ssoForced = computed(() => ssoOnly(authPolicy.value));
+// Local form (login/bootstrap/register) is visible only when local login is
+// enabled and we are not on a pure-OIDC deployment.
+const showLocalForm = computed(
+  () =>
+    localAuthAvailable.value &&
+    !ssoForced.value &&
+    (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
+);
+
 const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
@@ -1010,6 +1028,32 @@ async function logout(silent = false) {
   Object.assign(authForm, { username: "", password: "" });
 }
 
+// ---------- external IdP (SSO) ----------
+/** Send the browser to the OIDC start endpoint (top-level navigation so the
+ *  IdP redirect + SameSite=Lax state cookie round-trip works normally). */
+function startSso() {
+  authNotice.value = "";
+  ssoError.value = "";
+  window.location.assign(oidcStartUrl());
+}
+
+/** Map a server `login_error=<code>` to a human-readable message. Falls back
+ *  to the raw code so an unknown/forward-compatible reason stays visible. */
+function ssoErrorMessage(code: string): string {
+  const map: Record<string, string> = {
+    oidc_provider_error: t("ssoProviderError"),
+    oidc_state_mismatch: t("ssoStateError"),
+    oidc_state_invalid: t("ssoStateError"),
+    oidc_integrity_failed: t("ssoStateError"),
+    oidc_redirect_mismatch: t("ssoStateError"),
+    external_identity_conflict: t("ssoConflict"),
+    user_disabled: t("ssoDisabled"),
+    provisioning_disabled: t("ssoProvisioningDisabled"),
+    oidc_not_configured: t("ssoNotConfigured"),
+  };
+  return map[code] ?? code;
+}
+
 // ---------- boot ----------
 onMounted(async () => {
   // Handle deep-link tokens: /reset-password?token=... and /verify-email?token=...
@@ -1029,6 +1073,15 @@ onMounted(async () => {
       history.replaceState(null, "", location.pathname);
     }
   }
+  // Surface an OIDC callback failure (server redirects back with
+  // `?login_error=<code>`) and clear the query param so a reload does not
+  // show a stale error. (Matches the deep-link handling that also clears the
+  // query string on a top-level landing.)
+  const urlError = new URLSearchParams(location.search).get("login_error");
+  if (urlError) {
+    ssoError.value = urlError;
+    history.replaceState(null, "", location.pathname);
+  }
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       if (showCreate.value) showCreate.value = false;
@@ -1046,6 +1099,14 @@ onMounted(async () => {
     authenticated.value = false;
     ready.value = true;
   }
+  // Best-effort: learn the auth policy to shape the sign-in page. Never fails
+  // the boot — if it errors the page falls back to the local form defaults.
+  // The `ssoForced` computed then drives the pure-OIDC (SSO-only) panel.
+  try {
+    authPolicy.value = await api.authConfig();
+  } catch {
+    /* keep authPolicy null -> local-form default */
+  }
 });
 const refreshTimer = window.setInterval(() => {
   if (!authenticated.value) return;
@@ -1058,11 +1119,36 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 <template>
   <!-- ============ AUTH ============ -->
   <main v-if="!authenticated" class="auth-page">
-    <form class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
+    <!-- Pure-OIDC deployment (auth_mode === "oidc"): only the SSO affordance. -->
+    <div v-if="ssoForced" class="auth-panel">
+      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
+      <h1>{{ t('loginTitle') }}</h1>
+      <p v-if="!ssoError" class="auth-hint">{{ t('ssoHint') }}</p>
+      <div v-if="ssoError" class="auth-notice auth-error">{{ ssoErrorMessage(ssoError) }}</div>
+      <button class="primary-button sso-button" type="button" @click="startSso">
+        <span class="sso-label">{{ t('ssoAction') }} · {{ ssoProviderName }}</span><ArrowRight :size="16" />
+      </button>
+    </div>
+
+    <!-- Hybrid / local mode: the conventional form, plus an SSO entry when the
+         deployment offers OIDC. Local fields are hidden when the server closes
+         local login (local_login_enabled = false). -->
+    <form v-else class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : t('resetTitle') }}</h1>
 
-      <template v-if="authMode === 'login' || authMode === 'bootstrap' || authMode === 'register'">
+      <!-- SSO shortcut (shown above the local form when offered). -->
+      <button v-if="showSso && !ssoForced" class="secondary-button sso-button" type="button" @click="startSso">
+        <span class="sso-label">{{ t('ssoAction') }} · {{ ssoProviderName }}</span>
+      </button>
+      <template v-if="showSso && !ssoForced && localAuthAvailable && (authMode === 'login' || authMode === 'bootstrap' || authMode === 'register')">
+        <div class="auth-divider" role="separator"><span>{{ t('ssoOrLocal') }}</span></div>
+      </template>
+
+      <div v-if="ssoError" class="auth-notice auth-error">{{ ssoErrorMessage(ssoError) }}</div>
+
+      <!-- Local credential entry (hidden in pure-SSO and when local disabled). -->
+      <template v-if="showLocalForm">
         <label>{{ t('username') }}<input v-model="authForm.username" required autocomplete="username" minlength="3" /></label>
         <label v-if="authMode === 'register'">{{ t('email') }}<input v-model="authForm.email" type="email" autocomplete="email" /></label>
         <label v-if="authMode === 'register'" class="auth-hint">{{ t('registerHint') }}</label>
@@ -1070,6 +1156,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <label v-if="authMode === 'register'" class="auth-hint">{{ t('passwordMinHint') }}</label>
       </template>
 
+      <!-- Forgot-password flow (local email/username based). -->
       <template v-else-if="authMode === 'forgot'">
         <label>{{ t('username') }}<input v-model="authForm.username" required autocomplete="username" /></label>
         <p class="auth-hint">{{ t('forgotHint') }}</p>
@@ -1079,7 +1166,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
       </template>
 
-      <template v-else>
+      <!-- Reset-password flow. -->
+      <template v-else-if="authMode === 'reset'">
         <label>{{ t('username') }}<input :value="authForm.token" disabled /></label>
         <label>{{ t('resetNewPassword') }}<input v-model="authForm.newPassword" required minlength="12" type="password" /></label>
       </template>
@@ -1087,13 +1175,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div v-if="authNotice" class="auth-notice">{{ authNotice }}</div>
       <div v-if="verifyResult" class="auth-notice">{{ verifyResult === 'ok' ? t('verifyDone') : t('verifyFail') }}</div>
 
-      <button class="primary-button" type="submit">
+      <!-- Local actions (submit + mode switch) are only meaningful when a local
+           credential entry is present or a forgot/reset flow is active. -->
+      <button v-if="showLocalForm || authMode === 'forgot' || authMode === 'reset'" class="primary-button" type="submit">
         {{ authMode === 'login' ? t('login') : authMode === 'bootstrap' ? t('createAdmin') : authMode === 'register' ? t('register') : authMode === 'forgot' ? t('forgotSubmit') : t('resetSubmit') }}
       </button>
 
-      <button v-if="authMode === 'login'" class="secondary-button" type="button" @click="authMode='forgot'; authNotice=''">{{ t('forgotPassword') }}</button>
-      <button v-if="authMode === 'forgot' || authMode === 'reset'" class="secondary-button" type="button" @click="authMode='login'; authNotice=''">{{ t('backToLogin') }}</button>
-      <button v-if="authMode === 'login' || authMode === 'bootstrap' || authMode === 'register'" class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : authMode === 'bootstrap' ? 'register' : 'login'; authNotice=''; verifyResult=null">
+      <button v-if="showLocalForm && authMode === 'login'" class="secondary-button" type="button" @click="authMode='forgot'; authNotice=''; ssoError=''">{{ t('forgotPassword') }}</button>
+      <button v-if="(authMode === 'forgot' || authMode === 'reset') && localAuthAvailable" class="secondary-button" type="button" @click="authMode='login'; authNotice=''; ssoError=''">{{ t('backToLogin') }}</button>
+      <button v-if="showLocalForm && (authMode === 'login' || authMode === 'bootstrap' || authMode === 'register')" class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : authMode === 'bootstrap' ? 'register' : 'login'; authNotice=''; verifyResult=null">
         {{ authMode === 'login' ? t('initAdmin') : authMode === 'bootstrap' ? t('needAccount') : t('haveAccount') }}
       </button>
 
@@ -1115,6 +1205,25 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </button>
       </div>
     </form>
+
+    <!-- Theme switch for the pure-SSO landing panel. -->
+    <div v-if="ssoForced" class="surface-theme-switch auth-theme" role="group" :aria-label="t('theme')">
+      <button
+        v-for="mode in THEME_MODES"
+        :key="mode"
+        type="button"
+        class="surface-theme-option"
+        :class="{ 'is-active': themeMode === mode }"
+        :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+        :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
+        :aria-pressed="themeMode === mode"
+        @click="setTheme(mode)"
+      >
+        <Sun v-if="mode === 'light'" :size="15" />
+        <Moon v-else-if="mode === 'dark'" :size="15" />
+        <Monitor v-else :size="15" />
+      </button>
+    </div>
   </main>
 
   <!-- ============ APP ============ -->
