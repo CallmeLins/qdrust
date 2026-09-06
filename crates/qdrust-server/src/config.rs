@@ -48,6 +48,43 @@ pub struct PublicAuthConfig {
     pub header_auth_enabled: bool,
 }
 
+/// Deep OIDC provider settings consumed by the authorization-code + PKCE flow
+/// (Phase 1). The public `/auth/config` endpoint only ever sees the coarse
+/// `oidc_enabled` / `oidc_provider_name` booleans — never anything here.
+#[derive(Clone, Debug)]
+pub struct OidcConfig {
+    /// Discovery base URL, e.g. `https://auth.example.com/application/o/qdrust/`.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// Explicit redirect_uri override. When empty it is derived at request time
+    /// from the request host + base_path so one image serves any sub-path.
+    pub redirect_uri: String,
+    /// Space-separated scopes; defaults to `openid profile email`.
+    pub scopes: String,
+    /// Auto-provision a local user on first login.
+    pub auto_create_users: bool,
+    /// Role for auto-provisioned users that are not in an admin group.
+    pub default_role: String,
+    /// Comma-separated groups that map to the `admin` role.
+    pub admin_groups: Vec<String>,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            scopes: "openid profile email".into(),
+            auto_create_users: true,
+            default_role: "user".into(),
+            admin_groups: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: IpAddr,
@@ -86,6 +123,8 @@ pub struct Config {
     /// config (never inferred from the issuer URL). Empty unless OIDC enabled.
     pub oidc_provider_name: String,
     pub header_auth_enabled: bool,
+    /// Deep OIDC provider settings for the code+PKCE flow.
+    pub oidc: OidcConfig,
     pub config_file: Option<PathBuf>,
 }
 
@@ -159,6 +198,36 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_default(),
+            oidc: OidcConfig {
+                issuer: env::var("QDRUST_OIDC_ISSUER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
+                client_id: env::var("QDRUST_OIDC_CLIENT_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
+                client_secret: env::var("QDRUST_OIDC_CLIENT_SECRET")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
+                redirect_uri: env::var("QDRUST_OIDC_REDIRECT_URI")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
+                scopes: env::var("QDRUST_OIDC_SCOPES")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "openid profile email".into()),
+                auto_create_users: env::var("QDRUST_OIDC_AUTO_CREATE_USERS")
+                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(true),
+                default_role: env::var("QDRUST_OIDC_DEFAULT_ROLE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "user".into()),
+                admin_groups: csv_env("QDRUST_OIDC_ADMIN_GROUPS"),
+            },
             header_auth_enabled: env::var("QDRUST_HEADER_AUTH_ENABLED")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -263,6 +332,72 @@ impl Config {
                 .map(str::to_string)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| self.oidc_provider_name.clone()),
+            oidc: {
+                // Config-file values only apply when the env value is still the
+                // default/empty, matching the "env wins, file is fallback" rule.
+                let oidc = json.get("oidc").cloned().unwrap_or(serde_json::Value::Null);
+                let file_get = |key: &str| -> String {
+                    oidc.get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                OidcConfig {
+                    issuer: if self.oidc.issuer.is_empty() {
+                        file_get("issuer")
+                    } else {
+                        self.oidc.issuer.clone()
+                    },
+                    client_id: if self.oidc.client_id.is_empty() {
+                        file_get("client_id")
+                    } else {
+                        self.oidc.client_id.clone()
+                    },
+                    client_secret: if self.oidc.client_secret.is_empty() {
+                        file_get("client_secret")
+                    } else {
+                        self.oidc.client_secret.clone()
+                    },
+                    redirect_uri: if self.oidc.redirect_uri.is_empty() {
+                        file_get("redirect_uri")
+                    } else {
+                        self.oidc.redirect_uri.clone()
+                    },
+                    scopes: if self.oidc.scopes.is_empty() {
+                        let s = file_get("scopes");
+                        if s.is_empty() {
+                            "openid profile email".into()
+                        } else {
+                            s
+                        }
+                    } else {
+                        self.oidc.scopes.clone()
+                    },
+                    auto_create_users: oidc
+                        .get("auto_create_users")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(self.oidc.auto_create_users),
+                    default_role: if self.oidc.default_role.is_empty() {
+                        let s = file_get("default_role");
+                        if s.is_empty() { "user".into() } else { s }
+                    } else {
+                        self.oidc.default_role.clone()
+                    },
+                    admin_groups: if self.oidc.admin_groups.is_empty() {
+                        oidc.get("admin_groups")
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(str::to_string)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        self.oidc.admin_groups.clone()
+                    },
+                }
+            },
             header_auth_enabled: get_bool("header_auth_enabled")
                 .unwrap_or(self.header_auth_enabled),
             config_file: self.config_file,
@@ -316,6 +451,26 @@ impl Config {
                 self.auth_mode.as_str()
             );
         }
+        // When OIDC is on, the flow needs at least an issuer and client_id
+        // (client_secret is required for our confidential-client + PKCE setup).
+        if oidc_enabled {
+            anyhow::ensure!(
+                !self.oidc.issuer.trim().is_empty(),
+                "OIDC enabled but QDRUST_OIDC_ISSUER is not set"
+            );
+            anyhow::ensure!(
+                !self.oidc.client_id.trim().is_empty(),
+                "OIDC enabled but QDRUST_OIDC_CLIENT_ID is not set"
+            );
+            anyhow::ensure!(
+                !self.oidc.client_secret.trim().is_empty(),
+                "OIDC enabled but QDRUST_OIDC_CLIENT_SECRET is not set"
+            );
+        }
+        anyhow::ensure!(
+            matches!(self.oidc.default_role.as_str(), "admin" | "user"),
+            "QDRUST_OIDC_DEFAULT_ROLE must be admin or user"
+        );
         Ok(Self {
             default_timezone,
             base_path,
@@ -323,6 +478,18 @@ impl Config {
             ..self
         })
     }
+}
+
+/// Split a comma-separated env value into trimmed, non-empty parts.
+fn csv_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_env<T>(name: &str, default: T) -> Result<T>
@@ -397,6 +564,7 @@ mod tests {
             oidc_enabled: false,
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
+            oidc: OidcConfig::default(),
             config_file: None,
         }
         .validate()
@@ -432,6 +600,7 @@ mod tests {
             oidc_enabled: false,
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
+            oidc: OidcConfig::default(),
             config_file: None,
         }
         .validate();
@@ -475,6 +644,7 @@ mod tests {
             oidc_enabled: false,
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
+            oidc: OidcConfig::default(),
             config_file: None,
         }
         .validate()
@@ -514,6 +684,12 @@ mod tests {
             oidc_enabled: true,
             oidc_provider_name: "Authentik".to_string(),
             header_auth_enabled: false,
+            oidc: OidcConfig {
+                issuer: "https://auth.example.com/application/o/qdrust/".into(),
+                client_id: "qdrust".into(),
+                client_secret: "secret".into(),
+                ..OidcConfig::default()
+            },
             config_file: None,
         }
         .validate()
@@ -552,6 +728,7 @@ mod tests {
             oidc_enabled: false,
             oidc_provider_name: String::new(),
             header_auth_enabled: false,
+            oidc: OidcConfig::default(),
             config_file: None,
         }
         .validate();
@@ -586,6 +763,12 @@ mod tests {
             oidc_enabled: true,
             oidc_provider_name: "Keycloak".to_string(),
             header_auth_enabled: false,
+            oidc: OidcConfig {
+                issuer: "https://auth.example.com/realms/qdrust".into(),
+                client_id: "qdrust".into(),
+                client_secret: "secret".into(),
+                ..OidcConfig::default()
+            },
             config_file: None,
         }
         .validate()

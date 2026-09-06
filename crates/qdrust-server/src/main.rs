@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             login_rate_limit_attempts: config.login_rate_limit_attempts,
             login_rate_limit_window: config.login_rate_limit_window,
             public: config.public_auth_config(),
+            oidc: config.oidc.clone(),
         },
         run_events,
         subscription_events,

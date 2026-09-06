@@ -7,14 +7,14 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        FromRef, FromRequest, Path, Query, Request as AxumRequest, State, WebSocketUpgrade,
-        rejection::JsonRejection, ws::Message,
+        FromRef, FromRequest, OriginalUri, Path, Query, Request as AxumRequest, State,
+        WebSocketUpgrade, rejection::JsonRejection, ws::Message,
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{COOKIE, HeaderName, SET_COOKIE},
     },
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{any, delete, get, get_service},
 };
 use qdrust_core::plugin::{
@@ -31,19 +31,21 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::auth::LoginRateLimiter;
 use crate::auth::{hash_password, token_hash, verify_password};
+use crate::oidc;
 use crate::{
     model::{
         AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession, BatchTaskOperation,
         BatchTaskResult, ChangePassword, ClearLogs, CreateNotificationAction,
         CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask,
-        CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ForgotPassword,
-        ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetSiteSetting, UpdateNotificationChannel, UpdatePluginManifest,
-        UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
-        VerifyEmail,
+        CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentityClaim,
+        ForgotPassword, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
+        RegisterUser, ResetPassword, SetSiteSetting, UpdateNotificationChannel,
+        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
+use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier, reqwest::async_http_client};
 
 const SESSION_COOKIE: &str = "qd_session";
 const CSRF_COOKIE: &str = "qd_csrf";
@@ -69,6 +71,8 @@ pub struct AuthConfig {
     /// Public login-policy snapshot (no secrets), surfaced by
     /// `GET /api/v1/auth/config` and used to gate local entry points.
     pub public: crate::config::PublicAuthConfig,
+    /// Deep OIDC provider settings for the authorization-code + PKCE flow.
+    pub oidc: crate::config::OidcConfig,
 }
 
 impl Default for AuthConfig {
@@ -85,6 +89,7 @@ impl Default for AuthConfig {
                 oidc_provider_name: String::new(),
                 header_auth_enabled: false,
             },
+            oidc: crate::config::OidcConfig::default(),
         }
     }
 }
@@ -107,6 +112,9 @@ struct AppState {
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
+    /// The URL sub-path the site is served under (e.g. "/qd" or ""). Threaded
+    /// into handlers so OIDC redirect URIs can be derived consistently.
+    base_path: String,
 }
 
 impl FromRef<AppState> for Store {
@@ -181,6 +189,8 @@ pub fn router_with_auth(
         .route("/api/v1/auth/login", axum::routing::post(login))
         .route("/api/v1/auth/session", get(current_session))
         .route("/api/v1/auth/logout", axum::routing::post(logout))
+        .route("/api/v1/auth/oidc/start", get(oidc_login_start))
+        .route("/api/v1/auth/oidc/callback", get(oidc_login_callback))
         .route(
             "/api/v1/auth/password",
             axum::routing::post(change_password),
@@ -347,6 +357,7 @@ pub fn router_with_auth(
         settings,
         http_client,
         session_cache,
+        base_path: base_path.to_string(),
     };
 
     // Keep liveness/readiness probes at the root (external health checks and
@@ -400,6 +411,220 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         "oidc_provider_name": public.oidc_provider_name,
         "header_auth_enabled": public.header_auth_enabled,
     }))
+}
+
+/// `GET /api/v1/auth/oidc/start`
+///
+/// Kicks off the OIDC Authorization Code + PKCE flow: discovers the provider,
+/// builds the authorization URL with a deterministic PKCE verifier/nonce derived
+/// from a freshly generated `state`, persists a single-use DB row keyed on
+/// `sha256(state)`, and redirects the browser to the IdP. A short-lived
+/// `SameSite=Lax` cookie carrying the raw `state` is set so the callback can
+/// cross-check it.
+async fn oidc_login_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response, ApiError> {
+    let oidc = &state.auth.oidc;
+    if oidc.issuer.trim().is_empty() {
+        return Err(ApiError::NotFound(
+            "oidc_not_configured",
+            "OIDC login is not configured",
+        ));
+    }
+
+    let redirect_uri = oidc::derive_redirect_uri(&state.base_path, &headers, &uri);
+    let client = oidc::build_client(oidc, &redirect_uri).await?;
+
+    let raw_state = oidc::generate_state();
+    let verifier = oidc::derive_pkce_verifier(&raw_state, &oidc.client_secret);
+    let nonce = oidc::derive_nonce(&raw_state, &oidc.client_secret);
+    let state_h = oidc::state_hash(&raw_state);
+    let nonce_h = oidc::nonce_hash(&nonce);
+    let verifier_h = oidc::verifier_hash(&verifier);
+    let scopes = oidc::parse_scopes(&oidc.scopes);
+
+    let authorize_url = oidc::build_authorize_url(&client, &raw_state, &nonce, &verifier, &scopes);
+
+    let expires_at = chrono::Utc::now().timestamp() + oidc::OIDC_STATE_TTL_SECS;
+    state
+        .store
+        .insert_oidc_login_state(&state_h, &nonce_h, &verifier_h, &redirect_uri, expires_at)
+        .await?;
+
+    let mut response = Redirect::to(&authorize_url).into_response();
+    let secure_suffix = if state.auth.cookie_secure {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie_value = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
+        oidc::OIDC_STATE_COOKIE,
+        raw_state,
+        oidc::OIDC_STATE_TTL_SECS,
+        secure_suffix
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie_value) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    Ok(response)
+}
+
+/// `GET /api/v1/auth/oidc/callback`
+///
+/// The IdP redirects back here with `code`/`state`. Validates the single-use
+/// state, recomputes and verifies the PKCE verifier + nonce, exchanges the code,
+/// verifies the ID token (issuer/audience/nonce/exp/signature), resolves or
+/// provisions the local user, then issues the normal qdrust session as a
+/// top-level redirect back to the app. All failure modes redirect to a
+/// failure page without ever creating a session.
+async fn oidc_login_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let oidc = &state.auth.oidc;
+    if oidc.issuer.trim().is_empty() {
+        return Err(ApiError::NotFound(
+            "oidc_not_configured",
+            "OIDC login is not configured",
+        ));
+    }
+
+    // The IdP reported an error (denied, access_denied, ...): fail without a session.
+    if let Some(err) = params.get("error") {
+        tracing::warn!(error = %err, "oidc callback received provider error");
+        return Ok(oidc_callback_redirect(&state, Some("oidc_provider_error")));
+    }
+
+    let code = match params.get("code") {
+        Some(c) => c,
+        None => return Ok(oidc_callback_redirect(&state, Some("oidc_missing_code"))),
+    };
+    let state_param = match params.get("state") {
+        Some(s) => s,
+        None => return Ok(oidc_callback_redirect(&state, Some("oidc_missing_state"))),
+    };
+
+    // Cross-check the browser state cookie against the query param (defense in depth).
+    match cookie(&headers, oidc::OIDC_STATE_COOKIE) {
+        Some(cookie_state) if cookie_state == *state_param => {}
+        Some(_) => return Ok(oidc_callback_redirect(&state, Some("oidc_state_mismatch"))),
+        None => {
+            return Ok(oidc_callback_redirect(
+                &state,
+                Some("oidc_state_cookie_missing"),
+            ));
+        }
+    }
+
+    let state_h = oidc::state_hash(state_param);
+    let stored = match state.store.take_oidc_login_state(&state_h).await? {
+        Some(s) => s,
+        None => return Ok(oidc_callback_redirect(&state, Some("oidc_state_invalid"))),
+    };
+
+    let verifier = oidc::derive_pkce_verifier(state_param, &oidc.client_secret);
+    let nonce = oidc::derive_nonce(state_param, &oidc.client_secret);
+    if oidc::verifier_hash(&verifier) != stored.pkce_verifier_encrypted
+        || oidc::nonce_hash(&nonce) != stored.nonce_hash
+    {
+        return Ok(oidc_callback_redirect(
+            &state,
+            Some("oidc_integrity_failed"),
+        ));
+    }
+
+    let redirect_uri = oidc::derive_redirect_uri(&state.base_path, &headers, &uri);
+    if redirect_uri != stored.redirect_uri {
+        return Ok(oidc_callback_redirect(
+            &state,
+            Some("oidc_redirect_mismatch"),
+        ));
+    }
+
+    let client = oidc::build_client(oidc, &redirect_uri).await?;
+    let verifier_obj = PkceCodeVerifier::new(verifier);
+    let token = client
+        .exchange_code(AuthorizationCode::new(code.clone()))
+        .set_pkce_verifier(verifier_obj)
+        .request_async(async_http_client)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("oidc token exchange failed: {e}")))?;
+
+    let id_token = token.extra_fields().id_token().ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "oidc: identity provider returned no id_token"
+        ))
+    })?;
+    let nonce_obj = Nonce::new(nonce);
+    let claims = id_token
+        .claims(&client.id_token_verifier(), &nonce_obj)
+        .map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!("oidc id_token verification failed: {e}"))
+        })?;
+
+    let subject = claims.subject().as_str().to_string();
+    let email = claims.email().map(|e| e.as_str().to_string());
+    let username_hint = claims.preferred_username().map(|u| u.as_str().to_string());
+
+    let claim = ExternalIdentityClaim {
+        provider: "oidc".to_string(),
+        issuer: oidc.issuer.clone(),
+        subject,
+        email,
+        username_hint,
+        groups: vec![],
+    };
+    let admin_groups: Vec<&str> = oidc.admin_groups.iter().map(|s| s.as_str()).collect();
+    let resolution = state
+        .store
+        .resolve_external_identity(
+            &claim,
+            oidc.auto_create_users,
+            &oidc.default_role,
+            &admin_groups,
+        )
+        .await?;
+
+    match resolution.user {
+        Some(user) => {
+            // Reuse the normal session issuance, then convert the JSON response
+            // into a top-level redirect carrying the same session cookies.
+            let session_response = issue_session_response(&state, user).await?;
+            let mut response = oidc_callback_redirect(&state, None);
+            for value in session_response.headers().get_all(SET_COOKIE) {
+                response.headers_mut().append(SET_COOKIE, value.clone());
+            }
+            Ok(response)
+        }
+        None => {
+            let reason = resolution
+                .refusal
+                .unwrap_or_else(|| "oidc_refused".to_string());
+            tracing::warn!(reason = %reason, "oidc login refused by identity resolution");
+            Ok(oidc_callback_redirect(&state, Some(&reason)))
+        }
+    }
+}
+
+/// Build the full-page redirect the browser ends up on after the OIDC callback.
+/// `None` error => success landing page (`{base}/`); `Some(code)` => failure page
+/// (`{base}/?login_error=<code>`).
+fn oidc_callback_redirect(state: &AppState, error: Option<&str>) -> Response {
+    let base = state.base_path.trim_end_matches('/');
+    let location = match error {
+        Some(code) => format!("{base}/?login_error={code}"),
+        None => format!("{base}/"),
+    };
+    let mut response = Redirect::to(&location).into_response();
+    // Always clear the short-lived OIDC state cookie on the callback response,
+    // whether login succeeded or failed.
+    oidc::append_clear_oidc_cookie(response.headers_mut(), state.auth.cookie_secure);
+    response
 }
 
 async fn bootstrap(

@@ -20,6 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+base64 = "0.22"
 subtle = "2"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "mysql", "migrate", "macros", "json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
@@ -31,6 +32,9 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 http-body-util = "0.1"
 redis = { version = "0.27", features = ["tokio-comp"] }
 futures = "0.3"
+# OIDC / OpenID Connect client (PKCE S256, discovery). Backed by reqwest for
+# outgoing HTTP (shared rustls stack). We never hand-roll JWT/JWKS validation.
+openidconnect = { version = "3", default-features = false, features = ["reqwest"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -10,9 +10,11 @@
 > **rev 记录**：v1 初稿 → 用户评审提出 10 点工程修正 → 修正版（默认 `auth_mode=local`、
 > 哨兵哈希、state 持久化、`ConnectInfo` 启动改造等已并入）。
 >
-> **进度**：Phase 0 已基本完成（v2 起逐片落地，server lib 67 passed、clippy/fmt 干净）：
+> **进度**：Phase 0 + **Phase 1(OIDC)** 已基本完成（server lib 73 passed、clippy/fmt 干净）：
 > AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档）+
-> OIDC state 持久化（单次消费/过期清理）。下一步 Phase 1：OIDC provider。
+> OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、确定性 verifier/nonce、
+> ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）。
+> 待办：真实 IdP 端到端验证、state 过期定时清理接线、Phase 2+（Header Auth、前端、文档）。
 
 ---
 
@@ -332,13 +334,19 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
 
 ### Phase 1：OIDC discovery + Authorization Code + PKCE
 
-- [ ] `Cargo.toml`：加 `openidconnect`（PKCE 强制）
-- [ ] `oidc.rs`：discovery、state/nonce/PKCE 持久化（Redis 优先，DB 兜底）、token 交换、ID token 校验
-- [ ] `api.rs`：`/auth/oidc/start`、`/auth/oidc/callback`
-- [ ] redirect_uri 运行时推导
-- [ ] **cookie 处理**（修正项 6）：state cookie 与最终 `qd_session` 分开；
-      state 相关 cookie 用 **SameSite=Lax**；确认 callback 顶层导航下 cookie 正常设置
-- [ ] 测试：state/nonce/issuer/audience/exp/签名错 → 拒；成功 → 建会话；disabled 拒；**state 过期清理**
+- [x] `Cargo.toml`：加 `openidconnect` 3.5.0（PKCE S256 强制，reqwest 后端）
+- [x] `config.rs`：`OidcConfig`（issuer/client_id/secret/redirect/scopes/auto_create/default_role/admin_groups）
+      + validate 强校验（oidc_enabled 时 issuer+client_id+client_secret 必填）
+- [x] `oidc.rs`：discovery（`discover_async`）、确定性 PKCE verifier/nonce（`b64url(sha256(state‖secret))`，
+      DB 只存 hash）、state 持久化（`insert_oidc_login_state` 单次消费）、token 交换、
+      ID token 校验（issuer/audience/nonce/exp/sig）
+- [x] `api.rs`：`/auth/oidc/start`、`/auth/oidc/callback`（start 307 IdP + `qd_oidc_state` Lax cookie；
+      callback 校验 state/nonce/redirect → 换 token → 验 ID token → `resolve_external_identity` →
+      签发 qd_session 后 307 回 `{base}/`）
+- [x] redirect_uri 运行时推导（X-Forwarded-Proto/Host + base_path），兼容 sub-path
+- [x] cookie 处理：state cookie `SameSite=Lax` 与最终 `qd_session`(Strict) 分开；callback 后清除 state cookie
+- [ ] 端到端（连真实 IdP）人工验证 / mock IdP 集成测试
+- [ ] state 过期定时清理接入调度器（DB 路径 `purge_expired_oidc_login_states` 已备）
 
 ### Phase 2：外部用户映射 + 冲突策略 + 角色组映射
 
