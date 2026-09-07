@@ -451,7 +451,7 @@ async fn oidc_login_start(
         ));
     }
 
-    let redirect_uri = oidc::derive_redirect_uri(&state.base_path, &headers, &uri);
+    let redirect_uri = oidc::effective_redirect_uri(oidc, &state.base_path, &headers, &uri);
     let built = oidc::build_client(oidc, &redirect_uri).await?;
     let client = &built.client;
 
@@ -556,7 +556,7 @@ async fn oidc_login_callback(
         ));
     }
 
-    let redirect_uri = oidc::derive_redirect_uri(&state.base_path, &headers, &uri);
+    let redirect_uri = oidc::effective_redirect_uri(oidc, &state.base_path, &headers, &uri);
     if redirect_uri != stored.redirect_uri {
         return Ok(oidc_callback_redirect(
             &state,

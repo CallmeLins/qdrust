@@ -170,6 +170,12 @@ pub fn groups_from_id_token(id_token: &str, claim: &str) -> Vec<String> {
 /// scenario) and falls back to the request's own scheme/host. The path is
 /// `{base_path}/api/v1/auth/oidc/callback`, so the same value is recomputed at
 /// callback time and must match what the IdP was configured with.
+///
+/// Note: for an origin-form HTTP request with no `X-Forwarded-*` headers the
+/// request's own scheme/authority are unavailable (the HTTP/1.1 request line
+/// carries only a path), so this falls back to `https://localhost/...`. Direct
+/// HTTP deployments (no reverse proxy) should set the explicit
+/// `QDRUST_OIDC_REDIRECT_URI` override instead (see [`effective_redirect_uri`]).
 pub fn derive_redirect_uri(base_path: &str, headers: &HeaderMap, uri: &Uri) -> String {
     let scheme = headers
         .get("x-forwarded-proto")
@@ -184,6 +190,31 @@ pub fn derive_redirect_uri(base_path: &str, headers: &HeaderMap, uri: &Uri) -> S
         .unwrap_or("localhost");
     let base = base_path.trim_end_matches('/');
     format!("{scheme}://{host}{base}{OIDC_CALLBACK_PATH}")
+}
+
+/// Resolve the redirect_uri a given request should use.
+///
+/// If the operator configured an explicit `redirect_uri` (`QDRUST_OIDC_
+/// REDIRECT_URI`) it is authoritative and returned verbatim. Otherwise the
+/// value is derived at request time from the request host + base path (see
+/// [`derive_redirect_uri`]) so a single image serves any sub-path behind a
+/// trusted reverse proxy.
+///
+/// Both the start and callback handlers must call this so they agree on the
+/// same redirect_uri (a mismatch would fail the callback's `redirect_uri`
+/// check).
+pub fn effective_redirect_uri(
+    oidc: &OidcConfig,
+    base_path: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> String {
+    let configured = oidc.redirect_uri.trim();
+    if !configured.is_empty() {
+        configured.to_string()
+    } else {
+        derive_redirect_uri(base_path, headers, uri)
+    }
 }
 
 /// Result of [`build_client`]: the discovery-configured [`OidcClient`] plus the
@@ -235,13 +266,30 @@ pub fn build_authorize_url(
     let challenge = PkceCodeChallenge::from_code_verifier_sha256(&verifier_obj);
     let raw_state_owned = raw_state.to_string();
     let nonce_owned = nonce.to_string();
+    // The openidconnect crate always adds the `openid` scope itself (the client
+    // is built with `use_openid_scope`). Passing it here too would emit a
+    // duplicate `scope=openid openid ...`; strip it and dedupe the rest so the
+    // authorization URL carries each scope exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let extra: Vec<Scope> = scopes
+        .iter()
+        .filter(|s| {
+            let name = s.to_string();
+            if name == "openid" || seen.contains(&name) {
+                return false;
+            }
+            seen.push(name);
+            true
+        })
+        .cloned()
+        .collect();
     let (authorize_url, _, _) = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
             move || CsrfToken::new(raw_state_owned.clone()),
             move || Nonce::new(nonce_owned.clone()),
         )
-        .add_scopes(scopes.to_vec())
+        .add_scopes(extra)
         .set_pkce_challenge(challenge)
         .url();
     authorize_url.to_string()
@@ -307,6 +355,37 @@ mod tests {
         let uri = Uri::from_static("http://internal:8080/api/v1/auth/oidc/start");
         let got = derive_redirect_uri("", &headers, &uri);
         assert_eq!(got, "http://internal:8080/api/v1/auth/oidc/callback");
+    }
+
+    #[test]
+    fn effective_redirect_uri_prefers_configured_override() {
+        let headers = HeaderMap::new();
+        let uri = Uri::from_static("/api/v1/auth/oidc/start");
+        // Configured override wins verbatim over the runtime derivation.
+        let oidc = OidcConfig {
+            redirect_uri: "https://sso.example.com/custom/callback".into(),
+            ..OidcConfig::default()
+        };
+        assert_eq!(
+            effective_redirect_uri(&oidc, "", &headers, &uri),
+            "https://sso.example.com/custom/callback"
+        );
+    }
+
+    #[test]
+    fn effective_redirect_uri_derives_when_no_override() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("auth.example.com"),
+        );
+        let uri = Uri::from_static("/qd/api/v1/auth/oidc/start");
+        let oidc = OidcConfig::default(); // redirect_uri empty
+        assert_eq!(
+            effective_redirect_uri(&oidc, "/qd", &headers, &uri),
+            "https://auth.example.com/qd/api/v1/auth/oidc/callback"
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@
 > **rev 记录**：v1 初稿 → 用户评审提出 10 点工程修正 → 修正版（默认 `auth_mode=local`、
 > 哨兵哈希、state 持久化、`ConnectInfo` 启动改造等已并入）。
 >
-> **进度**：Phase 0–5 **全部完成**
-> （server lib 91 passed、clippy/fmt 干净；webui vue-tsc/vitest 16 passed/build 通过）：
+> **进度**：Phase 0–6 **全部完成**
+> （server lib 97 passed、clippy/fmt 干净；webui vue-tsc/vitest 16 passed/build 通过）：
 > AuthMode+`/auth/config`+入口守卫 + 双后端迁移 + 外部身份 store 层（冲突拒并 + 哨兵建档，
 > role 首登写死不随组刷新）+ OIDC state 持久化 + **OIDC 完整授权码+PKCE 流程**（start/callback、
 > 确定性 verifier/nonce、ID token 校验、redirect_uri 运行时推导、state cookie Lax 与 qd_session 分开）
@@ -20,9 +20,14 @@
 > + **OIDC groups claim 映射**（`oidc.groups_claim` 默认 `groups`，从已验签 ID token 提取
 > 组成员并喂入首登角色解析，命中 `admin_groups` → admin）
 > + **OIDC state 过期定时清理**（已接入调度器小时级维护）。
-> 待办（收尾）：真实 IdP 端到端人工验证。
-
-> 待办：真实 IdP 端到端验证。
+>
+> **端到端验证**：已用本地 mock IdP（`scripts/mock-oidc-idp/`，基于 node-oidc-provider 的真实
+> discovery/签名/登录+consent 页面）跑通 admin/user 两条角色路径，并由此暴露并修复两处代码缺陷：
+> ① `QDRUST_OIDC_REDIRECT_URI` 显式覆盖此前被 start/callback 两处忽略（改用
+> `effective_redirect_uri`：配了覆盖用覆盖，否则按请求推导）；② 授权 URL 里 `openid` scope 因
+> openidconnect 自动添加 + qdrust 自带而重复（`build_authorize_url` 现在剥掉 crate 已保证的
+> `openid` 并去重）。真实第三方 IdP（Authentik/Keycloak/Pocket ID 等）部署环境的最终确认仍建议
+> 各做一次人工验证。
 
 ---
 
@@ -353,8 +358,10 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       签发 qd_session 后 307 回 `{base}/`）
 - [x] redirect_uri 运行时推导（X-Forwarded-Proto/Host + base_path），兼容 sub-path
 - [x] cookie 处理：state cookie `SameSite=Lax` 与最终 `qd_session`(Strict) 分开；callback 后清除 state cookie
-- [ ] 端到端（连真实 IdP）人工验证 / mock IdP 集成测试
-- [ ] state 过期定时清理接入调度器（DB 路径 `purge_expired_oidc_login_states` 已备）
+- [x] state 过期定时清理接入调度器（DB 路径 `purge_expired_oidc_login_states` 已备）
+      （scheduler.rs 维护循环第 ~122 行已接入，与 purge_expired_sessions 并列，小时级清理）
+- [~] 端到端验证：本地 node-oidc-provider mock IdP 跑通（`scripts/mock-oidc-idp/`，
+      `e2e.mjs admin|user`，见 rev 区）；真实第三方 IdP 环境仍建议各做一次人工验证
 
 ### Phase 2：外部用户映射 + 冲突策略 + 角色组映射
 
@@ -430,6 +437,22 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       `AsyncHttpClient`**（`discover_async(issuer, &http)` 与 `request_async(&http)` 传引用，
       禁跟随重定向防 SSRF）。`build_client` 改返回 `BuiltClient{client,http}` 结构。
       `groups_from_id_token` 依赖的 `IdToken::to_string()` 在 4.x 仍在，无需改动。
+
+**Phase 6 补充（本地 mock IdP 端到端实测暴露的两处缺陷修复）**：
+- [x] **`QDRUST_OIDC_REDIRECT_URI` 显式覆盖此前从未生效**：start（原 api.rs ~454）与 callback
+      （~559）都无条件调 `derive_redirect_uri`，忽略配置的 `oidc.redirect_uri`。直接 HTTP 访问
+      （无反代注入 `X-Forwarded-*`）时推导回落为 `https://localhost/...` 导致与 IdP 登记的回调
+      不匹配、登录必挂。修复：新增 `oidc::effective_redirect_uri(oidc, base_path, headers, uri)`
+      —— 配置了覆盖则原样返回，否则按请求推导；start/callback 两处统一改用它（保持两处值一致，
+      通过 callback 的 redirect_uri 一致性校验）。配套单测
+      `effective_redirect_uri_prefers_configured_override` / `_derives_when_no_override`。
+- [x] **授权 URL 中 `openid` scope 重复**：openidconnect 4 的 `CoreClient` 默认
+      `use_openid_scope=true` 会自动加 `openid`，而 qdrust 自带 scopes 也含 `openid`
+      （默认 `"openid profile email"`），`add_scopes` 拼接后出现 `scope=openid openid profile email`。
+      修复：`build_authorize_url` 剥掉 crate 已保证的 `openid` 并对剩余去重。
+- 实测结论：`scripts/mock-oidc-idp/`（node-oidc-provider）下 `e2e.mjs admin` → 建档
+  `role=admin`、`e2e.mjs user` → 建档 `role=user`；ID token 须含 `email`/`groups`
+  （mock 关 `conformIdTokenClaims` 使其进 ID token，非 userinfo）。
 
 ---
 

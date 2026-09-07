@@ -1,0 +1,13 @@
+{
+  "name": "qdrust-mock-oidc-idp",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Local development OpenID Connect provider used to manually verify qdrust-server's OIDC login flow (Authorization Code + PKCE). See README.md in this directory.",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "oidc-provider": "^9.12.2"
+  }
+}
