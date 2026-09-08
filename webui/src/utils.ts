@@ -19,12 +19,26 @@ export interface AuthPolicy {
   oidc_enabled: boolean;
   oidc_provider_name: string;
   header_auth_enabled: boolean;
+  oidc_logout_url: string;
+  oidc_post_logout_redirect_uri: string;
 }
 
 /** True when the deployment offers SSO through OIDC (an SSO button should be
  *  shown on the sign-in page). */
 export function ssoAvailable(policy: AuthPolicy | null): boolean {
   return !!policy?.oidc_enabled;
+}
+
+/** The IdP end-session URL to bounce the browser to after local logout, or ""
+ *  when the deployment does not configure OIDC single logout. Appends the
+ *  optional `post_logout_redirect_uri` so the user returns to this app. */
+export function oidcLogoutUrl(policy: AuthPolicy | null): string {
+  const base = policy?.oidc_logout_url?.trim();
+  if (!base) return "";
+  const post = policy?.oidc_post_logout_redirect_uri?.trim();
+  if (!post) return base;
+  const sep = base.includes("?") ? "&" : "?";
+  return `${base}${sep}post_logout_redirect_uri=${encodeURIComponent(post)}`;
 }
 
 /** True when the username/password entry points are enabled on the server and

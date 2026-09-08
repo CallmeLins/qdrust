@@ -46,6 +46,11 @@ pub struct PublicAuthConfig {
     /// Display name shown on the SSO button. Empty unless OIDC is enabled.
     pub oidc_provider_name: String,
     pub header_auth_enabled: bool,
+    /// Optional IdP end-session URL so the WebUI can end the external session
+    /// on "log out". Empty when OIDC single-logout is not configured.
+    pub oidc_logout_url: String,
+    /// Optional `post_logout_redirect_uri` to return to after IdP logout.
+    pub oidc_post_logout_redirect_uri: String,
 }
 
 /// Deep OIDC provider settings consumed by the authorization-code + PKCE flow
@@ -72,6 +77,13 @@ pub struct OidcConfig {
     /// specific (authentik: `groups`; Keycloak often requires a mapper; many
     /// Issuer return it in userinfo instead). Defaults to `groups`.
     pub groups_claim: String,
+    /// Optional IdP end-session (single-logout) endpoint. When set, the WebUI
+    /// "log out" also navigates the browser here to end the IdP session.
+    pub logout_url: String,
+    /// Optional redirect after IdP single logout (the OIDC
+    /// `post_logout_redirect_uri`). Only sent when configured, since IdPs
+    /// require it to be registered on the client.
+    pub post_logout_redirect_uri: String,
 }
 
 impl Default for OidcConfig {
@@ -86,6 +98,8 @@ impl Default for OidcConfig {
             default_role: "user".into(),
             admin_groups: Vec::new(),
             groups_claim: "groups".into(),
+            logout_url: String::new(),
+            post_logout_redirect_uri: String::new(),
         }
     }
 }
@@ -202,6 +216,8 @@ impl Config {
             oidc_enabled: self.oidc_enabled,
             oidc_provider_name: self.oidc_provider_name.clone(),
             header_auth_enabled: self.header_auth_enabled,
+            oidc_logout_url: self.oidc.logout_url.clone(),
+            oidc_post_logout_redirect_uri: self.oidc.post_logout_redirect_uri.clone(),
         }
     }
 }
@@ -291,6 +307,14 @@ impl Config {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "groups".into()),
+                logout_url: env::var("QDRUST_OIDC_LOGOUT_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
+                post_logout_redirect_uri: env::var("QDRUST_OIDC_POST_LOGOUT_REDIRECT_URI")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default(),
             },
             header_auth_enabled: env::var("QDRUST_HEADER_AUTH_ENABLED")
                 .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -504,6 +528,16 @@ impl Config {
                         if s.is_empty() { "groups".into() } else { s }
                     } else {
                         self.oidc.groups_claim.clone()
+                    },
+                    logout_url: if self.oidc.logout_url.is_empty() {
+                        file_get("logout_url")
+                    } else {
+                        self.oidc.logout_url.clone()
+                    },
+                    post_logout_redirect_uri: if self.oidc.post_logout_redirect_uri.is_empty() {
+                        file_get("post_logout_redirect_uri")
+                    } else {
+                        self.oidc.post_logout_redirect_uri.clone()
                     },
                 }
             },

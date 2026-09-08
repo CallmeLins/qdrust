@@ -7,7 +7,7 @@ import {
 } from "@lucide/vue";
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
-import { formatRunTime, localLoginAvailable, ssoAvailable, ssoOnly } from "./utils";
+import { formatRunTime, localLoginAvailable, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -170,9 +170,37 @@ interface TaskForm {
   timezone: string;
   variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "Asia/Shanghai", variables: [] });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
+
+// Full IANA timezone list for the task scheduling select. `Intl.supportedValuesOf`
+// is available in modern browsers; fall back to a curated subset where missing
+// so the field still offers sensible choices without a hard-coded single option.
+const ALL_TIMEZONES: string[] = [
+  "Africa/Cairo","Africa/Johannesburg","Africa/Lagos","Africa/Nairobi","America/Argentina/Buenos_Aires",
+  "America/Bogota","America/Caracas","America/Chicago","America/Denver","America/Halifax",
+  "America/Lima","America/Los_Angeles","America/Mexico_City","America/New_York","America/Phoenix",
+  "America/Santiago","America/Sao_Paulo","America/Toronto","America/Vancouver","Asia/Almaty",
+  "Asia/Bangkok","Asia/Dhaka","Asia/Dubai","Asia/Ho_Chi_Minh","Asia/Hong_Kong","Asia/Jakarta",
+  "Asia/Jerusalem","Asia/Karachi","Asia/Kolkata","Asia/Kuala_Lumpur","Asia/Manila","Asia/Seoul",
+  "Asia/Shanghai","Asia/Singapore","Asia/Taipei","Asia/Tokyo","Asia/Yangon","Australia/Adelaide",
+  "Australia/Brisbane","Australia/Melbourne","Australia/Perth","Australia/Sydney","Europe/Amsterdam",
+  "Europe/Berlin","Europe/Brussels","Europe/Dublin","Europe/Helsinki","Europe/Lisbon","Europe/London",
+  "Europe/Madrid","Europe/Moscow","Europe/Oslo","Europe/Paris","Europe/Prague","Europe/Rome",
+  "Europe/Stockholm","Europe/Vienna","Europe/Warsaw","Europe/Zurich","Pacific/Auckland",
+  "Pacific/Honolulu","Pacific/Port_Moresby","UTC",
+];
+const timezoneOptions: string[] = (() => {
+  if (typeof Intl !== "undefined" && typeof (Intl as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf === "function") {
+    try {
+      return (Intl as { supportedValuesOf: (k: string) => string[] }).supportedValuesOf("timeZone");
+    } catch {
+      /* fall through */
+    }
+  }
+  return ALL_TIMEZONES;
+})();
 
 function variablesToRows(value: unknown): { name: string; value: string }[] {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -1023,9 +1051,18 @@ async function logout(silent = false) {
   currentUser.value = null;
   tasks.value = [];
   runsByTask.value = {};
-  if (!silent) notify(t("logout"));
   authMode.value = "login";
   Object.assign(authForm, { username: "", password: "" });
+  // OIDC single logout: once the local session is gone, also end the external
+  // IdP session with a top-level navigation (explicit user logout only). The
+  // configured post_logout_redirect_uri (if any) brings the user back to this
+  // app's now-logged-out page.
+  const idpLogout = silent ? "" : oidcLogoutUrl(authPolicy.value);
+  if (idpLogout) {
+    window.location.assign(idpLogout);
+    return;
+  }
+  if (!silent) notify(t("logout"));
 }
 
 // ---------- external IdP (SSO) ----------
@@ -1035,6 +1072,20 @@ function startSso() {
   authNotice.value = "";
   ssoError.value = "";
   window.location.assign(oidcStartUrl());
+}
+
+// In a pure-OIDC deployment (auth_mode === "oidc") the only way in is the
+// external IdP, so on landing unauthenticated we jump straight to it rather
+// than showing an empty login card that just waits for a click. We never
+// auto-redirect when the IdP bounced us back with a `login_error` (that would
+// loop): the SSO-only panel remains as the error/retry landing page.
+function maybeAutoStartSso() {
+  if (authenticated.value) return;
+  if (!ssoForced.value) return;
+  // Do not hijack a page that is reporting an earlier SSO failure.
+  const url = new URLSearchParams(location.search).get("login_error");
+  if (url) return;
+  startSso();
 }
 
 /** Map a server `login_error=<code>` to a human-readable message. Falls back
@@ -1094,7 +1145,15 @@ onMounted(async () => {
     const session = await api.session();
     currentUser.value = session.user;
     authenticated.value = true;
-    await Promise.all([loadTasks(), api.ready().then(() => { ready.value = true; })]);
+    // A live session proves the backend is reachable -> the "service ok"
+    // indicator is on without a separate readiness round-trip.
+    ready.value = true;
+    // Best-effort load of the task list. Do NOT gate the authenticated boot on
+    // liveness/readiness probes: under a sub-path deployment the backend keeps
+    // `/ready`/`/health` at the bare root (Docker HEALTHCHECK), so a request to
+    // them may 404/502 at the reverse proxy and must never log a valid session
+    // back out (that made SSO "never log in" under /qd).
+    await loadTasks();
   } catch {
     authenticated.value = false;
     ready.value = true;
@@ -1107,6 +1166,8 @@ onMounted(async () => {
   } catch {
     /* keep authPolicy null -> local-form default */
   }
+  // Pure-OIDC mode: jump straight to the IdP unless a prior SSO attempt failed.
+  maybeAutoStartSso();
 });
 const refreshTimer = window.setInterval(() => {
   if (!authenticated.value) return;
@@ -1722,10 +1783,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <label :title="t('priorityHint')">{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
         </div>
         <small class="kv-hint">{{ t('taskNumericHint') }}</small>
-        <label>{{ t('timezone') }}<input v-model="taskForm.timezone" list="tz-options" :title="t('timezoneHint')" placeholder="Asia/Shanghai" /></label>
-        <datalist id="tz-options">
-          <option v-for="tz in ['UTC','Asia/Shanghai','Asia/Tokyo','Asia/Hong_Kong','Europe/London','Europe/Berlin','America/New_York','America/Los_Angeles','Australia/Sydney']" :key="tz" :value="tz" />
-        </datalist>
+        <label :title="t('timezoneHint')">{{ t('timezone') }}<select v-model="taskForm.timezone"><option value="">{{ t('timezoneDefault') }}</option><option v-for="tz in timezoneOptions" :key="tz" :value="tz">{{ tz }}</option></select><ChevronDown :size="16" /></label>
         <label class="kv-label">{{ t('variables') }}
           <span class="kv-rows">
             <span v-for="(row, i) in taskForm.variables" :key="i" class="kv-row">

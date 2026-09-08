@@ -90,6 +90,8 @@ impl Default for AuthConfig {
                 oidc_enabled: false,
                 oidc_provider_name: String::new(),
                 header_auth_enabled: false,
+                oidc_logout_url: String::new(),
+                oidc_post_logout_redirect_uri: String::new(),
             },
             oidc: crate::config::OidcConfig::default(),
         }
@@ -427,6 +429,8 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         "oidc_enabled": public.oidc_enabled,
         "oidc_provider_name": public.oidc_provider_name,
         "header_auth_enabled": public.header_auth_enabled,
+        "oidc_logout_url": public.oidc_logout_url,
+        "oidc_post_logout_redirect_uri": public.oidc_post_logout_redirect_uri,
     }))
 }
 
@@ -597,7 +601,15 @@ async fn oidc_login_callback(
 
     let subject = claims.subject().as_str().to_string();
     let email = claims.email().map(|e| e.as_str().to_string());
-    let username_hint = claims.preferred_username().map(|u| u.as_str().to_string());
+    // Prefer the typed `preferred_username`; when the IdP leaves it out (many
+    // only ship `name`/`email`, or an opaque `preferred_username`), fall back to
+    // a human-friendly claim chain off the verified ID token (`preferred_username`
+    // → nickname → name → email local-part). Without this the local username
+    // becomes the opaque `sub`, which shows up as a long id in the UI.
+    let username_hint = claims
+        .preferred_username()
+        .map(|u| u.as_str().to_string())
+        .or_else(|| oidc::username_hint_from_id_token(&id_token.to_string()));
 
     // Group membership drives group->admin promotion via `oidc.admin_groups`.
     // The ID token was cryptographically verified by `id_token.claims()` above;
@@ -2856,6 +2868,8 @@ mod tests {
                 String::new()
             },
             header_auth_enabled: false,
+            oidc_logout_url: String::new(),
+            oidc_post_logout_redirect_uri: String::new(),
         }
     }
 
@@ -2901,6 +2915,8 @@ mod tests {
         assert_eq!(value["oidc_enabled"], true);
         assert_eq!(value["oidc_provider_name"], "Authentik");
         assert_eq!(value["header_auth_enabled"], false);
+        assert_eq!(value["oidc_logout_url"], "");
+        assert_eq!(value["oidc_post_logout_redirect_uri"], "");
         // No secret material may ever appear in this response.
         assert!(!text.to_lowercase().contains("secret"));
         assert!(!text.to_lowercase().contains("client_id"));

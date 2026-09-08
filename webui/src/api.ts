@@ -44,6 +44,10 @@ export interface AuthConfig {
   oidc_enabled: boolean;
   oidc_provider_name: string;
   header_auth_enabled: boolean;
+  /** Optional IdP end-session URL so "log out" can end the external session. */
+  oidc_logout_url: string;
+  /** Optional post_logout_redirect_uri returned to after IdP single logout. */
+  oidc_post_logout_redirect_uri: string;
 }
 
 /** Live run-step WebSocket event */

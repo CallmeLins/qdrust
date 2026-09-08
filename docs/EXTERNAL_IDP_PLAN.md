@@ -454,6 +454,28 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
   `role=admin`、`e2e.mjs user` → 建档 `role=user`；ID token 须含 `email`/`groups`
   （mock 关 `conformIdTokenClaims` 使其进 ID token，非 userinfo）。
 
+**Phase 6 补充 2（用户反馈四连修）**：
+- [x] **sub-path `/qd` 下 SSO"登录不进去"**：前端 boot 在会话有效后用 `await api.ready()`
+      作为登录的一部分，而后端把 `/ready`/`/health` 故意挂在根路径（供 Docker HEALTHCHECK）。
+      经"剥离前缀"反代时，SPA 从 `/qd/` 发起的裸 `/ready` 请求打不到 qdrust → `Promise.all`
+      reject → 外层 catch 把已登录会话又置为未登录。修复：boot 不再 await 就绪探针
+      （以 `api.session()` 成功作为后端可达的判定，点亮"系统正常"指示），探针失败永不登出。
+- [x] **`auth_mode=oidc` 默认应直达 IdP**：新增 `maybeAutoStartSso()`，纯 OIDC 落地未登录且
+      无 `login_error` 时自动 `window.location.assign(oidcStartUrl())`；带 `login_error`
+      或已登录则保留 SSO-only 面板作为错误/重试兜底（避免重定向循环）。
+- [x] **OIDC 单点登出**：`OidcConfig.logout_url`（env `QDRUST_OIDC_LOGOUT_URL` / config-file
+      `logout_url`）+ 可选 `post_logout_redirect_uri`（env `QDRUST_OIDC_POST_LOGOUT_REDIRECT_URI`）。
+      `PublicAuthConfig` 新增 `oidc_logout_url`/`oidc_post_logout_redirect_uri` 并透出到
+      `/auth/config`；前端显式登出先清本地 session，再按需顶层跳到 IdP 端会话端点
+      （`oidcLogoutUrl()` 助手拼接 `post_logout_redirect_uri`）。post_logout 仅在配置时发送，
+      因 IdP 要求其在 client 端已登记。
+- [x] **OIDC 建档用户名为一串 `sub` id**：许多 IdP 只在 ID token 给 `name`/`email`，缺
+      `preferred_username`，导致本地 username 回落为不透明 `sub`。新增
+      `oidc::username_hint_from_id_token`：在**已验签** ID token 上按
+      `preferred_username → nickname → name → email 本地部分` 取人性化登录名
+      （支持 `name` 本地化对象 `{"value":...}`），回调处与 typed `preferred_username` 互补。
+      `store::unique_external_username` 仍负责清洗与唯一化。
+
 ---
 
 ## 8. 测试映射与安全清单

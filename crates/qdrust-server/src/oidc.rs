@@ -119,6 +119,18 @@ pub fn parse_scopes(scopes: &str) -> Vec<Scope> {
         .collect()
 }
 
+/// Decode the (unverified) JSON payload of a compact JWT. The token must have
+/// already passed signature verification upstream (`IdToken::claims`) before
+/// any caller trusts what this returns; we only read profile fields for display.
+fn decode_id_token_payload(id_token: &str) -> Option<serde_json::Value> {
+    let payload_b64 = match id_token.split('.').collect::<Vec<_>>().as_slice() {
+        [_, payload, _] => *payload,
+        _ => return None,
+    };
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    serde_json::from_slice(&payload_bytes).ok()
+}
+
 /// Extract a group-membership claim from an already-verified compact ID token.
 ///
 /// The openidconnect crate binds the parsed ID token to `EmptyAdditionalClaims`,
@@ -135,17 +147,8 @@ pub fn parse_scopes(scopes: &str) -> Vec<Scope> {
 /// Anything else (absent claim, not an array of strings, non-string) yields an
 /// empty vec so the caller falls back to `default_role`.
 pub fn groups_from_id_token(id_token: &str, claim: &str) -> Vec<String> {
-    let payload_b64 = match id_token.split('.').collect::<Vec<_>>().as_slice() {
-        [_, payload, _] => *payload,
-        _ => return Vec::new(),
-    };
-    let payload_bytes = match URL_SAFE_NO_PAD.decode(payload_b64) {
-        Ok(bytes) => bytes,
-        Err(_) => return Vec::new(),
-    };
-    let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
+    let Some(payload) = decode_id_token_payload(id_token) else {
+        return Vec::new();
     };
     match payload.get(claim) {
         Some(serde_json::Value::Array(items)) => items
@@ -162,6 +165,45 @@ pub fn groups_from_id_token(id_token: &str, claim: &str) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Pick a human-friendly local username from an already-verified ID token.
+///
+/// Many IdPs only put `name`/`email` in the ID token and omit (or make opaque)
+/// `preferred_username`, in which case the generic subject (`sub`) — often a
+/// long random id — would otherwise become the user's login name. Prefer the
+/// first present claim in `preferred_username` → `nickname` → `name` →
+/// email local-part, and only fall back to nothing (let the caller use the
+/// `sub`). `name` may be an object `{ "value": ... }` for localized claims, so
+/// read both a bare string and a `value` field. Callers sanitize the result.
+pub fn username_hint_from_id_token(id_token: &str) -> Option<String> {
+    let payload = decode_id_token_payload(id_token)?;
+    let pick = |key: &str| -> Option<String> {
+        match payload.get(key) {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                Some(s.trim().to_string())
+            }
+            Some(serde_json::Value::Object(map)) => map
+                .get("value")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string()),
+            _ => None,
+        }
+    };
+    for key in ["preferred_username", "nickname", "name"] {
+        if let Some(v) = pick(key) {
+            return Some(v);
+        }
+    }
+    // Email local part is a reasonable default handle when nothing else is set.
+    if let Some(email) = payload.get("email").and_then(|v| v.as_str())
+        && let Some(local) = email.split('@').next()
+        && !local.trim().is_empty()
+    {
+        return Some(local.trim().to_string());
+    }
+    None
 }
 
 /// Compute the redirect_uri handed to the IdP.
@@ -451,5 +493,63 @@ mod tests {
         // Groups present but not strings -> empty.
         let bad = fake_id_token(serde_json::json!({ "groups": 42 }));
         assert!(groups_from_id_token(&bad, "groups").is_empty());
+    }
+
+    #[test]
+    fn username_hint_prefers_preferred_username_then_nickname_then_name() {
+        let token = fake_id_token(serde_json::json!({
+            "sub": "11111111-2222-3333-4444-555555555555",
+            "preferred_username": "alice",
+            "nickname": "ali",
+            "name": "Alice Example",
+            "email": "alice@example.com",
+        }));
+        assert_eq!(
+            username_hint_from_id_token(&token).as_deref(),
+            Some("alice")
+        );
+        // No preferred_username -> nickname.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "11111111-2222-3333-4444-555555555555",
+            "nickname": "ali",
+            "name": "Alice Example",
+        }));
+        assert_eq!(username_hint_from_id_token(&token).as_deref(), Some("ali"));
+        // Only name -> name.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "11111111-2222-3333-4444-555555555555",
+            "name": "Alice Example",
+        }));
+        assert_eq!(
+            username_hint_from_id_token(&token).as_deref(),
+            Some("Alice Example")
+        );
+    }
+
+    #[test]
+    fn username_hint_handles_localized_name_and_email_fallback() {
+        // Localized `name` is an object with a `value` field.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "11111111-2222-3333-4444-555555555555",
+            "name": { "value": "Bob Builder" },
+        }));
+        assert_eq!(
+            username_hint_from_id_token(&token).as_deref(),
+            Some("Bob Builder")
+        );
+        // Only an email -> use its local part.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "11111111-2222-3333-4444-555555555555",
+            "email": "carol@example.com",
+        }));
+        assert_eq!(
+            username_hint_from_id_token(&token).as_deref(),
+            Some("carol")
+        );
+        // Nothing useful -> None so the caller keeps the opaque sub.
+        let token =
+            fake_id_token(serde_json::json!({ "sub": "11111111-2222-3333-4444-555555555555" }));
+        assert!(username_hint_from_id_token(&token).is_none());
+        assert!(username_hint_from_id_token("not-a-jwt").is_none());
     }
 }
