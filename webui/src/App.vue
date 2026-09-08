@@ -7,6 +7,7 @@ import {
 } from "@lucide/vue";
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
+import Dropdown from "./Dropdown.vue";
 import { formatRunTime, localLoginAvailable, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
@@ -144,6 +145,10 @@ const taskGroups = ref<string[]>([]);
 const loading = ref(false);
 const search = ref("");
 const groupFilter = ref("");
+const groupFilterDropdownOptions = computed(() => [
+  { value: "", label: t("all") },
+  ...taskGroups.value.map((g) => ({ value: g, label: g })),
+]);
 const selected = reactive(new Set<number>());
 const runsByTask = ref<Record<number, Run[]>>({});
 const runHistoryTask = ref<Task | null>(null);
@@ -173,6 +178,16 @@ interface TaskForm {
 const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
+/** Dropdown options for the "bind to template" field in the task form. */
+const templateDropdownOptions = computed(() => [
+  { value: null as string | number | null, label: t("noTemplatesToBind") },
+  ...templatesForSelect.value.map((tpl) => ({
+    value: tpl.id as string | number | null,
+    label: `${tpl.name}（${tpl.source_format}）`,
+  })),
+]);
+/** HTTP method choices for the task form. */
+const httpMethodDropdownOptions: { value: string; label: string }[] = ["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => ({ value: m, label: m }));
 
 // Full IANA timezone list for the task scheduling select. `Intl.supportedValuesOf`
 // is available in modern browsers; fall back to a curated subset where missing
@@ -201,6 +216,12 @@ const timezoneOptions: string[] = (() => {
   }
   return ALL_TIMEZONES;
 })();
+/** Dropdown options for the timezone field: an empty "follow server default"
+ *  entry plus the full IANA list. */
+const timezoneDropdownOptions: { value: string; label: string }[] = [
+  { value: "", label: t("timezoneDefault") },
+  ...timezoneOptions.map((tz) => ({ value: tz, label: tz })),
+];
 
 function variablesToRows(value: unknown): { name: string; value: string }[] {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -394,8 +415,7 @@ function openCreateTask() {
       .then((items) => { templates.value = items; })
       .catch((cause) => notify(cause instanceof Error ? cause.message : t("genericError"), "error"));
   }
-}
-function openEditTask(task: Task) {
+}function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
   Object.assign(taskForm, {
     id: task.id,
@@ -772,12 +792,26 @@ const channelForm = reactive({
   secret: "", toUser: "", wecomKey: "", to: "", subject: "",
 });
 const actionForm = reactive({ taskId: 0, channelId: 0, event: "failure" });
+const actionTaskDropdownOptions = computed(() => [
+  { value: 0, label: t("chooseTask"), disabled: true },
+  ...tasks.value.map((task) => ({ value: task.id, label: task.name })),
+]);
+const actionChannelDropdownOptions = computed(() => [
+  { value: 0, label: t("chooseChannel"), disabled: true },
+  ...channels.value.map((ch) => ({ value: ch.id, label: ch.name })),
+]);
+const eventDropdownOptions: { value: string; label: string }[] = [
+  { value: "success", label: t("eventSuccess") },
+  { value: "failure", label: t("eventFailure") },
+  { value: "always", label: t("eventAlways") },
+];
 const channelKindLabels: Record<NotificationChannel["kind"], string> = {
   webhook: t("webhookKind"), email: t("emailKind"), bark: t("barkKind"),
   serverchan: t("serverchanKind"), telegram: t("telegramKind"), dingtalk: t("dingtalkKind"),
   wxpusher: t("wxpusherKind"), wxpusher_spt: t("wxpusherSptKind"),
   wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"),
 };
+const channelKindDropdownOptions: { value: string; label: string }[] = Object.entries(channelKindLabels).map(([value, label]) => ({ value, label }));
 function channelKindLabel(kind: string): string {
   return channelKindLabels[kind as NotificationChannel["kind"]] ?? kind;
 }
@@ -829,6 +863,8 @@ async function loadActions() {
 }
 async function saveAction() {
   try {
+    if (!actionForm.taskId) { notify(t("chooseTask"), "error"); return; }
+    if (!actionForm.channelId) { notify(t("chooseChannel"), "error"); return; }
     await api.createNotificationAction(actionForm.taskId, actionForm.channelId, actionForm.event);
     await loadActions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
@@ -883,6 +919,10 @@ const myPushRequests = ref<PushRequest[]>([]);
 const pendingPushRequests = ref<PushRequest[]>([]);
 const pushNote = ref("");
 const pushTemplateId = ref(0);
+const pushTemplateDropdownOptions = computed(() => [
+  { value: 0, label: t("chooseTask"), disabled: true },
+  ...templates.value.map((tpl) => ({ value: tpl.id, label: tpl.name })),
+]);
 const isAdmin = computed(() => currentUser.value?.role === "admin");
 async function openPush() {
   view.value = "push";
@@ -895,6 +935,7 @@ async function openPush() {
 }
 async function submitPush() {
   try {
+    if (!pushTemplateId.value) { notify(t("chooseTask"), "error"); return; }
     await api.createPushRequest(pushTemplateId.value, pushNote.value);
     pushNote.value = "";
     pushTemplateId.value = 0;
@@ -932,12 +973,13 @@ async function toggleUser(user: User) {
   try { await api.adminUpdateUser(user.id, { disabled: !user.disabled }); await openAdmin(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
+const roleDropdownOptions: { value: string; label: string }[] = [
+  { value: "user", label: t("roleUser") },
+  { value: "admin", label: t("roleAdmin") },
+];
 async function changeUserRole(user: User, role: string) {
   try { await api.adminUpdateUser(user.id, { role }); await openAdmin(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
-function onRoleChange(user: User, event: Event) {
-  changeUserRole(user, (event.target as HTMLSelectElement).value);
 }
 async function deleteUser(user: User) {
   if (!window.confirm(fmt("deleteUserConfirm", { name: user.username }))) return;
@@ -1360,10 +1402,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <label class="search"><Search :size="17" /><input v-model="search" type="search" :placeholder="t('search')" /></label>
             <label class="group-filter">
               <span>{{ t('groupFilter') }}</span>
-              <select v-model="groupFilter">
-                <option value="">{{ t('all') }}</option>
-                <option v-for="g in taskGroups" :key="g" :value="g">{{ g }}</option>
-              </select>
+              <Dropdown v-model="groupFilter" :options="groupFilterDropdownOptions" compact />
             </label>
             <button class="icon-button" :title="t('refresh')" @click="loadTasks"><RefreshCw :class="{ spin: loading }" :size="18" /></button>
           </div>
@@ -1517,18 +1556,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <form class="modal inline-modal" @submit.prevent="saveChannel">
             <label>{{ t('channelName') }}<input v-model="channelForm.name" required /></label>
             <label>{{ t('channelKind') }}
-              <select v-model="channelForm.kind">
-                <option value="webhook">{{ t('webhookKind') }}</option>
-                <option value="email">{{ t('emailKind') }}</option>
-                <option value="bark">{{ t('barkKind') }}</option>
-                <option value="serverchan">{{ t('serverchanKind') }}</option>
-                <option value="telegram">{{ t('telegramKind') }}</option>
-                <option value="dingtalk">{{ t('dingtalkKind') }}</option>
-                <option value="wxpusher">{{ t('wxpusherKind') }}</option>
-                <option value="wxpusher_spt">{{ t('wxpusherSptKind') }}</option>
-                <option value="wecom_app">{{ t('wecomAppKind') }}</option>
-                <option value="wecom_webhook">{{ t('wecomWebhookKind') }}</option>
-              </select>
+              <Dropdown v-model="channelForm.kind" :options="channelKindDropdownOptions" />
             </label>
             <template v-if="channelForm.kind === 'webhook'">
               <label>{{ t('webhookUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
@@ -1582,23 +1610,13 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <h2>{{ t('taskActions') }}</h2>
           <form class="modal inline-modal" @submit.prevent="saveAction">
             <label>{{ t('task') }}
-              <select v-model="actionForm.taskId" required @change="loadActions">
-                <option :value="0" disabled>{{ t('chooseTask') }}</option>
-                <option v-for="task in tasks" :key="task.id" :value="task.id">{{ task.name }}</option>
-              </select>
+              <Dropdown v-model="actionForm.taskId" :options="actionTaskDropdownOptions" @change="loadActions" />
             </label>
             <label>{{ t('channel') }}
-              <select v-model="actionForm.channelId" required>
-                <option :value="0" disabled>{{ t('chooseChannel') }}</option>
-                <option v-for="channel in channels" :key="channel.id" :value="channel.id">{{ channel.name }}</option>
-              </select>
+              <Dropdown v-model="actionForm.channelId" :options="actionChannelDropdownOptions" />
             </label>
             <label>{{ t('event') }}
-              <select v-model="actionForm.event">
-                <option value="success">{{ t('eventSuccess') }}</option>
-                <option value="failure">{{ t('eventFailure') }}</option>
-                <option value="always">{{ t('eventAlways') }}</option>
-              </select>
+              <Dropdown v-model="actionForm.event" :options="eventDropdownOptions" />
             </label>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
@@ -1645,10 +1663,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <h2>{{ t('myRequests') }}</h2>
           <form class="modal inline-modal" @submit.prevent="submitPush">
             <label>{{ t('pushTemplate') }}
-              <select v-model="pushTemplateId" required>
-                <option :value="0" disabled>{{ t('chooseTask') }}</option>
-                <option v-for="tpl in templates" :key="tpl.id" :value="tpl.id">{{ tpl.name }}</option>
-              </select>
+              <Dropdown v-model="pushTemplateId" :options="pushTemplateDropdownOptions" />
             </label>
             <label>{{ t('pushNote') }}<textarea v-model="pushNote" rows="3" /></label>
             <button class="primary-button">{{ t('submitPush') }}</button>
@@ -1681,9 +1696,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div v-for="user in adminUsers" :key="user.id" class="run-row">
             <strong>{{ user.username }}</strong>
             <span class="chip">{{ user.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</span>
-            <select v-if="user.id !== currentUser?.id" class="role-select" :value="user.role" @change="onRoleChange(user, $event)">              <option value="user">{{ t('roleUser') }}</option>
-              <option value="admin">{{ t('roleAdmin') }}</option>
-            </select>
+            <Dropdown v-if="user.id !== currentUser?.id" :model-value="user.role" :options="roleDropdownOptions" compact @change="(v) => changeUserRole(user, String(v))" />
             <span v-if="user.email">{{ user.email }}</span>
             <span :class="user.email_verified ? 'ok-text' : 'muted'">{{ user.email_verified ? t('verified') : t('unverified') }}</span>
             <span class="run-time">{{ formatRunTime(user.created_at) }}</span>
@@ -1755,13 +1768,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
         <label>{{ t('taskName') }}<input v-model="taskForm.name" required maxlength="100" /></label>
         <label>{{ t('template') }}
-          <select v-model="taskForm.templateId" @change="onTemplatePicked">
-            <option :value="null">{{ t('noTemplatesToBind') }}</option>
-            <option v-for="tpl in templatesForSelect" :key="tpl.id" :value="tpl.id">{{ tpl.name }}（{{ tpl.source_format }}）</option>
-          </select>
+          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" />
         </label>
         <div class="form-row">
-          <label>{{ t('method') }}<select v-model="taskForm.method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select><ChevronDown :size="16" /></label>
+          <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" /></label>
           <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
         </div>
         <div class="form-row">
@@ -1783,7 +1793,9 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <label :title="t('priorityHint')">{{ t('priority') }}<input v-model="taskForm.priority" type="number" placeholder="0" /></label>
         </div>
         <small class="kv-hint">{{ t('taskNumericHint') }}</small>
-        <label :title="t('timezoneHint')">{{ t('timezone') }}<select v-model="taskForm.timezone"><option value="">{{ t('timezoneDefault') }}</option><option v-for="tz in timezoneOptions" :key="tz" :value="tz">{{ tz }}</option></select><ChevronDown :size="16" /></label>
+        <label :title="t('timezoneHint')">{{ t('timezone') }}
+          <Dropdown v-model="taskForm.timezone" :options="timezoneDropdownOptions" />
+        </label>
         <label class="kv-label">{{ t('variables') }}
           <span class="kv-rows">
             <span v-for="(row, i) in taskForm.variables" :key="i" class="kv-row">

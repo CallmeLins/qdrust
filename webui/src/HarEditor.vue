@@ -8,6 +8,7 @@
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ChevronDown, ChevronUp, Copy, FileJson2, Trash2 } from "@lucide/vue";
+import Dropdown from "./Dropdown.vue";
 import { t } from "./i18n";
 
 // ---------------- 类型（QD HAR 数据形状） ----------------
@@ -484,6 +485,13 @@ const postText = computed<string>({
 });
 const postParams = computed<HarPostParam[]>(() => cur()?.request.postData?.params ?? []);
 
+/** postData 无/text/params 三模式选项（供 Dropdown 组件使用） */
+const postModeDropdownOptions: { value: string; label: string }[] = [
+  { value: "none", label: t("harNone") },
+  { value: "text", label: "text" },
+  { value: "params", label: "params" },
+];
+
 // ---------------- 折叠区 ----------------
 
 function toggleSection(key: string): void {
@@ -809,11 +817,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
                   </label>
                   <label class="field">
                     {{ t('harMode') }}
-                    <select v-model="postMode">
-                      <option value="none">{{ t('harNone') }}</option>
-                      <option value="text">text</option>
-                      <option value="params">params</option>
-                    </select>
+                    <Dropdown v-model="postMode" :options="postModeDropdownOptions" />
                   </label>
                 </div>
                 <div v-if="postMode === 'text'">
@@ -1421,6 +1425,12 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   display: grid;
   grid-template-columns: 1fr 140px;
   gap: 10px;
+}
+/* 让 .field 内的 Dropdown 触发器与同组输入框（34px）等高对齐 */
+.field :deep(.dd-trigger) {
+  min-height: 34px;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 /* ---------- JSON 模式 ---------- */

@@ -633,6 +633,50 @@ code {
   border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .modal select { appearance: none; }
+
+/* ---- custom dropdown (Dropdown.vue) ----
+   Replaces native <select> so the open list (a) stays the same width as the
+   trigger instead of ballooning to the widest option, and (b) reuses the app's
+   rounded / themed surface instead of a raw, square browser popup. */
+.dd { position: relative; display: block; min-width: 0; }
+.dd-trigger {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; min-height: 40px; padding: 0 12px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: rgb(var(--card-surface)); color: var(--ink);
+  font-size: 13px; text-align: left; cursor: pointer;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+.dd-trigger:hover { border-color: var(--ink-3); }
+.dd-trigger:focus-visible, .dd-trigger.open {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+.dd-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+.dd-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-trigger.placeholder .dd-value { color: var(--ink-3); }
+.dd-caret { flex: none; color: var(--ink-3); transition: transform var(--t-fast); }
+.dd-caret.flip { transform: rotate(180deg); }
+.dd-pop {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20;
+  max-height: 260px; overflow: auto;
+  margin: 0; padding: 5px; list-style: none;
+  border: 1px solid var(--line-strong); border-radius: var(--r-m);
+  background: var(--surface-strong); color: var(--ink);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.16);
+}
+.dd-pop li {
+  padding: 7px 9px; border-radius: var(--r-s); cursor: pointer;
+  font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dd-pop li:hover:not(.disabled) { background: var(--accent-glow); }
+.dd-pop li.active { color: var(--primary); font-weight: 600; background: var(--accent-glow); }
+.dd-pop li.disabled { opacity: 0.5; cursor: not-allowed; }
+/* Compact variant: for toolbars / table rows so it behaves like a small inline
+   select rather than a full-height form field. */
+.dd.compact { display: inline-block; }
+.dd.compact .dd-trigger { min-height: 34px; padding: 0 10px; font-size: 12px; }
+.dd.compact .dd-pop li { font-size: 12px; padding: 5px 8px; }
 .modal input::placeholder, .modal textarea::placeholder { color: var(--ink-3); }
 .modal .checkbox { display: flex; align-items: center; gap: 8px; grid-template-columns: none; }
 .modal .checkbox input { width: 16px; height: 16px; min-height: 0; accent-color: var(--primary); }

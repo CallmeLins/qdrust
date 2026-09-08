@@ -430,16 +430,36 @@ QDRUST_OIDC_AUTO_CREATE_USERS=true    # 首登自动建档（哨兵口令，本�
 QDRUST_OIDC_DEFAULT_ROLE=user         # 未命中 admin 组的建档角色
 QDRUST_OIDC_ADMIN_GROUPS=qdrust-admins # 命中则首次建档为 admin
 QDRUST_OIDC_GROUPS_CLAIM=groups       # ID token 中携带组成员身份的 claim 名（默认 groups）
+# --- 可选：OIDC 单点登出（end-session） ---
+# QDRUST_OIDC_LOGOUT_URL=https://auth.example.com/protocol/openid-connect/logout
+#   # 用户点击登出时，清本地会话后顶层跳转到该 IdP 端点，把提供方会话也一并结束。
+# QDRUST_OIDC_POST_LOGOUT_REDIRECT_URI=https://your.domain/qd/
+#   # 可选：IdP 登出后跳回的应用地址。仅在 IdP 侧已登记该地址时才应配置，
+#   # 否则多数 IdP 会拒绝未登记的回跳参数，用户将停留在 IdP 自带的登出完成页。
 ```
 
 在 IdP 侧把回调地址登记为
 `https://你的域名[/<base_path>]/api/v1/auth/oidc/callback`。
+
+**纯 OIDC 模式（`QDRUST_AUTH_MODE=oidc`）的登录体验**：未登录用户访问页面时会**自动跳转**到
+IdP 发起 SSO，不再先停留在一个多余的登录面板；仅在回调失败（带 `login_error`）或已登录时
+保留 SSO 兜底面板，避免重定向循环。
 
 OIDC 首登按 **ID token 里的 `groups` claim**（可通过 `QDRUST_OIDC_GROUPS_CLAIM` 换成
 IdP 实际使用的 claim 名，如某些 Keycloak 映射后的 `roles`）解析角色：claim 命中
 `QDRUST_OIDC_ADMIN_GROUPS` 中任一成员则建档为 `admin`，否则落 `QDRUST_OIDC_DEFAULT_ROLE`。
 若 IdP 不在 ID token 内下发组（部分 IdP 只在 userinfo 返回），则保持 claim 缺失、统一落
 `default_role`，再让管理员手动调整。
+
+**新建档用户名的取值链**：优先取 `preferred_username`，其次 `nickname` → `name` → `email`
+本地部分，都缺失才回落为不透明的 `sub`。很多 IdP（authentik / Keycloak / Google）只在
+ID token 下发 `name`/`email` 而不下发 `preferred_username`，此回退链可避免管理员看到一串
+sub id。只影响**新建档**，存量用户需手动改名或重新建档。
+
+**二级目录部署下 SSO 登录**：登录判定**不再依赖** `/ready` 探针（后端把 `/ready`/`/health`
+保留在根路径供 Docker HEALTHCHECK；经原样转发的 nginx 时，二级目录页面发起的根路径探针
+本就不会命中）。会话有效性改为以 `/session` 成功为准，因此子路径部署时 SSO 登录不再被
+探针失败误判为"未登录"。
 
 **反向代理 Header 认证（forward-auth）** —— 对接 nginx `auth_request` / authelia forward-auth /
 authentik proxy：反代在**每个请求**注入身份头，服务端仅在源 IP 属于可信代理时才信任：
@@ -606,6 +626,12 @@ A：用 `api://browser/*` 无头浏览器插件。配置 `QDRUST_BROWSER_URL` �
 
 **Q：浏览器插件能自动跑多步页面交互（点按钮、填表单）吗？**
 A：可以。用 `start` 开一个会话，对同一 `session` 跨步骤执行 `type`（输入）/ `click`（点击）/ `content`（取渲染后状态），`extract_variables` 提出会话 id 后用 `{{var}}` 复用于后续步骤；流程结束用 `end` 关会话。会话在 server 内存中跨调用存活（空闲 30 分钟 / 最长 24 小时回收），所以中途可以停下等人——比如让人工过完验证码再继续。会话里的 `#` 等选择器要 URL 编码（`#id` → `%23id`）。
+
+**Q：`QDRUST_AUTH_MODE=oidc` 但页面没有直接跳转 IdP / 只看到登录面板？**
+A：纯 OIDC 模式下未登录访问应**自动跳转**到 IdP 发起 SSO。只有两种情况会停留并显示 SSO 兜底面板：(1) 当前已带 `?login_error=`（上次回调失败，给你一个可重试的入口，避免跳转死循环）；(2) 页面已登录。若你始终停留在面板，多半是回调带上了遗留的 `login_error` 参数——清掉 URL 参数刷新即可。
+
+**Q：OIDC 登录了，但点登出又回到登录页，IdP 侧会话还在？**
+A：默认只清除 qdrust 本地会话。要让提供方会话一起结束，配置 `QDRUST_OIDC_LOGOUT_URL` 指向 IdP 的 end-session 端点（authentik：`.../protocol/openid-connect/logout`；Keycloak：`.../realms/<realm>/protocol/openid-connect/logout`）。可选配 `QDRUST_OIDC_POST_LOGOUT_REDIRECT_URI` 让 IdP 登出后跳回应用——**仅当该地址已在 IdP 的 OIDC 客户端登记过**才配，否则多数 IdP 会拒绝未登记的回跳参数。
 
 ---
 
