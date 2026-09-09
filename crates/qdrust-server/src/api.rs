@@ -601,15 +601,26 @@ async fn oidc_login_callback(
 
     let subject = claims.subject().as_str().to_string();
     let email = claims.email().map(|e| e.as_str().to_string());
-    // Prefer the typed `preferred_username`; when the IdP leaves it out (many
-    // only ship `name`/`email`, or an opaque `preferred_username`), fall back to
-    // a human-friendly claim chain off the verified ID token (`preferred_username`
-    // → nickname → name → email local-part). Without this the local username
-    // becomes the opaque `sub`, which shows up as a long id in the UI.
-    let username_hint = claims
-        .preferred_username()
-        .map(|u| u.as_str().to_string())
-        .or_else(|| oidc::username_hint_from_id_token(&id_token.to_string()));
+    // TEMP DEBUG — log the verified ID-token claims (non-secret profile fields)
+    // so a tester can see exactly what the IdP emitted and confirm the username
+    // root cause. Enable with RUST_LOG=qdrust_server=debug; remove after diagnosis.
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && let Some(payload) = oidc::debug_decode_claims(&id_token.to_string())
+    {
+        tracing::debug!(subject = %subject, claims = %payload, "oidc id_token claims (debug)");
+    }
+    // Prefer a human-friendly handle for the local username. We merge the typed
+    // `preferred_username` and a raw-claim chain (`preferred_username` →
+    // `nickname` → `name` → email local-part), but skip any candidate that is an
+    // opaque id (long hex/uuid/numeric). Many IdPs ship an opaque
+    // `preferred_username` while the real handle lives only in `name`/`email`;
+    // blindly trusting it first would persist a long "hex id" as the username in
+    // the UI. Without this the local username would otherwise become the opaque
+    // `sub`.
+    let username_hint = oidc::username_hint_from_id_token(
+        claims.preferred_username().map(|u| u.as_str()),
+        &id_token.to_string(),
+    );
 
     // Group membership drives group->admin promotion via `oidc.admin_groups`.
     // The ID token was cryptographically verified by `id_token.claims()` above;

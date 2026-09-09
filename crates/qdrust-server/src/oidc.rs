@@ -131,6 +131,15 @@ fn decode_id_token_payload(id_token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&payload_bytes).ok()
 }
 
+/// TEMP DEBUG — decode an already-verified ID token's payload for logging, so a
+/// tester can capture exactly which claims an IdP emitted (preferred_username /
+/// nickname / name / email / sub) and confirm the username-picking root cause.
+/// Call ONLY after `id_token.claims()` has verified the signature upstream.
+/// Remove once the diagnosis is settled.
+pub fn debug_decode_claims(id_token: &str) -> Option<serde_json::Value> {
+    decode_id_token_payload(id_token)
+}
+
 /// Extract a group-membership claim from an already-verified compact ID token.
 ///
 /// The openidconnect crate binds the parsed ID token to `EmptyAdditionalClaims`,
@@ -167,16 +176,56 @@ pub fn groups_from_id_token(id_token: &str, claim: &str) -> Vec<String> {
     }
 }
 
-/// Pick a human-friendly local username from an already-verified ID token.
+/// True when `s` looks like an opaque identifier assigned by an IdP rather
+/// than a human-chosen handle: a long all-hex string (lower/upper case),
+/// a canonical UUID, or a long run of digits. Such values are fine as a `sub`
+/// but make a poor local login name (they render as a long "hex id" in the UI),
+/// so the username-picking logic below skips them in favour of a readable
+/// `name`/`email` when one exists.
+pub fn looks_like_opaque_id(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let all_hex = |x: &str| x.chars().all(|c| c.is_ascii_hexdigit());
+    // Long hex blob (>= 16 chars), e.g. "a3f9c1..." or a hex sha/uuid-without-dashes.
+    let long_hex = t.len() >= 16 && all_hex(t);
+    // Canonical UUID form: 8-4-4-4-12 of hex.
+    let uuid_form = {
+        let parts: Vec<&str> = t.split('-').collect();
+        parts.len() == 5 && parts.iter().all(|p| !p.is_empty() && all_hex(p)) && t.len() == 36
+    };
+    // Long numeric id (>= 8 digits), e.g. GitHub-style numeric ids.
+    let long_digits = t.len() >= 8 && t.chars().all(|c| c.is_ascii_digit());
+    long_hex || uuid_form || long_digits
+}
+
+/// Pick a human-friendly local username hint from an already-verified ID token.
 ///
 /// Many IdPs only put `name`/`email` in the ID token and omit (or make opaque)
 /// `preferred_username`, in which case the generic subject (`sub`) — often a
-/// long random id — would otherwise become the user's login name. Prefer the
-/// first present claim in `preferred_username` → `nickname` → `name` →
-/// email local-part, and only fall back to nothing (let the caller use the
-/// `sub`). `name` may be an object `{ "value": ... }` for localized claims, so
-/// read both a bare string and a `value` field. Callers sanitize the result.
-pub fn username_hint_from_id_token(id_token: &str) -> Option<String> {
+/// long random id — would otherwise become the user's login name. Some IdPs go
+/// further and ship an *opaque* `preferred_username` (a hex/uuid/numeric handle)
+/// while the real, readable handle only lives in `name`/`email`; blindly
+/// trusting `preferred_username` first would then persist that opaque string.
+///
+/// To handle both, we consider candidates in order `preferred_username` →
+/// `nickname` → `name` → email local-part but **skip any candidate that looks
+/// like an opaque id** (see [`looks_like_opaque_id`]) so a readable `name`/
+/// `email` still wins. Only if every candidate is opaque/absent do we return
+/// `None`, letting the caller keep the `sub`.
+///
+/// `name` may be an object `{ "value": ... }` for localized claims, so read both
+/// a bare string and a `value` field. Callers sanitize the result.
+///
+/// `typed_preferred_username` is the value already decoded through the
+/// openidconnect crate's typed claim accessor (kept separate because that crate
+/// may drop non-standard or localized forms); it is merged in at the front of
+/// the chain.
+pub fn username_hint_from_id_token(
+    typed_preferred_username: Option<&str>,
+    id_token: &str,
+) -> Option<String> {
     let payload = decode_id_token_payload(id_token)?;
     let pick = |key: &str| -> Option<String> {
         match payload.get(key) {
@@ -191,17 +240,33 @@ pub fn username_hint_from_id_token(id_token: &str) -> Option<String> {
             _ => None,
         }
     };
-    for key in ["preferred_username", "nickname", "name"] {
-        if let Some(v) = pick(key) {
+    // Dedupe so a preferred_username seen both typed and raw isn't checked twice.
+    let mut seen = std::collections::HashSet::new();
+    let mut prefer = |v: String| -> Option<String> {
+        if looks_like_opaque_id(&v) || !seen.insert(v.clone()) {
+            return None;
+        }
+        Some(v)
+    };
+    for candidate in [
+        typed_preferred_username.map(str::to_string),
+        pick("preferred_username"),
+        pick("nickname"),
+        pick("name"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(v) = prefer(candidate) {
             return Some(v);
         }
     }
     // Email local part is a reasonable default handle when nothing else is set.
     if let Some(email) = payload.get("email").and_then(|v| v.as_str())
         && let Some(local) = email.split('@').next()
-        && !local.trim().is_empty()
+        && let Some(v) = prefer(local.trim().to_string())
     {
-        return Some(local.trim().to_string());
+        return Some(v);
     }
     None
 }
@@ -505,7 +570,7 @@ mod tests {
             "email": "alice@example.com",
         }));
         assert_eq!(
-            username_hint_from_id_token(&token).as_deref(),
+            username_hint_from_id_token(None, &token).as_deref(),
             Some("alice")
         );
         // No preferred_username -> nickname.
@@ -514,14 +579,17 @@ mod tests {
             "nickname": "ali",
             "name": "Alice Example",
         }));
-        assert_eq!(username_hint_from_id_token(&token).as_deref(), Some("ali"));
+        assert_eq!(
+            username_hint_from_id_token(None, &token).as_deref(),
+            Some("ali")
+        );
         // Only name -> name.
         let token = fake_id_token(serde_json::json!({
             "sub": "11111111-2222-3333-4444-555555555555",
             "name": "Alice Example",
         }));
         assert_eq!(
-            username_hint_from_id_token(&token).as_deref(),
+            username_hint_from_id_token(None, &token).as_deref(),
             Some("Alice Example")
         );
     }
@@ -534,7 +602,7 @@ mod tests {
             "name": { "value": "Bob Builder" },
         }));
         assert_eq!(
-            username_hint_from_id_token(&token).as_deref(),
+            username_hint_from_id_token(None, &token).as_deref(),
             Some("Bob Builder")
         );
         // Only an email -> use its local part.
@@ -543,13 +611,65 @@ mod tests {
             "email": "carol@example.com",
         }));
         assert_eq!(
-            username_hint_from_id_token(&token).as_deref(),
+            username_hint_from_id_token(None, &token).as_deref(),
             Some("carol")
         );
         // Nothing useful -> None so the caller keeps the opaque sub.
         let token =
             fake_id_token(serde_json::json!({ "sub": "11111111-2222-3333-4444-555555555555" }));
-        assert!(username_hint_from_id_token(&token).is_none());
-        assert!(username_hint_from_id_token("not-a-jwt").is_none());
+        assert!(username_hint_from_id_token(None, &token).is_none());
+        assert!(username_hint_from_id_token(None, "not-a-jwt").is_none());
+    }
+
+    #[test]
+    fn opaque_preferred_username_skipped_for_readable_name_or_email() {
+        // An IdP that ships an opaque preferred_username but a readable name:
+        // the opaque handle must NOT win; name is preferred.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "preferred_username": "3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e",
+            "nickname": "christa",
+            "name": "christaikobo",
+            "email": "christaikobo@example.com",
+        }));
+        assert_eq!(
+            username_hint_from_id_token(None, &token).as_deref(),
+            Some("christa")
+        );
+
+        // Opaque preferred_username + only an email local-part readable.
+        let token = fake_id_token(serde_json::json!({
+            "sub": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "preferred_username": "3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e",
+            "email": "christaikobo@example.com",
+        }));
+        assert_eq!(
+            username_hint_from_id_token(None, &token).as_deref(),
+            Some("christaikobo")
+        );
+
+        // The typed preferred_username (passed separately, as the callback does)
+        // is opaque too -> it must not win over the readable email local-part.
+        let typed = "3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e";
+        assert_eq!(
+            username_hint_from_id_token(Some(typed), &token).as_deref(),
+            Some("christaikobo")
+        );
+
+        // Everything opaque (preferred_username hex + sub uuid + no name/email)
+        // -> None so the caller keeps the sub.
+        let token =
+            fake_id_token(serde_json::json!({ "sub": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }));
+        assert!(username_hint_from_id_token(Some(typed), &token).is_none());
+    }
+
+    #[test]
+    fn opaque_id_detection_heuristic() {
+        assert!(looks_like_opaque_id("3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e")); // long hex
+        assert!(looks_like_opaque_id("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")); // uuid
+        assert!(looks_like_opaque_id("12345678901234")); // long digits
+        assert!(!looks_like_opaque_id("christaikobo")); // human
+        assert!(!looks_like_opaque_id("alice")); // short, not hex/digits
+        assert!(looks_like_opaque_id("")); // blank is not a usable handle either
     }
 }

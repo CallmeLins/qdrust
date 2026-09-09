@@ -475,6 +475,12 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       `preferred_username → nickname → name → email 本地部分` 取人性化登录名
       （支持 `name` 本地化对象 `{"value":...}`），回调处与 typed `preferred_username` 互补。
       `store::unique_external_username` 仍负责清洗与唯一化。
+- [x] **补充修正（仍 hex）**：部分 IdP 把内部 id 直接塞进 `preferred_username`（全 hex/UUID/
+      纯数字），上一版将其无条件放第一优先，即便 `name`/`email` 可读仍把 hex 存为用户名。
+      改为引入 `oidc::looks_like_opaque_id` 对 `preferred_username`/`nickname`/`name`/email-local
+      全链统一过滤 opaque 候选，取第一个可读值；`username_hint_from_id_token` 签名改为接受
+      typed `preferred_username`（一并参与 opaque 判定），api.rs callback 收敛为单入口。
+      mock 不受影响（`preferred_username='admin'` 可读仍取）。只影响新建档。
 
 ---
 

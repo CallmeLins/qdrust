@@ -451,10 +451,13 @@ IdP 实际使用的 claim 名，如某些 Keycloak 映射后的 `roles`）解析
 若 IdP 不在 ID token 内下发组（部分 IdP 只在 userinfo 返回），则保持 claim 缺失、统一落
 `default_role`，再让管理员手动调整。
 
-**新建档用户名的取值链**：优先取 `preferred_username`，其次 `nickname` → `name` → `email`
-本地部分，都缺失才回落为不透明的 `sub`。很多 IdP（authentik / Keycloak / Google）只在
-ID token 下发 `name`/`email` 而不下发 `preferred_username`，此回退链可避免管理员看到一串
-sub id。只影响**新建档**，存量用户需手动改名或重新建档。
+**新建档用户名的取值链**：按 `preferred_username` → `nickname` → `name` → `email`
+本地部分依次取**第一个可读值**，都缺失才回落为不透明的 `sub`。这里会**跳过明显是
+不透明标识**的候选（如全十六进制/UUID/纯数字的 `preferred_username`——部分 IdP
+把内部 id 直接塞进该 claim），避免把一串 hex 存成登录名，此时只要 `name`/`email`
+可读就会取到它们。很多 IdP（authentik / Keycloak / Google）只在 ID token 下发
+`name`/`email` 而不下发可读的 `preferred_username`，此逻辑可避免管理员看到一串
+sub/hex id。只影响**新建档**，存量用户需手动改名或重新建档。
 
 **二级目录部署下 SSO 登录**：登录判定**不再依赖** `/ready` 探针（后端把 `/ready`/`/health`
 保留在根路径供 Docker HEALTHCHECK；经原样转发的 nginx 时，二级目录页面发起的根路径探针
