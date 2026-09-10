@@ -481,6 +481,19 @@ ExternalIdentity { provider, issuer, subject, email, username_hint, groups: Vec<
       全链统一过滤 opaque 候选，取第一个可读值；`username_hint_from_id_token` 签名改为接受
       typed `preferred_username`（一并参与 opaque 判定），api.rs callback 收敛为单入口。
       mock 不受影响（`preferred_username='admin'` 可读仍取）。只影响新建档。
+- [x] **再修正（真实 IdP 只发 `sub`）**：抓取到的真实 ID token claims 显示该 IdP 的 ID token
+      **只含 `sub`**（`preferred_username`/`nickname`/`name`/`email` 全缺），即便 scope 带 `openid`
+      也不在 ID token 里给 profile——这是"重建 DB 仍是 hex"的真因（不是 opaque preferred_username，
+      而是整条 ID-token 取值链全空 → 回落 opaque `sub`）。修复：新增
+      `oidc::fetch_user_info`（用 access_token 调 discovery 的 `userinfo_endpoint`，带
+      `expected_subject=sub` 防 token 替换），在 ID token 取不到可读 handle/email 时补取，
+      再走 `oidc::username_hint_from_candidates` 选择；该调用**尽力而为**，provider 无 userinfo
+      或失败只记日志不阻断登录。选择核心抽为 `username_hint_from_candidates`（ID token 与
+      UserInfo 共用）。仅影响新建档。
+- [x] **末级兜底（整条链全空）**：若 ID token 与 UserInfo 都拿不到任何可读字段（IdP 只发一个
+      不透明 `sub`），不再把原始 `sub` 存成用户名，改由新增的 `oidc::username_fallback_from_subject`
+      派生短句柄 `user-<前 8 位>`（去掉 uuid 连字符等分隔符后取前缀；同一 `sub` 恒定映射；
+      空白 `sub` 退化为 `user`）。`sub` 仍单独存储为稳定身份键。仅影响新建档。
 
 ---
 

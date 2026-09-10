@@ -1,6 +1,6 @@
 [package]
 name = "qdrust-plugin-browser"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT"
 description = "In-process long-lived session manager + debug bin: drive a remote headless browser over CDP (obscura / Browserless) for qdrust templates"
@@ -15,7 +15,7 @@ name = "qdrust-plugin-browser"
 path = "src/main.rs"
 
 [dependencies]
-qdrust-core = { path = "../qdrust-core", version = "0.1.7" }
+qdrust-core = { path = "../qdrust-core", version = "0.1.8" }
 anyhow = "1"
 base64 = "0.22"
 chromiumoxide = "0.9"

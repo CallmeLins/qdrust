@@ -47,7 +47,7 @@ use crate::{
     },
     store::Store,
 };
-use openidconnect::{AuthorizationCode, Nonce, PkceCodeVerifier};
+use openidconnect::{AuthorizationCode, Nonce, OAuth2TokenResponse, PkceCodeVerifier};
 
 const SESSION_COOKIE: &str = "qd_session";
 const CSRF_COOKIE: &str = "qd_csrf";
@@ -600,7 +600,6 @@ async fn oidc_login_callback(
         })?;
 
     let subject = claims.subject().as_str().to_string();
-    let email = claims.email().map(|e| e.as_str().to_string());
     // TEMP DEBUG — log the verified ID-token claims (non-secret profile fields)
     // so a tester can see exactly what the IdP emitted and confirm the username
     // root cause. Enable with RUST_LOG=qdrust_server=debug; remove after diagnosis.
@@ -609,18 +608,52 @@ async fn oidc_login_callback(
     {
         tracing::debug!(subject = %subject, claims = %payload, "oidc id_token claims (debug)");
     }
-    // Prefer a human-friendly handle for the local username. We merge the typed
-    // `preferred_username` and a raw-claim chain (`preferred_username` →
-    // `nickname` → `name` → email local-part), but skip any candidate that is an
-    // opaque id (long hex/uuid/numeric). Many IdPs ship an opaque
-    // `preferred_username` while the real handle lives only in `name`/`email`;
-    // blindly trusting it first would persist a long "hex id" as the username in
-    // the UI. Without this the local username would otherwise become the opaque
-    // `sub`.
-    let username_hint = oidc::username_hint_from_id_token(
+
+    // Pick a human-friendly handle for the local username. First try the claims
+    // carried in the (verified) ID token: `preferred_username` → `nickname` →
+    // `name` → email local-part, skipping any opaque id (long hex/uuid/numeric)
+    // so an IdP-assigned handle never shadows a readable one.
+    let mut username_hint = oidc::username_hint_from_id_token(
         claims.preferred_username().map(|u| u.as_str()),
         &id_token.to_string(),
     );
+    let mut email = claims.email().map(|e| e.as_str().to_string());
+
+    // Many IdPs ship an ID token with only `sub` and put the profile claims
+    // behind the UserInfo endpoint (authentik minimal mappers, Keycloak default
+    // claims, various enterprise IdPs). When the ID token gave us no usable
+    // handle, call UserInfo with the access token to recover the real
+    // username/email instead of persisting the opaque `sub`.
+    if (username_hint.is_none() || email.is_none())
+        && let Some(profile) = oidc::fetch_user_info(
+            &built.client,
+            &built.http,
+            token.access_token().secret(),
+            &subject,
+        )
+        .await
+    {
+        if email.is_none() {
+            email = profile.email.clone();
+        }
+        if username_hint.is_none() {
+            username_hint = oidc::username_hint_from_candidates(
+                profile.preferred_username.as_deref(),
+                profile.nickname.as_deref(),
+                profile.name.as_deref(),
+                profile.email.as_deref(),
+            );
+        }
+    }
+
+    // Last resort: the IdP exposed no readable profile anywhere (ID token had
+    // only `sub`, and UserInfo was absent or equally bare). Persisting the raw
+    // `sub` would render a 36-char uuid as the username, so derive a short,
+    // stable handle from it (`user-23cc07f8`) instead. `sub` itself is still
+    // stored separately and remains the account's stable identity key.
+    if username_hint.is_none() {
+        username_hint = Some(oidc::username_fallback_from_subject(&subject));
+    }
 
     // Group membership drives group->admin promotion via `oidc.admin_groups`.
     // The ID token was cryptographically verified by `id_token.claims()` above;

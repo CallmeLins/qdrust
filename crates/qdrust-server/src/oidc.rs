@@ -19,9 +19,9 @@ use axum::http::{HeaderMap, Uri};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use openidconnect::{
-    ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl,
-    Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    AccessToken, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet,
+    IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SubjectIdentifier,
+    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata, CoreUserInfoClaims},
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -226,8 +226,9 @@ pub fn username_hint_from_id_token(
     typed_preferred_username: Option<&str>,
     id_token: &str,
 ) -> Option<String> {
-    let payload = decode_id_token_payload(id_token)?;
+    let payload = decode_id_token_payload(id_token);
     let pick = |key: &str| -> Option<String> {
+        let payload = payload.as_ref()?;
         match payload.get(key) {
             Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
                 Some(s.trim().to_string())
@@ -240,35 +241,170 @@ pub fn username_hint_from_id_token(
             _ => None,
         }
     };
-    // Dedupe so a preferred_username seen both typed and raw isn't checked twice.
-    let mut seen = std::collections::HashSet::new();
-    let mut prefer = |v: String| -> Option<String> {
-        if looks_like_opaque_id(&v) || !seen.insert(v.clone()) {
+    // The typed accessor is merged ahead of the raw `preferred_username` so a
+    // localized/typed form is still considered first; `username_hint_from_
+    // candidates` dedupes the two identical values.
+    let raw_preferred = pick("preferred_username");
+    let nickname = pick("nickname");
+    let name = pick("name");
+    let email = pick("email");
+    username_hint_from_candidates(
+        typed_preferred_username.or(raw_preferred.as_deref()),
+        nickname.as_deref(),
+        name.as_deref(),
+        email.as_deref(),
+    )
+}
+
+/// The human-readable profile fields we read back from a provider's UserInfo
+/// endpoint (or, as a fallback, from the ID token). Only the fields needed to
+/// pick a local username and match an existing account are kept; `sub` is
+/// carried separately by the caller.
+#[derive(Clone, Debug, Default)]
+pub struct UserInfoProfile {
+    pub preferred_username: Option<String>,
+    pub nickname: Option<String>,
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl UserInfoProfile {
+    /// True when the profile carries no usable identity field at all.
+    pub fn is_empty(&self) -> bool {
+        self.preferred_username.is_none()
+            && self.nickname.is_none()
+            && self.name.is_none()
+            && self.email.is_none()
+    }
+}
+
+/// Call the provider's OIDC UserInfo endpoint with the freshly-issued access
+/// token and return the profile claims it carries.
+///
+/// Many IdPs (authentik with a minimal scope mapper, Keycloak with only the
+/// default ID-token claims, and various enterprise providers) ship an ID token
+/// that contains **only** `sub` and put `preferred_username` / `name` / `email`
+/// behind the UserInfo endpoint instead. Without this call the local username
+/// would fall back to the opaque `sub` and show up as a long id in the UI.
+///
+/// Returns `Ok(None)` when the provider advertises no userinfo endpoint (nothing
+/// to fetch) or when the call fails — a UserInfo problem must never block a
+/// login that already verified the ID token, so failures degrade to "no extra
+/// profile" and the caller falls back to the ID-token claims / `sub`.
+///
+/// `expected_subject` is the verified `sub` from the ID token; passing it makes
+/// the crate reject a UserInfo response for a different subject (token
+/// substitution defence).
+pub async fn fetch_user_info(
+    client: &OidcClient,
+    http: &reqwest::Client,
+    access_token: &str,
+    expected_subject: &str,
+) -> Option<UserInfoProfile> {
+    let subject = SubjectIdentifier::new(expected_subject.to_string());
+    let request = match client.user_info(AccessToken::new(access_token.to_string()), Some(subject))
+    {
+        Ok(req) => req,
+        Err(e) => {
+            // Most commonly: the provider advertises no userinfo endpoint.
+            tracing::debug!(error = %e, "oidc userinfo unavailable; skipping");
             return None;
         }
-        Some(v)
     };
-    for candidate in [
-        typed_preferred_username.map(str::to_string),
-        pick("preferred_username"),
-        pick("nickname"),
-        pick("name"),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    let claims: CoreUserInfoClaims = match request.request_async(http).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "oidc userinfo request failed; continuing without it");
+            return None;
+        }
+    };
+    Some(UserInfoProfile {
+        preferred_username: claims
+            .preferred_username()
+            .map(|u| u.as_str().trim().to_string())
+            .filter(|s| !s.is_empty()),
+        // `name`/`nickname` are localized claims (`Option<&LocalizedClaim<_>>`);
+        // `get(None)` reads the un-tagged/default value.
+        nickname: claims
+            .nickname()
+            .and_then(|c| c.get(None))
+            .map(|n| n.as_str().trim().to_string())
+            .filter(|s| !s.is_empty()),
+        name: claims
+            .name()
+            .and_then(|c| c.get(None))
+            .map(|n| n.as_str().trim().to_string())
+            .filter(|s| !s.is_empty()),
+        email: claims
+            .email()
+            .map(|e| e.as_str().trim().to_string())
+            .filter(|s| !s.is_empty()),
+    })
+}
+
+/// Pick a human-friendly local username from a merged set of candidate claims.
+///
+/// This is the shared selection core used for both the ID-token claims and the
+/// UserInfo profile. Candidates are considered in order `preferred_username` →
+/// `nickname` → `name` → email local-part, **skipping any candidate that looks
+/// like an opaque id** (see [`looks_like_opaque_id`]) so a readable `name`/
+/// `email` still wins over an IdP-assigned hex/uuid handle. Returns `None` when
+/// every candidate is opaque or absent, letting the caller fall back to `sub`.
+pub fn username_hint_from_candidates(
+    preferred_username: Option<&str>,
+    nickname: Option<&str>,
+    name: Option<&str>,
+    email: Option<&str>,
+) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut prefer = |v: &str| -> Option<String> {
+        let v = v.trim();
+        if v.is_empty() || looks_like_opaque_id(v) || !seen.insert(v.to_string()) {
+            return None;
+        }
+        Some(v.to_string())
+    };
+    for candidate in [preferred_username, nickname, name].into_iter().flatten() {
         if let Some(v) = prefer(candidate) {
             return Some(v);
         }
     }
     // Email local part is a reasonable default handle when nothing else is set.
-    if let Some(email) = payload.get("email").and_then(|v| v.as_str())
+    if let Some(email) = email
         && let Some(local) = email.split('@').next()
-        && let Some(v) = prefer(local.trim().to_string())
+        && let Some(v) = prefer(local)
     {
         return Some(v);
     }
     None
+}
+
+/// Derive a short, readable login handle from an opaque subject identifier.
+///
+/// This is the last-resort fallback for IdPs whose ID token carries **only**
+/// `sub` (a long hex/uuid/numeric id) and whose UserInfo endpoint either is not
+/// advertised or also returns no readable profile. Persisting the raw `sub` makes
+/// the account show up as a 36-char uuid in the UI, so we shorten it to a stable,
+/// human-scannable handle instead.
+///
+/// The result is `user-<first 8 hex-ish chars>` (e.g. `user-23cc07f8`), with any
+/// non-alphanumeric separators (uuid dashes, dots, etc.) stripped before taking
+/// the prefix so the handle stays `[a-z0-9-]`-clean. A blank subject yields the
+/// bare `user` prefix. The mapping is deterministic, so the same `sub` always
+/// produces the same handle and re-logins stay stable.
+pub fn username_fallback_from_subject(subject: &str) -> String {
+    const PREFIX: &str = "user";
+    const TAIL: usize = 8;
+    let cleaned: String = subject
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if cleaned.is_empty() {
+        return PREFIX.to_string();
+    }
+    let tail: String = cleaned.chars().take(TAIL).collect();
+    format!("{PREFIX}-{tail}")
 }
 
 /// Compute the redirect_uri handed to the IdP.
@@ -671,5 +807,106 @@ mod tests {
         assert!(!looks_like_opaque_id("christaikobo")); // human
         assert!(!looks_like_opaque_id("alice")); // short, not hex/digits
         assert!(looks_like_opaque_id("")); // blank is not a usable handle either
+    }
+
+    #[test]
+    fn candidates_pick_readable_handle_and_skip_opaque() {
+        // Preferred username wins when readable.
+        assert_eq!(
+            username_hint_from_candidates(
+                Some("christaikobo"),
+                Some("christa"),
+                Some("Christa Iko"),
+                Some("christaikobo@example.com"),
+            )
+            .as_deref(),
+            Some("christaikobo")
+        );
+        // Opaque preferred_username is skipped in favour of nickname.
+        assert_eq!(
+            username_hint_from_candidates(
+                Some("3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e"),
+                Some("christa"),
+                None,
+                None,
+            )
+            .as_deref(),
+            Some("christa")
+        );
+        // Everything opaque/absent -> None (caller keeps the sub).
+        assert!(
+            username_hint_from_candidates(
+                Some("3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e"),
+                None,
+                None,
+                None,
+            )
+            .is_none()
+        );
+        // No candidates at all -> None.
+        assert!(username_hint_from_candidates(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn candidates_use_email_local_part_as_last_resort() {
+        // This mirrors the reported real-world case: an IdP whose ID token has
+        // only `sub`, with the readable handle reachable only via UserInfo's
+        // `email` field.
+        assert_eq!(
+            username_hint_from_candidates(None, None, None, Some("christaikobo@example.com"))
+                .as_deref(),
+            Some("christaikobo")
+        );
+        // Opaque email local part is rejected too.
+        assert!(
+            username_hint_from_candidates(None, None, None, Some("1234567890@x.com")).is_none()
+        );
+    }
+
+    #[test]
+    fn user_info_profile_is_empty_detects_blank_profiles() {
+        assert!(UserInfoProfile::default().is_empty());
+        let with_email = UserInfoProfile {
+            email: Some("a@b.com".into()),
+            ..UserInfoProfile::default()
+        };
+        assert!(!with_email.is_empty());
+    }
+
+    #[test]
+    fn subject_fallback_shortens_opaque_sub_to_readable_handle() {
+        // The reported real-world case: an ID token whose only claim is a uuid
+        // `sub`. The fallback must not surface the raw uuid.
+        assert_eq!(
+            username_fallback_from_subject("23cc07f8-redacted-b40581b80dcb"),
+            "user-23cc07f8"
+        );
+        // Canonical uuid -> first 8 hex chars, dashes stripped.
+        assert_eq!(
+            username_fallback_from_subject("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            "user-aaaaaaaa"
+        );
+        // Long hex and long numeric ids work the same way.
+        assert_eq!(
+            username_fallback_from_subject("3f9c1e2a7b4d8f0a6c3e9d1b5a7f0c2e"),
+            "user-3f9c1e2a"
+        );
+        assert_eq!(
+            username_fallback_from_subject("12345678901234"),
+            "user-12345678"
+        );
+        // Short/blank subjects degrade gracefully instead of panicking.
+        assert_eq!(username_fallback_from_subject("ab"), "user-ab");
+        assert_eq!(username_fallback_from_subject(""), "user");
+        assert_eq!(username_fallback_from_subject("   "), "user");
+        // Deterministic: same sub -> same handle across logins.
+        assert_eq!(
+            username_fallback_from_subject("23cc07f8-redacted-b40581b80dcb"),
+            username_fallback_from_subject("23cc07f8-redacted-b40581b80dcb")
+        );
+        // The derived handle must itself look like a readable (non-opaque) name.
+        assert!(!looks_like_opaque_id(&username_fallback_from_subject(
+            "23cc07f8-redacted-b40581b80dcb"
+        )));
     }
 }
