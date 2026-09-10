@@ -981,7 +981,8 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   padding: 6px;
   display: grid;
   gap: 2px;
-  background: #151915;
+  background: var(--surface-strong);
+  color: var(--ink);
   border: 1px solid var(--line-strong);
   border-radius: var(--r-m);
   box-shadow: var(--shadow-l);
