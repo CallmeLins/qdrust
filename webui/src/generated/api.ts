@@ -1105,7 +1105,12 @@ export interface components {
             channel_id: number;
             /** @enum {string} */
             event: "success" | "failure" | "always";
+            /**
+             * Format: int64
+             * @default 1
+             */
             failure_threshold: number;
+            /** @default false */
             automatic_only: boolean;
             title_template?: string | null;
             body_template?: string | null;
@@ -1117,8 +1122,13 @@ export interface components {
             channel_id: number;
             /** @enum {string} */
             event: "success" | "failure" | "always";
-            failure_threshold?: number;
-            automatic_only?: boolean;
+            /**
+             * Format: int64
+             * @default 1
+             */
+            failure_threshold: number;
+            /** @default false */
+            automatic_only: boolean;
             title_template?: string | null;
             body_template?: string | null;
         };

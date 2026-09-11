@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "qdrust API",
-    "version": "0.1.8"
+    "version": "0.1.9"
   },
   "servers": [
     {
@@ -2387,7 +2387,9 @@
         "type": "object",
         "required": [
           "channel_id",
-          "event"
+          "event",
+          "failure_threshold",
+          "automatic_only"
         ],
         "properties": {
           "channel_id": {
