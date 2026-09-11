@@ -1071,47 +1071,39 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   flex: none;
   accent-color: var(--accent);
 }
+/* Flat method labels: the colour lives in the text only — no fill, no border —
+   matching the task list's `.method`. Left-aligned so it reads as a gutter
+   label in front of the url instead of a centred chip, and the urls of every
+   row share one left baseline. */
 .method-badge {
   flex: none;
   min-width: 44px;
-  text-align: center;
-  font-size: 11px;
+  display: grid;
+  justify-items: start;
+  align-items: center;
+  padding: 0;
+  font-size: 10px;
   font-weight: 800;
-  letter-spacing: 0.4px;
-  border-radius: 5px;
-  padding: 2px 5px;
+  letter-spacing: 0.6px;
   font-family: var(--font-mono);
-  border: 1px solid transparent;
 }
 .method-badge.get {
   color: var(--ok);
-  background: rgba(159, 232, 112, 0.1);
-  border-color: rgba(159, 232, 112, 0.24);
 }
 .method-badge.post {
   color: var(--info);
-  background: rgba(125, 216, 255, 0.1);
-  border-color: rgba(125, 216, 255, 0.24);
 }
 .method-badge.put {
   color: var(--warn);
-  background: rgba(255, 200, 97, 0.1);
-  border-color: rgba(255, 200, 97, 0.24);
 }
 .method-badge.del {
   color: var(--bad);
-  background: rgba(255, 115, 105, 0.1);
-  border-color: rgba(255, 115, 105, 0.24);
 }
 .method-badge.other {
   color: var(--ink-2);
-  background: var(--surface-strong);
-  border-color: var(--line-strong);
 }
 .method-badge.ctrl {
   color: var(--violet);
-  background: rgba(195, 155, 255, 0.1);
-  border-color: rgba(195, 155, 255, 0.24);
 }
 .har-url-wrap {
   flex: 1;

@@ -539,35 +539,75 @@ tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--intera
 .task-name div { min-width: 0; display: grid; gap: 4px; }
 .task-name strong { color: var(--ink); font-size: 13px; font-weight: 600; }
 .task-name small { max-width: 330px; overflow: hidden; color: var(--ink-3); text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11px; }
-.row-actions { text-align: right; white-space: nowrap; }
+.row-actions { position: relative; text-align: right; white-space: nowrap; }
 .row-actions .icon-button { width: 31px; height: 31px; }
 
+/* Overflow (kebab) menu. On narrow screens the four inline row actions do not
+   fit beside the task name, so they move into a menu behind a single button —
+   the same pattern Stripe / Vercel / Linear use on their list rows. */
+.row-more { display: none; }
+.row-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 61;
+  min-width: 168px; padding: 6px; display: grid; gap: 2px; text-align: left;
+  background: var(--surface-strong); border: 1px solid var(--line-strong);
+  border-radius: var(--r-m); box-shadow: var(--shadow-l); color: var(--ink);
+}
+.row-menu button {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  padding: 8px 10px; border: 0; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--ink-2);
+  font-family: inherit; font-size: 13px; font-weight: 500; text-align: left;
+}
+.row-menu button:hover { background: var(--accent-glow); color: var(--accent); }
+.row-menu button.danger:hover { background: rgb(220 38 38 / 0.1); color: var(--bad); }
+.row-menu-backdrop { position: fixed; inset: 0; z-index: 60; }
+
+/* Short, fixed-format cells must stay on one line. Under the default auto
+   table layout a narrow viewport shrinks every column toward its min-content
+   width, which made the cron chip break into "0 0 8 */1 *" / "* *" and stacked
+   the status pill into two vertical glyphs. Keeping them un-wrapped raises the
+   table's min-content width instead, so it scrolls cleanly rather than folding. */
+.col-schedule code,
+td.col-time,
+td.col-status { white-space: nowrap; }
+
+/* The verb reads as a coloured gutter label rather than a filled chip: no
+   fill, no border — the colour lives in the glyphs. The fixed gutter width is
+   kept so task names still line up down the column. */
 .method {
-  width: 48px; height: 25px; border-radius: 6px; flex: none;
-  color: var(--ok); background: rgb(22 163 74 / 0.12);
-  border: 1px solid rgb(22 163 74 / 0.24);
-  display: grid; place-items: center; font-size: 9px; font-weight: 800; letter-spacing: 0.8px;
+  min-width: 40px; height: 25px; flex: none;
+  color: var(--ok);
+  display: grid; justify-items: start; align-items: center;
+  font-size: 9px; font-weight: 800; letter-spacing: 0.8px;
   font-family: var(--font-mono);
 }
-.method.post { color: var(--info); background: rgb(2 132 199 / 0.1); border-color: rgb(2 132 199 / 0.24); }
-.method.delete { color: var(--bad); background: rgb(220 38 38 / 0.1); border-color: rgb(220 38 38 / 0.24); }
-.method.patch, .method.put { color: var(--violet); background: rgb(124 58 237 / 0.1); border-color: rgb(124 58 237 / 0.24); }
+.method.post { color: var(--info); }
+.method.delete { color: var(--bad); }
+.method.patch, .method.put { color: var(--violet); }
 
+/* Inline code is plain monospace again — the tinted pill competed with the
+   task name for attention. The accent colour stays in the text, not on a
+   surface. A hair of horizontal padding keeps it from touching its neighbours
+   where it sits inline next to a label. */
 code {
-  padding: 4px 7px; border-radius: 5px; color: var(--accent);
-  background: var(--accent-glow); border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  padding: 0 3px; color: var(--accent);
   font-family: var(--font-mono); font-size: 11px;
 }
 
+/* Status is a coloured dot plus a label; the pill surface is gone so nothing
+   in the row is filled. The dot now carries the state colour, so it has to
+   follow the label (see .run-bad below). */
 .status-pill {
-  padding: 5px 11px; border: 1px solid rgb(22 163 74 / 0.3); border-radius: 999px;
-  color: var(--ok); background: rgb(22 163 74 / 0.08); font-size: 11px; font-weight: 600;
-  transition: border-color var(--t-fast), background-color var(--t-fast);
+  padding: 5px 0; border: 0; background: transparent; border-radius: 0;
+  color: var(--ok); font-size: 11px; font-weight: 600;
+  transition: opacity var(--t-fast);
 }
-.status-pill:hover { border-color: rgb(22 163 74 / 0.55); background: rgb(22 163 74 / 0.14); }
+.status-pill:hover { opacity: 0.7; }
 .status-pill span { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--ok); }
-.status-pill.paused { color: var(--ink-2); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); border-color: var(--line-strong); }
+.status-pill.paused { color: var(--ink-2); }
 .status-pill.paused span { background: var(--ink-3); box-shadow: none; }
+.status-pill.run-bad { color: var(--bad); }
+.status-pill.run-bad span { background: var(--bad); }
 
 .chip { padding: 3px 10px; border-radius: 999px; color: var(--ink-2); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); border: 1px solid var(--line); font-size: 11px; white-space: nowrap; }
 .chip-published { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
@@ -685,8 +725,18 @@ code {
 /* align-items:end keeps the inputs on one baseline even when a label wraps */
 .form-row { display: grid; grid-template-columns: 140px 1fr; gap: 14px; align-items: end; }
 .schedule-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.schedule-mode { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
-.schedule-mode .text-button { flex: none; white-space: nowrap; }
+.schedule-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.schedule-head > span { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+/* Compact segmented control for the schedule mode. Anchored to the right of the
+   "schedule mode" label so the switch sits with the fields it controls instead
+   of floating under them as a lone link. */
+.seg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line-strong); border-radius: 999px; background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
+.seg button { border: 0; border-radius: 999px; padding: 4px 14px; background: transparent; color: var(--ink-2); font-size: 11.5px; font-weight: 600; line-height: 1.6; cursor: pointer; transition: background-color var(--t-fast), color var(--t-fast); }
+.seg button:hover { color: var(--ink); }
+.seg button.active { background: var(--primary); color: var(--primary-content); }
+/* The cron expression needs the whole row — half of a 560px modal is too narrow
+   for "0 0 8 * * * *" plus its own label. */
+.field-full { grid-column: 1 / -1; }
 .form-row svg { position: absolute; right: 10px; bottom: 12px; pointer-events: none; color: var(--ink-3); }
 .form-row-4 { grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); }
 .form-row-4 label { min-width: 0; }
@@ -900,4 +950,82 @@ code {
   .stats { margin-top: 24px; }
   .topbar-right { gap: 6px; }
   .toast-stack { right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
+}
+
+/* ------------------------------------------------------------
+   Narrow screens: the tasks table becomes a list, not a squeezed table.
+   A seven-column grid has no layout that both keeps the columns aligned
+   and fits a laptop-with-sidebar viewport, so below the breakpoint each
+   row renders as a self-contained list item with ONE visual focus — the
+   task name. The url and the cron/time/group meta row each take their own
+   line; the status pill and the overflow menu are pinned right so the eye
+   has a fixed scan column. This mirrors how Stripe, Vercel and Linear
+   render entity lists on small screens.
+   ------------------------------------------------------------ */
+@media (max-width: 1024px) {
+  .tasks-wrap { overflow: visible; border: 0; background: transparent; box-shadow: none; border-radius: 0; }
+  .tasks-table { min-width: 0; }
+  .tasks-table thead { display: none; }
+  .tasks-table tbody { display: block; }
+  /* check spans both rows; name spans the auto+auto+1fr tracks so the meta
+     columns below are sized by their own short content and the flexible
+     track absorbs whatever is left for the name. */
+  .tasks-table tr {
+    display: grid;
+    grid-template-columns: 24px auto auto minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "check name  name  name   status more"
+      "check sched time  grp    .      .";
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 5px;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-m);
+    background: rgb(var(--card-surface));
+    box-shadow: var(--card-shadow);
+  }
+  .tasks-table td { height: auto; padding: 0; border: 0; min-width: 0; }
+  .tasks-table .col-check { grid-area: check; width: auto; text-align: center; }
+  .tasks-table .col-status { grid-area: status; }
+  .tasks-table .col-schedule { grid-area: sched; display: block; }
+  .tasks-table .col-time { grid-area: time; color: var(--ink-3); font-size: 12px; }
+  .tasks-table .col-group {
+    grid-area: grp; display: block; overflow: hidden;
+    color: var(--ink-3); font-size: 12px; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tasks-table .row-actions { grid-area: more; margin: 0; gap: 6px; }
+  /* Treat the method chip as a gutter label: the title sits beside it and the
+     url hangs under the title column, so both keep the same left edge. */
+  .tasks-table .col-name { grid-area: name; overflow: hidden; }
+  .tasks-table .task-name {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "method title" "url url";
+    column-gap: 10px;
+    row-gap: 3px;
+    align-items: center;
+  }
+  .tasks-table .task-name > div { display: contents; }
+  .tasks-table .method { grid-area: method; }
+  .tasks-table .task-name strong { grid-area: title; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tasks-table .task-name small { grid-area: url; max-width: 100%; }
+  /* Swap the four inline actions for the overflow menu. */
+  .tasks-table .row-act { display: none; }
+  .tasks-table .row-more { display: inline-flex; }
+}
+
+/* Small phones: the meta row no longer fits on one line, so give each value
+   its own row rather than letting the text fold mid-token. */
+@media (max-width: 560px) {
+  .tasks-table tr {
+    grid-template-columns: 24px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "check name  more"
+      "check sched status"
+      "check time  grp";
+    column-gap: 8px;
+    padding: 11px 12px;
+  }
 }

@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, FileJson2, FileUp,
-  LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, Pencil, Play, Plus, RefreshCw, Search, Send,
+  LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
@@ -152,6 +152,11 @@ const groupFilterDropdownOptions = computed(() => [
 const selected = reactive(new Set<number>());
 const runsByTask = ref<Record<number, Run[]>>({});
 const runHistoryTask = ref<Task | null>(null);
+/** Task whose overflow (kebab) menu is open on narrow screens; null = none. */
+const openRowMenu = ref<number | null>(null);
+function toggleRowMenu(id: number) {
+  openRowMenu.value = openRowMenu.value === id ? null : id;
+}
 
 interface TaskForm {
   id: number | null;
@@ -1432,8 +1437,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <h2>{{ search || groupFilter ? t('noTasksMatch') : t('createFirst') }}</h2>
             <button v-if="!search && !groupFilter" class="secondary-button" @click="openCreateTask"><Plus :size="16" />{{ t('createTaskShort') }}</button>
           </div>
-          <div v-else class="table-wrap">
-            <table>
+          <div v-else class="table-wrap tasks-wrap">
+            <table class="tasks-table">
               <thead><tr>
                 <th class="col-check"><input type="checkbox" :checked="filteredTasks.length > 0 && filteredTasks.every(x => selected.has(x.id))" :title="t('selectAll')" @change="selectAllVisible" /></th>
                 <th>{{ t('name') }}</th><th class="col-schedule">{{ t('schedule') }}</th><th>{{ t('lastRunAt') }}</th><th>{{ t('status') }}</th><th class="col-group">{{ t('group') }}</th><th><span class="sr-only">{{ t('more') }}</span></th>
@@ -1442,16 +1447,24 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <template v-for="task in filteredTasks" :key="task.id">
                   <tr>
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
-                    <td><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
+                    <td class="col-name"><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
                     <td class="col-schedule"><code>{{ task.cron }}</code></td>
-                    <td>{{ formatRunTime(task.last_run_at, undefined, task.timezone || undefined) }}</td>
-                    <td><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
+                    <td class="col-time">{{ formatRunTime(task.last_run_at, undefined, task.timezone || undefined) }}</td>
+                    <td class="col-status"><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
                     <td class="col-group">{{ task.grp ?? '–' }}</td>
                     <td class="row-actions">
-                      <button class="icon-button" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
-                      <button class="icon-button" :title="t('runHistory')" @click="openRunHistory(task)"><Activity :size="17" /></button>
-                      <button class="icon-button" :title="t('editTask')" @click="openEditTask(task)"><Pencil :size="17" /></button>
-                      <button class="icon-button" :title="t('deleteTask')" @click="removeTask(task)"><Trash2 :size="17" /></button>
+                      <button class="icon-button row-act" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
+                      <button class="icon-button row-act" :title="t('runHistory')" @click="openRunHistory(task)"><Activity :size="17" /></button>
+                      <button class="icon-button row-act" :title="t('editTask')" @click="openEditTask(task)"><Pencil :size="17" /></button>
+                      <button class="icon-button row-act" :title="t('deleteTask')" @click="removeTask(task)"><Trash2 :size="17" /></button>
+                      <button class="icon-button row-more" :title="t('more')" :aria-expanded="openRowMenu === task.id" @click="toggleRowMenu(task.id)"><MoreVertical :size="17" /></button>
+                      <div v-if="openRowMenu === task.id" class="row-menu">
+                        <button @click="openRowMenu = null; runNow(task)"><Play :size="15" />{{ t('runNow') }}</button>
+                        <button @click="openRowMenu = null; openRunHistory(task)"><Activity :size="15" />{{ t('runHistory') }}</button>
+                        <button @click="openRowMenu = null; openEditTask(task)"><Pencil :size="15" />{{ t('editTask') }}</button>
+                        <button class="danger" @click="openRowMenu = null; removeTask(task)"><Trash2 :size="15" />{{ t('deleteTask') }}</button>
+                      </div>
+                      <div v-if="openRowMenu === task.id" class="row-menu-backdrop" @click="openRowMenu = null" />
                     </td>
                   </tr>
                 </template>
@@ -1791,21 +1804,36 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <label>{{ t('template') }}
           <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" />
         </label>
+        <div class="schedule-head">
+          <span>{{ t('scheduleMode') }}</span>
+          <div class="seg" role="group">
+            <button
+              type="button"
+              :class="{ active: !taskForm.scheduleAdvanced }"
+              :aria-pressed="!taskForm.scheduleAdvanced"
+              @click="taskForm.scheduleAdvanced = false"
+            >{{ t('scheduleVisual') }}</button>
+            <button
+              type="button"
+              :class="{ active: taskForm.scheduleAdvanced }"
+              :aria-pressed="taskForm.scheduleAdvanced"
+              @click="taskForm.scheduleAdvanced = true"
+            >{{ t('scheduleCronMode') }}</button>
+          </div>
+        </div>
         <div class="form-row schedule-fields">
           <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" /></label>
           <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
+          <label v-else>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
         </div>
-        <div class="form-row">
-          <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleTime') }}<input v-model="taskForm.scheduleTime" type="time" step="1" required /></label>
-          <label v-if="taskForm.scheduleAdvanced">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
-          <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
+        <div class="form-row schedule-fields">
+          <template v-if="!taskForm.scheduleAdvanced">
+            <label>{{ t('scheduleTime') }}<input v-model="taskForm.scheduleTime" type="time" step="1" required /></label>
+            <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
+          </template>
+          <label v-else class="field-full">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
         </div>
-        <div class="schedule-mode">
-          <small class="kv-hint">
-          <template v-if="!taskForm.scheduleAdvanced">{{ t('scheduleHint') }}</template>
-          </small>
-          <button type="button" class="text-button" @click="taskForm.scheduleAdvanced = !taskForm.scheduleAdvanced">{{ taskForm.scheduleAdvanced ? t('scheduleTime') : t('scheduleAdvanced') }}</button>
-        </div>
+        <small class="kv-hint">{{ taskForm.scheduleAdvanced ? t('scheduleCronHint') : t('scheduleHint') }}</small>
         <label>{{ t('url') }}<input v-model="taskForm.url" required type="url" placeholder="https://example.com/api/health" /></label>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
