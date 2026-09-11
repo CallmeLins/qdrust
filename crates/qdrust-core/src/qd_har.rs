@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::expression::QdExpressionEngine;
 
 #[derive(Clone, Debug)]
 pub struct QdHar {
@@ -57,6 +61,60 @@ impl QdHar {
 
     pub fn enabled_entries(&self) -> impl Iterator<Item = &QdHarEntry> {
         self.entries().iter().filter(|entry| entry.checked)
+    }
+
+    /// The variables a user must fill in before a task created from this
+    /// template can run. This is a port of QD's `HARSave.get_variables`
+    /// (`web/handlers/har.py`), which QD runs when a template is saved and
+    /// shows as the "变量" form on the new-task page.
+    ///
+    /// Every entry contributes the Jinja variables its request reads from the
+    /// method, the URL, the body and each header/cookie name and value. The
+    /// pass is order-sensitive: a name is only ignored *after* an entry extracts
+    /// it, so 绯月's `{{username}}` (fed through a GB2312 converter and then
+    /// extracted back into `username`) stays an input, while a `{{token}}`
+    /// produced by an earlier login entry never is. Names the Jinja engine
+    /// resolves itself (`md5`, `urlencode`, `int`, ...) are helper calls rather
+    /// than inputs. Only names, never values, are returned, in first-appearance
+    /// order.
+    pub fn variables(&self) -> Vec<String> {
+        let engine = QdExpressionEngine::default();
+        let known = engine.known_names();
+        let mut extracted: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut variables = Vec::new();
+        for entry in &self.document.log.entries {
+            let request = &entry.request;
+            let mut found = Vec::new();
+            let fields = [Some(request.method.as_str()), Some(request.url.as_str())]
+                .into_iter()
+                .flatten()
+                .chain(
+                    request
+                        .post_data
+                        .as_ref()
+                        .and_then(|data| data.text.as_deref()),
+                );
+            for field in fields {
+                found.extend(engine.undeclared_variables(field));
+            }
+            for item in request.headers.iter().chain(request.cookies.iter()) {
+                found.extend(engine.undeclared_variables(&item.name));
+                found.extend(engine.undeclared_variables(&item.value));
+            }
+            for name in found {
+                if known.contains(&name) || extracted.contains(&name) {
+                    continue;
+                }
+                if seen.insert(name.clone()) {
+                    variables.push(name);
+                }
+            }
+            for rule in &entry.extract_variables {
+                extracted.insert(rule.name.clone());
+            }
+        }
+        variables
     }
 }
 
@@ -677,5 +735,113 @@ mod tests {
         .unwrap();
         let error = QdProgram::compile(&har).unwrap_err().to_string();
         assert!(error.contains("expected endif"));
+    }
+
+    #[test]
+    fn finds_filtered_credentials_as_input_variables() {
+        // Jpopsuki.har (issue #9): both credentials are wrapped in `|urlencode`,
+        // so a plain `{{name}}` scan finds neither of them.
+        let raw = json!([
+            {
+                "request": {
+                    "method": "GET",
+                    "url": "https://jpopsuki.eu/login.php",
+                    "headers": [],
+                    "cookies": []
+                },
+                "rule": {
+                    "success_asserts": [{"re": "200", "from": "status"}],
+                    "failed_asserts": [],
+                    "extract_variables": []
+                }
+            },
+            {
+                "request": {
+                    "method": "POST",
+                    "url": "https://jpopsuki.eu/login.php",
+                    "headers": [{"name": "Content-Type", "value": "application/x-www-form-urlencoded"}],
+                    "cookies": [],
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "data": "username={{jpop_username|urlencode}}&password={{jpop_password|urlencode}}&login=Log%20In%21"
+                },
+                "rule": {
+                    "success_asserts": [{"re": "302", "from": "status"}],
+                    "failed_asserts": [],
+                    "extract_variables": []
+                }
+            }
+        ]);
+        let har = QdHar::parse_qd(raw).expect("Jpopsuki HAR must parse");
+        assert_eq!(har.variables(), ["jpop_username", "jpop_password"]);
+    }
+
+    #[test]
+    fn keeps_variables_that_are_read_before_being_extracted() {
+        // 绯月.har (issue #9): the first entry converts the raw `{{username}}`
+        // to GB2312 and extracts the converted text back into `username`, so
+        // `username` is both an input and an output. QD still asks the user for
+        // it, and `safeid` (produced by an earlier entry) must not be asked for.
+        let raw = json!([
+            {
+                "comment": "GB2312编码",
+                "request": {
+                    "method": "POST",
+                    "url": "api://util/gb2312",
+                    "headers": [],
+                    "cookies": [],
+                    "data": "content={{username}}"
+                },
+                "rule": {
+                    "success_asserts": [{"re": "200", "from": "status"}],
+                    "failed_asserts": [],
+                    "extract_variables": [{"name": "username", "re": "\"转换后\": \"(.*)\"", "from": "content"}]
+                }
+            },
+            {
+                "request": {
+                    "method": "POST",
+                    "url": "https://bbs.kfpromax.com/login.php",
+                    "headers": [],
+                    "cookies": [],
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "data": "step=2&pwuser={{username}}&pwpwd={{password}}&submit=x"
+                },
+                "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+            },
+            {
+                "comment": "While 循环开始",
+                "request": {
+                    "method": "GET",
+                    "url": "{% while int(loop_index0) < 100 and task != 'no' %}",
+                    "headers": [],
+                    "cookies": []
+                },
+                "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+            },
+            {
+                "request": {
+                    "method": "GET",
+                    "url": "https://bbs.kfpromax.com/kf_growup.php",
+                    "headers": [],
+                    "cookies": []
+                },
+                "rule": {
+                    "success_asserts": [],
+                    "failed_asserts": [],
+                    "extract_variables": [{"name": "safeid", "re": "safeid=(\\w+)", "from": "content"}]
+                }
+            },
+            {
+                "request": {
+                    "method": "GET",
+                    "url": "https://bbs.kfpromax.com/kf_growup.php?safeid={{safeid|urlencode}}",
+                    "headers": [],
+                    "cookies": []
+                },
+                "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+            }
+        ]);
+        let har = QdHar::parse_qd(raw).expect("绯月 HAR must parse");
+        assert_eq!(har.variables(), ["username", "password"]);
     }
 }

@@ -329,6 +329,11 @@ pub struct Template {
     pub definition: Option<TemplateDefinition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qd_har: Option<serde_json::Value>,
+    /// Input variables a task created from this template has to supply, in
+    /// first-appearance order: for QD HARs the `{{name}}` reads QD lists as its
+    /// "变量" form, for native templates the declared `variables` map keys.
+    #[serde(default)]
+    pub variables: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

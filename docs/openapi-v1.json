@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "qdrust API",
-    "version": "0.1.9"
+    "version": "0.1.10"
   },
   "servers": [
     {
@@ -2657,6 +2657,7 @@
           "description",
           "schema_version",
           "source_format",
+          "variables",
           "created_at",
           "updated_at"
         ],
@@ -2691,6 +2692,13 @@
           "qd_har": {
             "type": "object",
             "additionalProperties": true
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Input variables a task created from this template must supply (QD's 变量 list)"
           },
           "grp": {
             "type": [

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -1050,6 +1051,62 @@ impl QdExpressionEngine {
             .context("cannot render QD template value")
     }
 
+    /// Every name the engine resolves on its own: the QD-compatible functions
+    /// and filters (`md5`, `urlencode`, `int`, ...) plus MiniJinja's builtins
+    /// (`range`, `dict`, ...).
+    ///
+    /// QD subtracts an equivalent list (its `libs/utils.py: jinja_globals`)
+    /// when deciding which variables a template needs from the user, so that a
+    /// helper call such as `{{ md5(password) }}` contributes `password` rather
+    /// than `md5`.
+    pub fn known_names(&self) -> HashSet<String> {
+        self.environment
+            .globals()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// The variables `source` reads from the environment, in first-appearance
+    /// order, minus the names the engine provides itself. This is the
+    /// `jinja2.meta.find_undeclared_variables` step of QD's
+    /// `HARSave.get_variables`.
+    ///
+    /// Filter names are not variables (`{{ x|urlencode }}` only reads `x`), and
+    /// a source that is not valid Jinja yields nothing rather than an error.
+    /// QD's `env.parse` swallows those too, which is what keeps `{% while ... %}`
+    /// control entries from contributing bogus inputs.
+    pub fn undeclared_variables(&self, source: &str) -> Vec<String> {
+        let known = self.known_names();
+        let undeclared = undeclared_names(source)
+            .into_iter()
+            .filter(|name| !known.contains(name))
+            .collect::<HashSet<_>>();
+        if undeclared.is_empty() {
+            return Vec::new();
+        }
+        // `undeclared_names` is a set, so recover the source order: the variable
+        // form should read like the template. Identifiers inside string literals
+        // match here too, but the membership check drops them.
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+        for found in IDENTIFIER.find_iter(source) {
+            let name = found.as_str();
+            if undeclared.contains(name) && seen.insert(name) {
+                ordered.push(name.to_string());
+            }
+        }
+        // Safety net: a name the AST reported but the scan missed would be
+        // silently dropped from the form, so keep it (never expected, because
+        // MiniJinja identifiers are `[A-Za-z_][A-Za-z0-9_]*`).
+        let mut leftovers = undeclared
+            .into_iter()
+            .filter(|name| !seen.contains(name.as_str()))
+            .collect::<Vec<_>>();
+        leftovers.sort();
+        ordered.extend(leftovers);
+        ordered
+    }
+
     pub fn evaluate_bool(
         &self,
         expression: &str,
@@ -1064,6 +1121,26 @@ impl QdExpressionEngine {
             .context("cannot evaluate QD condition")?
             .is_true())
     }
+}
+
+/// Jinja identifiers, used to report discovered variables in source order.
+static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("identifier pattern must compile")
+});
+
+/// Undeclared names in a QD template fragment.
+///
+/// Parsed with a bare environment, exactly like QD's `HARSave.get_variables`
+/// (`Environment()` in `web/handlers/har.py`): unknown filters are fine because
+/// filters are resolved at render time, while an unbalanced or unsupported tag
+/// (`{% while ... %}`, a lone `{% endif %}`) is a syntax error and yields no
+/// names at all.
+fn undeclared_names(source: &str) -> HashSet<String> {
+    let environment = Environment::new();
+    let Ok(template) = environment.template_from_str(source) else {
+        return HashSet::new();
+    };
+    template.undeclared_variables(false)
 }
 
 fn parse_i64(value: &JinjaValue) -> Result<i64, Error> {
@@ -1881,6 +1958,49 @@ mod tests {
         assert!(
             Regex::new(r"^1\d{12}\.\d{6}$").unwrap().is_match(&rendered),
             "unexpected multiply output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn finds_undeclared_variables_behind_filters_and_functions() {
+        let engine = QdExpressionEngine::default();
+
+        // QD filters/functions are not inputs, even when they wrap one.
+        assert_eq!(
+            engine.undeclared_variables("username={{jpop_username|urlencode}}"),
+            ["jpop_username"]
+        );
+        assert_eq!(
+            engine.undeclared_variables("{{ md5(password) }}"),
+            ["password"]
+        );
+        // Attribute access reports the root name, like jinja2.meta.
+        assert_eq!(engine.undeclared_variables("{{ user.name }}"), ["user"]);
+        // Literals contribute nothing.
+        assert!(engine.undeclared_variables("{{ 'username' }}").is_empty());
+        // Source order is preserved so the form reads like the template.
+        assert_eq!(
+            engine.undeclared_variables("{{ beta }} {{ alpha }} {{ beta }}"),
+            ["beta", "alpha"]
+        );
+    }
+
+    #[test]
+    fn invalid_jinja_control_fragments_yield_no_variables() {
+        // QD parses every field on its own with a bare `Environment()`; a
+        // `while` tag or a dangling `endif` is a syntax error there and must
+        // not invent variables here either.
+        let engine = QdExpressionEngine::default();
+        assert!(
+            engine
+                .undeclared_variables("{% while int(loop_index0) < 100 and task != 'no' %}")
+                .is_empty()
+        );
+        assert!(engine.undeclared_variables("{% endwhile %}").is_empty());
+        // Valid control flow still contributes its inputs.
+        assert_eq!(
+            engine.undeclared_variables("{% if token %}ok{% endif %}"),
+            ["token"]
         );
     }
 

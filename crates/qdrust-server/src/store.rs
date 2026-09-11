@@ -19,7 +19,10 @@ use crate::model::{
     UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
     UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
-use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
+use qdrust_core::{
+    qd_har::QdHar,
+    template::{TEMPLATE_SCHEMA_VERSION, TemplateDefinition},
+};
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations-mysql");
@@ -2714,18 +2717,28 @@ fn template_from_row(row: $row) -> Result<Template> {
     let (definition, qd_har) = match source_format.as_str() {
         "qd_har" => (
             None,
-            Some(serde_json::from_str(
+            Some(serde_json::from_str::<serde_json::Value>(
                 source.as_deref().context("QD HAR source is missing")?,
             )?),
         ),
         "native_v1" => (
             Some(
-                serde_json::from_str(&definition)
+                serde_json::from_str::<TemplateDefinition>(&definition)
                     .context("invalid template definition in database")?,
             ),
             None,
         ),
         value => return Err(anyhow!("unsupported template source format: {value}")),
+    };
+    // The variable list is derived, not stored: QD computes it when a template
+    // is saved, but doing it on read keeps existing rows correct after fixes to
+    // the extractor (see QdHar::variables).
+    let variables = match (&definition, &qd_har) {
+        (_, Some(har)) => QdHar::parse_qd(har.clone())
+            .map(|har| har.variables())
+            .unwrap_or_default(),
+        (Some(definition), None) => definition.variables.keys().cloned().collect(),
+        (None, None) => Vec::new(),
     };
     Ok(Template {
         id: row.try_get("id")?,
@@ -2735,6 +2748,7 @@ fn template_from_row(row: $row) -> Result<Template> {
         source_format,
         definition,
         qd_har,
+        variables,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         grp: row.try_get("grp")?,
@@ -3795,6 +3809,51 @@ mod tests {
         assert_eq!(imported.source_format, "qd_har");
         assert_eq!(imported.qd_har, Some(har));
         assert!(imported.definition.is_none());
+    }
+
+    #[tokio::test]
+    async fn exposes_qd_template_input_variables() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let imported = store
+            .import_qd_har(ImportQdHarTemplate {
+                name: "issue 9 har".into(),
+                description: None,
+                har: serde_json::json!([
+                    {
+                        "request": {
+                            "method": "POST",
+                            "url": "https://example.invalid/login.php",
+                            "headers": [],
+                            "cookies": [],
+                            "mimeType": "application/x-www-form-urlencoded",
+                            "data": "username={{username|urlencode}}&password={{password|urlencode}}"
+                        },
+                        "rule": {
+                            "success_asserts": [],
+                            "failed_asserts": [],
+                            "extract_variables": [{"name": "token", "re": "token=(\\w+)", "from": "content"}]
+                        }
+                    },
+                    {
+                        "request": {
+                            "method": "GET",
+                            "url": "https://example.invalid/api?t={{token}}",
+                            "headers": [],
+                            "cookies": []
+                        },
+                        "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+                    }
+                ]),
+            })
+            .await
+            .unwrap();
+
+        // Reads behind a filter are still inputs; the `token` produced by the
+        // first entry's extract_variables is not offered to the user.
+        assert_eq!(imported.variables, ["username", "password"]);
+
+        let listed = store.list_templates().await.unwrap();
+        assert_eq!(listed[0].variables, ["username", "password"]);
     }
 
     #[tokio::test]

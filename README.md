@@ -523,6 +523,17 @@ location / {
 cargo run -p qdrust-cli -- validate .\template.har.json
 ```
 
+#### 模板变量是怎么算出来的
+
+基于模板新建任务时，WebUI 会按 QD `HARSave.get_variables` 的语义列出需要填写的变量（`GET /api/v1/templates` 返回的 `variables` 字段）：
+
+- 只看请求实际读取的名字：method、URL、请求体，以及每个请求头 / Cookie 的名字与值；
+- 用 Jinja 解析，所以 **过滤器和函数名不算变量**：`{{jpop_username|urlencode}}` 只产出 `jpop_username`，`{{md5(password)}}` 只产出 `password`；
+- **按条目顺序判定**：只有被 `extract_variables` 提取**之后**的引用才不算输入。所以登录后的 `{{token}}` 不会被问，而先喂给 `api://util/gb2312` 再由该条目回写提取的 `{{username}}` 仍然是输入；
+- 无法解析的片段（如 `{% while ... %}` 控制条目）不产生变量。
+
+`native_v1` 模板则直接用定义里声明的变量名。
+
 ### 创建与运行任务
 
 1. 新建模板或导入 HAR 后，基于模板创建任务并填写变量。

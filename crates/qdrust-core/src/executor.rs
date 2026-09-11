@@ -1277,6 +1277,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_http2_pseudo_headers_from_browser_captures() {
+        // Issue #6: QD's Chrome export keeps the HTTP/2 pseudo-headers
+        // `:method`/`:path`/`:scheme` in `request.headers`. reqwest rejects
+        // those as illegal header names, so the executor has to drop them: the
+        // method and URL already carry the same information.
+        let app = Router::new().route("/user.php", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {
+                "method": "GET",
+                "url": format!("http://{address}/user.php?id=62692"),
+                "headers": [
+                    {"name": ":method", "value": "GET", "checked": true},
+                    {"name": ":path", "value": "/user.php?id=62692", "checked": true},
+                    {"name": ":scheme", "value": "https", "checked": true},
+                    {"name": "user-agent", "value": "qd", "checked": true}
+                ],
+                "cookies": []
+            },
+            "success_asserts": [{"re": "200", "from": "status"}]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, 200);
+        assert_eq!(results[0].body_size, 2);
+    }
+
+    #[tokio::test]
     async fn executes_if_and_for_control_flow() {
         let app = Router::new().route("/{item}", get(|| async { "ok" }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

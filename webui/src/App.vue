@@ -262,60 +262,6 @@ function parseVisualCron(cron: string): { time: string; days: string } | null {
   const pad = (x: string) => x.padStart(2, "0");
   return { time: `${pad(h)}:${pad(m)}:${pad(s)}`, days: d };
 }
-/** 扫描模板 HAR 中所有 {{变量名}} 引用（qd find_variables 同思路），排除 __log__ 等内部变量 */
-function harVariableNames(har: unknown): string[] {
-  const names = new Set<string>();
-  const walk = (value: unknown) => {
-    if (typeof value === "string") {
-      for (const match of value.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) names.add(match[1]);
-      // QD templates commonly apply filters/functions, e.g. {{username|urlencode}}
-      // or {{rsa(password)}}. The simple identifier form above does not catch
-      // those, so explicitly retain credential inputs wherever they occur in
-      // a Jinja expression.
-      if (/\{\{[\s\S]*?\busername\b[\s\S]*?\}\}/.test(value)) names.add("username");
-      if (/\{\{[\s\S]*?\bpassword\b[\s\S]*?\}\}/.test(value)) names.add("password");
-    } else if (Array.isArray(value)) value.forEach(walk);
-    else if (value && typeof value === "object") Object.values(value).forEach(walk);
-  };
-  walk(har);
-  // QD also exposes cookie values as task-level inputs. Cookie names are not
-  // written as {{name}} in many exported HAR files, so discover empty or
-  // templated cookie values explicitly and create an input for each one.
-  const entries = (har as Record<string, unknown>)?.log && typeof har === "object"
-    ? ((har as Record<string, unknown>).log as Record<string, unknown>)?.entries
-    : Array.isArray(har) ? har : null;
-  if (Array.isArray(entries)) for (const entry of entries) {
-    const cookies = (entry as Record<string, unknown>)?.request && typeof (entry as Record<string, unknown>).request === "object"
-      ? ((entry as Record<string, unknown>).request as Record<string, unknown>).cookies : null;
-    if (Array.isArray(cookies)) for (const cookie of cookies) {
-      if (!cookie || typeof cookie !== "object") continue;
-      const item = cookie as Record<string, unknown>;
-      const name = typeof item.name === "string" ? item.name.trim() : "";
-      const value = typeof item.value === "string" ? item.value : "";
-      if (name && (!value || /\{\{/.test(value))) names.add(name);
-    }
-  }
-  return [...names].filter((name) => !name.startsWith("__"));
-}
-
-/** 收集模板的提取输出变量名（extract_variables），它们在运行时产生，不需要用户填写 */
-function harExtractedNames(har: unknown): Set<string> {
-  const names = new Set<string>();
-  const entries = (har as Record<string, unknown>)?.log && typeof har === "object"
-    ? ((har as Record<string, unknown>).log as Record<string, unknown>)?.entries
-    : Array.isArray(har) ? har : null;
-  if (!Array.isArray(entries)) return names;
-  for (const entry of entries) {
-    if (!entry || typeof entry !== "object") continue;
-    const record = entry as Record<string, unknown>;
-    const rule = record.rule && typeof record.rule === "object" ? record.rule as Record<string, unknown> : record;
-    for (const extract of Array.isArray(rule.extract_variables) ? rule.extract_variables : []) {
-      const name = (extract as Record<string, unknown>)?.name;
-      if (typeof name === "string") names.add(name);
-    }
-  }
-  return names;
-}
 
 const filteredTasks = computed(() => {
   const term = search.value.trim().toLowerCase();
@@ -631,10 +577,10 @@ function onTemplatePicked() {
   if (!tmpl) return;
   if (!taskForm.name) taskForm.name = tmpl.name;
   if (!taskForm.url) taskForm.url = firstHarUrl(tmpl);
-  // QD 式变量联动：从模板 HAR 提取 {{变量名}} 引用，自动生成填值行（保留已输入的同名值）。
-  // extract_variables 的提取输出（如 points/error/__log__）在运行时产生，不出现在填值表单。
-  const extracted = harExtractedNames(tmpl.qd_har);
-  const names = harVariableNames(tmpl.qd_har).filter((name) => !extracted.has(name));
+  // QD 式变量联动：变量清单由服务端按 QD 的 HARSave.get_variables 语义算出
+  // （过滤器和函数名不算变量，且只有被 extract_variables 提取之后的引用才不算输入），
+  // 这里只负责生成填值行，并保留用户已输入的同名值。
+  const names = tmpl.variables ?? [];
   if (names.length) {
     const existing = new Map(taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value]));
     taskForm.variables = names.map((name) => ({ name, value: existing.get(name) ?? "" }));

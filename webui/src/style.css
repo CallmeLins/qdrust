@@ -564,9 +564,9 @@ tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--intera
 
 /* Short, fixed-format cells must stay on one line. Under the default auto
    table layout a narrow viewport shrinks every column toward its min-content
-   width, which made the cron chip break into "0 0 8 */1 *" / "* *" and stacked
-   the status pill into two vertical glyphs. Keeping them un-wrapped raises the
-   table's min-content width instead, so it scrolls cleanly rather than folding. */
+   width, which made the cron chip wrap mid-token and stacked the status pill
+   into two vertical glyphs. Keeping them un-wrapped raises the table's
+   min-content width instead, so it scrolls cleanly rather than folding. */
 .col-schedule code,
 td.col-time,
 td.col-status { white-space: nowrap; }

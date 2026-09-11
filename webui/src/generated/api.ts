@@ -1221,6 +1221,8 @@ export interface components {
             qd_har?: {
                 [key: string]: unknown;
             };
+            /** @description Input variables a task created from this template must supply (QD's 变量 list) */
+            variables: string[];
             /** @description Group label (QD _groups equivalent) */
             grp?: string | null;
             /** Format: int64 */

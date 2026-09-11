@@ -916,6 +916,7 @@ mod tests {
                     }]
                 }
             })),
+            variables: Vec::new(),
             created_at: 0,
             updated_at: 0,
             grp: None,
@@ -1006,6 +1007,7 @@ mod tests {
                     }]
                 }
             })),
+            variables: Vec::new(),
             created_at: 0,
             updated_at: 0,
             grp: None,
