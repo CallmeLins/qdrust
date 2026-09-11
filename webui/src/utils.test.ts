@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatRunTime, localLoginAvailable, oidcLogoutUrl, ssoAvailable, ssoOnly, type AuthPolicy } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -61,6 +61,48 @@ describe("oidcLogoutUrl", () => {
   it("appends post_logout_redirect_uri when configured", () => {
     const p: AuthPolicy = { auth_mode: "oidc", local_login_enabled: false, oidc_enabled: true, oidc_provider_name: "K", header_auth_enabled: false, oidc_logout_url: "https://idp.example/logout?x=1", oidc_post_logout_redirect_uri: "https://app.example/qd/" };
     expect(oidcLogoutUrl(p)).toBe("https://idp.example/logout?x=1&post_logout_redirect_uri=https%3A%2F%2Fapp.example%2Fqd%2F");
+  });
+});
+
+describe("logout-return marker", () => {
+  const fakeStorage = (): StorageLike & { readonly map: Map<string, string> } => {
+    const map = new Map<string, string>();
+    return {
+      map,
+      getItem: (key) => map.get(key) ?? null,
+      setItem: (key, value) => void map.set(key, value),
+      removeItem: (key) => void map.delete(key),
+    };
+  };
+
+  it("reports true once after a fresh logout and consumes the marker", () => {
+    const storage = fakeStorage();
+    markLogoutReturn(storage, 1_000);
+    expect(storage.map.get(OIDC_LOGOUT_RETURN_KEY)).toBe("1000");
+    expect(consumeLogoutReturn(storage, 1_500)).toBe(true);
+    // One logout must not auto-start SSO twice.
+    expect(consumeLogoutReturn(storage, 1_500)).toBe(false);
+    expect(storage.map.has(OIDC_LOGOUT_RETURN_KEY)).toBe(false);
+  });
+
+  it("is false when no logout happened", () => {
+    expect(consumeLogoutReturn(fakeStorage())).toBe(false);
+  });
+
+  it("ignores a stale marker past the TTL but still clears it", () => {
+    const storage = fakeStorage();
+    markLogoutReturn(storage, 1_000);
+    expect(consumeLogoutReturn(storage, 1_000 + OIDC_LOGOUT_RETURN_TTL_MS)).toBe(false);
+    expect(storage.map.has(OIDC_LOGOUT_RETURN_KEY)).toBe(false);
+  });
+
+  it("ignores a future timestamp and a garbage value", () => {
+    const skew = fakeStorage();
+    markLogoutReturn(skew, 10_000);
+    expect(consumeLogoutReturn(skew, 9_000)).toBe(false);
+    const garbage = fakeStorage();
+    garbage.setItem(OIDC_LOGOUT_RETURN_KEY, "not-a-number");
+    expect(consumeLogoutReturn(garbage)).toBe(false);
   });
 });
 

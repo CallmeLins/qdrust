@@ -41,6 +41,40 @@ export function oidcLogoutUrl(policy: AuthPolicy | null): string {
   return `${base}${sep}post_logout_redirect_uri=${encodeURIComponent(post)}`;
 }
 
+/** The subset of `Storage` the logout-return marker needs; narrowed so tests can
+ *  pass a plain in-memory stub instead of a real `Storage`. */
+export type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+/** sessionStorage key for the "we just left for the IdP end-session endpoint"
+ *  marker. */
+export const OIDC_LOGOUT_RETURN_KEY = "qdrust-oidc-logout-return";
+
+/** How long a return to this app still counts as coming back from an IdP logout.
+ *  Without a bound, an abandoned logout (the user hits Back at the IdP, or the
+ *  redirect never happens) would leave the marker set forever and a much later
+ *  visit would be hijacked into an unexpected SSO redirect. */
+export const OIDC_LOGOUT_RETURN_TTL_MS = 300_000;
+
+/** Record that we are leaving for the IdP end-session endpoint and expect to
+ *  come back logged out. Stored as a timestamp rather than a flag so
+ *  `consumeLogoutReturn` can age it out. */
+export function markLogoutReturn(storage: StorageLike, now: number = Date.now()): void {
+  storage.setItem(OIDC_LOGOUT_RETURN_KEY, String(now));
+}
+
+/** Read-and-clear the logout-return marker. Returns true only when it was set
+ *  recently (within `OIDC_LOGOUT_RETURN_TTL_MS`). The marker is consumed either
+ *  way, so one logout can trigger at most one automatic SSO start. */
+export function consumeLogoutReturn(storage: StorageLike, now: number = Date.now()): boolean {
+  const raw = storage.getItem(OIDC_LOGOUT_RETURN_KEY);
+  if (raw == null) return false;
+  storage.removeItem(OIDC_LOGOUT_RETURN_KEY);
+  const stamp = Number(raw);
+  if (!Number.isFinite(stamp)) return false;
+  const age = now - stamp;
+  return age >= 0 && age < OIDC_LOGOUT_RETURN_TTL_MS;
+}
+
 /** True when the username/password entry points are enabled on the server and
  *  the user is not forced onto a credential-less path. When false the local
  *  form must be hidden (the server also returns 403 `local_login_disabled`). */

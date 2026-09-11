@@ -447,6 +447,54 @@ async fn execute_with_run(
     }
 }
 
+/// Render an epoch-seconds timestamp in the task's own IANA timezone (UTC when
+/// the task has none, or when the stored name no longer parses). Backs the
+/// `{t}` variable in notification templates.
+fn format_notification_time(timestamp: i64, timezone: Option<&str>) -> String {
+    let tz = timezone
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::Tz::UTC);
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|dt| {
+            dt.with_timezone(&tz)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Values substituted into a notification `title_template` / `body_template`
+/// (and into a custom-HTTP url / headers / body). Extracted from the delivery
+/// loop so the substitution rules stay unit-testable without a store or a
+/// network client.
+struct TemplateVars<'a> {
+    event: &'a str,
+    task_id: i64,
+    task_name: &'a str,
+    run_id: i64,
+    status: String,
+    error: &'a str,
+    log: &'a str,
+    time: String,
+}
+
+impl TemplateVars<'_> {
+    /// Replace every known `{placeholder}`. Unknown placeholders are left as-is
+    /// so a typo shows up in the delivered message instead of silently vanishing.
+    fn render(&self, value: &str) -> String {
+        value
+            .replace("{event}", self.event)
+            .replace("{task_id}", &self.task_id.to_string())
+            .replace("{task}", self.task_name)
+            .replace("{run_id}", &self.run_id.to_string())
+            .replace("{status}", &self.status)
+            .replace("{error}", self.error)
+            .replace("{log}", self.log)
+            .replace("{t}", &self.time)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_notifications(
     store: &Store,
@@ -501,29 +549,33 @@ async fn send_notifications(
         let log = log_message
             .or_else(|| run.as_ref().and_then(|run| run.log.as_deref()))
             .unwrap_or("");
-        let render_notification = |value: &str| {
-            value
-                .replace("{event}", event)
-                .replace("{task_id}", &task.id.to_string())
-                .replace("{task}", &task.name)
-                .replace("{run_id}", &run_id.to_string())
-                .replace(
-                    "{status}",
-                    &http_status.map(|s| s.to_string()).unwrap_or_default(),
-                )
-                .replace("{error}", error_message.unwrap_or(""))
-                .replace("{log}", log)
+        let vars = TemplateVars {
+            event,
+            task_id: task.id,
+            task_name: &task.name,
+            run_id,
+            status: http_status.map(|s| s.to_string()).unwrap_or_default(),
+            error: error_message.unwrap_or(""),
+            log,
+            // Prefer the finish time, fall back to the enqueue time, and only
+            // then to "now" (a run row that vanished from the store).
+            time: format_notification_time(
+                run.as_ref()
+                    .map(|run| run.finished_at.unwrap_or(run.created_at))
+                    .unwrap_or_else(|| Utc::now().timestamp()),
+                task.timezone.as_deref(),
+            ),
         };
         let channel = delivery.channel;
         let title = action
             .title_template
             .as_deref()
-            .map(render_notification)
+            .map(|value| vars.render(value))
             .unwrap_or_else(|| title.clone());
         let body = action
             .body_template
             .as_deref()
-            .map(render_notification)
+            .map(|value| vars.render(value))
             .unwrap_or_else(|| body.clone());
         match channel.kind.as_str() {
             "webhook" => {
@@ -552,11 +604,11 @@ async fn send_notifications(
                 let Ok(method) = method.parse::<Method>() else {
                     continue;
                 };
-                let mut request = client.request(method, render_notification(url));
+                let mut request = client.request(method, vars.render(url));
                 if let Some(headers) = channel.config.get("headers").and_then(|v| v.as_object()) {
                     for (name, value) in headers {
                         if let Some(value) = value.as_str() {
-                            request = request.header(name, render_notification(value));
+                            request = request.header(name, vars.render(value));
                         }
                     }
                 }
@@ -568,10 +620,7 @@ async fn send_notifications(
                 let result = if configured_body.is_empty() {
                     request.json(&payload).send().await
                 } else {
-                    request
-                        .body(render_notification(configured_body))
-                        .send()
-                        .await
+                    request.body(vars.render(configured_body)).send().await
                 };
                 if let Err(err) = result.and_then(|response| response.error_for_status()) {
                     error!(task_id=task.id, channel_id=channel.id, %err, "custom HTTP notification failed");
@@ -1225,6 +1274,56 @@ mod tests {
         assert!(BrowserSessionManager::new(Some("  ".to_string())).is_configured());
         assert!(
             BrowserSessionManager::new(Some("http://localhost:9222".to_string())).is_configured()
+        );
+    }
+
+    fn template_vars<'a>(
+        event: &'a str,
+        error: &'a str,
+        log: &'a str,
+        status: Option<u16>,
+    ) -> TemplateVars<'a> {
+        TemplateVars {
+            event,
+            task_id: 7,
+            task_name: "daily check",
+            run_id: 42,
+            status: status.map(|s| s.to_string()).unwrap_or_default(),
+            error,
+            log,
+            time: "2026-09-11 20:00:00".into(),
+        }
+    }
+
+    #[test]
+    fn notification_template_substitutes_every_variable() {
+        let vars = template_vars("failure", "boom", "line one", Some(500));
+        assert_eq!(
+            vars.render("{event}|{task_id}|{task}|{run_id}|{status}|{error}|{log}|{t}"),
+            "failure|7|daily check|42|500|boom|line one|2026-09-11 20:00:00"
+        );
+    }
+
+    #[test]
+    fn notification_template_keeps_unknown_placeholders_and_blanks_missing_status() {
+        let vars = template_vars("success", "", "", None);
+        // `{status}` collapses to empty when the run has no HTTP status, and an
+        // unknown placeholder is preserved verbatim rather than dropped.
+        assert_eq!(vars.render("s={status} {nope}"), "s= {nope}");
+    }
+
+    #[test]
+    fn notification_time_uses_the_task_timezone() {
+        // Epoch 0 renders in the task's zone, falling back to UTC for a task
+        // without a timezone or with an unparsable one.
+        assert_eq!(
+            format_notification_time(0, Some("Asia/Shanghai")),
+            "1970-01-01 08:00:00"
+        );
+        assert_eq!(format_notification_time(0, None), "1970-01-01 00:00:00");
+        assert_eq!(
+            format_notification_time(0, Some("Mars/Olympus")),
+            "1970-01-01 00:00:00"
         );
     }
 }

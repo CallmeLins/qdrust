@@ -8,7 +8,7 @@ import {
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
-import { formatRunTime, localLoginAvailable, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
+import { consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -814,7 +814,7 @@ const channelKindLabels: Record<NotificationChannel["kind"], string> = {
   webhook: t("webhookKind"), email: t("emailKind"), bark: t("barkKind"),
   serverchan: t("serverchanKind"), telegram: t("telegramKind"), dingtalk: t("dingtalkKind"),
   wxpusher: t("wxpusherKind"), wxpusher_spt: t("wxpusherSptKind"),
-  wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"), custom_http: "Custom HTTP",
+  wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"), custom_http: t("customHttpKind"),
 };
 const channelKindDropdownOptions: { value: string; label: string }[] = Object.entries(channelKindLabels).map(([value, label]) => ({ value, label }));
 function channelKindLabel(kind: string): string {
@@ -878,6 +878,10 @@ async function saveAction() {
     if (!actionForm.channelId) { notify(t("chooseChannel"), "error"); return; }
     const threshold = Math.max(1, Number(actionForm.failureThreshold) || 1);
     await api.batchCreateNotificationActions(taskIds, actionForm.channelId, actionForm.event, threshold, actionForm.automaticOnly, actionForm.titleTemplate, actionForm.bodyTemplate);
+    // Clear the batch selection and the per-action options (keep the taskId that
+    // drives the list below) so a second click cannot silently duplicate the
+    // very same bindings.
+    Object.assign(actionForm, { taskIds: [], failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
     await loadActions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -1113,7 +1117,7 @@ async function logout(silent = false) {
   // app's now-logged-out page.
   const idpLogout = silent ? "" : oidcLogoutUrl(authPolicy.value);
   if (idpLogout) {
-    sessionStorage.setItem("qdrust-oidc-logout-return", "1");
+    markLogoutReturn(sessionStorage);
     window.location.assign(idpLogout);
     return;
   }
@@ -1136,12 +1140,13 @@ function startSso() {
 // loop): the SSO-only panel remains as the error/retry landing page.
 function maybeAutoStartSso() {
   if (authenticated.value) return;
-  const returningFromLogout = sessionStorage.getItem("qdrust-oidc-logout-return") === "1";
+  // Read-and-clear: the marker makes exactly one post-logout landing page jump
+  // to the IdP, and ages out so an abandoned logout cannot hijack a later visit.
+  const returningFromLogout = consumeLogoutReturn(sessionStorage);
   if (!ssoForced.value && !returningFromLogout) return;
   // Do not hijack a page that is reporting an earlier SSO failure.
   const url = new URLSearchParams(location.search).get("login_error");
   if (url) return;
-  sessionStorage.removeItem("qdrust-oidc-logout-return");
   startSso();
 }
 
@@ -1585,10 +1590,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <label>{{ t('webhookUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
             </template>
             <template v-else-if="channelForm.kind === 'custom_http'">
-              <label>URL<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
-              <label>Method<input v-model="channelForm.customMethod" required /></label>
-              <label>Headers JSON<textarea v-model="channelForm.customHeaders" rows="3" spellcheck="false" /></label>
-              <label>Body template<textarea v-model="channelForm.customBody" rows="3" spellcheck="false" placeholder="{task} {event} {error}" /></label>
+              <label>{{ t('customHttpUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
+              <label>{{ t('customHttpMethod') }}<input v-model="channelForm.customMethod" required /></label>
+              <label>{{ t('customHttpHeaders') }}<textarea v-model="channelForm.customHeaders" rows="3" spellcheck="false" /></label>
+              <label>{{ t('customHttpBodyTemplate') }}<textarea v-model="channelForm.customBody" rows="3" spellcheck="false" placeholder="{task} {event} {error}" /></label>
+              <small class="kv-hint">{{ t('customHttpHint') }}</small>
             </template>
             <template v-else-if="channelForm.kind === 'email'">
               <label>{{ t('emailTo') }}<input v-model="channelForm.to" required type="email" /></label>
@@ -1641,23 +1647,26 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <label>{{ t('task') }}
               <Dropdown v-model="actionForm.taskId" :options="actionTaskDropdownOptions" @change="loadActions" />
             </label>
-            <label class="action-task-multi">Tasks (optional batch)<select v-model="actionForm.taskIds" multiple><option v-for="task in tasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label>
+            <label class="action-task-multi">{{ t('notifyBatchTasks') }}<select v-model="actionForm.taskIds" multiple><option v-for="task in tasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label>
             <label>{{ t('channel') }}
               <Dropdown v-model="actionForm.channelId" :options="actionChannelDropdownOptions" />
             </label>
             <label>{{ t('event') }}
               <Dropdown v-model="actionForm.event" :options="eventDropdownOptions" />
             </label>
-            <label>Failure threshold<input v-model="actionForm.failureThreshold" type="number" min="1" /></label>
-            <label class="checkbox"><input v-model="actionForm.automaticOnly" type="checkbox" />Automatic runs only</label>
-            <label>Title template<input v-model="actionForm.titleTemplate" placeholder="{task} {event}" /></label>
-            <label>Body template<textarea v-model="actionForm.bodyTemplate" rows="3" placeholder="{log} {error}" /></label>
+            <label>{{ t('notifyFailureThreshold') }}<input v-model="actionForm.failureThreshold" type="number" min="1" /></label>
+            <label class="checkbox"><input v-model="actionForm.automaticOnly" type="checkbox" />{{ t('notifyAutomaticOnly') }}</label>
+            <label>{{ t('notifyTitleTemplate') }}<input v-model="actionForm.titleTemplate" placeholder="{task} {event}" /></label>
+            <label>{{ t('notifyBodyTemplate') }}<textarea v-model="actionForm.bodyTemplate" rows="3" placeholder="{log} {error}" /></label>
+            <small class="kv-hint">{{ t('notifyVarsHint') }}</small>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
           <div v-for="action in actions" :key="action.id" class="run-row">
             <strong>{{ action.event === 'success' ? t('eventSuccess') : action.event === 'failure' ? t('eventFailure') : t('eventAlways') }}</strong>
             <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
             <span>{{ t('task') }}: {{ taskName(action.task_id) }}</span>
+            <span v-if="action.failure_threshold > 1" class="chip" :title="t('notifyFailureThreshold')">&ge;{{ action.failure_threshold }}</span>
+            <span v-if="action.automatic_only" class="chip">{{ t('notifyAutomaticOnlyShort') }}</span>
             <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
           </div>
         </section>

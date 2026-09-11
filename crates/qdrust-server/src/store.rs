@@ -885,11 +885,15 @@ macro_rules! define_store {
         self.enqueue_run_with_trigger(task_id, "manual").await
     }
 
+    /// NOTE: `trigger` is a reserved word in MySQL (8.0+), so every reference to
+    /// that column is backtick-quoted. SQLite accepts backtick-quoted identifiers
+    /// too, so the same SQL string works on both backends without a dialect
+    /// branch. See also `RUN_FIELDS`.
     pub async fn enqueue_run_with_trigger(&self, task_id: i64, trigger: &str) -> Result<Option<Run>> {
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,attempt,trigger)
+            "INSERT INTO runs(task_id,status,created_at,attempt,`trigger`)
              SELECT ?, 'pending', ?, 0, ?
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
@@ -917,7 +921,7 @@ macro_rules! define_store {
         let run_after = now + delay_seconds.max(0);
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,run_after,attempt,trigger)
+            "INSERT INTO runs(task_id,status,created_at,run_after,attempt,`trigger`)
              SELECT ?, 'pending', ?, ?, 0, 'scheduled'
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
@@ -946,7 +950,7 @@ macro_rules! define_store {
         let run_after = now + delay_seconds.max(1);
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,run_after,retry_of,attempt,trigger)
+            "INSERT INTO runs(task_id,status,created_at,run_after,retry_of,attempt,`trigger`)
              SELECT ?, 'pending', ?, ?, ?, 0, 'retry'
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
@@ -2589,7 +2593,10 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
-const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,trigger FROM runs";
+// `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
+// them as well). Every other reference to this column in the file must be
+// quoted the same way or MySQL deployments fail with a 1064 syntax error.
+const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -3126,7 +3133,13 @@ fn validate_notification(name: &str, kind: &str, config: &serde_json::Value) -> 
                 .and_then(|v| v.as_str())
                 .context("custom HTTP config requires url")?;
             let url = reqwest::Url::parse(url).context("invalid custom HTTP URL")?;
-            ensure!(url.scheme() == "https", "custom HTTP URL must use HTTPS");
+            // Unlike the generic `webhook` kind, custom HTTP exists to reach
+            // self-hosted services (ntfy, Gotify, ...) which are commonly served
+            // over plain HTTP on a LAN, so both schemes are accepted here.
+            ensure!(
+                matches!(url.scheme(), "http" | "https"),
+                "custom HTTP URL must use http or https"
+            );
             let method = config
                 .get("method")
                 .and_then(|v| v.as_str())
