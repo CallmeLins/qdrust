@@ -179,6 +179,7 @@ export const api = {
   notificationActions: (taskId: number) => request<NotificationAction[]>(`/api/v1/tasks/${taskId}/notification-actions`),
   createNotificationAction: (taskId: number, channelId: number, event: string) => request<NotificationAction>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "POST", body: JSON.stringify({ channel_id: channelId, event }) }),
   deleteNotificationAction: (id: number) => request<void>(`/api/v1/notification-actions/${id}`, { method: "DELETE" }),
+  batchCreateNotificationActions: (taskIds: number[], channelId: number, event: string, failureThreshold = 1, automaticOnly = false, titleTemplate?: string, bodyTemplate?: string) => request<{ created: number }>("/api/v1/notification-actions/batch", { method: "POST", body: JSON.stringify({ task_ids: taskIds, channel_id: channelId, event, failure_threshold: failureThreshold, automatic_only: automaticOnly, title_template: titleTemplate || null, body_template: bodyTemplate || null }) }),
 
   // ---- tasks ----
   tasks: () => request<Task[]>("/api/v1/tasks"),

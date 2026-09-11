@@ -475,6 +475,12 @@ impl QdExecutor {
         let mut rendered_cookie_header: Option<String> = None;
         for header in entry.request.headers.iter().filter(|header| header.checked) {
             let rendered_name = self.render(&header.name, context)?;
+            // HTTP/2 pseudo-headers are metadata from the browser capture, not
+            // legal request headers for reqwest. The URL/method already carry
+            // their meaning.
+            if rendered_name.starts_with(':') {
+                continue;
+            }
             let rendered_value = self.render(&header.value, context)?;
             // reqwest is built without compression decoders; request identity
             // responses so extracted content remains readable for all HARs.
@@ -684,6 +690,10 @@ impl QdExecutor {
         )
         .map_err(with_response)?;
         for rule in &entry.extract_variables {
+            // QD uses an empty extraction expression as a no-op placeholder.
+            if rule.rule.re.is_empty() {
+                continue;
+            }
             let pattern = self.render(&rule.rule.re, context)?;
             let source = rule_source(&rule.rule.from, status, &headers, &content);
             let extracted = extract(&pattern, &source)?;

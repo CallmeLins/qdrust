@@ -101,7 +101,9 @@ pub fn spawn(
                     let jitter = rand::rng().random_range(0..=max_delay.min(604_800));
                     tick_store.enqueue_delayed_run(task.id, jitter).await
                 } else {
-                    tick_store.enqueue_run(task.id).await
+                    tick_store
+                        .enqueue_run_with_trigger(task.id, "scheduled")
+                        .await
                 };
                 let _ = result;
             }
@@ -358,6 +360,7 @@ async fn execute_with_run(
                 "success",
                 Some(status),
                 None,
+                log_message.as_deref(),
                 email,
             )
             .await;
@@ -413,6 +416,7 @@ async fn execute_with_run(
                 "failure",
                 None,
                 Some(&message),
+                None,
                 email,
             )
             .await;
@@ -452,9 +456,10 @@ async fn send_notifications(
     event: &str,
     http_status: Option<u16>,
     error_message: Option<&str>,
+    log_message: Option<&str>,
     email: &EmailClient,
 ) {
-    let channels = match store.notification_channels_for_event(task.id, event).await {
+    let deliveries = match store.notification_channels_for_event(task.id, event).await {
         Ok(channels) => channels,
         Err(err) => {
             error!(task_id=task.id, %err, "cannot load notification channels");
@@ -478,7 +483,48 @@ async fn send_notifications(
             .unwrap_or_else(|| "-".into()),
         error_message.unwrap_or("-"),
     );
-    for channel in channels {
+    let run = store.get_run(run_id).await.ok().flatten();
+    let automatic = run.as_ref().is_some_and(|run| run.trigger != "manual");
+    let failure_count = if event == "failure" {
+        store.count_recent_failures(task.id).await.unwrap_or(1)
+    } else {
+        0
+    };
+    for delivery in deliveries {
+        let action = delivery.action;
+        if action.automatic_only && !automatic {
+            continue;
+        }
+        if event == "failure" && failure_count < action.failure_threshold {
+            continue;
+        }
+        let log = log_message
+            .or_else(|| run.as_ref().and_then(|run| run.log.as_deref()))
+            .unwrap_or("");
+        let render_notification = |value: &str| {
+            value
+                .replace("{event}", event)
+                .replace("{task_id}", &task.id.to_string())
+                .replace("{task}", &task.name)
+                .replace("{run_id}", &run_id.to_string())
+                .replace(
+                    "{status}",
+                    &http_status.map(|s| s.to_string()).unwrap_or_default(),
+                )
+                .replace("{error}", error_message.unwrap_or(""))
+                .replace("{log}", log)
+        };
+        let channel = delivery.channel;
+        let title = action
+            .title_template
+            .as_deref()
+            .map(render_notification)
+            .unwrap_or_else(|| title.clone());
+        let body = action
+            .body_template
+            .as_deref()
+            .map(render_notification)
+            .unwrap_or_else(|| body.clone());
         match channel.kind.as_str() {
             "webhook" => {
                 let Some(url) = channel.config.get("url").and_then(|value| value.as_str()) else {
@@ -492,6 +538,43 @@ async fn send_notifications(
                     .and_then(|response| response.error_for_status())
                 {
                     error!(task_id=task.id, channel_id=channel.id, %err, "notification delivery failed");
+                }
+            }
+            "custom_http" => {
+                let Some(url) = channel.config.get("url").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let method = channel
+                    .config
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("POST");
+                let Ok(method) = method.parse::<Method>() else {
+                    continue;
+                };
+                let mut request = client.request(method, render_notification(url));
+                if let Some(headers) = channel.config.get("headers").and_then(|v| v.as_object()) {
+                    for (name, value) in headers {
+                        if let Some(value) = value.as_str() {
+                            request = request.header(name, render_notification(value));
+                        }
+                    }
+                }
+                let configured_body = channel
+                    .config
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let result = if configured_body.is_empty() {
+                    request.json(&payload).send().await
+                } else {
+                    request
+                        .body(render_notification(configured_body))
+                        .send()
+                        .await
+                };
+                if let Err(err) = result.and_then(|response| response.error_for_status()) {
+                    error!(task_id=task.id, channel_id=channel.id, %err, "custom HTTP notification failed");
                 }
             }
             "email" => {

@@ -302,6 +302,18 @@ fn normalize_qd_document(raw: Value) -> Value {
         let Some(request) = entry.get_mut("request").and_then(Value::as_object_mut) else {
             continue;
         };
+        // QD exports commonly omit these flags. In QD that means enabled;
+        // serde's default for the compatibility fields is false, so normalize
+        // them before deserialization.
+        for key in ["headers", "cookies"] {
+            if let Some(Value::Array(items)) = request.get_mut(key) {
+                for item in items {
+                    if let Some(object) = item.as_object_mut() {
+                        object.entry("checked").or_insert_with(|| Value::Bool(true));
+                    }
+                }
+            }
+        }
         let data = request
             .get("data")
             .and_then(Value::as_str)
@@ -509,6 +521,33 @@ mod tests {
         assert_eq!(
             captcha.post_data.as_ref().unwrap().text.as_deref(),
             Some("accountType=01")
+        );
+    }
+
+    #[test]
+    fn parse_qd_enables_unflagged_headers_and_cookies() {
+        let raw = json!([{
+            "request": {
+                "method": "GET",
+                "url": "https://example.invalid",
+                "headers": [{"name": ":method", "value": "GET"}, {"name": "Host", "value": "example.invalid"}],
+                "cookies": [{"name": "sid", "value": "abc"}]
+            }
+        }]);
+        let har = QdHar::parse_qd(raw).unwrap();
+        assert!(
+            har.entries()[0]
+                .request
+                .headers
+                .iter()
+                .all(|header| header.checked)
+        );
+        assert!(
+            har.entries()[0]
+                .request
+                .cookies
+                .iter()
+                .all(|cookie| cookie.checked)
         );
     }
 

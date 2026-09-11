@@ -14,10 +14,10 @@ use crate::model::{
     CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
     CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim,
     ExternalLoginResolution, ImportQdHarTemplate, IssuedSession, NotificationAction,
-    NotificationChannel, OidcLoginState, PluginManifest, PushRequest, Run, RunStep, SetSiteSetting,
-    SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription, UpdateNotificationChannel,
-    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-    UpdateTemplateSubscription, User, UserCredentials,
+    NotificationChannel, NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run,
+    RunStep, SetSiteSetting, SiteSetting, SubscriptionSync, Task, Template, TemplateSubscription,
+    UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{qd_har::QdHar, template::TEMPLATE_SCHEMA_VERSION};
 
@@ -882,17 +882,22 @@ macro_rules! define_store {
     }
 
     pub async fn enqueue_run(&self, task_id: i64) -> Result<Option<Run>> {
+        self.enqueue_run_with_trigger(task_id, "manual").await
+    }
+
+    pub async fn enqueue_run_with_trigger(&self, task_id: i64, trigger: &str) -> Result<Option<Run>> {
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,attempt)
-             SELECT ?, 'pending', ?, 0
+            "INSERT INTO runs(task_id,status,created_at,attempt,trigger)
+             SELECT ?, 'pending', ?, 0, ?
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
              )",
         )
         .bind(task_id)
         .bind(now)
+        .bind(trigger)
         .bind(task_id)
         .execute(&mut *conn)
         .await?;
@@ -912,8 +917,8 @@ macro_rules! define_store {
         let run_after = now + delay_seconds.max(0);
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,run_after,attempt)
-             SELECT ?, 'pending', ?, ?, 0
+            "INSERT INTO runs(task_id,status,created_at,run_after,attempt,trigger)
+             SELECT ?, 'pending', ?, ?, 0, 'scheduled'
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
              )",
@@ -941,8 +946,8 @@ macro_rules! define_store {
         let run_after = now + delay_seconds.max(1);
         let mut conn = self.pool.acquire().await?;
         let result = sqlx::query(
-            "INSERT INTO runs(task_id,status,created_at,run_after,retry_of,attempt)
-             SELECT ?, 'pending', ?, ?, ?, 0
+            "INSERT INTO runs(task_id,status,created_at,run_after,retry_of,attempt,trigger)
+             SELECT ?, 'pending', ?, ?, ?, 0, 'retry'
              WHERE NOT EXISTS (
                 SELECT 1 FROM runs WHERE task_id=? AND status IN ('pending','leased','running')
              )",
@@ -969,6 +974,17 @@ macro_rules! define_store {
             .bind(original_run_id)
             .fetch_one(&self.pool)
             .await?;
+        Ok(row.try_get::<i64, _>("count")?)
+    }
+
+    pub async fn count_recent_failures(&self, task_id: i64) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS count FROM runs WHERE task_id=? AND status='failed' AND created_at >= COALESCE((SELECT MAX(created_at) FROM runs WHERE task_id=? AND status='succeeded'), 0)",
+        )
+        .bind(task_id)
+        .bind(task_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(row.try_get::<i64, _>("count")?)
     }
 
@@ -1253,18 +1269,27 @@ macro_rules! define_store {
             matches!(input.event.as_str(), "success" | "failure" | "always"),
             "invalid notification event"
         );
+        ensure!(input.failure_threshold > 0, "failure threshold must be positive");
         let owns: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks t JOIN notification_channels c ON c.owner_id=t.owner_id WHERE t.id=? AND t.owner_id=? AND c.id=?)")
             .bind(task_id).bind(owner_id).bind(input.channel_id).fetch_one(&self.pool).await?;
         if !owns {
             return Ok(None);
         }
         let mut conn = self.pool.acquire().await?;
-        sqlx::query("INSERT INTO notification_actions(task_id,channel_id,event,created_at) VALUES (?,?,?,?)")
-            .bind(task_id).bind(input.channel_id).bind(input.event).bind(Utc::now().timestamp()).execute(&mut *conn).await?;
+        sqlx::query("INSERT INTO notification_actions(task_id,channel_id,event,failure_threshold,automatic_only,title_template,body_template,created_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(task_id).bind(input.channel_id).bind(input.event).bind(input.failure_threshold).bind(input.automatic_only).bind(input.title_template).bind(input.body_template).bind(Utc::now().timestamp()).execute(&mut *conn).await?;
         let id = self.last_insert_id(&mut conn).await?;
         drop(conn);
         self.get_notification_action(id, owner_id)
             .await
+    }
+
+    pub async fn create_notification_actions_for_tasks(&self, owner_id: i64, task_ids: &[i64], input: CreateNotificationAction) -> Result<usize> {
+        let mut created = 0;
+        for task_id in task_ids {
+            if self.create_notification_action(*task_id, owner_id, input.clone()).await?.is_some() { created += 1; }
+        }
+        Ok(created)
     }
 
     pub async fn list_notification_actions(
@@ -1275,7 +1300,7 @@ macro_rules! define_store {
         if self.get_for_owner(task_id, owner_id).await?.is_none() {
             return Ok(None);
         }
-        let rows = sqlx::query("SELECT a.id,a.task_id,a.channel_id,a.event,a.created_at FROM notification_actions a WHERE a.task_id=? ORDER BY a.id")
+        let rows = sqlx::query("SELECT a.id,a.task_id,a.channel_id,a.event,a.failure_threshold,a.automatic_only,a.title_template,a.body_template,a.created_at FROM notification_actions a WHERE a.task_id=? ORDER BY a.id")
             .bind(task_id).fetch_all(&self.pool).await?;
         Ok(Some(
             rows.into_iter()
@@ -1293,14 +1318,14 @@ macro_rules! define_store {
         &self,
         task_id: i64,
         event: &str,
-    ) -> Result<Vec<NotificationChannel>> {
+    ) -> Result<Vec<NotificationDelivery>> {
         ensure!(
             matches!(event, "success" | "failure"),
             "invalid notification event"
         );
-        let rows = sqlx::query("SELECT c.id,c.name,c.kind,c.config,c.enabled,c.created_at,c.updated_at FROM notification_channels c JOIN notification_actions a ON a.channel_id=c.id WHERE a.task_id=? AND c.enabled=1 AND a.event IN (?, 'always') ORDER BY a.id")
+        let rows = sqlx::query("SELECT c.id AS channel_id,c.name AS channel_name,c.kind AS channel_kind,c.config AS channel_config,c.enabled AS channel_enabled,c.created_at AS channel_created_at,c.updated_at AS channel_updated_at,a.id AS action_id,a.task_id AS action_task_id,a.channel_id AS action_channel_id,a.event AS action_event,a.failure_threshold,a.automatic_only,a.title_template,a.body_template,a.created_at AS action_created_at FROM notification_channels c JOIN notification_actions a ON a.channel_id=c.id WHERE a.task_id=? AND c.enabled=1 AND a.event IN (?, 'always') ORDER BY a.id")
             .bind(task_id).bind(event).fetch_all(&self.pool).await?;
-        rows.into_iter().map(notification_from_row).collect()
+        rows.into_iter().map(notification_delivery_from_row).collect()
     }
 
     pub async fn create_plugin(
@@ -1377,7 +1402,7 @@ macro_rules! define_store {
         id: i64,
         owner_id: i64,
     ) -> Result<Option<NotificationAction>> {
-        let row = sqlx::query("SELECT a.id,a.task_id,a.channel_id,a.event,a.created_at FROM notification_actions a JOIN tasks t ON t.id=a.task_id WHERE a.id=? AND t.owner_id=?")
+        let row = sqlx::query("SELECT a.id,a.task_id,a.channel_id,a.event,a.failure_threshold,a.automatic_only,a.title_template,a.body_template,a.created_at FROM notification_actions a JOIN tasks t ON t.id=a.task_id WHERE a.id=? AND t.owner_id=?")
             .bind(id).bind(owner_id).fetch_optional(&self.pool).await?;
         row.map(notification_action_from_row).transpose()
     }
@@ -2564,7 +2589,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
-const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of FROM runs";
+const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,trigger FROM runs";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -2726,6 +2751,7 @@ fn run_from_row(row: $row) -> Result<Run> {
         cancel_requested: row.try_get("cancel_requested")?,
         run_after: row.try_get("run_after")?,
         retry_of: row.try_get("retry_of")?,
+        trigger: row.try_get("trigger")?,
     })
 }
 
@@ -2747,7 +2773,36 @@ fn notification_action_from_row(row: $row) -> Result<NotificationAction> {
         task_id: row.try_get("task_id")?,
         channel_id: row.try_get("channel_id")?,
         event: row.try_get("event")?,
+        failure_threshold: row.try_get("failure_threshold")?,
+        automatic_only: row.try_get("automatic_only")?,
+        title_template: row.try_get("title_template")?,
+        body_template: row.try_get("body_template")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn notification_delivery_from_row(row: $row) -> Result<NotificationDelivery> {
+    Ok(NotificationDelivery {
+        channel: NotificationChannel {
+            id: row.try_get("channel_id")?,
+            name: row.try_get("channel_name")?,
+            kind: row.try_get("channel_kind")?,
+            config: serde_json::from_str(&row.try_get::<String, _>("channel_config")?)?,
+            enabled: row.try_get("channel_enabled")?,
+            created_at: row.try_get("channel_created_at")?,
+            updated_at: row.try_get("channel_updated_at")?,
+        },
+        action: NotificationAction {
+            id: row.try_get("action_id")?,
+            task_id: row.try_get("action_task_id")?,
+            channel_id: row.try_get("action_channel_id")?,
+            event: row.try_get("action_event")?,
+            failure_threshold: row.try_get("failure_threshold")?,
+            automatic_only: row.try_get("automatic_only")?,
+            title_template: row.try_get("title_template")?,
+            body_template: row.try_get("body_template")?,
+            created_at: row.try_get("action_created_at")?,
+        },
     })
 }
 
@@ -2937,9 +2992,11 @@ impl Store {
         pub async fn record_run(id: i64, status: Option<u16>, error: Option<&str>) -> Result<()> { id, status, error };
         pub async fn start_run(task_id: i64) -> Result<Run> { task_id };
         pub async fn enqueue_run(task_id: i64) -> Result<Option<Run>> { task_id };
+        pub async fn enqueue_run_with_trigger(task_id: i64, trigger: &str) -> Result<Option<Run>> { task_id, trigger };
         pub async fn enqueue_delayed_run(task_id: i64, delay_seconds: i64) -> Result<Option<Run>> { task_id, delay_seconds };
         pub async fn schedule_retry(task_id: i64, retry_of: i64, delay_seconds: i64) -> Result<Option<Run>> { task_id, retry_of, delay_seconds };
         pub async fn count_retries(original_run_id: i64) -> Result<i64> { original_run_id };
+        pub async fn count_recent_failures(task_id: i64) -> Result<i64> { task_id };
         pub async fn claim_run(worker: &str, lease_seconds: i64) -> Result<Option<Run>> { worker, lease_seconds };
         pub async fn start_leased_run(run_id: i64, worker: &str) -> Result<bool> { run_id, worker };
         pub async fn renew_run(run_id: i64, worker: &str, lease_seconds: i64) -> Result<bool> { run_id, worker, lease_seconds };
@@ -2963,9 +3020,10 @@ impl Store {
         pub async fn update_notification_channel(id: i64, owner_id: i64, input: UpdateNotificationChannel) -> Result<Option<NotificationChannel>> { id, owner_id, input };
         pub async fn delete_notification_channel(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
         pub async fn create_notification_action(task_id: i64, owner_id: i64, input: CreateNotificationAction) -> Result<Option<NotificationAction>> { task_id, owner_id, input };
+        pub async fn create_notification_actions_for_tasks(owner_id: i64, task_ids: &[i64], input: CreateNotificationAction) -> Result<usize> { owner_id, task_ids, input };
         pub async fn list_notification_actions(task_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationAction>>> { task_id, owner_id };
         pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
-        pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationChannel>> { task_id, event };
+        pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
         pub async fn list_enabled_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
@@ -3062,10 +3120,30 @@ fn validate_notification(name: &str, kind: &str, config: &serde_json::Value) -> 
             let url = reqwest::Url::parse(url).context("invalid webhook URL")?;
             ensure!(url.scheme() == "https", "webhook URL must use HTTPS");
         }
+        "custom_http" => {
+            let url = config
+                .get("url")
+                .and_then(|v| v.as_str())
+                .context("custom HTTP config requires url")?;
+            let url = reqwest::Url::parse(url).context("invalid custom HTTP URL")?;
+            ensure!(url.scheme() == "https", "custom HTTP URL must use HTTPS");
+            let method = config
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("POST");
+            ensure!(
+                method.parse::<reqwest::Method>().is_ok(),
+                "invalid custom HTTP method"
+            );
+            if let Some(headers) = config.get("headers") {
+                ensure!(headers.is_object(), "custom HTTP headers must be an object");
+            }
+        }
         "email" => ensure!(
             config.get("to").and_then(|v| v.as_str()).is_some(),
             "email config requires to"
         ),
+        kind if crate::push_channels::is_push_channel(kind) => {}
         _ => anyhow::bail!("unsupported notification channel kind"),
     }
     Ok(())

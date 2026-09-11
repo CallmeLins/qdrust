@@ -1069,7 +1069,7 @@ export interface components {
             id: number;
             name: string;
             /** @enum {string} */
-            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook";
+            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook" | "custom_http";
             config: {
                 [key: string]: unknown;
             };
@@ -1082,7 +1082,7 @@ export interface components {
         CreateNotificationChannel: {
             name: string;
             /** @enum {string} */
-            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook";
+            kind: "webhook" | "email" | "bark" | "serverchan" | "telegram" | "dingtalk" | "wxpusher" | "wxpusher_spt" | "wecom_app" | "wecom_webhook" | "custom_http";
             config: {
                 [key: string]: unknown;
             };
@@ -1105,6 +1105,10 @@ export interface components {
             channel_id: number;
             /** @enum {string} */
             event: "success" | "failure" | "always";
+            failure_threshold: number;
+            automatic_only: boolean;
+            title_template?: string | null;
+            body_template?: string | null;
             /** Format: int64 */
             created_at: number;
         };
@@ -1113,6 +1117,10 @@ export interface components {
             channel_id: number;
             /** @enum {string} */
             event: "success" | "failure" | "always";
+            failure_threshold?: number;
+            automatic_only?: boolean;
+            title_template?: string | null;
+            body_template?: string | null;
         };
         Plugin: {
             /** Format: int64 */

@@ -359,6 +359,7 @@ pub struct Run {
     /// For retry runs: id of the first (original) run of the retry chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_of: Option<i64>,
+    pub trigger: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -412,6 +413,10 @@ pub struct NotificationAction {
     pub task_id: i64,
     pub channel_id: i64,
     pub event: String,
+    pub failure_threshold: i64,
+    pub automatic_only: bool,
+    pub title_template: Option<String>,
+    pub body_template: Option<String>,
     pub created_at: i64,
 }
 
@@ -419,6 +424,31 @@ pub struct NotificationAction {
 pub struct CreateNotificationAction {
     pub channel_id: i64,
     pub event: String,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: i64,
+    #[serde(default)]
+    pub automatic_only: bool,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub body_template: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BatchCreateNotificationAction {
+    pub task_ids: Vec<i64>,
+    #[serde(flatten)]
+    pub action: CreateNotificationAction,
+}
+
+#[derive(Clone, Debug)]
+pub struct NotificationDelivery {
+    pub channel: NotificationChannel,
+    pub action: NotificationAction,
+}
+
+fn default_failure_threshold() -> i64 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize)]

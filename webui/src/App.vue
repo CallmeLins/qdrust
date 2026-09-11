@@ -789,9 +789,9 @@ const channelForm = reactive({
   name: "", kind: "webhook" as NotificationChannel["kind"],
   url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "",
   dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "",
-  secret: "", toUser: "", wecomKey: "", to: "", subject: "",
+  secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "",
 });
-const actionForm = reactive({ taskId: 0, channelId: 0, event: "failure" });
+const actionForm = reactive({ taskIds: [] as number[], taskId: 0, channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
 const actionTaskDropdownOptions = computed(() => [
   { value: 0, label: t("chooseTask"), disabled: true },
   ...tasks.value.map((task) => ({ value: task.id, label: task.name })),
@@ -809,7 +809,7 @@ const channelKindLabels: Record<NotificationChannel["kind"], string> = {
   webhook: t("webhookKind"), email: t("emailKind"), bark: t("barkKind"),
   serverchan: t("serverchanKind"), telegram: t("telegramKind"), dingtalk: t("dingtalkKind"),
   wxpusher: t("wxpusherKind"), wxpusher_spt: t("wxpusherSptKind"),
-  wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"),
+  wecom_app: t("wecomAppKind"), wecom_webhook: t("wecomWebhookKind"), custom_http: "Custom HTTP",
 };
 const channelKindDropdownOptions: { value: string; label: string }[] = Object.entries(channelKindLabels).map(([value, label]) => ({ value, label }));
 function channelKindLabel(kind: string): string {
@@ -821,6 +821,11 @@ function buildChannelConfig(): Record<string, unknown> {
   const optional = (value: string) => trim(value) || undefined;
   switch (f.kind) {
     case "webhook": return { url: trim(f.url) };
+    case "custom_http": {
+      let headers: Record<string, string> = {};
+      try { headers = JSON.parse(f.customHeaders || "{}"); } catch { throw new Error("custom HTTP headers must be valid JSON"); }
+      return { url: trim(f.url), method: trim(f.customMethod).toUpperCase() || "POST", headers, body: f.customBody };
+    }
     case "email": return { to: trim(f.to), ...(optional(f.subject) ? { subject: trim(f.subject) } : {}) };
     case "bark": return { url: trim(f.url), ...(optional(f.sound) ? { sound: trim(f.sound) } : {}), ...(optional(f.group) ? { group: trim(f.group) } : {}) };
     case "serverchan": return { sendkey: trim(f.sendkey) };
@@ -844,7 +849,7 @@ async function openNotifications() {
 async function saveChannel() {
   try {
     await api.createNotificationChannel(channelForm.name, channelForm.kind, buildChannelConfig());
-    Object.assign(channelForm, { name: "", kind: "webhook", url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "", dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "", secret: "", toUser: "", wecomKey: "", to: "", subject: "" });
+    Object.assign(channelForm, { name: "", kind: "webhook", url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "", dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "", secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "" });
     await openNotifications();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -863,9 +868,11 @@ async function loadActions() {
 }
 async function saveAction() {
   try {
-    if (!actionForm.taskId) { notify(t("chooseTask"), "error"); return; }
+    const taskIds = actionForm.taskIds.length ? actionForm.taskIds : actionForm.taskId ? [actionForm.taskId] : [];
+    if (!taskIds.length) { notify(t("chooseTask"), "error"); return; }
     if (!actionForm.channelId) { notify(t("chooseChannel"), "error"); return; }
-    await api.createNotificationAction(actionForm.taskId, actionForm.channelId, actionForm.event);
+    const threshold = Math.max(1, Number(actionForm.failureThreshold) || 1);
+    await api.batchCreateNotificationActions(taskIds, actionForm.channelId, actionForm.event, threshold, actionForm.automaticOnly, actionForm.titleTemplate, actionForm.bodyTemplate);
     await loadActions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -1101,6 +1108,7 @@ async function logout(silent = false) {
   // app's now-logged-out page.
   const idpLogout = silent ? "" : oidcLogoutUrl(authPolicy.value);
   if (idpLogout) {
+    sessionStorage.setItem("qdrust-oidc-logout-return", "1");
     window.location.assign(idpLogout);
     return;
   }
@@ -1123,10 +1131,12 @@ function startSso() {
 // loop): the SSO-only panel remains as the error/retry landing page.
 function maybeAutoStartSso() {
   if (authenticated.value) return;
-  if (!ssoForced.value) return;
+  const returningFromLogout = sessionStorage.getItem("qdrust-oidc-logout-return") === "1";
+  if (!ssoForced.value && !returningFromLogout) return;
   // Do not hijack a page that is reporting an earlier SSO failure.
   const url = new URLSearchParams(location.search).get("login_error");
   if (url) return;
+  sessionStorage.removeItem("qdrust-oidc-logout-return");
   startSso();
 }
 
@@ -1561,6 +1571,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <template v-if="channelForm.kind === 'webhook'">
               <label>{{ t('webhookUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
             </template>
+            <template v-else-if="channelForm.kind === 'custom_http'">
+              <label>URL<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
+              <label>Method<input v-model="channelForm.customMethod" required /></label>
+              <label>Headers JSON<textarea v-model="channelForm.customHeaders" rows="3" spellcheck="false" /></label>
+              <label>Body template<textarea v-model="channelForm.customBody" rows="3" spellcheck="false" placeholder="{task} {event} {error}" /></label>
+            </template>
             <template v-else-if="channelForm.kind === 'email'">
               <label>{{ t('emailTo') }}<input v-model="channelForm.to" required type="email" /></label>
               <label>{{ t('emailSubject') }}<input v-model="channelForm.subject" /></label>
@@ -1612,12 +1628,17 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <label>{{ t('task') }}
               <Dropdown v-model="actionForm.taskId" :options="actionTaskDropdownOptions" @change="loadActions" />
             </label>
+            <label class="action-task-multi">Tasks (optional batch)<select v-model="actionForm.taskIds" multiple><option v-for="task in tasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label>
             <label>{{ t('channel') }}
               <Dropdown v-model="actionForm.channelId" :options="actionChannelDropdownOptions" />
             </label>
             <label>{{ t('event') }}
               <Dropdown v-model="actionForm.event" :options="eventDropdownOptions" />
             </label>
+            <label>Failure threshold<input v-model="actionForm.failureThreshold" type="number" min="1" /></label>
+            <label class="checkbox"><input v-model="actionForm.automaticOnly" type="checkbox" />Automatic runs only</label>
+            <label>Title template<input v-model="actionForm.titleTemplate" placeholder="{task} {event}" /></label>
+            <label>Body template<textarea v-model="actionForm.bodyTemplate" rows="3" placeholder="{log} {error}" /></label>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
           <div v-for="action in actions" :key="action.id" class="run-row">
@@ -1770,7 +1791,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <label>{{ t('template') }}
           <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" />
         </label>
-        <div class="form-row">
+        <div class="form-row schedule-fields">
           <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" /></label>
           <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
         </div>
@@ -1779,10 +1800,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <label v-if="taskForm.scheduleAdvanced">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
           <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
         </div>
-        <small class="kv-hint">
+        <div class="schedule-mode">
+          <small class="kv-hint">
           <template v-if="!taskForm.scheduleAdvanced">{{ t('scheduleHint') }}</template>
-          <a href="#" class="text-button" @click.prevent="taskForm.scheduleAdvanced = !taskForm.scheduleAdvanced">{{ taskForm.scheduleAdvanced ? t('scheduleTime') : t('scheduleAdvanced') }}</a>
-        </small>
+          </small>
+          <button type="button" class="text-button" @click="taskForm.scheduleAdvanced = !taskForm.scheduleAdvanced">{{ taskForm.scheduleAdvanced ? t('scheduleTime') : t('scheduleAdvanced') }}</button>
+        </div>
         <label>{{ t('url') }}<input v-model="taskForm.url" required type="url" placeholder="https://example.com/api/health" /></label>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>

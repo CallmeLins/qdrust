@@ -36,14 +36,14 @@ use crate::auth::{hash_password, token_hash, verify_password};
 use crate::oidc;
 use crate::{
     model::{
-        AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession, BatchTaskOperation,
-        BatchTaskResult, ChangePassword, ClearLogs, CreateNotificationAction,
-        CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask,
-        CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentityClaim,
-        ForgotPassword, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
-        RegisterUser, ResetPassword, SetSiteSetting, UpdateNotificationChannel,
-        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession,
+        BatchCreateNotificationAction, BatchTaskOperation, BatchTaskResult, ChangePassword,
+        ClearLogs, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest,
+        CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
+        DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportQdHarTemplate,
+        InvokePlugin, IssuedSession, QdHarValidation, RegisterUser, ResetPassword, SetSiteSetting,
+        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
@@ -301,6 +301,10 @@ pub fn router_with_auth(
         .route(
             "/api/v1/tasks/{id}/notification-actions",
             get(list_notification_actions).post(create_notification_action),
+        )
+        .route(
+            "/api/v1/notification-actions/batch",
+            axum::routing::post(batch_create_notification_actions),
         )
         .route(
             "/api/v1/notification-actions/{id}",
@@ -1609,6 +1613,19 @@ async fn create_notification_action(
             "Task or notification channel not found",
         ))?;
     Ok((StatusCode::CREATED, Json(json!(action))))
+}
+
+async fn batch_create_notification_actions(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<BatchCreateNotificationAction>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let created = store
+        .create_notification_actions_for_tasks(session.user.id, &input.task_ids, input.action)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!({"created": created})))
 }
 
 async fn delete_notification_action(

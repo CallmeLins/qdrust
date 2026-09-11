@@ -2259,7 +2259,8 @@
               "wxpusher",
               "wxpusher_spt",
               "wecom_app",
-              "wecom_webhook"
+              "wecom_webhook",
+              "custom_http"
             ]
           },
           "config": {
@@ -2302,7 +2303,8 @@
               "wxpusher",
               "wxpusher_spt",
               "wecom_app",
-              "wecom_webhook"
+              "wecom_webhook",
+              "custom_http"
             ]
           },
           "config": {
@@ -2346,6 +2348,8 @@
           "task_id",
           "channel_id",
           "event",
+          "failure_threshold",
+          "automatic_only",
           "created_at"
         ],
         "properties": {
@@ -2369,6 +2373,10 @@
               "always"
             ]
           },
+          "failure_threshold": { "type": "integer", "format": "int64", "default": 1 },
+          "automatic_only": { "type": "boolean", "default": false },
+          "title_template": { "type": ["string", "null"] },
+          "body_template": { "type": ["string", "null"] },
           "created_at": {
             "type": "integer",
             "format": "int64"
@@ -2394,6 +2402,10 @@
               "always"
             ]
           }
+          ,"failure_threshold": { "type": "integer", "format": "int64", "default": 1 },
+          "automatic_only": { "type": "boolean", "default": false },
+          "title_template": { "type": ["string", "null"] },
+          "body_template": { "type": ["string", "null"] }
         }
       },
       "Plugin": {
