@@ -673,6 +673,8 @@ code {
   border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .modal select { appearance: none; }
+/* A field the bound task template owns: kept visible for reference, not editable. */
+.modal input[readonly] { background: var(--surface-strong); color: var(--ink-2); cursor: not-allowed; }
 
 /* ---- custom dropdown (Dropdown.vue) ----
    Replaces native <select> so the open list (a) stays the same width as the
@@ -697,8 +699,13 @@ code {
 .dd-trigger.placeholder .dd-value { color: var(--ink-3); }
 .dd-caret { flex: none; color: var(--ink-3); transition: transform var(--t-fast); }
 .dd-caret.flip { transform: rotate(180deg); }
+/* Teleported to <body> and pinned with viewport coordinates (see Dropdown.vue):
+   an absolute list both extended the scrollable area of the container it was
+   opened from (options ended up below the fold and needed a scroll — issue #12)
+   and got clipped by that container. z-index sits above the modal backdrops
+   (50 / 60) but below the toast stack (90). */
 .dd-pop {
-  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20;
+  position: fixed; z-index: 80;
   max-height: 260px; overflow: auto;
   margin: 0; padding: 5px; list-style: none;
   border: 1px solid var(--line-strong); border-radius: var(--r-m);
@@ -716,7 +723,9 @@ code {
    select rather than a full-height form field. */
 .dd.compact { display: inline-block; }
 .dd.compact .dd-trigger { min-height: 34px; padding: 0 10px; font-size: 12px; }
-.dd.compact .dd-pop li { font-size: 12px; padding: 5px 8px; }
+/* `compact` is carried by the list itself because the teleported list is no
+   longer a DOM descendant of `.dd`. */
+.dd-pop.compact li { font-size: 12px; padding: 5px 8px; }
 .modal input::placeholder, .modal textarea::placeholder { color: var(--ink-3); }
 .modal .checkbox { display: flex; align-items: center; gap: 8px; grid-template-columns: none; }
 .modal .checkbox input { width: 16px; height: 16px; min-height: 0; accent-color: var(--primary); }

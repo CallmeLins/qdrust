@@ -169,6 +169,7 @@ const zh = {
   variableValue: "值",
   variablesHint: "变量可在 URL/请求头/请求体/模板中通过 {{变量名}} 引用，支持 qd 函数（md5/urlencode/timestamp 等）",
   templateVarsHint: "以下变量从所选模板自动识别（扫描 {{变量名}} 引用），填入的值将在每次运行时替换",
+  templateRequestHint: "已绑定模板：请求方法与 URL 由模板内的各条请求决定（多页模板常混合 GET/POST），此处只读展示模板的首个请求，无需修改",
   // HAR editor
   harTitle: "HAR 编辑器",
   harAddRequest: "＋ 添加请求",
@@ -590,6 +591,7 @@ const en: Record<MessageKey, string> = {
   variableValue: "Value",
   variablesHint: "Variables are referenced as {{name}} in URLs, headers, bodies and templates; qd functions (md5/urlencode/timestamp…) are supported",
   templateVarsHint: "Variables below were auto-detected from the selected template ({{name}} references); values are substituted on every run",
+  templateRequestHint: "Template bound: its own requests decide the method and URL (multi-page templates often mix GET and POST). This is a read-only mirror of the template's first request.",
   // HAR editor
   harTitle: "HAR Editor",
   harAddRequest: "＋ Add request",

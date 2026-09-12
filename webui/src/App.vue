@@ -566,17 +566,30 @@ async function openTemplates() {
     publicTemplates.value = pub;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
-function firstHarUrl(template: Template): string {
+/** A bound template owns the request chain, so task-level method/url only mirror it. */
+const templateBound = computed(() => taskForm.templateId != null);
+function firstHarRequest(template: Template): { method: string; url: string } | null {
   const entries = (template.qd_har as any)?.log?.entries;
-  if (!Array.isArray(entries)) return "";
+  if (!Array.isArray(entries)) return null;
   const entry = entries.find((e: any) => e.checked) ?? entries[0];
-  return entry?.request?.url ?? "";
+  const request = entry?.request;
+  if (!request) return null;
+  return {
+    method: typeof request.method === "string" ? request.method.toUpperCase() : "",
+    url: typeof request.url === "string" ? request.url : "",
+  };
 }
 function onTemplatePicked() {
   const tmpl = templatesForSelect.value.find((x) => x.id === taskForm.templateId);
   if (!tmpl) return;
   if (!taskForm.name) taskForm.name = tmpl.name;
-  if (!taskForm.url) taskForm.url = firstHarUrl(tmpl);
+  // 绑定模板后 Method / URL 变为只读，这里直接镜像模板的首条请求：多页模板常混合
+  // GET/POST，任务级 Method 本来就没有意义（issue #10），但仍要让任务列表有 URL 可显示。
+  const first = firstHarRequest(tmpl);
+  if (first) {
+    if (first.url) taskForm.url = first.url;
+    if (httpMethodDropdownOptions.some((o) => o.value === first.method)) taskForm.method = first.method;
+  }
   // QD 式变量联动：变量清单由服务端按 QD 的 HARSave.get_variables 语义算出
   // （过滤器和函数名不算变量，且只有被 extract_variables 提取之后的引用才不算输入），
   // 这里只负责生成填值行，并保留用户已输入的同名值。
@@ -1777,7 +1790,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
         </div>
         <div class="form-row schedule-fields">
-          <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" /></label>
+          <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" :disabled="templateBound" /></label>
           <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
           <label v-else>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
         </div>
@@ -1789,7 +1802,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <label v-else class="field-full">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
         </div>
         <small class="kv-hint">{{ taskForm.scheduleAdvanced ? t('scheduleCronHint') : t('scheduleHint') }}</small>
-        <label>{{ t('url') }}<input v-model="taskForm.url" required type="url" placeholder="https://example.com/api/health" /></label>
+        <label>{{ t('url') }}<input v-model="taskForm.url" :readonly="templateBound" :required="!templateBound" type="url" placeholder="https://example.com/api/health" /></label>
+        <small v-if="templateBound" class="kv-hint">{{ t('templateRequestHint') }}</small>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
         <div class="form-row form-row-4">
