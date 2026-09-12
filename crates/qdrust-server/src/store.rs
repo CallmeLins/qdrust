@@ -21,7 +21,7 @@ use crate::model::{
 };
 use qdrust_core::{
     qd_har::QdHar,
-    template::{TEMPLATE_SCHEMA_VERSION, TemplateDefinition},
+    template::{Step, TEMPLATE_SCHEMA_VERSION, TemplateDefinition},
 };
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -676,8 +676,65 @@ macro_rules! define_store {
         self.create_with_owner(Some(owner_id), input).await
     }
 
+    /// Resolve the `(method, url)` pair stored on a task row.
+    ///
+    /// A task bound to a template never executes these fields — the scheduler
+    /// replays the template instead — so the pair is mirrored from the
+    /// template's first request. That is what lets the WebUI stop asking for a
+    /// request it would only ignore, while the values stay meaningful in task
+    /// listings and for API clients that still create plain tasks. An unbound
+    /// task keeps the caller's request; `current` is the row's existing pair,
+    /// used when an update omits both.
+    async fn resolve_task_request(
+        &self,
+        template_id: Option<i64>,
+        requested_method: Option<&str>,
+        requested_url: Option<&str>,
+        current: Option<(&str, &str)>,
+    ) -> Result<(String, String)> {
+        if let Some(url) = requested_url.map(str::trim).filter(|url| !url.is_empty()) {
+            return Ok((
+                requested_method.unwrap_or("GET").to_uppercase(),
+                url.to_owned(),
+            ));
+        }
+        let mut bound_to_template = false;
+        if let Some(template_id) = template_id {
+            let template = self
+                .get_template(template_id)
+                .await?
+                .with_context(|| format!("template {template_id} not found"))?;
+            bound_to_template = true;
+            if let Some(mirrored) = template_mirror_request(&template) {
+                return Ok(mirrored);
+            }
+        }
+        match current {
+            Some((method, url)) => Ok((
+                requested_method.unwrap_or(method).to_uppercase(),
+                url.to_owned(),
+            )),
+            None if bound_to_template => Err(anyhow!(
+                "the bound template has no request to mirror, set the task URL explicitly"
+            )),
+            None => Err(anyhow!("task URL is required when no template is bound")),
+        }
+    }
+
     async fn create_with_owner(&self, owner_id: Option<i64>, input: CreateTask) -> Result<Task> {
-        validate(&input.name, &input.cron, &input.url, input.timezone.as_deref())?;
+        let template_id = input.template_id;
+        let (method, url) = self
+            .resolve_task_request(template_id, input.method.as_deref(), Some(&input.url), None)
+            .await?;
+        // A bound task's URL is only a mirror of the template, so a URL that
+        // would not parse on its own (e.g. an `api://util/...` step with
+        // `{{var}}` in the query) must not block creation.
+        validate(
+            &input.name,
+            &input.cron,
+            template_id.is_none().then_some(url.as_str()),
+            input.timezone.as_deref(),
+        )?;
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
@@ -686,8 +743,8 @@ macro_rules! define_store {
         )
         .bind(input.name)
         .bind(input.cron)
-        .bind(input.method.unwrap_or_else(|| "GET".into()).to_uppercase())
-        .bind(input.url)
+        .bind(method)
+        .bind(url)
         .bind(serde_json::to_string(&input.headers)?)
         .bind(input.body)
         .bind(input.disabled)
@@ -789,10 +846,23 @@ macro_rules! define_store {
         let Some(current) = current else {
             return Ok(None);
         };
+        let template_id = input.template_id.or(current.template_id);
+        let (method, url) = self
+            .resolve_task_request(
+                template_id,
+                input.method.as_deref(),
+                input.url.as_deref(),
+                Some((current.method.as_str(), current.url.as_str())),
+            )
+            .await?;
         let name = input.name.unwrap_or(current.name);
         let cron = input.cron.unwrap_or(current.cron);
-        let url = input.url.unwrap_or(current.url);
-        validate(&name, &cron, &url, input.timezone.as_ref().and_then(|tz| tz.as_deref()))?;
+        validate(
+            &name,
+            &cron,
+            template_id.is_none().then_some(url.as_str()),
+            input.timezone.as_ref().and_then(|tz| tz.as_deref()),
+        )?;
         let headers = input
             .headers
             .map(serde_json::Value::Object)
@@ -806,12 +876,12 @@ macro_rules! define_store {
         )
         .bind(name)
         .bind(cron)
-        .bind(input.method.unwrap_or(current.method).to_uppercase())
+        .bind(method)
         .bind(url)
         .bind(serde_json::to_string(&headers)?)
         .bind(input.body.or(current.body))
         .bind(input.disabled.unwrap_or(current.disabled))
-        .bind(input.template_id.or(current.template_id))
+        .bind(template_id)
         .bind(grp.as_deref())
         .bind(merge_optional(input.timeout_seconds, current.timeout_seconds))
         .bind(merge_optional(input.retry_count, current.retry_count))
@@ -3182,14 +3252,43 @@ fn merge_optional<T>(input: Option<Option<T>>, current: Option<T>) -> Option<T> 
     input.unwrap_or(current)
 }
 
-fn validate(name: &str, schedule: &str, url: &str, timezone: Option<&str>) -> Result<()> {
+/// The request a task bound to a template mirrors: the template's first
+/// request. QD HARs use the first enabled entry (falling back to the very first
+/// entry when none is checked); native v1 definitions use the first `request`
+/// step. `None` means the template carries no request to mirror.
+fn template_mirror_request(template: &Template) -> Option<(String, String)> {
+    let har = template
+        .qd_har
+        .as_ref()
+        .and_then(|raw| QdHar::parse_qd(raw.clone()).ok());
+    if let Some(har) = har {
+        let entry = har
+            .enabled_entries()
+            .next()
+            .or_else(|| har.entries().first())?;
+        return Some((entry.request.method.clone(), entry.request.url.clone()));
+    }
+    let definition = template.definition.as_ref()?;
+    definition.steps.iter().find_map(|step| match step {
+        Step::Request(request) => Some((request.method.clone(), request.url.clone())),
+        _ => None,
+    })
+}
+
+/// `url` is `None` for a task bound to a template: the stored URL is then only a
+/// mirror of the template's request and never used for execution, so it does not
+/// have to parse on its own (an `api://util/...` step with `{{var}}` in the
+/// query would not).
+fn validate(name: &str, schedule: &str, url: Option<&str>, timezone: Option<&str>) -> Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("name cannot be empty"));
     }
     schedule
         .parse::<cron::Schedule>()
         .context("invalid cron expression")?;
-    reqwest::Url::parse(url).context("invalid task URL")?;
+    if let Some(url) = url {
+        reqwest::Url::parse(url).context("invalid task URL")?;
+    }
     if let Some(timezone) = timezone.filter(|tz| !tz.trim().is_empty()) {
         timezone
             .parse::<chrono_tz::Tz>()
@@ -3854,6 +3953,105 @@ mod tests {
 
         let listed = store.list_templates().await.unwrap();
         assert_eq!(listed[0].variables, ["username", "password"]);
+    }
+
+    #[tokio::test]
+    async fn mirrors_template_request_onto_bound_task() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let imported = store
+            .import_qd_har(ImportQdHarTemplate {
+                name: "bound har".into(),
+                description: None,
+                har: serde_json::json!({
+                    "log": {
+                        "version": "1.2",
+                        "entries": [
+                            {
+                                "checked": false,
+                                "request": {"method": "GET", "url": "https://example.invalid/skipped", "headers": [], "cookies": []},
+                                "success_asserts": [], "failed_asserts": [], "extract_variables": []
+                            },
+                            {
+                                "checked": true,
+                                "request": {"method": "POST", "url": "api://util/delay/0?t={{token}}", "headers": [], "cookies": []},
+                                "success_asserts": [], "failed_asserts": [], "extract_variables": []
+                            }
+                        ]
+                    }
+                }),
+            })
+            .await
+            .unwrap();
+
+        // The task form no longer asks for a request, so a bound task is created
+        // without a URL and mirrors the template's first *enabled* entry. That
+        // entry's URL would not parse standalone (braces in the query), which is
+        // exactly why a bound task skips URL validation.
+        let mut bound_input = CreateTask {
+            name: "bound".into(),
+            cron: "0 0 8 * * * *".into(),
+            method: None,
+            url: String::new(),
+            headers: Default::default(),
+            body: None,
+            disabled: false,
+            template_id: Some(imported.id),
+            grp: None,
+            timeout_seconds: None,
+            retry_count: None,
+            retry_interval_seconds: None,
+            priority: None,
+            timezone: None,
+            random_delay_max_seconds: None,
+            variables: None,
+        };
+        let bound = store.create(bound_input.clone()).await.unwrap();
+        assert_eq!(bound.method, "POST");
+        assert_eq!(bound.url, "api://util/delay/0?t={{token}}");
+
+        // Pointing the task at another template re-mirrors it, without the
+        // client having to send a URL at all.
+        let native = store
+            .create_template(CreateTemplate {
+                name: "native".into(),
+                description: None,
+                definition: template_definition("native"),
+                grp: None,
+            })
+            .await
+            .unwrap();
+        let swapped = store
+            .update(
+                bound.id,
+                UpdateTask {
+                    name: None,
+                    cron: None,
+                    method: None,
+                    url: None,
+                    headers: None,
+                    body: None,
+                    disabled: None,
+                    template_id: Some(native.id),
+                    grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    random_delay_max_seconds: None,
+                    variables: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(swapped.method, "GET");
+        assert_eq!(swapped.url, "https://example.invalid/health");
+
+        // A plain task still needs its own request.
+        bound_input.name = "bare".into();
+        bound_input.template_id = None;
+        assert!(store.create(bound_input).await.is_err());
     }
 
     #[tokio::test]

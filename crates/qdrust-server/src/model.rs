@@ -61,6 +61,10 @@ pub struct CreateTask {
     pub name: String,
     pub cron: String,
     pub method: Option<String>,
+    /// Request URL for a task that is not bound to a template. It may be omitted
+    /// when `template_id` is set: the server then mirrors the template's first
+    /// request, because a bound task always executes the template.
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub headers: serde_json::Map<String, serde_json::Value>,

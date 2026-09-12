@@ -958,10 +958,10 @@ export interface components {
         CreateTask: {
             name: string;
             cron: string;
-            /** @default GET */
-            method: string | null;
-            /** Format: uri */
-            url: string;
+            /** @description HTTP method of the task's own request; defaults to GET. Ignored when template_id is set, because a bound task executes the template. */
+            method?: string | null;
+            /** @description Request URL of a task that is not bound to a template. May be omitted when template_id is set: the task then mirrors the template's first request, because a task bound to a template always executes the template. */
+            url?: string;
             headers?: {
                 [key: string]: unknown;
             };

@@ -166,10 +166,6 @@ interface TaskForm {
   scheduleDays: string;
   scheduleAdvanced: boolean;
   randomDelay: string;
-  method: string;
-  url: string;
-  headersText: string;
-  body: string;
   disabled: boolean;
   grp: string;
   templateId: number | null;
@@ -180,19 +176,26 @@ interface TaskForm {
   timezone: string;
   variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", method: "GET", url: "", headersText: "{}", body: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
-/** Dropdown options for the "bind to template" field in the task form. */
-const templateDropdownOptions = computed(() => [
-  { value: null as string | number | null, label: t("noTemplatesToBind") },
-  ...templatesForSelect.value.map((tpl) => ({
+/**
+ * Dropdown options for the "bind to template" field in the task form.
+ *
+ * A task's request comes from its template — the scheduler replays the template
+ * and ignores any request stored next to it — so the form asks for a template
+ * instead of a method/URL pair. For the same reason "（无模板）" is only offered
+ * while editing a task that predates that rule and carries a standalone request;
+ * hiding it would silently force such a task onto a template it never ran.
+ */
+const templateDropdownOptions = computed(() => {
+  const bound = templatesForSelect.value.map((tpl) => ({
     value: tpl.id as string | number | null,
     label: `${tpl.name}（${tpl.source_format}）`,
-  })),
-]);
-/** HTTP method choices for the task form. */
-const httpMethodDropdownOptions: { value: string; label: string }[] = ["GET", "POST", "PUT", "PATCH", "DELETE"].map((m) => ({ value: m, label: m }));
+  }));
+  if (taskForm.id == null || taskForm.templateId != null) return bound;
+  return [{ value: null as string | number | null, label: t("noTemplatesToBind") }, ...bound];
+});
 
 // Full IANA timezone list for the task scheduling select. `Intl.supportedValuesOf`
 // is available in modern browsers; fall back to a curated subset where missing
@@ -309,16 +312,12 @@ async function refreshTaskStatuses() {
 }
 
 async function submitTask() {
-  let headers: Record<string, unknown> = {};
-  if (taskForm.headersText.trim()) {
-    try {
-      const parsed = JSON.parse(taskForm.headersText);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("headers must be an object");
-      headers = parsed;
-    } catch (cause) {
-      notify(cause instanceof Error ? `Headers: ${cause.message}` : t("genericError"), "error");
-      return;
-    }
+  // A task runs a template; the request fields are gone from this form because
+  // the scheduler replays the template anyway. Only a task that predates the
+  // rule (and therefore still carries a standalone request) may be saved
+  // without one — the server keeps its stored URL untouched.
+  if (taskForm.templateId == null && taskForm.id == null) {
+    return void notify(t("templateRequired"), "error");
   }
   if (taskForm.timeoutSeconds && !(Number(taskForm.timeoutSeconds) > 0)) return void notify("timeout must be a positive number", "error");
   if (taskForm.retryInterval && !(Number(taskForm.retryInterval) > 0)) return void notify("retry interval must be a positive number", "error");
@@ -327,10 +326,6 @@ async function submitTask() {
   const payload: CreateTask = {
     name: taskForm.name,
     cron,
-    method: taskForm.method,
-    url: taskForm.url,
-    headers,
-    body: taskForm.body || null,
     disabled: taskForm.disabled,
     grp: taskForm.grp || null,
     template_id: taskForm.templateId,
@@ -344,7 +339,7 @@ async function submitTask() {
   };
   try {
     if (taskForm.id != null) {
-      await api.updateTask(taskForm.id, { ...payload, headers: Object.keys(headers).length ? headers : null });
+      await api.updateTask(taskForm.id, { ...payload });
       notify(t("taskUpdated"));
     } else {
       await api.createTask(payload);
@@ -376,10 +371,6 @@ function openCreateTask() {
     scheduleDays: visual?.days ?? "1",
     scheduleAdvanced: !visual,
     randomDelay: task.random_delay_max_seconds != null && task.random_delay_max_seconds > 0 ? String(task.random_delay_max_seconds) : "",
-    method: task.method,
-    url: task.url,
-    headersText: task.headers && typeof task.headers === "object" && !Array.isArray(task.headers) ? JSON.stringify(task.headers, null, 2) : "{}",
-    body: task.body ?? "",
     disabled: task.disabled,
     grp: task.grp ?? "",
     templateId: task.template_id ?? null,
@@ -566,30 +557,10 @@ async function openTemplates() {
     publicTemplates.value = pub;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
-/** A bound template owns the request chain, so task-level method/url only mirror it. */
-const templateBound = computed(() => taskForm.templateId != null);
-function firstHarRequest(template: Template): { method: string; url: string } | null {
-  const entries = (template.qd_har as any)?.log?.entries;
-  if (!Array.isArray(entries)) return null;
-  const entry = entries.find((e: any) => e.checked) ?? entries[0];
-  const request = entry?.request;
-  if (!request) return null;
-  return {
-    method: typeof request.method === "string" ? request.method.toUpperCase() : "",
-    url: typeof request.url === "string" ? request.url : "",
-  };
-}
 function onTemplatePicked() {
   const tmpl = templatesForSelect.value.find((x) => x.id === taskForm.templateId);
   if (!tmpl) return;
   if (!taskForm.name) taskForm.name = tmpl.name;
-  // 绑定模板后 Method / URL 变为只读，这里直接镜像模板的首条请求：多页模板常混合
-  // GET/POST，任务级 Method 本来就没有意义（issue #10），但仍要让任务列表有 URL 可显示。
-  const first = firstHarRequest(tmpl);
-  if (first) {
-    if (first.url) taskForm.url = first.url;
-    if (httpMethodDropdownOptions.some((o) => o.value === first.method)) taskForm.method = first.method;
-  }
   // QD 式变量联动：变量清单由服务端按 QD 的 HARSave.get_variables 语义算出
   // （过滤器和函数名不算变量，且只有被 extract_variables 提取之后的引用才不算输入），
   // 这里只负责生成填值行，并保留用户已输入的同名值。
@@ -1770,8 +1741,9 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
         <label>{{ t('taskName') }}<input v-model="taskForm.name" required maxlength="100" /></label>
         <label>{{ t('template') }}
-          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" />
+          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" :placeholder="t('selectTemplate')" />
         </label>
+        <small v-if="taskForm.templateId == null && taskForm.id == null" class="kv-hint">{{ t('templateRequiredHint') }}</small>
         <div class="schedule-head">
           <span>{{ t('scheduleMode') }}</span>
           <div class="seg" role="group">
@@ -1790,20 +1762,16 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
         </div>
         <div class="form-row schedule-fields">
-          <label>{{ t('method') }}<Dropdown v-model="taskForm.method" :options="httpMethodDropdownOptions" :disabled="templateBound" /></label>
-          <label v-if="!taskForm.scheduleAdvanced">{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
-          <label v-else>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
-        </div>
-        <div class="form-row schedule-fields">
           <template v-if="!taskForm.scheduleAdvanced">
+            <label>{{ t('scheduleEveryDays') }}<input v-model="taskForm.scheduleDays" type="number" min="1" max="366" /></label>
             <label>{{ t('scheduleTime') }}<input v-model="taskForm.scheduleTime" type="time" step="1" required /></label>
-            <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
           </template>
           <label v-else class="field-full">{{ t('cron') }}<input v-model="taskForm.cron" required placeholder="0 0 8 * * * *" /></label>
         </div>
+        <div class="form-row schedule-fields">
+          <label>{{ t('randomDelayMax') }}<input v-model="taskForm.randomDelay" type="number" min="0" max="604800" placeholder="0" /></label>
+        </div>
         <small class="kv-hint">{{ taskForm.scheduleAdvanced ? t('scheduleCronHint') : t('scheduleHint') }}</small>
-        <label>{{ t('url') }}<input v-model="taskForm.url" :readonly="templateBound" :required="!templateBound" type="url" placeholder="https://example.com/api/health" /></label>
-        <small v-if="templateBound" class="kv-hint">{{ t('templateRequestHint') }}</small>
         <label>{{ t('group') }}<input v-model="taskForm.grp" list="grp-options" :placeholder="t('group')" /></label>
         <datalist id="grp-options"><option v-for="g in taskGroups" :key="g" :value="g" /></datalist>
         <div class="form-row form-row-4">
@@ -1828,8 +1796,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </span>
           <small class="kv-hint">{{ taskForm.templateId ? t('templateVarsHint') : t('variablesHint') }}</small>
         </label>
-        <label>{{ t('requestHeaders') }}<textarea v-model="taskForm.headersText" rows="4" spellcheck="false" /></label>
-        <label>{{ t('body') }}<textarea v-model="taskForm.body" rows="3" spellcheck="false" /></label>
         <label class="checkbox"><input v-model="taskForm.disabled" type="checkbox" />{{ t('createPaused') }}</label>
         <div class="modal-actions">
           <button class="secondary-button" type="button" @click="showCreate = false">{{ t('cancel') }}</button>

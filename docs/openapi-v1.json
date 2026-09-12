@@ -1852,8 +1852,7 @@
         "type": "object",
         "required": [
           "name",
-          "cron",
-          "url"
+          "cron"
         ],
         "properties": {
           "name": {
@@ -1867,11 +1866,11 @@
               "string",
               "null"
             ],
-            "default": "GET"
+            "description": "HTTP method of the task's own request; defaults to GET. Ignored when template_id is set, because a bound task executes the template."
           },
           "url": {
             "type": "string",
-            "format": "uri"
+            "description": "Request URL of a task that is not bound to a template. May be omitted when template_id is set: the task then mirrors the template's first request, because a task bound to a template always executes the template."
           },
           "headers": {
             "type": "object",
