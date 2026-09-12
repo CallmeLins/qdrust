@@ -56,7 +56,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 
   | 工具 | 说明 |
   |---|---|
-  | `delay` | 固定 / 随机延迟 |
+  | `delay` | 固定 / 随机延迟（`?seconds=N`，或 QD 路径式 `api://util/delay/N`） |
   | `timestamp` | 当前时间戳（多种格式） |
   | `unicode` / `urldecode` / `urlencode` | 编码转换 |
   | `gb2312` | GB2312 百分号编码（urllib.quote 语义） |

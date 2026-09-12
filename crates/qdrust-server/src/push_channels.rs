@@ -26,6 +26,29 @@ pub fn is_push_channel(kind: &str) -> bool {
     CHANNEL_KINDS.contains(&kind)
 }
 
+/// Every notification channel kind the server accepts: the three it delivers
+/// itself (generic `webhook`, `custom_http`, `email`) plus the push channels
+/// above. Kept in one place so the API pre-check and the config validator
+/// cannot drift apart — a missing entry here is exactly how `custom_http`
+/// once became impossible to create.
+pub const ALL_CHANNEL_KINDS: [&str; 11] = [
+    "webhook",
+    "custom_http",
+    "email",
+    "bark",
+    "serverchan",
+    "telegram",
+    "dingtalk",
+    "wxpusher",
+    "wxpusher_spt",
+    "wecom_app",
+    "wecom_webhook",
+];
+
+pub fn is_known_channel_kind(kind: &str) -> bool {
+    ALL_CHANNEL_KINDS.contains(&kind)
+}
+
 /// Dispatch a rendered notification to the given channel kind.
 pub async fn push_to_channel(
     client: &Client,
@@ -383,6 +406,21 @@ mod tests {
         assert!(!is_push_channel("webhook"));
         assert!(!is_push_channel("email"));
         assert!(!is_push_channel("unknown"));
+    }
+
+    #[test]
+    fn recognizes_every_accepted_channel_kind() {
+        // Both the API pre-check and the store's config validator key off this
+        // list, so every deliverable kind must be present. A kind added to
+        // CHANNEL_KINDS without a matching entry here is what made
+        // `custom_http` un-creatable.
+        for kind in CHANNEL_KINDS {
+            assert!(is_known_channel_kind(kind), "{kind} missing");
+        }
+        for kind in ["webhook", "custom_http", "email"] {
+            assert!(is_known_channel_kind(kind), "{kind} missing");
+        }
+        assert!(!is_known_channel_kind("nope"));
     }
 
     #[tokio::test]

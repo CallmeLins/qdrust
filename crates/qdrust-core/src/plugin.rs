@@ -340,14 +340,23 @@ impl Plugin for UtilityPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<PluginResponse>> + Send + 'a>> {
         Box::pin(async move {
             match request.action.as_str() {
-                "delay" => {
-                    let seconds = request
-                        .query
-                        .get("seconds")
-                        .map(String::as_str)
-                        .unwrap_or("0")
-                        .parse::<f64>()
-                        .context("invalid delay seconds")?;
+                // QD registers three delay routes: `/util/delay` (seconds via the
+                // `seconds` query) plus `/util/delay/(\d+)` and
+                // `/util/delay/(\d+\.\d+)` (seconds in the path). Its HAR editor's
+                // "insert delay" button emits the path form `api://util/delay/3`,
+                // so both spellings must work. The action is the whole path here,
+                // so a path-form call arrives as `delay/<n>`.
+                action if action == "delay" || action.starts_with("delay/") => {
+                    let seconds = match action.strip_prefix("delay/") {
+                        Some(raw) => raw.parse::<f64>().context("invalid delay seconds")?,
+                        None => request
+                            .query
+                            .get("seconds")
+                            .map(String::as_str)
+                            .unwrap_or("0")
+                            .parse::<f64>()
+                            .context("invalid delay seconds")?,
+                    };
                     ensure!(
                         seconds.is_finite() && (0.0..=300.0).contains(&seconds),
                         "delay must be between 0 and 300 seconds"
@@ -1090,6 +1099,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_qd_delay_path_form() {
+        // The spelling QD's own HAR editor inserts: its "insert delay" button
+        // writes `api://util/delay/3` (see qiandao
+        // web/static/har/entry_editor.js), backed by the
+        // `/util/delay/(\d+)` and `/util/delay/(\d+\.\d+)` routes.
+        let request = PluginRequest::from_api_url("api://util/delay/3").unwrap();
+        assert_eq!(request.plugin_id, "util");
+        assert_eq!(request.action, "delay/3");
+        assert!(request.query.is_empty());
+
+        let float = PluginRequest::from_api_url("api://util/delay/3.5").unwrap();
+        assert_eq!(float.action, "delay/3.5");
+    }
+
     #[tokio::test]
     async fn registers_and_calls_builtin_utility() {
         let mut registry = PluginRegistry::default();
@@ -1098,6 +1122,20 @@ mod tests {
             .unwrap();
         let response = registry
             .call("api://util/delay?seconds=0", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"delayed 0 seconds");
+    }
+
+    #[tokio::test]
+    async fn calls_delay_through_qd_path_form() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let response = registry
+            .call("api://util/delay/0", Duration::from_secs(1))
             .await
             .unwrap();
         assert_eq!(response.status, 200);
