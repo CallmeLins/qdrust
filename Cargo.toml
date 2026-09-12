@@ -17,10 +17,13 @@ version = "0.1.11"
 edition = "2024"
 license = "MIT"
 
-# Internal path dependencies carry no `version` requirement: the crates are not
-# published to crates.io, so a version spec would be a second copy of the
-# release version to keep in sync (it already drifted once: qdrust-server
-# pinned qdrust-plugin-browser at "0.1.0" while the crate was at 0.1.10).
+# Internal path dependencies pin the release version explicitly. They must:
+# a) satisfy `wildcards = "deny"` in deny.toml (a versionless path dep
+#    resolves to `*`, which fails the CI cargo-deny gate), and
+# b) resolve to a concrete crate for cargo-deny (versionless workspace
+#    dependencies trigger its unfixable `unresolved-workspace-dependency`
+#    bug diagnostic). scripts/bump-version.py rewrites these together with
+#    [workspace.package], so they never drift in practice.
 [workspace.dependencies]
-qdrust-core = { path = "crates/qdrust-core" }
-qdrust-plugin-browser = { path = "crates/qdrust-plugin-browser" }
+qdrust-core = { path = "crates/qdrust-core", version = "0.1.11" }
+qdrust-plugin-browser = { path = "crates/qdrust-plugin-browser", version = "0.1.11" }

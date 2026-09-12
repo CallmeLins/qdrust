@@ -8,7 +8,12 @@ Usage:
 Single source of truth: the `version` key under [workspace.package] in the
 root Cargo.toml. Everything else is derived from it:
 
-    Cargo.toml               [workspace.package] version   <- the one to edit
+    Cargo.toml               [workspace.package] version    <- the one to edit
+                             + the two internal entries in
+                               [workspace.dependencies] (they must carry the
+                               same version: deny.toml denies wildcard reqs
+                               and cargo-deny cannot resolve versionless
+                               workspace dependencies)
     Cargo.lock               synced via `cargo update --workspace`
     webui/package.json       "version"
     webui/package-lock.json  root package "version" (two spots)
@@ -39,29 +44,66 @@ OPENAPI_JSON = ROOT / "docs" / "openapi-v1.json"
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 
+INTERNAL_DEPS = ("qdrust-core", "qdrust-plugin-browser")
+
+
+def workspace_section(text: str, header: str) -> str:
+    match = re.search(
+        rf"^\[{re.escape(header)}\]\s*$(.*?)(?=^\[|\Z)", text, re.S | re.M
+    )
+    if not match:
+        sys.exit(f"error: [{header}] section not found in Cargo.toml")
+    return match.group(1)
+
+
 def workspace_version() -> str:
     """Read the version from [workspace.package] in the root Cargo.toml."""
-    text = CARGO_TOML.read_text(encoding="utf-8")
-    section = re.search(r"^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)", text, re.S | re.M)
-    if not section:
-        sys.exit("error: [workspace.package] section not found in Cargo.toml")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', section.group(1), re.M)
+    match = re.search(r'^version\s*=\s*"([^"]+)"', workspace_section(CARGO_TOML.read_text(encoding="utf-8"), "workspace.package"), re.M)
     if not match:
         sys.exit("error: version key not found under [workspace.package]")
     return match.group(1)
 
 
+def workspace_dep_versions() -> dict[str, str]:
+    """Versions of the internal crates in [workspace.dependencies]."""
+    body = workspace_section(CARGO_TOML.read_text(encoding="utf-8"), "workspace.dependencies")
+    out: dict[str, str] = {}
+    for name in INTERNAL_DEPS:
+        match = re.search(rf'^{re.escape(name)}\s*=.*?version\s*=\s*"([^"]+)"', body, re.M)
+        if not match:
+            sys.exit(f"error: {name} in [workspace.dependencies] carries no version")
+        out[name] = match.group(1)
+    return out
+
+
 def plan_cargo_toml(old: str, new: str) -> str:
     text = CARGO_TOML.read_text(encoding="utf-8")
 
-    def swap(match: re.Match[str]) -> str:
+    def swap_package(match: re.Match[str]) -> str:
         return re.sub(r'^(version\s*=\s*)"[^"]+"', rf'\g<1>"{new}"', match.group(0), count=1, flags=re.M)
 
-    updated, count = re.subn(
-        r"^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)", swap, text, count=1, flags=re.S | re.M
+    def swap_deps(match: re.Match[str]) -> str:
+        body = match.group(0)
+        for name in INTERNAL_DEPS:
+            body, count = re.subn(
+                rf'^({re.escape(name)}\s*=.*?version\s*=\s*)"[^"]+"',
+                rf'\g<1>"{new}"',
+                body,
+                count=1,
+                flags=re.M,
+            )
+            if count != 1:
+                sys.exit(f"error: failed to plan a version rewrite for {name}")
+        return body
+
+    updated = re.sub(
+        r"^\[workspace\.package\]\s*$(.*?)(?=^\[|\Z)", swap_package, text, count=1, flags=re.S | re.M
     )
-    if count != 1 or updated == text:
-        sys.exit("error: failed to plan a [workspace.package] version rewrite")
+    updated = re.sub(
+        r"^\[workspace\.dependencies\]\s*$(.*?)(?=^\[|\Z)", swap_deps, updated, count=1, flags=re.S | re.M
+    )
+    if updated == text:
+        sys.exit("error: failed to plan any [workspace.package] version rewrite")
     return updated
 
 
@@ -139,6 +181,7 @@ def main() -> None:
         current = workspace_version()
         versions = {
             "Cargo.toml [workspace.package]": current,
+            **{f"Cargo.toml [workspace.dependencies] {k}": v for k, v in workspace_dep_versions().items()},
             **{f"webui/{k}": v for k, v in webui_versions().items()},
             "docs/openapi-v1.json info": openapi_version(),
         }
@@ -177,6 +220,7 @@ def main() -> None:
     print(f"Bumped {current} -> {target}:")
     for label in (
         "Cargo.toml [workspace.package]",
+        "Cargo.toml [workspace.dependencies] (2 internal deps)",
         "webui/package.json",
         "webui/package-lock.json (root + top)",
         "docs/openapi-v1.json info",
