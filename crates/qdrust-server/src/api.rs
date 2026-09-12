@@ -3455,6 +3455,12 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let document: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(document["openapi"], "3.1.0");
+        // The OpenAPI document is hand-maintained; its version must move with
+        // the crate (scripts/bump-version.py keeps them in sync).
+        assert_eq!(
+            document["info"]["version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
         assert!(document["paths"]["/api/v1/tasks"].is_object());
         assert_eq!(
             document["components"]["schemas"]["ApiError"]["required"]

@@ -1,8 +1,8 @@
 [package]
 name = "qdrust-server"
-version = "0.1.10"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1"
@@ -13,8 +13,8 @@ chrono-tz = "0.10"
 cron = "0.15"
 dotenvy = "0.15"
 futures-util = "0.3"
-qdrust-core = { path = "../qdrust-core", version = "0.1.10" }
-qdrust-plugin-browser = { path = "../qdrust-plugin-browser", version = "0.1.0" }
+qdrust-core.workspace = true
+qdrust-plugin-browser.workspace = true
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

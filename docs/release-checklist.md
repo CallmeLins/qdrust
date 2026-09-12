@@ -25,6 +25,9 @@
 
 ## Release Gates
 
+- Bump the version with `python scripts/bump-version.py <x.y.z>` (updates the
+  workspace version, the WebUI package, the OpenAPI document, and both
+  lockfiles in one step) and commit before tagging.
 - Push an immutable `vMAJOR.MINOR.PATCH` tag only after all gates pass.
 - Confirm the GHCR manifest contains amd64 and arm64 images.
 - Confirm provenance and SBOM attestations exist.

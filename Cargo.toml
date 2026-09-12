@@ -7,3 +7,20 @@ members = [
 ]
 default-members = ["crates/qdrust-server"]
 resolver = "3"
+
+# Release version lives HERE and only here. Every workspace crate inherits it
+# via `version.workspace = true`, and scripts/bump-version.py keeps the WebUI
+# package + OpenAPI document + lockfiles in sync (CI runs the same script with
+# --check as a drift gate).
+[workspace.package]
+version = "0.1.11"
+edition = "2024"
+license = "MIT"
+
+# Internal path dependencies carry no `version` requirement: the crates are not
+# published to crates.io, so a version spec would be a second copy of the
+# release version to keep in sync (it already drifted once: qdrust-server
+# pinned qdrust-plugin-browser at "0.1.0" while the crate was at 0.1.10).
+[workspace.dependencies]
+qdrust-core = { path = "crates/qdrust-core" }
+qdrust-plugin-browser = { path = "crates/qdrust-plugin-browser" }

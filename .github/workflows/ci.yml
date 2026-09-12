@@ -18,6 +18,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # Cargo / webui package / OpenAPI versions must agree (see
+      # scripts/bump-version.py, the single entry point for version bumps).
+      - run: python3 scripts/bump-version.py --check
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
