@@ -758,7 +758,46 @@ code {
 .kv-row input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow); }
 .kv-add { justify-self: start; }
 .kv-hint { color: var(--ink-3); font-size: 11px; line-height: 1.6; }
-.action-task-multi select { min-height: 80px; }
+
+/* ---- notifications: task multi-select + action form.
+   The task picker is a checkbox list spanning both columns of .inline-modal.
+   It replaced a native <select multiple>, whose ctrl-click selection is a
+   discoverability trap and reads as a second, redundant task control next to
+   the single-task select. One checkbox list now drives both. */
+.field-wide { grid-column: 1 / -1; }
+.action-tasks { display: grid; gap: 8px; }
+.action-tasks-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.action-tasks-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.action-tasks-head .text-button { white-space: nowrap; }
+/* .modal label is display:grid, so the search field needs the higher-specificity
+   override to keep its icon and input on one line inside a 34px box. */
+.modal .action-tasks-filter {
+  display: flex; align-items: center; gap: 8px;
+  width: min(240px, 100%); height: 34px; padding: 0 10px; margin-left: auto;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: rgb(var(--card-surface)); color: var(--ink-3);
+}
+.modal .action-tasks-filter input {
+  width: 100%; height: 100%; min-height: 0; padding: 0;
+  border: 0; outline: 0; background: transparent; color: var(--ink); font-size: 12.5px;
+}
+.check-list {
+  display: grid; gap: 2px; max-height: 220px; overflow-y: auto; padding: 6px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: rgb(var(--card-surface));
+}
+.modal .check-list .check-row {
+  display: flex; align-items: center; gap: 9px; padding: 7px 9px;
+  border-radius: var(--r-s); color: var(--ink); font-size: 13px; font-weight: 500;
+  cursor: pointer; transition: background-color var(--t-fast);
+}
+.modal .check-list .check-row:hover { background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
+.modal .check-list .check-row input { width: 16px; height: 16px; min-height: 0; accent-color: var(--primary); flex: none; }
+.check-row-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal .check-list .check-row code {
+  flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-3); font-size: 11px;
+}
 
 /* HAR import modal */
 .modal-backdrop-wide { z-index: 60; }

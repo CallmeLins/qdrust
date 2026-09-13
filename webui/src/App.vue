@@ -726,11 +726,32 @@ const channelForm = reactive({
   dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "",
   secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "",
 });
-const actionForm = reactive({ taskIds: [] as number[], taskId: 0, channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
-const actionTaskDropdownOptions = computed(() => [
-  { value: 0, label: t("chooseTask"), disabled: true },
-  ...tasks.value.map((task) => ({ value: task.id, label: task.name })),
-]);
+const actionForm = reactive({ taskIds: [] as number[], channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
+// One checkbox list replaces the old single-task <select> + ctrl-click multiple
+// <select>: the same ticks drive both the saved bindings and the list below, so
+// there is no "single vs batch" pair of controls to reconcile.
+const actionTaskFilter = ref("");
+const actionTasks = computed(() => {
+  const needle = actionTaskFilter.value.trim().toLowerCase();
+  if (!needle) return tasks.value;
+  return tasks.value.filter((task) => {
+    const url = task.url ?? "";
+    return task.name.toLowerCase().includes(needle) || url.toLowerCase().includes(needle);
+  });
+});
+const allActionTasksChecked = computed(() => actionTasks.value.length > 0 && actionTasks.value.every((task) => actionForm.taskIds.includes(task.id)));
+function toggleActionTask(id: number) {
+  const at = actionForm.taskIds.indexOf(id);
+  if (at >= 0) actionForm.taskIds.splice(at, 1); else actionForm.taskIds.push(id);
+  void loadActions();
+}
+function toggleAllActionTasks() {
+  const ids = actionTasks.value.map((task) => task.id);
+  actionForm.taskIds = allActionTasksChecked.value
+    ? actionForm.taskIds.filter((id) => !ids.includes(id))
+    : [...new Set([...actionForm.taskIds, ...ids])];
+  void loadActions();
+}
 const actionChannelDropdownOptions = computed(() => [
   { value: 0, label: t("chooseChannel"), disabled: true },
   ...channels.value.map((ch) => ({ value: ch.id, label: ch.name })),
@@ -778,8 +799,17 @@ async function openNotifications() {
     const [ch, list] = await Promise.all([api.notificationChannels(), api.tasks()]);
     channels.value = ch;
     tasks.value = list;
-    if (actionForm.taskId) actions.value = await api.notificationActions(actionForm.taskId);
+    // Drop tasks that vanished while the page was open, then refresh the
+    // bindings of whatever is still ticked.
+    const known = new Set(list.map((task) => task.id));
+    actionForm.taskIds = actionForm.taskIds.filter((id) => known.has(id));
+    await loadActions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+/** Jump to the notification page with the given tasks already ticked. */
+function openNotificationsFor(taskIds: number[]) {
+  actionForm.taskIds = [...taskIds];
+  return openNotifications();
 }
 async function saveChannel() {
   try {
@@ -798,20 +828,25 @@ async function removeChannel(channel: NotificationChannel) {
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function loadActions() {
-  try { actions.value = actionForm.taskId ? await api.notificationActions(actionForm.taskId) : []; }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+  try {
+    if (!actionForm.taskIds.length) { actions.value = []; return; }
+    const lists = await Promise.all(actionForm.taskIds.map((id) => api.notificationActions(id)));
+    actions.value = lists.flat();
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function saveAction() {
   try {
-    const taskIds = actionForm.taskIds.length ? actionForm.taskIds : actionForm.taskId ? [actionForm.taskId] : [];
-    if (!taskIds.length) { notify(t("chooseTask"), "error"); return; }
+    if (!actionForm.taskIds.length) { notify(t("chooseTask"), "error"); return; }
     if (!actionForm.channelId) { notify(t("chooseChannel"), "error"); return; }
     const threshold = Math.max(1, Number(actionForm.failureThreshold) || 1);
-    await api.batchCreateNotificationActions(taskIds, actionForm.channelId, actionForm.event, threshold, actionForm.automaticOnly, actionForm.titleTemplate, actionForm.bodyTemplate);
-    // Clear the batch selection and the per-action options (keep the taskId that
-    // drives the list below) so a second click cannot silently duplicate the
-    // very same bindings.
-    Object.assign(actionForm, { taskIds: [], failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
+    // The ticks survive a save (the list below keeps showing the bindings), so
+    // filter out the pairs that already exist instead of inserting duplicates.
+    const bound = new Set(actions.value.map((action) => `${action.task_id}:${action.channel_id}:${action.event}`));
+    const pending = actionForm.taskIds.filter((id) => !bound.has(`${id}:${actionForm.channelId}:${actionForm.event}`));
+    if (!pending.length) { notify(t("notifyAlreadyBound"), "error"); return; }
+    await api.batchCreateNotificationActions(pending, actionForm.channelId, actionForm.event, threshold, actionForm.automaticOnly, actionForm.titleTemplate, actionForm.bodyTemplate);
+    notify(fmt("notifyBoundCount", { n: pending.length }));
+    Object.assign(actionForm, { failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
     await loadActions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -1362,6 +1397,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <button class="secondary-button" @click="batchTasks('enable')">{{ t('batchEnable') }}</button>
             <button class="secondary-button" @click="batchTasks('disable')">{{ t('batchDisable') }}</button>
             <button class="secondary-button" @click="batchTasks('run')">{{ t('batchRun') }}</button>
+            <button class="secondary-button" @click="openNotificationsFor([...selected])"><Bell :size="15" />{{ t('batchNotify') }}</button>
             <button class="secondary-button danger" @click="batchTasks('delete')">{{ t('batchDelete') }}</button>
             <button class="icon-button" :title="t('close')" @click="selected.clear()"><X :size="16" /></button>
           </div>
@@ -1396,6 +1432,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                       <div v-if="openRowMenu === task.id" class="row-menu">
                         <button @click="openRowMenu = null; runNow(task)"><Play :size="15" />{{ t('runNow') }}</button>
                         <button @click="openRowMenu = null; openRunHistory(task)"><Activity :size="15" />{{ t('runHistory') }}</button>
+                        <button @click="openRowMenu = null; openNotificationsFor([task.id])"><Bell :size="15" />{{ t('batchNotify') }}</button>
                         <button @click="openRowMenu = null; openEditTask(task)"><Pencil :size="15" />{{ t('editTask') }}</button>
                         <button class="danger" @click="openRowMenu = null; removeTask(task)"><Trash2 :size="15" />{{ t('deleteTask') }}</button>
                       </div>
@@ -1574,10 +1611,22 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           <h2>{{ t('taskActions') }}</h2>
           <form class="modal inline-modal" @submit.prevent="saveAction">
-            <label>{{ t('task') }}
-              <Dropdown v-model="actionForm.taskId" :options="actionTaskDropdownOptions" @change="loadActions" />
-            </label>
-            <label class="action-task-multi">{{ t('notifyBatchTasks') }}<select v-model="actionForm.taskIds" multiple><option v-for="task in tasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label>
+            <div class="action-tasks field-wide">
+              <div class="action-tasks-head">
+                <span class="action-tasks-label">{{ t('notifyBatchTasks') }}</span>
+                <span v-if="actionForm.taskIds.length" class="chip">{{ fmt('selectedCount', { n: actionForm.taskIds.length }) }}</span>
+                <label class="search action-tasks-filter"><Search :size="15" /><input v-model="actionTaskFilter" type="search" :placeholder="t('notifyFilterTasks')" /></label>
+                <button type="button" class="text-button" @click="toggleAllActionTasks">{{ allActionTasksChecked ? t('notifyClearSelection') : t('selectAll') }}</button>
+              </div>
+              <div class="check-list" role="group" :aria-label="t('notifyBatchTasks')">
+                <label v-for="task in actionTasks" :key="task.id" class="check-row">
+                  <input type="checkbox" :checked="actionForm.taskIds.includes(task.id)" @change="toggleActionTask(task.id)" />
+                  <span class="check-row-name">{{ task.name }}</span>
+                  <code v-if="task.url">{{ task.url }}</code>
+                </label>
+                <div v-if="actionTasks.length === 0" class="muted">{{ t('noTasksMatch') }}</div>
+              </div>
+            </div>
             <label>{{ t('channel') }}
               <Dropdown v-model="actionForm.channelId" :options="actionChannelDropdownOptions" />
             </label>
@@ -1586,11 +1635,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </label>
             <label>{{ t('notifyFailureThreshold') }}<input v-model="actionForm.failureThreshold" type="number" min="1" /></label>
             <label class="checkbox"><input v-model="actionForm.automaticOnly" type="checkbox" />{{ t('notifyAutomaticOnly') }}</label>
-            <label>{{ t('notifyTitleTemplate') }}<input v-model="actionForm.titleTemplate" placeholder="{task} {event}" /></label>
-            <label>{{ t('notifyBodyTemplate') }}<textarea v-model="actionForm.bodyTemplate" rows="3" placeholder="{log} {error}" /></label>
-            <small class="kv-hint">{{ t('notifyVarsHint') }}</small>
+            <label>{{ t('notifyTitleTemplate') }}<textarea v-model="actionForm.titleTemplate" rows="2" spellcheck="false" placeholder="{task} {event}" /></label>
+            <label>{{ t('notifyBodyTemplate') }}<textarea v-model="actionForm.bodyTemplate" rows="2" spellcheck="false" placeholder="{log} {error}" /></label>
+            <small class="kv-hint field-wide">{{ t('notifyVarsHint') }}</small>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
+          <div v-if="!actionForm.taskIds.length" class="muted">{{ t('notifyPickTasksHint') }}</div>
           <div v-for="action in actions" :key="action.id" class="run-row">
             <strong>{{ action.event === 'success' ? t('eventSuccess') : action.event === 'failure' ? t('eventFailure') : t('eventAlways') }}</strong>
             <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
