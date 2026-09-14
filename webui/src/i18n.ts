@@ -458,6 +458,7 @@ const zh = {
   runStCancelled: "已取消",
   // aggregated log ("all runs" page)
   runLogTitle: "运行日志",
+  collapseRunLog: "收起运行日志",
   runLogHint: "所有任务的运行日志总览，可按状态与任务筛选。",
   runLogAll: "全部",
   runLogTask: "任务",
@@ -932,6 +933,7 @@ const en: Record<MessageKey, string> = {
   runStCancelled: "Cancelled",
   // aggregated log ("all runs" page)
   runLogTitle: "Run log",
+  collapseRunLog: "Hide run log",
   runLogHint: "Every task's runs in one place, filterable by status and task.",
   runLogAll: "All",
   runLogTask: "Task",

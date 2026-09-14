@@ -127,14 +127,14 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "library" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "library" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
 const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
-  tasks: t("tasks"), taskRuns: t("runHistory"), runs: t("runLogTitle"), templates: t("templates"), plugins: t("pluginsTitle"),
+  tasks: t("tasks"), taskRuns: t("runHistory"), templates: t("templates"), plugins: t("pluginsTitle"),
   notifications: t("notificationsTitle"), library: t("libraryTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
@@ -506,10 +506,11 @@ async function removeRun(run: Run) {
     await refreshRunViews();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
-/** Reload whichever run list is on screen; both views cancel and delete runs. */
+/** Reload whichever run list is on screen; both the task-run page and the
+ *  run-log panel cancel and delete runs. */
 async function refreshRunViews() {
-  if (view.value === "runs") await loadRunLog();
-  else if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+  if (view.value === "taskRuns" && runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+  else if (showRunLog.value) await loadRunLog();
 }
 async function clearTaskRuns() {
   const task = runHistoryTask.value;
@@ -554,6 +555,8 @@ const allRuns = ref<Run[]>([]);
 const runLogStatus = ref<"" | "succeeded" | "failed">("");
 const runLogTaskId = ref(0);
 const runLogLoading = ref(false);
+/** Whether the run-log panel is expanded on the tasks page. */
+const showRunLog = ref(false);
 const runLogHasMore = ref(false);
 const runLogCursor = ref<number | null>(null);
 const runLogStatusOptions = computed(() => [
@@ -571,9 +574,10 @@ function runTaskName(taskId: number): string {
 function taskTimezone(taskId: number): string | undefined {
   return tasks.value.find((task) => task.id === taskId)?.timezone ?? undefined;
 }
-async function openRunLog() {
-  view.value = "runs";
-  await loadRunLog();
+/** Expand/collapse the run-log panel; opening it (re)loads the first page. */
+async function toggleRunLog() {
+  showRunLog.value = !showRunLog.value;
+  if (showRunLog.value) await loadRunLog();
 }
 /** Load the first page, or append the next one when `reset` is false. */
 async function loadRunLog(reset = true) {
@@ -1529,7 +1533,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <nav aria-label="主导航">
         <a :class="['nav-link', { active: view === 'tasks' }]" href="#" @click.prevent="view='tasks'"><LayoutDashboard :size="18" />{{ t('tasks') }}</a>
-        <a :class="['nav-link', { active: view === 'runs' }]" href="#" @click.prevent="openRunLog"><Activity :size="18" />{{ t('runLogTitle') }}</a>
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
@@ -1582,7 +1585,65 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div v-if="view === 'tasks'" class="page">
         <section class="page-heading">
           <div><h1>{{ t('tasks') }}</h1><p>{{ t('createFirst') }}</p></div>
-          <button class="primary-button" @click="openCreateTask"><Plus :size="17" />{{ t('createTaskShort') }}</button>
+          <div class="heading-actions">
+            <button class="primary-button" @click="openCreateTask"><Plus :size="17" />{{ t('createTaskShort') }}</button>
+            <button
+              class="secondary-button"
+              :class="{ 'is-active': showRunLog }"
+              :aria-expanded="showRunLog"
+              @click="toggleRunLog"
+            ><Activity :size="16" />{{ showRunLog ? t('collapseRunLog') : t('runLogTitle') }}</button>
+          </div>
+        </section>
+
+        <!-- Every task's runs in one place; the per-task history page stays for depth. -->
+        <section v-if="showRunLog" class="task-section">
+          <h2>{{ t('runLogTitle') }}</h2>
+          <p class="muted section-hint">{{ t('runLogHint') }}</p>
+          <div class="toolbar">
+            <div class="seg" role="group" :aria-label="t('status')">
+              <button
+                v-for="option in runLogStatusOptions"
+                :key="option.value"
+                type="button"
+                :class="{ active: runLogStatus === option.value }"
+                @click="setRunLogStatus(option.value)"
+              >{{ option.label }}</button>
+            </div>
+            <label class="group-filter">
+              <span>{{ t('runLogTask') }}</span>
+              <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
+            </label>
+            <span v-if="allRuns.length" class="muted">{{ fmt('runLogShown', { n: allRuns.length }) }}</span>
+            <button class="icon-button" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
+          </div>
+          <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
+          <div v-else-if="allRuns.length === 0" class="empty-state">
+            <span><Activity :size="25" /></span>
+            <h2>{{ t('runLogEmpty') }}</h2>
+          </div>
+          <div v-else class="table-wrap">
+            <table class="runs-table">
+              <thead><tr>
+                <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="run in allRuns" :key="run.id">
+                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
+                  <td><button class="text-button" @click="openRunHistoryById(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
+                  <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
+                  <td class="row-actions">
+                    <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
+                    <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <button v-if="runLogHasMore" class="secondary-button" :disabled="runLogLoading" @click="loadRunLog(false)">
+            {{ runLogLoading ? t('loading') : t('runLogLoadMore') }}
+          </button>
         </section>
 
         <section class="stats" aria-label="任务概览">
@@ -1652,59 +1713,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
-        </section>
-      </div>
-
-      <!-- ===== AGGREGATED RUN LOG ===== -->
-      <div v-else-if="view === 'runs'" class="page">
-        <section class="page-heading">
-          <div><h1>{{ t('runLogTitle') }}</h1><p>{{ t('runLogHint') }}</p></div>
-          <button class="secondary-button" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="16" />{{ t('refresh') }}</button>
-        </section>
-        <section class="task-section">
-          <div class="toolbar">
-            <div class="seg" role="group" :aria-label="t('status')">
-              <button
-                v-for="option in runLogStatusOptions"
-                :key="option.value"
-                type="button"
-                :class="{ active: runLogStatus === option.value }"
-                @click="setRunLogStatus(option.value)"
-              >{{ option.label }}</button>
-            </div>
-            <label class="group-filter">
-              <span>{{ t('runLogTask') }}</span>
-              <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
-            </label>
-            <span v-if="allRuns.length" class="muted">{{ fmt('runLogShown', { n: allRuns.length }) }}</span>
-          </div>
-          <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
-          <div v-else-if="allRuns.length === 0" class="empty-state">
-            <span><Activity :size="25" /></span>
-            <h2>{{ t('runLogEmpty') }}</h2>
-          </div>
-          <div v-else class="table-wrap">
-            <table class="runs-table">
-              <thead><tr>
-                <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
-              </tr></thead>
-              <tbody>
-                <tr v-for="run in allRuns" :key="run.id">
-                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
-                  <td><button class="text-button" @click="openRunHistoryById(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
-                  <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
-                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
-                  <td class="row-actions">
-                    <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
-                    <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <button v-if="runLogHasMore" class="secondary-button" :disabled="runLogLoading" @click="loadRunLog(false)">
-            {{ runLogLoading ? t('loading') : t('runLogLoadMore') }}
-          </button>
         </section>
       </div>
 
