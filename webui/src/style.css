@@ -350,6 +350,10 @@ nav { display: grid; gap: 3px; margin-top: 28px; }
 h1 { margin: 0; font-size: clamp(26px, 3.4vw, 34px); line-height: 1.12; letter-spacing: -0.5px; font-weight: 700; color: var(--ink); }
 h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .page-heading p { margin: 9px 0 0; color: var(--ink-2); font-size: 14px; }
+/* Two import sources sit side by side in the templates heading. */
+.heading-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* Hint line under a section heading (e.g. the subscription panel). */
+.section-hint { margin: 6px 0 18px; font-size: 13px; }
 
 /* ============================================================
    buttons
@@ -377,6 +381,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   background: rgb(var(--card-surface));
 }
 .secondary-button:hover { border-color: var(--primary); color: var(--primary); background: rgb(var(--card-surface-hover)); }
+.secondary-button.is-active { border-color: var(--primary); color: var(--primary); background: var(--accent-glow); }
 .secondary-button.danger { color: var(--bad); border-color: rgb(220 38 38 / 0.35); }
 .secondary-button.danger:hover { border-color: rgb(220 38 38 / 0.6); background: rgb(220 38 38 / 0.08); }
 
@@ -977,6 +982,8 @@ code {
 @media (max-width: 520px) {
   .page-heading { display: grid; }
   .page-heading .primary-button { width: 100%; }
+  .heading-actions { flex-direction: column; align-items: stretch; }
+  .heading-actions > button { width: 100%; }
   .toolbar { align-items: center; }
   .modal { padding: 20px; }
   .modal-backdrop { padding: 10px; }

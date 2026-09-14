@@ -127,7 +127,7 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "subscriptions" | "library" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "library" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
@@ -135,7 +135,7 @@ const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
   tasks: t("tasks"), taskRuns: t("runHistory"), runs: t("runLogTitle"), templates: t("templates"), plugins: t("pluginsTitle"),
-  notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"), library: t("libraryTitle"),
+  notifications: t("notificationsTitle"), library: t("libraryTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
 
@@ -616,9 +616,14 @@ const publishedTemplateIds = computed(() => new Set(publicTemplates.value.map((x
 async function openTemplates() {
   view.value = "templates";
   try {
-    const [mine, pub] = await Promise.all([api.templates(undefined, undefined, 200), api.publicTemplates()]);
+    const [mine, pub, subs] = await Promise.all([
+      api.templates(undefined, undefined, 200),
+      api.publicTemplates(),
+      api.subscriptions(),
+    ]);
     templates.value = mine;
     publicTemplates.value = pub;
+    subscriptions.value = subs;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 function onTemplatePicked() {
@@ -933,11 +938,13 @@ async function removeAction(id: number) {
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
-// ---------- subscriptions ----------
+// ---------- subscriptions (a section of the templates page, not a page of its own) ----------
 const subscriptions = ref<TemplateSubscription[]>([]);
 const subSyncs = ref<SubscriptionSync[]>([]);
 const subForm = reactive<{ name: string; url: string; mode: "select" | "all" }>({ name: "", url: "", mode: "select" });
 const syncingId = ref<number | null>(null);
+/** Whether the "import from a subscription" panel is expanded on the templates page. */
+const showSubscriptions = ref(false);
 const subModeOptions = computed(() => [
   { value: "select" as const, label: t("subModeSelect") },
   { value: "all" as const, label: t("subModeAll") },
@@ -948,11 +955,6 @@ function subModeLabel(mode: string): string {
 function subModeHint(mode: string): string {
   return mode === "all" ? t("subModeAllHint") : t("subModeSelectHint");
 }
-async function openSubscriptions() {
-  view.value = "subscriptions";
-  try { await loadSubscriptions(); }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
 /** Refresh subscriptions and templates without touching the active view, so an
  *  import from the library can pick up the new templates in place. */
 async function loadSubscriptions() {
@@ -962,21 +964,21 @@ async function saveSubscription() {
   try {
     await api.createSubscription(subForm.name, subForm.url, subForm.mode);
     Object.assign(subForm, { name: "", url: "" });
-    await openSubscriptions();
+    await loadSubscriptions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleSubscription(sub: TemplateSubscription) {
-  try { await api.updateSubscription(sub.id, { enabled: !sub.enabled }); await openSubscriptions(); }
+  try { await api.updateSubscription(sub.id, { enabled: !sub.enabled }); await loadSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function setSubscriptionMode(sub: TemplateSubscription, mode: "select" | "all") {
   if (mode === sub.mode) return;
-  try { await api.updateSubscription(sub.id, { mode }); await openSubscriptions(); }
+  try { await api.updateSubscription(sub.id, { mode }); await loadSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeSubscription(id: number) {
   if (!window.confirm(t("deleteSubConfirm"))) return;
-  try { await api.deleteSubscription(id); await openSubscriptions(); }
+  try { await api.deleteSubscription(id); await loadSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function syncSubscription(id: number) {
@@ -984,7 +986,7 @@ async function syncSubscription(id: number) {
   try {
     await api.syncSubscription(id);
     subSyncs.value = await api.subscriptionSyncs(id);
-    await openSubscriptions();
+    await loadSubscriptions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
   finally { syncingId.value = null; }
 }
@@ -1035,6 +1037,9 @@ const libraryHintText = computed(() => {
 });
 async function openLibrary(sub: TemplateSubscription) {
   view.value = "library";
+  // Keep the subscription panel expanded so "back" returns to the list the user
+  // came from rather than a collapsed templates page.
+  showSubscriptions.value = true;
   librarySubscription.value = sub;
   library.value = null;
   librarySelected.value = new Set();
@@ -1528,7 +1533,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
-        <a :class="['nav-link', { active: view === 'subscriptions' }]" href="#" @click.prevent="openSubscriptions"><RefreshCw :size="18" />{{ t('subscriptions') }}</a>
         <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
         <a :class="['nav-link', { active: view === 'settings' }]" href="#" @click.prevent="view='settings'"><Settings :size="18" />{{ t('settings') }}</a>
@@ -1743,8 +1747,52 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div v-else-if="view === 'templates'" class="page">
         <section class="page-heading">
           <div><h1>{{ t('templates') }}</h1><p>{{ t('templateHint') }}</p></div>
-          <button class="primary-button" @click="openImportModal()"><Plus :size="17" />{{ t('importHar') }}</button>
+          <div class="heading-actions">
+            <button class="primary-button" @click="openImportModal()"><Plus :size="17" />{{ t('importLocal') }}</button>
+            <button
+              class="secondary-button"
+              :class="{ 'is-active': showSubscriptions }"
+              :aria-expanded="showSubscriptions"
+              @click="showSubscriptions = !showSubscriptions"
+            ><RefreshCw :size="16" />{{ showSubscriptions ? t('collapseSubs') : t('importFromSubscription') }}</button>
+          </div>
         </section>
+
+        <!-- The second import source: add a GitHub template library and pick from it. -->
+        <section v-if="showSubscriptions" class="task-section">
+          <h2>{{ t('subscriptionsTitle') }}</h2>
+          <p class="muted section-hint">{{ t('subHint') }}</p>
+          <form class="modal inline-modal" @submit.prevent="saveSubscription">
+            <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
+            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
+            <label>{{ t('subMode') }}
+              <Dropdown v-model="subForm.mode" :options="subModeOptions" />
+              <small class="muted">{{ subModeHint(subForm.mode) }}</small>
+            </label>
+            <button class="primary-button">{{ t('addSub') }}</button>
+          </form>
+          <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
+          <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
+            <strong>{{ sub.name }}</strong><span class="muted">{{ sub.url }}</span>
+            <span class="chip" :title="subModeHint(sub.mode)">{{ subModeLabel(sub.mode) }}</span>
+            <span v-if="sub.last_synced_at" class="run-time">{{ t('lastSync') }} {{ formatRunTime(sub.last_synced_at) }}</span>
+            <span v-if="sub.last_error" class="error-text">{{ sub.last_error }}</span>
+            <button class="primary-button" @click="openLibrary(sub)">{{ t('browseLibrary') }}</button>
+            <button class="secondary-button" v-if="sub.mode === 'all'" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)">{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
+            <button class="secondary-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
+            <button class="secondary-button" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
+            <button class="secondary-button" @click="toggleSubscription(sub)">{{ sub.enabled ? t('disableSub') : t('enableSub') }}</button>
+            <button class="icon-button" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
+          </div>
+          <template v-if="subSyncs.length">
+            <h2>{{ t('syncRecords') }}</h2>
+            <div v-for="s in subSyncs" :key="s.id" class="run-row">
+              <span class="run-id">#{{ s.id }}</span><strong :class="runStatusClass(s.status)">{{ s.status }}</strong>
+              <span class="muted">{{ s.message }}</span><span class="run-time">{{ formatRunTime(s.created_at) }}</span>
+            </div>
+          </template>
+        </section>
+
         <section class="task-section">
           <div class="toolbar">
             <label class="search"><Search :size="17" /><input v-model="templateSearch" type="search" :placeholder="t('templateSearch')" /></label>
@@ -1911,40 +1959,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </section>
       </div>
 
-      <!-- ===== SUBSCRIPTIONS ===== -->
-      <div v-else-if="view === 'subscriptions'" class="page">
-        <section class="page-heading"><div><h1>{{ t('subscriptionsTitle') }}</h1><p>{{ t('subHint') }}</p></div></section>
-        <section class="task-section">
-          <form class="modal inline-modal" @submit.prevent="saveSubscription">
-            <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
-            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
-            <label>{{ t('subMode') }}
-              <Dropdown v-model="subForm.mode" :options="subModeOptions" />
-              <small class="muted">{{ subModeHint(subForm.mode) }}</small>
-            </label>
-            <button class="primary-button">{{ t('addSub') }}</button>
-          </form>
-          <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
-          <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
-            <strong>{{ sub.name }}</strong><span class="muted">{{ sub.url }}</span>
-            <span class="chip" :title="subModeHint(sub.mode)">{{ subModeLabel(sub.mode) }}</span>
-            <span v-if="sub.last_synced_at" class="run-time">{{ t('lastSync') }} {{ formatRunTime(sub.last_synced_at) }}</span>
-            <span v-if="sub.last_error" class="error-text">{{ sub.last_error }}</span>
-            <button class="primary-button" @click="openLibrary(sub)">{{ t('browseLibrary') }}</button>
-            <button class="secondary-button" v-if="sub.mode === 'all'" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)">{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
-            <button class="secondary-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
-            <button class="secondary-button" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
-            <button class="secondary-button" @click="toggleSubscription(sub)">{{ sub.enabled ? t('disableSub') : t('enableSub') }}</button>
-            <button class="icon-button" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
-          </div>
-          <h2 v-if="subSyncs.length">{{ t('syncRecords') }}</h2>
-          <div v-for="s in subSyncs" :key="s.id" class="run-row">
-            <span class="run-id">#{{ s.id }}</span><strong :class="runStatusClass(s.status)">{{ s.status }}</strong>
-            <span class="muted">{{ s.message }}</span><span class="run-time">{{ formatRunTime(s.created_at) }}</span>
-          </div>
-        </section>
-      </div>
-
       <!-- ===== TEMPLATE LIBRARY ===== -->
       <div v-else-if="view === 'library'" class="page">
         <section class="page-heading">
@@ -1952,7 +1966,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <h1>{{ t('libraryTitle') }}</h1>
             <p>{{ libraryHintText }}</p>
           </div>
-          <button class="secondary-button" @click="openSubscriptions"><ArrowLeft :size="16" />{{ t('libraryBack') }}</button>
+          <button class="secondary-button" @click="openTemplates"><ArrowLeft :size="16" />{{ t('libraryBack') }}</button>
         </section>
         <section class="task-section">
           <div class="toolbar library-toolbar">
