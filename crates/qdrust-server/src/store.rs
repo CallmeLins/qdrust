@@ -59,6 +59,35 @@ fn mysql_username_cmp() -> &'static str {
     "username = ?"
 }
 
+/// Filter for [`Store::search_runs_for_owner`] — the aggregated run log.
+///
+/// Every field is optional so the WebUI can start from "all runs, newest
+/// first" and narrow down to "failed runs of this task".
+#[derive(Debug, Clone)]
+pub struct RunFilter {
+    /// Restrict to one run status (`succeeded`, `failed`, `running`, ...).
+    pub status: Option<String>,
+    /// Restrict to one task.
+    pub task_id: Option<i64>,
+    /// Keyset pagination: return only runs older than this run id.
+    pub before_id: Option<i64>,
+    /// Upper bound on returned rows, clamped to `1..=500`.
+    pub limit: i64,
+}
+
+impl Default for RunFilter {
+    /// An unfiltered page. Not derived, because `limit: 0` would clamp to 1 and
+    /// silently starve every caller that forgets to set it.
+    fn default() -> Self {
+        Self {
+            status: None,
+            task_id: None,
+            before_id: None,
+            limit: 100,
+        }
+    }
+}
+
 macro_rules! define_store {
     ($module:ident, $db:ty, $pool:ty, $pool_options:ty, $options_builder:path, $migrator:expr,
      $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $parent_check:path) => {
@@ -1269,6 +1298,42 @@ macro_rules! define_store {
             return Ok(None);
         }
         Ok(Some(self.list_task_runs(task_id).await?))
+    }
+
+    /// Runs across every task the owner has, newest first, for the aggregated
+    /// log view. Fetches one row past the limit so the caller can report
+    /// "there is more" without a second COUNT query.
+    pub async fn search_runs_for_owner(
+        &self,
+        owner_id: i64,
+        filter: &RunFilter,
+    ) -> Result<Vec<Run>> {
+        let mut sql = String::from(RUN_FIELDS_QUALIFIED);
+        sql.push_str(" WHERE t.owner_id=?");
+        if filter.status.is_some() {
+            sql.push_str(" AND r.status=?");
+        }
+        if filter.task_id.is_some() {
+            sql.push_str(" AND r.task_id=?");
+        }
+        if filter.before_id.is_some() {
+            sql.push_str(" AND r.id<?");
+        }
+        sql.push_str(" ORDER BY r.id DESC LIMIT ?");
+
+        let mut query = sqlx::query(&sql).bind(owner_id);
+        if let Some(status) = filter.status.as_deref() {
+            query = query.bind(status);
+        }
+        if let Some(task_id) = filter.task_id {
+            query = query.bind(task_id);
+        }
+        if let Some(before_id) = filter.before_id {
+            query = query.bind(before_id);
+        }
+        let limit = filter.limit.clamp(1, 500);
+        let rows = query.bind(limit + 1).fetch_all(&self.pool).await?;
+        rows.into_iter().map(run_from_row).collect()
     }
 
     pub async fn create_notification_channel(
@@ -2670,6 +2735,9 @@ const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definit
 // them as well). Every other reference to this column in the file must be
 // quoted the same way or MySQL deployments fail with a 1064 syntax error.
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
+/// `RUN_FIELDS` with every column qualified by the `r` alias, for the queries
+/// that join `tasks` (a bare `id` is ambiguous against `tasks.id`).
+const RUN_FIELDS_QUALIFIED: &str = "SELECT r.id,r.task_id,r.status,r.http_status,r.error,r.log,r.started_at,r.finished_at,r.created_at,r.lease_owner,r.lease_expires_at,r.attempt,r.cancel_requested,r.run_after,r.retry_of,r.`trigger` FROM runs r JOIN tasks t ON t.id=r.task_id";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -3105,6 +3173,7 @@ impl Store {
         pub async fn get_run(id: i64) -> Result<Option<Run>> { id };
         pub async fn list_task_runs(task_id: i64) -> Result<Vec<Run>> { task_id };
         pub async fn list_task_runs_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Vec<Run>>> { task_id, owner_id };
+        pub async fn search_runs_for_owner(owner_id: i64, filter: &RunFilter) -> Result<Vec<Run>> { owner_id, filter };
         pub async fn create_notification_channel(owner_id: i64, input: CreateNotificationChannel) -> Result<NotificationChannel> { owner_id, input };
         pub async fn list_notification_channels(owner_id: i64) -> Result<Vec<NotificationChannel>> { owner_id };
         pub async fn get_notification_channel(id: i64, owner_id: i64) -> Result<Option<NotificationChannel>> { id, owner_id };
@@ -3827,6 +3896,93 @@ mod tests {
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].http_status, Some(204));
         assert!(runs[0].finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn aggregated_runs_filter_by_owner_task_and_status() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("runs_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("runs_bob", &password_hash, "user")
+            .await
+            .unwrap();
+        let first = store
+            .create_for_owner(alice.id, input("alice one"))
+            .await
+            .unwrap();
+        let second = store
+            .create_for_owner(alice.id, input("alice two"))
+            .await
+            .unwrap();
+        let stranger = store
+            .create_for_owner(bob.id, input("bob one"))
+            .await
+            .unwrap();
+
+        // two green runs on `first`, one red run on `second`, one on bob's task.
+        // `finish_run` derives the status from the error, not the HTTP code.
+        for (task, error) in [
+            (&first, None),
+            (&first, None),
+            (&second, Some("boom")),
+            (&stranger, Some("boom")),
+        ] {
+            let run = store.start_run(task.id).await.unwrap();
+            store.finish_run(run.id, Some(200), error).await.unwrap();
+        }
+
+        let all = store
+            .search_runs_for_owner(alice.id, &RunFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "bob's run must not leak into alice's log");
+
+        let failed = store
+            .search_runs_for_owner(
+                alice.id,
+                &RunFilter {
+                    status: Some("failed".into()),
+                    ..RunFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].task_id, second.id);
+
+        let scoped = store
+            .search_runs_for_owner(
+                alice.id,
+                &RunFilter {
+                    task_id: Some(first.id),
+                    ..RunFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|run| run.task_id == first.id));
+
+        // Keyset cursor: ask for the page after the newest run, which is the
+        // older of the two runs on `first`.
+        let page = store
+            .search_runs_for_owner(
+                alice.id,
+                &RunFilter {
+                    before_id: Some(all[0].id),
+                    limit: 1,
+                    ..RunFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        // limit+1 rows are fetched so the caller can detect "has_more".
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().all(|run| run.id < all[0].id));
     }
 
     #[tokio::test]

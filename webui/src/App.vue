@@ -127,14 +127,14 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
 const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
-  tasks: t("tasks"), taskRuns: t("runHistory"), templates: t("templates"), plugins: t("pluginsTitle"),
+  tasks: t("tasks"), taskRuns: t("runHistory"), runs: t("runLogTitle"), templates: t("templates"), plugins: t("pluginsTitle"),
   notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
@@ -488,18 +488,28 @@ function openRunHistoryFromToast(toast: Toast) {
   dismissToast(toast.id);
   if (task) void openRunHistory(task);
 }
+/** Jump from an aggregated-log row to that task's own history. */
+function openRunHistoryById(taskId: number) {
+  const task = tasks.value.find((x) => x.id === taskId);
+  if (task) void openRunHistory(task);
+}
 async function cancelRun(run: Run) {
   try {
     await api.cancelRun(run.id);
-    if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+    await refreshRunViews();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeRun(run: Run) {
   if (!window.confirm(t("confirmDeleteRun"))) return;
   try {
     await api.deleteRun(run.id);
-    if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+    await refreshRunViews();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+/** Reload whichever run list is on screen; both views cancel and delete runs. */
+async function refreshRunViews() {
+  if (view.value === "runs") await loadRunLog();
+  else if (runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
 }
 async function clearTaskRuns() {
   const task = runHistoryTask.value;
@@ -534,6 +544,60 @@ function runStatusClass(status: string): string {
   if (status === "failed") return "run-bad";
   if (status === "cancelled") return "run-cancelled";
   return "run-active";
+}
+
+// ---------- aggregated run log ----------
+// "Are all 30 tasks still green?" used to mean opening 30 run-history pages.
+// One filtered list answers it instead; the per-task page stays for depth.
+const RUN_LOG_PAGE = 100;
+const allRuns = ref<Run[]>([]);
+const runLogStatus = ref<"" | "succeeded" | "failed">("");
+const runLogTaskId = ref(0);
+const runLogLoading = ref(false);
+const runLogHasMore = ref(false);
+const runLogCursor = ref<number | null>(null);
+const runLogStatusOptions = computed(() => [
+  { value: "" as const, label: t("runLogAll") },
+  { value: "succeeded" as const, label: t("runStSucceeded") },
+  { value: "failed" as const, label: t("runStFailed") },
+]);
+const runLogTaskDropdownOptions = computed(() => [
+  { value: 0, label: t("runLogAllTasks") },
+  ...tasks.value.map((task) => ({ value: task.id, label: task.name })),
+]);
+function runTaskName(taskId: number): string {
+  return tasks.value.find((task) => task.id === taskId)?.name ?? `#${taskId}`;
+}
+function taskTimezone(taskId: number): string | undefined {
+  return tasks.value.find((task) => task.id === taskId)?.timezone ?? undefined;
+}
+async function openRunLog() {
+  view.value = "runs";
+  await loadRunLog();
+}
+/** Load the first page, or append the next one when `reset` is false. */
+async function loadRunLog(reset = true) {
+  runLogLoading.value = true;
+  try {
+    if (reset) runLogCursor.value = null;
+    const page = await api.runs({
+      status: runLogStatus.value || undefined,
+      taskId: runLogTaskId.value || undefined,
+      beforeId: reset ? undefined : runLogCursor.value ?? undefined,
+      limit: RUN_LOG_PAGE,
+    });
+    allRuns.value = reset ? page.items : [...allRuns.value, ...page.items];
+    runLogHasMore.value = page.has_more;
+    runLogCursor.value = page.next_cursor;
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    runLogLoading.value = false;
+  }
+}
+function setRunLogStatus(status: "" | "succeeded" | "failed") {
+  runLogStatus.value = status;
+  void loadRunLog();
 }
 
 // ---------- templates ----------
@@ -826,6 +890,20 @@ async function removeChannel(channel: NotificationChannel) {
   if (!window.confirm(fmt("deleteChannelConfirm", { name: channel.name }))) return;
   try { await api.deleteNotificationChannel(channel.id); await openNotifications(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+// A channel that never delivers is the hardest notification bug to notice, so
+// let the user fire one message and read the transport error inline.
+const testingChannelId = ref<number | null>(null);
+async function testChannel(channel: NotificationChannel) {
+  testingChannelId.value = channel.id;
+  try {
+    await api.testNotificationChannel(channel.id);
+    notify(fmt("testChannelSent", { name: channel.name }));
+  } catch (cause) {
+    notify(fmt("testChannelFailed", { message: cause instanceof Error ? cause.message : t("genericError") }), "error");
+  } finally {
+    testingChannelId.value = null;
+  }
 }
 async function loadActions() {
   try {
@@ -1320,6 +1398,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
       <nav aria-label="主导航">
         <a :class="['nav-link', { active: view === 'tasks' }]" href="#" @click.prevent="view='tasks'"><LayoutDashboard :size="18" />{{ t('tasks') }}</a>
+        <a :class="['nav-link', { active: view === 'runs' }]" href="#" @click.prevent="openRunLog"><Activity :size="18" />{{ t('runLogTitle') }}</a>
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
@@ -1418,7 +1497,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <template v-for="task in filteredTasks" :key="task.id">
                   <tr>
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
-                    <td class="col-name"><div class="task-name"><span :class="['method', task.method.toLowerCase()]">{{ task.method }}</span><div><strong>{{ task.name }}</strong><small>{{ task.url }}</small></div></div></td>
+                    <td class="col-name"><div class="task-name"><strong>{{ task.name }}</strong></div></td>
                     <td class="col-schedule"><code>{{ task.cron }}</code></td>
                     <td class="col-time">{{ formatRunTime(task.last_run_at, undefined, task.timezone || undefined) }}</td>
                     <td class="col-status"><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
@@ -1443,6 +1522,59 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+        </section>
+      </div>
+
+      <!-- ===== AGGREGATED RUN LOG ===== -->
+      <div v-else-if="view === 'runs'" class="page">
+        <section class="page-heading">
+          <div><h1>{{ t('runLogTitle') }}</h1><p>{{ t('runLogHint') }}</p></div>
+          <button class="secondary-button" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="16" />{{ t('refresh') }}</button>
+        </section>
+        <section class="task-section">
+          <div class="toolbar">
+            <div class="seg" role="group" :aria-label="t('status')">
+              <button
+                v-for="option in runLogStatusOptions"
+                :key="option.value"
+                type="button"
+                :class="{ active: runLogStatus === option.value }"
+                @click="setRunLogStatus(option.value)"
+              >{{ option.label }}</button>
+            </div>
+            <label class="group-filter">
+              <span>{{ t('runLogTask') }}</span>
+              <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
+            </label>
+            <span v-if="allRuns.length" class="muted">{{ fmt('runLogShown', { n: allRuns.length }) }}</span>
+          </div>
+          <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
+          <div v-else-if="allRuns.length === 0" class="empty-state">
+            <span><Activity :size="25" /></span>
+            <h2>{{ t('runLogEmpty') }}</h2>
+          </div>
+          <div v-else class="table-wrap">
+            <table class="runs-table">
+              <thead><tr>
+                <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="run in allRuns" :key="run.id">
+                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
+                  <td><button class="text-button" @click="openRunHistoryById(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
+                  <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
+                  <td class="row-actions">
+                    <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
+                    <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <button v-if="runLogHasMore" class="secondary-button" :disabled="runLogLoading" @click="loadRunLog(false)">
+            {{ runLogLoading ? t('loading') : t('runLogLoadMore') }}
+          </button>
         </section>
       </div>
 
@@ -1606,6 +1738,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div v-for="channel in channels" :key="channel.id" class="run-row">
             <strong>{{ channel.name }}</strong>
             <span class="chip">{{ channelKindLabel(channel.kind) }}</span>
+            <button class="secondary-button" :disabled="testingChannelId === channel.id" @click="testChannel(channel)"><Send :size="15" />{{ testingChannelId === channel.id ? t('testingChannel') : t('testChannel') }}</button>
             <button class="secondary-button" @click="toggleChannel(channel)">{{ channel.enabled ? t('disable') : t('enable') }}</button>
             <button class="icon-button" :title="t('deleteChannel')" @click="removeChannel(channel)"><Trash2 :size="16" /></button>
           </div>

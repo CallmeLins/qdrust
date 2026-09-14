@@ -479,6 +479,10 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .status-text { color: var(--accent); font-weight: 700; }
 
 .run-log-col { min-width: 320px; }
+/* The aggregated log rows are scanned, not read: a 30-row page of full logs can
+   only be skimmed if each row keeps a predictable height, so the cell caps and
+   scrolls. The per-task history page still shows logs in full. */
+.runs-table .run-log { display: block; max-height: 8.5em; overflow-y: auto; }
 .run-toolbar { display: inline-flex; gap: 4px; }
 .run-log { min-width: 0; white-space: pre-line; word-break: break-word; font-size: 12px; color: var(--ink-2); line-height: 1.6; font-family: var(--font-mono); }
 .run-time { margin-left: auto; color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -535,10 +539,10 @@ tbody tr { transition: background-color var(--t-fast); }
 tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
 .col-check { width: 40px; text-align: center; }
 
-.task-name { display: flex; align-items: center; gap: 12px; }
-.task-name div { min-width: 0; display: grid; gap: 4px; }
+/* Task name cell. The method badge and the url that used to sit beside/under
+   the name were noise: the template owns the request, so the row shows the one
+   thing a reader scans for. */
 .task-name strong { color: var(--ink); font-size: 13px; font-weight: 600; }
-.task-name small { max-width: 330px; overflow: hidden; color: var(--ink-3); text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11px; }
 .row-actions { position: relative; text-align: right; white-space: nowrap; }
 .row-actions .icon-button { width: 31px; height: 31px; }
 
@@ -570,20 +574,6 @@ tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--intera
 .col-schedule code,
 td.col-time,
 td.col-status { white-space: nowrap; }
-
-/* The verb reads as a coloured gutter label rather than a filled chip: no
-   fill, no border — the colour lives in the glyphs. The fixed gutter width is
-   kept so task names still line up down the column. */
-.method {
-  min-width: 40px; height: 25px; flex: none;
-  color: var(--ok);
-  display: grid; justify-items: start; align-items: center;
-  font-size: 9px; font-weight: 800; letter-spacing: 0.8px;
-  font-family: var(--font-mono);
-}
-.method.post { color: var(--info); }
-.method.delete { color: var(--bad); }
-.method.patch, .method.put { color: var(--violet); }
 
 /* Inline code is plain monospace again — the tinted pill competed with the
    task name for attention. The accent colour stays in the text, not on a
@@ -982,7 +972,6 @@ code {
   th, td { padding: 0 12px; }
   .col-schedule, .col-group { display: none; }
   .run-log-col { min-width: 150px; }
-  .task-name small { max-width: 160px; }
 }
 
 @media (max-width: 520px) {
@@ -1044,21 +1033,11 @@ code {
     color: var(--ink-3); font-size: 12px; text-overflow: ellipsis; white-space: nowrap;
   }
   .tasks-table .row-actions { grid-area: more; margin: 0; gap: 6px; }
-  /* Treat the method chip as a gutter label: the title sits beside it and the
-     url hangs under the title column, so both keep the same left edge. */
   .tasks-table .col-name { grid-area: name; overflow: hidden; }
-  .tasks-table .task-name {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    grid-template-areas: "method title" "url url";
-    column-gap: 10px;
-    row-gap: 3px;
-    align-items: center;
-  }
-  .tasks-table .task-name > div { display: contents; }
-  .tasks-table .method { grid-area: method; }
-  .tasks-table .task-name strong { grid-area: title; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tasks-table .task-name small { grid-area: url; max-width: 100%; }
+  /* One visual focus per row: the task name. The method badge and the url used
+     to hang beside/under it; both are gone, so the name owns the whole cell. */
+  .tasks-table .task-name { display: block; }
+  .tasks-table .task-name strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Swap the four inline actions for the overflow menu. */
   .tasks-table .row-act { display: none; }
   .tasks-table .row-more { display: inline-flex; }

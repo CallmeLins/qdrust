@@ -36,6 +36,13 @@ export interface TemplatePage {
   next_cursor: number | null;
 }
 
+/** Paginated response returned by GET /api/v1/runs (aggregated log). */
+export interface RunPage {
+  items: Run[];
+  has_more: boolean;
+  next_cursor: number | null;
+}
+
 /** Public authentication policy exposed by GET /api/v1/auth/config.
  *  Never contains secrets; mirrors the server `PublicAuthConfig`. */
 export interface AuthConfig {
@@ -176,6 +183,7 @@ export const api = {
   createNotificationChannel: (name: string, kind: NotificationChannel["kind"], config: Record<string, unknown>) => request<NotificationChannel>("/api/v1/notification-channels", { method: "POST", body: JSON.stringify({ name, kind, config, enabled: true }) }),
   updateNotificationChannel: (id: number, enabled: boolean) => request<NotificationChannel>(`/api/v1/notification-channels/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
   deleteNotificationChannel: (id: number) => request<void>(`/api/v1/notification-channels/${id}`, { method: "DELETE" }),
+  testNotificationChannel: (id: number) => request<{ ok: boolean; kind: string }>(`/api/v1/notification-channels/${id}/test`, { method: "POST" }),
   notificationActions: (taskId: number) => request<NotificationAction[]>(`/api/v1/tasks/${taskId}/notification-actions`),
   createNotificationAction: (taskId: number, channelId: number, event: string) => request<NotificationAction>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "POST", body: JSON.stringify({ channel_id: channelId, event }) }),
   deleteNotificationAction: (id: number) => request<void>(`/api/v1/notification-actions/${id}`, { method: "DELETE" }),
@@ -189,6 +197,15 @@ export const api = {
   runTask: (id: number) => request<Run>(`/api/v1/tasks/${id}/run`, { method: "POST" }),
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
+  /** Aggregated log: runs across every task the caller owns, newest first. */
+  runs: async (filter: { status?: string; taskId?: number; beforeId?: number; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (filter.status) params.set("status", filter.status);
+    if (filter.taskId) params.set("task_id", String(filter.taskId));
+    if (filter.beforeId) params.set("before_id", String(filter.beforeId));
+    params.set("limit", String(filter.limit ?? 100));
+    return request<RunPage>(`/api/v1/runs?${params.toString()}`);
+  },
   deleteTaskRuns: (id: number) => request<{ deleted?: number }>(`/api/v1/tasks/${id}/runs`, { method: "DELETE" }),
   deleteRun: (id: number) => request<void>(`/api/v1/runs/${id}`, { method: "DELETE" }),
   runSteps: (id: number) => request<RunStep[]>(`/api/v1/runs/${id}/steps`),

@@ -17,7 +17,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     api::RunEventSender,
-    email::{EmailClient, normalize_recipient},
+    delivery::{Message, TemplateVars, format_notification_time},
+    email::EmailClient,
     model::{PluginManifest, RunStep, Task, Template},
     store::Store,
 };
@@ -447,54 +448,6 @@ async fn execute_with_run(
     }
 }
 
-/// Render an epoch-seconds timestamp in the task's own IANA timezone (UTC when
-/// the task has none, or when the stored name no longer parses). Backs the
-/// `{t}` variable in notification templates.
-fn format_notification_time(timestamp: i64, timezone: Option<&str>) -> String {
-    let tz = timezone
-        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
-        .unwrap_or(chrono_tz::Tz::UTC);
-    Utc.timestamp_opt(timestamp, 0)
-        .single()
-        .map(|dt| {
-            dt.with_timezone(&tz)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
-/// Values substituted into a notification `title_template` / `body_template`
-/// (and into a custom-HTTP url / headers / body). Extracted from the delivery
-/// loop so the substitution rules stay unit-testable without a store or a
-/// network client.
-struct TemplateVars<'a> {
-    event: &'a str,
-    task_id: i64,
-    task_name: &'a str,
-    run_id: i64,
-    status: String,
-    error: &'a str,
-    log: &'a str,
-    time: String,
-}
-
-impl TemplateVars<'_> {
-    /// Replace every known `{placeholder}`. Unknown placeholders are left as-is
-    /// so a typo shows up in the delivered message instead of silently vanishing.
-    fn render(&self, value: &str) -> String {
-        value
-            .replace("{event}", self.event)
-            .replace("{task_id}", &self.task_id.to_string())
-            .replace("{task}", self.task_name)
-            .replace("{run_id}", &self.run_id.to_string())
-            .replace("{status}", &self.status)
-            .replace("{error}", self.error)
-            .replace("{log}", self.log)
-            .replace("{t}", &self.time)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn send_notifications(
     store: &Store,
@@ -577,99 +530,34 @@ async fn send_notifications(
             .as_deref()
             .map(|value| vars.render(value))
             .unwrap_or_else(|| body.clone());
-        match channel.kind.as_str() {
-            "webhook" => {
-                let Some(url) = channel.config.get("url").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                if let Err(err) = client
-                    .post(url)
-                    .json(&payload)
-                    .send()
-                    .await
-                    .and_then(|response| response.error_for_status())
-                {
-                    error!(task_id=task.id, channel_id=channel.id, %err, "notification delivery failed");
-                }
-            }
-            "custom_http" => {
-                let Some(url) = channel.config.get("url").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let method = channel
-                    .config
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("POST");
-                let Ok(method) = method.parse::<Method>() else {
-                    continue;
-                };
-                let mut request = client.request(method, vars.render(url));
-                if let Some(headers) = channel.config.get("headers").and_then(|v| v.as_object()) {
-                    for (name, value) in headers {
-                        if let Some(value) = value.as_str() {
-                            request = request.header(name, vars.render(value));
-                        }
-                    }
-                }
-                let configured_body = channel
-                    .config
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let result = if configured_body.is_empty() {
-                    request.json(&payload).send().await
-                } else {
-                    request.body(vars.render(configured_body)).send().await
-                };
-                if let Err(err) = result.and_then(|response| response.error_for_status()) {
-                    error!(task_id=task.id, channel_id=channel.id, %err, "custom HTTP notification failed");
-                }
-            }
-            "email" => {
-                let Some(to) = channel
-                    .config
-                    .get("to")
-                    .and_then(|value| value.as_str())
-                    .and_then(normalize_recipient)
-                else {
-                    continue;
-                };
-                let from = channel.config.get("from").and_then(|v| v.as_str());
-                if let Err(err) = email.send(&to, from, &title, &body) {
-                    error!(task_id=task.id, channel_id=channel.id, %err, "email notification failed");
-                } else {
-                    info!(task_id=task.id, channel_id=channel.id, %to, "email notification sent");
-                }
-            }
-            other if crate::push_channels::is_push_channel(other) => {
-                match crate::push_channels::push_to_channel(
-                    client,
-                    other,
-                    &channel.config,
-                    &title,
-                    &body,
-                )
-                .await
-                {
-                    Ok(()) => info!(
-                        task_id = task.id,
-                        channel_id = channel.id,
-                        kind = other,
-                        "push notification sent"
-                    ),
-                    Err(err) => {
-                        error!(task_id=task.id, channel_id=channel.id, kind=other, %err, "push notification failed")
-                    }
-                }
-            }
-            other => {
-                info!(
-                    channel_id = channel.id,
-                    kind = other,
-                    "notification channel sender is not implemented"
-                );
-            }
+        let message = Message {
+            title: &title,
+            body: &body,
+            payload: &payload,
+        };
+        match crate::delivery::deliver(
+            client,
+            &channel.kind,
+            &channel.config,
+            &message,
+            &|value| vars.render(value),
+            Some(email),
+        )
+        .await
+        {
+            Ok(()) => info!(
+                task_id = task.id,
+                channel_id = channel.id,
+                kind = %channel.kind,
+                "notification delivered"
+            ),
+            Err(err) => error!(
+                task_id = task.id,
+                channel_id = channel.id,
+                kind = %channel.kind,
+                %err,
+                "notification delivery failed"
+            ),
         }
     }
 }
@@ -896,6 +784,7 @@ async fn execute_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::email::normalize_recipient;
     use serde_json::json;
 
     #[tokio::test]

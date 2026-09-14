@@ -228,7 +228,7 @@ pub fn router_with_auth(
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
         .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
         .route("/api/v1/runs/{id}", delete(delete_run))
-        .route("/api/v1/runs", delete(delete_all_runs))
+        .route("/api/v1/runs", get(list_runs).delete(delete_all_runs))
         .route(
             "/api/v1/auth/verify-email",
             axum::routing::post(verify_email),
@@ -297,6 +297,10 @@ pub fn router_with_auth(
             get(get_notification_channel)
                 .put(update_notification_channel)
                 .delete(delete_notification_channel),
+        )
+        .route(
+            "/api/v1/notification-channels/{id}/test",
+            axum::routing::post(test_notification_channel),
         )
         .route(
             "/api/v1/tasks/{id}/notification-actions",
@@ -1391,6 +1395,52 @@ async fn list_task_runs(
     Ok(Json(json!(runs)))
 }
 
+/// Every run the caller owns, newest first — the aggregated log view.
+///
+/// Query parameters: `status` (exact match), `task_id`, `limit` (default 100,
+/// max 500) and `before_id` (keyset cursor: the `next_cursor` of the previous
+/// page). Returns `{items, has_more, next_cursor}` like the template list.
+async fn list_runs(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Query(params): Query<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(100)
+        .clamp(1, 500);
+    let filter = crate::store::RunFilter {
+        status: params
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        task_id: params.get("task_id").and_then(Value::as_i64),
+        before_id: params.get("before_id").and_then(Value::as_i64),
+        limit,
+    };
+    let mut runs = store
+        .search_runs_for_owner(session.user.id, &filter)
+        .await?;
+    let has_more = runs.len() as i64 > limit;
+    if has_more {
+        runs.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        runs.last().map(|run| run.id)
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "items": runs,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    })))
+}
+
 async fn run_task(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -1574,6 +1624,64 @@ async fn delete_notification_channel(
             "Notification channel not found",
         ))
     }
+}
+
+/// Send a test message through one channel.
+///
+/// Goes through the same [`crate::delivery::deliver`] the scheduler uses, so a
+/// green test means the credentials and the transport work. A delivery failure
+/// is reported verbatim in a 422: the whole point is to show the user why their
+/// channel is silent.
+async fn test_notification_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&state.store, &headers).await?;
+    let channel = state
+        .store
+        .get_notification_channel(id, session.user.id)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "notification_channel_not_found",
+            "Notification channel not found",
+        ))?;
+    let timezone = crate::config::Config::from_env()
+        .map(|config| config.default_timezone)
+        .ok();
+    let vars = crate::delivery::test_vars(timezone.as_deref());
+    // Title/body templates live on the task↔channel bindings, not on the
+    // channel, so a channel-level test can only exercise the generic message.
+    let title = vars.render("[qdrust] Test notification");
+    let body = vars.render(
+        "This is a test message from qdrust.\nIf you can read this, the channel works.\nTime: {t}",
+    );
+    let payload = json!({
+        "event": "test",
+        "task_id": null,
+        "task_name": null,
+        "run_id": null,
+        "http_status": null,
+        "error": null,
+        "title": title,
+        "body": body,
+    });
+    let message = crate::delivery::Message {
+        title: &title,
+        body: &body,
+        payload: &payload,
+    };
+    crate::delivery::deliver(
+        &state.http_client,
+        &channel.kind,
+        &channel.config,
+        &message,
+        &|value| vars.render(value),
+        None,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!({ "ok": true, "kind": channel.kind })))
 }
 
 async fn list_notification_actions(
@@ -3462,6 +3570,10 @@ mod tests {
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
         assert!(document["paths"]["/api/v1/tasks"].is_object());
+        // The two endpoints that back the WebUI's aggregated log and the
+        // channel-test button must stay in the published contract.
+        assert!(document["paths"]["/api/v1/runs"]["get"].is_object());
+        assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert_eq!(
             document["components"]["schemas"]["ApiError"]["required"]
                 .as_array()
@@ -3469,6 +3581,77 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    /// The aggregated run log is owner-scoped and paginated; the channel test
+    /// refuses a channel the caller does not own. Both are new routes, so this
+    /// also proves they are actually mounted.
+    #[tokio::test]
+    async fn run_log_page_and_channel_test_are_wired() {
+        let app = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username": "runs_admin", "password": "correct horse battery staple"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie_header = response_cookies(&response).join("; ");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runs?status=failed&limit=10")
+                    .header(COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // `response_json` needs the `x-request-id` header, which only ApiError
+        // responses carry, so read this success body directly.
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["items"], json!([]));
+        assert_eq!(body["has_more"], false);
+        assert_eq!(body["next_cursor"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/notification-channels/9999/test")
+                    .header(COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

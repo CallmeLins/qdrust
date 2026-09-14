@@ -247,7 +247,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** @description Every run the caller owns, newest first, for the aggregated log view */
+        get: operations["listRuns"];
         put?: never;
         post?: never;
         /** @description Clear the run history: admins wipe every run, users wipe the runs of their own tasks */
@@ -267,6 +268,25 @@ export interface paths {
         get: operations["listNotificationChannels"];
         put?: never;
         post: operations["createNotificationChannel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notification-channels/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** @description Send a test message through the channel, using the same delivery path as the scheduler */
+        post: operations["testNotificationChannel"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1946,6 +1966,40 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    listRuns: {
+        parameters: {
+            query?: {
+                /** @description Exact run status, e.g. succeeded, failed, running */
+                status?: string;
+                /** @description Only runs of this task */
+                task_id?: number;
+                /** @description Page size, clamped to 1..=500 (default 100) */
+                limit?: number;
+                /** @description Keyset cursor: the next_cursor of the previous page */
+                before_id?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Run page */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items: components["schemas"]["Run"][];
+                        has_more: boolean;
+                        next_cursor?: number | null;
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
     deleteAllRuns: {
         parameters: {
             query?: never;
@@ -2003,6 +2057,41 @@ export interface operations {
                 content?: never;
             };
             422: components["responses"]["ValidationError"];
+        };
+    };
+    testNotificationChannel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Test message delivered */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        ok?: boolean;
+                        kind?: string;
+                    };
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Delivery failed; the message carries the transport error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     getNotificationChannel: {
