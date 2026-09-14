@@ -267,16 +267,63 @@ pub struct TemplateSubscription {
     pub name: String,
     pub url: String,
     pub enabled: bool,
+    /// How the source is consumed: `select` treats it as a browsable library
+    /// whose entries the user imports by hand, `all` imports everything the
+    /// source offers on every sync. See [`SubscriptionMode`].
+    pub mode: String,
     pub last_synced_at: Option<i64>,
     pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
+/// The two ways a subscription can be consumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionMode {
+    /// Browse the source and import only the entries the user picks.
+    Select,
+    /// Import every template the source offers. A subscription only auto-syncs
+    /// in this mode; `Select` sources are fetched on demand from the library
+    /// browser, so a large public library never lands in the user's list.
+    All,
+}
+
+impl SubscriptionMode {
+    pub const SELECT: &'static str = "select";
+    pub const ALL: &'static str = "all";
+
+    /// Parse a wire value, rejecting anything unknown so a typo cannot silently
+    /// pick the wrong import behaviour.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            Self::SELECT => Some(Self::Select),
+            Self::ALL => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Select => Self::SELECT,
+            Self::All => Self::ALL,
+        }
+    }
+
+    /// Whether the periodic scheduler should sync this subscription on its own.
+    pub fn auto_syncs(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateTemplateSubscription {
     pub name: String,
     pub url: String,
+    /// Defaults to `select`: a source is assumed to be a library the user
+    /// browses, which is the safe default for the hundreds-of-entries public
+    /// libraries.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -284,6 +331,78 @@ pub struct UpdateTemplateSubscription {
     pub name: Option<String>,
     pub url: Option<String>,
     pub enabled: Option<bool>,
+    pub mode: Option<String>,
+}
+
+/// One template offered by a subscription source, as seen by the library
+/// browser. `installed*` / `update_available` are resolved against the local
+/// templates the subscription already imported.
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryEntry {
+    /// The entry's identity inside the source. For a manifest source this is
+    /// the `har` key; for a scanned repository it is the file path.
+    pub name: String,
+    pub author: Option<String>,
+    pub comments: Option<String>,
+    /// Upstream revision (the manifest's `yyyymmdd` version). Absent for
+    /// sources that publish no manifest.
+    pub version: Option<String>,
+    pub date: Option<String>,
+    pub filename: String,
+    pub url: Option<String>,
+    pub comment_url: Option<String>,
+    pub installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_template_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// True when the entry is installed at an older version than the source
+    /// now offers.
+    pub update_available: bool,
+}
+
+/// A subscription source's catalogue.
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateLibrary {
+    pub subscription_id: i64,
+    /// `manifest` when the source publishes `tpls_history.json`, `files` when
+    /// the catalogue had to be derived by scanning the repository tree.
+    pub source_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<String>,
+    pub entries: Vec<LibraryEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ImportLibraryTemplates {
+    /// Entry names to import, as returned by the library listing.
+    pub names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryImportResult {
+    pub imported: usize,
+    pub updated: usize,
+    /// Entries that could not be imported. Reported per entry rather than
+    /// aborting the batch, so one broken upstream template does not block the
+    /// rest of the selection.
+    pub failed: Vec<LibraryImportFailure>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryImportFailure {
+    pub name: String,
+    pub error: String,
+}
+
+/// Provenance row linking a local template back to the source entry it came
+/// from, used to mark entries as installed and to detect upstream updates.
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateImport {
+    pub subscription_id: i64,
+    pub template_id: i64,
+    pub entry_name: String,
+    pub entry_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

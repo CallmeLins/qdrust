@@ -858,6 +858,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/subscriptions/{id}/library": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the templates a subscription source offers, flagged as installed / updateable */
+        get: operations["browseSubscriptionLibrary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import the selected entries of a subscription source */
+        post: operations["importSubscriptionTemplates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/push-requests": {
         parameters: {
             query?: never;
@@ -1326,6 +1360,11 @@ export interface components {
             name: string;
             url: string;
             enabled: boolean;
+            /**
+             * @description `select` browses the source and imports only the entries the user picks; `all` imports every template the source offers on each sync
+             * @enum {string}
+             */
+            mode: "select" | "all";
             /** Format: int64 */
             last_synced_at?: number | null;
             last_error?: string | null;
@@ -1337,11 +1376,59 @@ export interface components {
         CreateTemplateSubscription: {
             name: string;
             url: string;
+            /**
+             * @description Defaults to `select`
+             * @enum {string|null}
+             */
+            mode?: "select" | "all" | null;
         };
         UpdateTemplateSubscription: {
             name?: string | null;
             url?: string | null;
             enabled?: boolean | null;
+            /** @enum {string|null} */
+            mode?: "select" | "all" | null;
+        };
+        LibraryEntry: {
+            /** @description The entry's identity inside the source, and the local template name */
+            name: string;
+            author?: string | null;
+            /** @description The manifest's variable documentation, reduced to plain text */
+            comments?: string | null;
+            version?: string | null;
+            date?: string | null;
+            filename: string;
+            url?: string | null;
+            comment_url?: string | null;
+            installed: boolean;
+            /** Format: int64 */
+            installed_template_id?: number | null;
+            installed_version?: string | null;
+            update_available: boolean;
+        };
+        TemplateLibrary: {
+            /** Format: int64 */
+            subscription_id: number;
+            /**
+             * @description `manifest` when the source publishes tpls_history.json, `files` when the catalogue was derived by scanning the repository tree
+             * @enum {string}
+             */
+            source_kind: "manifest" | "files";
+            manifest_version?: string | null;
+            entries: components["schemas"]["LibraryEntry"][];
+        };
+        ImportLibraryTemplates: {
+            /** @description Entry names to import, as returned by the library listing */
+            names: string[];
+        };
+        LibraryImportFailure: {
+            name: string;
+            error: string;
+        };
+        LibraryImportResult: {
+            imported: number;
+            updated: number;
+            failed: components["schemas"]["LibraryImportFailure"][];
         };
         SubscriptionSync: {
             /** Format: int64 */
@@ -1591,6 +1678,11 @@ export interface components {
         UpdateTemplateSubscription: {
             content: {
                 "application/json": components["schemas"]["UpdateTemplateSubscription"];
+            };
+        };
+        ImportLibraryTemplates: {
+            content: {
+                "application/json": components["schemas"]["ImportLibraryTemplates"];
             };
         };
         CreatePushRequest: {
@@ -3071,6 +3163,82 @@ export interface operations {
         responses: {
             /** @description WebSocket upgrade */
             101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    browseSubscriptionLibrary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source catalogue */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateLibrary"];
+                };
+            };
+            /** @description Subscription not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The source could not be read */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    importSubscriptionTemplates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["requestBodies"]["ImportLibraryTemplates"];
+            };
+        };
+        responses: {
+            /** @description Per-entry import outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryImportResult"];
+                };
+            };
+            /** @description Subscription not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Nothing selected, or the source could not be read */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -1,119 +1,22 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use qdrust_core::qd_har::QdHar;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
-use crate::{model::TemplateSubscription, store::Store};
+use crate::{
+    library,
+    model::{SubscriptionMode, TemplateSubscription},
+    store::Store,
+};
 
-/// Resolve a subscription URL into a list of (display_name, raw_url, source) template files.
-/// Supports GitHub repositories (tree/recursive listing via the contents API) and
-/// direct file URLs. Returns up to `limit` entries.
-pub async fn discover_templates(
-    client: &Client,
-    url: &str,
-    limit: usize,
-) -> Result<Vec<(String, String, String)>> {
-    if let Some((owner, repo, branch)) = parse_github_url(url) {
-        discover_github(client, &owner, &repo, &branch, limit).await
-    } else {
-        // Treat as a direct file URL.
-        let name = url
-            .rsplit('/')
-            .next()
-            .unwrap_or("template")
-            .trim_end_matches(".json")
-            .trim_end_matches(".har")
-            .to_string();
-        Ok(vec![(name, url.to_string(), url.to_string())])
-    }
-}
-
-fn parse_github_url(url: &str) -> Option<(String, String, String)> {
-    let rest = url.strip_prefix("https://github.com/")?;
-    let mut parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-    let owner = parts.first()?.to_string();
-    let repo = parts.get(1)?.trim_end_matches(".git").to_string();
-    parts.drain(0..2);
-    let mut branch = "HEAD".to_string();
-    if let Some(first) = parts.first().copied()
-        && (first == "tree" || first == "blob")
-    {
-        parts.remove(0);
-        if let Some(b) = parts.first().copied() {
-            branch = b.to_string();
-            parts.remove(0);
-        }
-    }
-    let _ = parts; // remaining path prefix is currently ignored; we scan the whole tree
-    Some((owner, repo, branch))
-}
-
-async fn discover_github(
-    client: &Client,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-    limit: usize,
-) -> Result<Vec<(String, String, String)>> {
-    let api_url =
-        format!("https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1");
-    let response = client
-        .get(&api_url)
-        .header("User-Agent", "qdrust-subscription")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .context("cannot reach GitHub API")?
-        .error_for_status()
-        .context("GitHub API returned an error")?;
-    let body: Value = response
-        .json()
-        .await
-        .context("invalid GitHub API response")?;
-    let Some(tree) = body.get("tree").and_then(Value::as_array) else {
-        bail!("GitHub tree response has no entries");
-    };
-    let mut found = Vec::new();
-    for entry in tree {
-        if found.len() >= limit {
-            break;
-        }
-        let Some(path) = entry.get("path").and_then(Value::as_str) else {
-            continue;
-        };
-        if entry.get("type").and_then(Value::as_str) != Some("blob") {
-            continue;
-        }
-        if !looks_like_qd_template(path) {
-            continue;
-        }
-        let raw_url = format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}");
-        let name = file_stem(path).to_string();
-        found.push((
-            name,
-            raw_url,
-            format!("https://github.com/{owner}/{repo}/blob/{branch}/{path}"),
-        ));
-    }
-    Ok(found)
-}
-
-fn looks_like_qd_template(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".har.json") || (lower.ends_with(".json") && !lower.ends_with(".har.json"))
-}
-
-fn file_stem(path: &str) -> &str {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    base.trim_end_matches(".har.json").trim_end_matches(".json")
-}
-
-/// Run a subscription sync: discover templates in the source, download each,
-/// import or update the matching template, and report progress.
+/// Run a subscription sync: catalogue the source, download each entry, import
+/// or update the matching template, and report progress.
+///
+/// Only `all`-mode subscriptions reach this; a `select`-mode source is a
+/// library the user browses and imports from by hand (see `library`).
 pub async fn sync_subscription(
     store: &Store,
     client: &Client,
@@ -130,13 +33,10 @@ pub async fn sync_subscription(
     let result =
         sync_subscription_inner(store, client, subscription, events.as_ref(), sync_id).await;
     match result {
-        Ok(imported) => {
+        Ok((imported, updated)) => {
+            let summary = format!("imported {imported} template(s), updated {updated}");
             store
-                .finish_subscription_sync(
-                    sync_id,
-                    "succeeded",
-                    Some(&format!("imported {imported} template(s)")),
-                )
+                .finish_subscription_sync(sync_id, "succeeded", Some(&summary))
                 .await
                 .ok();
             store
@@ -148,11 +48,12 @@ pub async fn sync_subscription(
                 subscription.id,
                 sync_id,
                 "succeeded",
-                Some(format!("imported {imported} template(s)")),
+                Some(summary),
             );
             info!(
                 subscription_id = subscription.id,
                 imported,
+                updated,
                 elapsed_ms = started.elapsed().as_millis(),
                 "subscription sync completed"
             );
@@ -185,100 +86,75 @@ pub async fn sync_subscription(
     }
 }
 
+/// Returns `(imported, updated)`.
 async fn sync_subscription_inner(
     store: &Store,
     client: &Client,
     subscription: &TemplateSubscription,
     events: Option<&broadcast::Sender<Value>>,
     sync_id: i64,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     store
         .finish_subscription_sync(sync_id, "running", None)
         .await?;
     if !subscription.enabled {
         bail!("subscription is disabled");
     }
-    let files = discover_templates(client, &subscription.url, 200).await?;
-    if files.is_empty() {
-        bail!("no template files found in subscription source");
+    if !matches!(
+        SubscriptionMode::parse(&subscription.mode),
+        Some(SubscriptionMode::All)
+    ) {
+        bail!("subscription is in select mode; import templates from the library instead");
     }
+    let catalogue = library::catalogue(client, &subscription.url).await?;
     emit(
         events,
         subscription.id,
         sync_id,
         "progress",
-        Some(format!("found {} template file(s)", files.len())),
+        Some(format!(
+            "found {} template(s) via {}",
+            catalogue.entries.len(),
+            catalogue.source_kind
+        )),
     );
+    let linked = library::installed_index(store.list_template_imports(subscription.id).await?);
+    let source = library::parse_github_url(&subscription.url);
     let mut imported = 0_usize;
-    for (index, (name, raw_url, source)) in files.iter().enumerate() {
+    let mut updated = 0_usize;
+    let total = catalogue.entries.len();
+    for (index, entry) in catalogue.entries.iter().enumerate() {
+        let name = &entry.name;
         emit(
             events,
             subscription.id,
             sync_id,
             "progress",
-            Some(format!(
-                "[{}/{}] downloading {name}",
-                index + 1,
-                files.len()
-            )),
+            Some(format!("[{}/{}] downloading {name}", index + 1, total)),
         );
-        let response = client
-            .get(raw_url)
-            .header("User-Agent", "qdrust-subscription")
-            .send()
-            .await
-            .with_context(|| format!("cannot download {name}"))?
-            .error_for_status()
-            .with_context(|| format!("download failed for {name}"))?;
-        let bytes = response
-            .bytes()
-            .await
-            .with_context(|| format!("cannot read body of {name}"))?;
-        let har: Value =
-            serde_json::from_slice(&bytes).with_context(|| format!("{name} is not valid JSON"))?;
-        QdHar::parse_qd(har.clone()).with_context(|| format!("{name} is not a valid QD HAR"))?;
-        upsert_subscription_template(store, subscription.owner_id, name, har, source).await?;
-        imported += 1;
-    }
-    Ok(imported)
-}
-
-async fn upsert_subscription_template(
-    store: &Store,
-    owner_id: i64,
-    name: &str,
-    har: Value,
-    _source: &str,
-) -> Result<()> {
-    let existing: Option<i64> = store.find_template_by_name(owner_id, name).await?;
-    match existing {
-        Some(id) => {
-            store
-                .update_qd_har_for_owner(
-                    id,
-                    owner_id,
-                    crate::model::UpdateQdHarTemplate {
-                        name: name.to_string(),
-                        description: None,
-                        har,
-                    },
-                )
-                .await?;
-        }
-        None => {
-            store
-                .import_qd_har_for_owner(
-                    owner_id,
-                    crate::model::ImportQdHarTemplate {
-                        name: name.to_string(),
-                        description: None,
-                        har,
-                    },
-                )
-                .await?;
+        // One unusable upstream template must not abort the whole sync; the
+        // entry is skipped and surfaces in the log instead.
+        match library::import_entry(
+            store,
+            client,
+            subscription,
+            source.as_ref(),
+            entry,
+            linked.get(name.as_str()).map(|import| import.template_id),
+        )
+        .await
+        {
+            Ok(true) => updated += 1,
+            Ok(false) => imported += 1,
+            Err(err) => warn!(
+                subscription_id = subscription.id,
+                entry = %name,
+                %err,
+                "skipping template that could not be imported"
+            ),
         }
     }
-    Ok(())
+    Ok((imported, updated))
 }
 
 fn emit(

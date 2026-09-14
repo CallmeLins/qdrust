@@ -1440,6 +1440,74 @@
         }
       }
     },
+    "/api/v1/subscriptions/{id}/library": {
+      "get": {
+        "operationId": "browseSubscriptionLibrary",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "summary": "List the templates a subscription source offers, flagged as installed / updateable",
+        "responses": {
+          "200": {
+            "description": "Source catalogue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateLibrary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found"
+          },
+          "422": {
+            "description": "The source could not be read"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}/import": {
+      "post": {
+        "operationId": "importSubscriptionTemplates",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "summary": "Import the selected entries of a subscription source",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/requestBodies/ImportLibraryTemplates"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-entry import outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryImportResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found"
+          },
+          "422": {
+            "description": "Nothing selected, or the source could not be read"
+          }
+        }
+      }
+    },
     "/api/v1/push-requests": {
       "get": {
         "operationId": "listMyPushRequests",
@@ -1840,6 +1908,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/UpdateTemplateSubscription"
+            }
+          }
+        }
+      },
+      "ImportLibraryTemplates": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ImportLibraryTemplates"
             }
           }
         }
@@ -3068,6 +3146,7 @@
           "name",
           "url",
           "enabled",
+          "mode",
           "created_at",
           "updated_at"
         ],
@@ -3088,6 +3167,14 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "select",
+              "all"
+            ],
+            "description": "`select` browses the source and imports only the entries the user picks; `all` imports every template the source offers on each sync"
           },
           "last_synced_at": {
             "type": [
@@ -3124,6 +3211,18 @@
           },
           "url": {
             "type": "string"
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "select",
+              "all",
+              null
+            ],
+            "description": "Defaults to `select`"
           }
         }
       },
@@ -3147,6 +3246,177 @@
               "boolean",
               "null"
             ]
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "select",
+              "all",
+              null
+            ]
+          }
+        }
+      },
+      "LibraryEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "filename",
+          "installed",
+          "update_available"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The entry's identity inside the source, and the local template name"
+          },
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comments": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The manifest's variable documentation, reduced to plain text"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filename": {
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comment_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "installed_template_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TemplateLibrary": {
+        "type": "object",
+        "required": [
+          "subscription_id",
+          "source_kind",
+          "entries"
+        ],
+        "properties": {
+          "subscription_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": [
+              "manifest",
+              "files"
+            ],
+            "description": "`manifest` when the source publishes tpls_history.json, `files` when the catalogue was derived by scanning the repository tree"
+          },
+          "manifest_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryEntry"
+            }
+          }
+        }
+      },
+      "ImportLibraryTemplates": {
+        "type": "object",
+        "required": [
+          "names"
+        ],
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Entry names to import, as returned by the library listing"
+          }
+        }
+      },
+      "LibraryImportFailure": {
+        "type": "object",
+        "required": [
+          "name",
+          "error"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "LibraryImportResult": {
+        "type": "object",
+        "required": [
+          "imported",
+          "updated",
+          "failed"
+        ],
+        "properties": {
+          "imported": {
+            "type": "integer"
+          },
+          "updated": {
+            "type": "integer"
+          },
+          "failed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryImportFailure"
+            }
           }
         }
       },

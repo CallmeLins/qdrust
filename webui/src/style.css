@@ -1056,3 +1056,67 @@ code {
     padding: 11px 12px;
   }
 }
+
+/* ---------- template library (browsing a subscription source) ---------- */
+
+.library-toolbar { justify-content: flex-start; flex-wrap: wrap; }
+.library-search {
+  flex: 1 1 220px; max-width: 320px; height: 38px; padding: 0 12px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: rgb(var(--card-surface)); color: var(--ink); outline: 0;
+}
+.library-search:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+.seg button .seg-count {
+  margin-left: 6px; padding: 0 5px; border-radius: 999px;
+  background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
+  font-size: 10.5px; font-variant-numeric: tabular-nums;
+}
+
+.chip-ok { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
+.chip-warn { color: var(--warn); border-color: rgb(180 83 9 / 0.35); background: rgb(180 83 9 / 0.12); }
+
+.library-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.library-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 13px 16px; border-radius: var(--r-m);
+  background-color: rgb(var(--card-surface));
+  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  box-shadow: var(--card-shadow);
+  transition: border-color var(--t-fast), background-color var(--t-fast), box-shadow var(--t-fast);
+}
+.library-row:hover {
+  background-color: rgb(var(--card-surface-hover));
+  box-shadow: var(--card-shadow-hover);
+}
+.library-row.is-installed { border-color: rgb(22 163 74 / 0.28); }
+/* The label is only the selection area, so the sibling discussion link stays a
+   plain link instead of toggling the checkbox. */
+.library-row-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: flex-start; gap: 12px; cursor: pointer; }
+.library-row input {
+  width: 16px; height: 16px; margin-top: 2px; flex: none;
+  accent-color: var(--primary);
+}
+
+.library-row-body { flex: 1 1 auto; min-width: 0; display: grid; gap: 4px; }
+.library-row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.library-row-title strong { color: var(--ink); font-size: 13.5px; overflow-wrap: anywhere; }
+.library-row-meta { display: flex; flex-wrap: wrap; gap: 3px 12px; color: var(--ink-3); font-size: 11.5px; }
+/* The manifest documents each template's variables in HTML-ish text, already
+   reduced to plain text server-side. `pre-line` keeps its line breaks. */
+.library-row-comments {
+  color: var(--ink-2); font-size: 12px; line-height: 1.5;
+  white-space: pre-line; overflow-wrap: anywhere;
+}
+.library-row-link {
+  flex: none; align-self: center;
+  color: var(--accent); font-size: 11.5px; text-decoration: none;
+}
+.library-row-link:hover { text-decoration: underline; }
+
+@media (max-width: 560px) {
+  .library-row { flex-wrap: wrap; }
+  .library-row-link { margin-left: 28px; }
+  .library-search { max-width: none; }
+}
+

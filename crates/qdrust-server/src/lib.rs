@@ -5,6 +5,7 @@ pub mod delivery;
 pub mod email;
 pub mod ga;
 pub mod header_auth;
+pub mod library;
 pub mod model;
 pub mod oidc;
 pub mod push_channels;

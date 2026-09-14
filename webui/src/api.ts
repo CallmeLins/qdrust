@@ -24,6 +24,9 @@ export type NotificationChannel = components["schemas"]["NotificationChannel"];
 export type NotificationAction = components["schemas"]["NotificationAction"];
 export type TemplateSubscription = components["schemas"]["TemplateSubscription"];
 export type SubscriptionSync = components["schemas"]["SubscriptionSync"];
+export type LibraryEntry = components["schemas"]["LibraryEntry"];
+export type TemplateLibrary = components["schemas"]["TemplateLibrary"];
+export type LibraryImportResult = components["schemas"]["LibraryImportResult"];
 export type PushRequest = components["schemas"]["PushRequest"];
 export type SiteSetting = components["schemas"]["SiteSetting"];
 export type BatchTaskResult = components["schemas"]["BatchTaskResult"];
@@ -214,11 +217,17 @@ export const api = {
 
   // ---- subscriptions ----
   subscriptions: () => request<TemplateSubscription[]>("/api/v1/subscriptions"),
-  createSubscription: (name: string, url: string) => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url }) }),
-  updateSubscription: (id: number, enabled: boolean) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
+  createSubscription: (name: string, url: string, mode: "select" | "all") => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url, mode }) }),
+  updateSubscription: (id: number, patch: { enabled?: boolean; mode?: "select" | "all" }) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteSubscription: (id: number) => request<void>(`/api/v1/subscriptions/${id}`, { method: "DELETE" }),
   syncSubscription: (id: number) => request<{ status: string }>(`/api/v1/subscriptions/${id}/sync`, { method: "POST" }),
   subscriptionSyncs: (id: number) => request<SubscriptionSync[]>(`/api/v1/subscriptions/${id}/syncs`),
+  /** Catalogue a subscription source: what it offers, what is already imported,
+   *  and what has moved on upstream. */
+  browseSubscriptionLibrary: (id: number) => request<TemplateLibrary>(`/api/v1/subscriptions/${id}/library`),
+  /** Import the named entries of a source. Per-entry failures come back in the
+   *  result rather than failing the whole call. */
+  importSubscriptionTemplates: (id: number, names: string[]) => request<LibraryImportResult>(`/api/v1/subscriptions/${id}/import`, { method: "POST", body: JSON.stringify({ names }) }),
 
   // ---- push requests ----
   myPushRequests: () => request<PushRequest[]>("/api/v1/push-requests"),

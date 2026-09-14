@@ -40,10 +40,11 @@ use crate::{
         BatchCreateNotificationAction, BatchTaskOperation, BatchTaskResult, ChangePassword,
         ClearLogs, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest,
         CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
-        DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportQdHarTemplate,
-        InvokePlugin, IssuedSession, QdHarValidation, RegisterUser, ResetPassword, SetSiteSetting,
-        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportLibraryTemplates,
+        ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
+        ResetPassword, SetSiteSetting, TemplateSubscription, UpdateNotificationChannel,
+        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
@@ -262,6 +263,14 @@ pub fn router_with_auth(
         .route(
             "/api/v1/subscriptions/{id}/sync/live",
             get(subscription_sync_websocket),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/library",
+            get(browse_subscription_library),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/import",
+            axum::routing::post(import_subscription_library),
         )
         .route(
             "/api/v1/push-requests",
@@ -2753,6 +2762,60 @@ async fn stream_subscription_events(
     let _ = socket.close().await;
 }
 
+/// Catalogue a subscription source so the user can pick what to import. Reads
+/// the source's `tpls_history.json` when it publishes one and otherwise scans
+/// the repository tree.
+async fn browse_subscription_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = owned_subscription(&state, id, session.user.id).await?;
+    let library = crate::library::browse(&state.store, &state.http_client, &subscription)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(library)))
+}
+
+/// Import the selected entries of a source. Runs inline rather than in the
+/// background because the caller picks a handful of templates and wants the
+/// per-entry outcome back; entries that fail are reported individually so a
+/// single broken upstream template does not discard the rest of the selection.
+async fn import_subscription_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<ImportLibraryTemplates>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = owned_subscription(&state, id, session.user.id).await?;
+    let result = crate::library::import_selected(
+        &state.store,
+        &state.http_client,
+        &subscription,
+        &input.names,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(result)))
+}
+
+async fn owned_subscription(
+    state: &AppState,
+    id: i64,
+    owner_id: i64,
+) -> Result<TemplateSubscription, ApiError> {
+    state
+        .store
+        .get_subscription(id, owner_id)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "subscription_not_found",
+            "Subscription not found",
+        ))
+}
+
 async fn create_push_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3652,6 +3715,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn subscription_library_routes_are_wired_and_owner_scoped() {
+        let app = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"username": "library_admin", "password": "correct horse battery staple"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie_header = response_cookies(&response).join("; ");
+
+        // Both routes are session-gated.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/subscriptions/1/library")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Ownership is resolved before the source is contacted, so an unknown
+        // id answers without any outbound request.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/subscriptions/9999/library")
+                    .header(COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/subscriptions/9999/import")
+                    .header(COOKIE, &cookie_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"names": ["雨晨分享站"]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A new subscription browses its source instead of importing all of it.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/subscriptions")
+                    .header(COOKIE, &cookie_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "official",
+                            "url": "https://github.com/qd-today/templates"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["mode"], json!("select"));
+        let id = created["id"].as_i64().unwrap();
+
+        // An empty selection is refused before the source is contacted, so this
+        // asserts the guard rather than the network.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/subscriptions/{id}/import"))
+                    .header(COOKIE, &cookie_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"names": []}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("no templates selected")
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, FileJson2, FileUp,
-  LayoutDashboard, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, RefreshCw, Search, Send,
+  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
+  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting } from "./api";
+import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LibraryEntry, type TemplateLibrary } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import { consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
@@ -127,7 +127,7 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "subscriptions" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "runs" | "templates" | "plugins" | "notifications" | "subscriptions" | "library" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
@@ -135,7 +135,7 @@ const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
   tasks: t("tasks"), taskRuns: t("runHistory"), runs: t("runLogTitle"), templates: t("templates"), plugins: t("pluginsTitle"),
-  notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"),
+  notifications: t("notificationsTitle"), subscriptions: t("subscriptionsTitle"), library: t("libraryTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
 
@@ -936,22 +936,42 @@ async function removeAction(id: number) {
 // ---------- subscriptions ----------
 const subscriptions = ref<TemplateSubscription[]>([]);
 const subSyncs = ref<SubscriptionSync[]>([]);
-const subForm = reactive({ name: "", url: "" });
+const subForm = reactive<{ name: string; url: string; mode: "select" | "all" }>({ name: "", url: "", mode: "select" });
 const syncingId = ref<number | null>(null);
+const subModeOptions = computed(() => [
+  { value: "select" as const, label: t("subModeSelect") },
+  { value: "all" as const, label: t("subModeAll") },
+]);
+function subModeLabel(mode: string): string {
+  return mode === "all" ? t("subModeAll") : t("subModeSelect");
+}
+function subModeHint(mode: string): string {
+  return mode === "all" ? t("subModeAllHint") : t("subModeSelectHint");
+}
 async function openSubscriptions() {
   view.value = "subscriptions";
-  try { [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.templates(undefined, undefined, 200)]); }
+  try { await loadSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+/** Refresh subscriptions and templates without touching the active view, so an
+ *  import from the library can pick up the new templates in place. */
+async function loadSubscriptions() {
+  [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.templates(undefined, undefined, 200)]);
 }
 async function saveSubscription() {
   try {
-    await api.createSubscription(subForm.name, subForm.url);
+    await api.createSubscription(subForm.name, subForm.url, subForm.mode);
     Object.assign(subForm, { name: "", url: "" });
     await openSubscriptions();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleSubscription(sub: TemplateSubscription) {
-  try { await api.updateSubscription(sub.id, !sub.enabled); await openSubscriptions(); }
+  try { await api.updateSubscription(sub.id, { enabled: !sub.enabled }); await openSubscriptions(); }
+  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function setSubscriptionMode(sub: TemplateSubscription, mode: "select" | "all") {
+  if (mode === sub.mode) return;
+  try { await api.updateSubscription(sub.id, { mode }); await openSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeSubscription(id: number) {
@@ -971,6 +991,112 @@ async function syncSubscription(id: number) {
 async function showSubSyncs(id: number) {
   try { subSyncs.value = await api.subscriptionSyncs(id); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+
+// ---------- template library (browsing a subscription source) ----------
+const library = ref<TemplateLibrary | null>(null);
+const librarySubscription = ref<TemplateSubscription | null>(null);
+const libraryLoading = ref(false);
+const libraryImporting = ref(false);
+const librarySearch = ref("");
+const libraryFilter = ref<"" | "installed" | "updates">("");
+const librarySelected = ref<Set<string>>(new Set());
+const libraryFailures = ref<{ name: string; error: string }[]>([]);
+const libraryFilterOptions = computed(() => [
+  { value: "" as const, label: t("libraryFilterAll") },
+  { value: "installed" as const, label: t("libraryFilterInstalled") },
+  { value: "updates" as const, label: t("libraryFilterUpdates") },
+]);
+/** Entries matching the current search and filter, in source order. */
+const libraryEntries = computed<LibraryEntry[]>(() => {
+  const entries = library.value?.entries ?? [];
+  const query = librarySearch.value.trim().toLowerCase();
+  return entries.filter((entry) => {
+    if (libraryFilter.value === "installed" && !entry.installed) return false;
+    if (libraryFilter.value === "updates" && !entry.update_available) return false;
+    if (!query) return true;
+    return `${entry.name} ${entry.author ?? ""}`.toLowerCase().includes(query);
+  });
+});
+const librarySelectedCount = computed(() => librarySelected.value.size);
+/** Only entries currently visible can be selected, so a filter never hides an
+ *  unintended part of the selection. */
+const libraryAllVisibleSelected = computed(
+  () => libraryEntries.value.length > 0 && libraryEntries.value.every((entry) => librarySelected.value.has(entry.name)),
+);
+const libraryUpdateCount = computed(() => (library.value?.entries ?? []).filter((entry) => entry.update_available).length);
+/** Names the source being browsed and how its catalogue was read, so a missing
+ *  manifest (a plain repository) is not mistaken for a broken library. */
+const libraryHintText = computed(() => {
+  const sub = librarySubscription.value;
+  if (!sub) return t("libraryHint");
+  const source = library.value?.source_kind === "files" ? t("librarySourceFiles") : library.value ? t("librarySourceManifest") : "";
+  return [`${sub.name} · ${sub.url}`, source, t("libraryHint")].filter(Boolean).join(" — ");
+});
+async function openLibrary(sub: TemplateSubscription) {
+  view.value = "library";
+  librarySubscription.value = sub;
+  library.value = null;
+  librarySelected.value = new Set();
+  libraryFailures.value = [];
+  librarySearch.value = "";
+  libraryFilter.value = "";
+  await loadLibrary();
+}
+async function loadLibrary() {
+  const sub = librarySubscription.value;
+  if (!sub) return;
+  libraryLoading.value = true;
+  try {
+    const result = await api.browseSubscriptionLibrary(sub.id);
+    library.value = result;
+    // Drop selections the source no longer offers.
+    const names = new Set(result.entries.map((entry) => entry.name));
+    librarySelected.value = new Set([...librarySelected.value].filter((name) => names.has(name)));
+  } catch (cause) {
+    library.value = null;
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    libraryLoading.value = false;
+  }
+}
+function toggleLibraryEntry(name: string) {
+  const next = new Set(librarySelected.value);
+  if (next.has(name)) next.delete(name); else next.add(name);
+  librarySelected.value = next;
+}
+function selectAllLibraryEntries() {
+  librarySelected.value = new Set(libraryEntries.value.map((entry) => entry.name));
+}
+function clearLibrarySelection() {
+  librarySelected.value = new Set();
+}
+async function importSelectedLibraryEntries() {
+  const sub = librarySubscription.value;
+  if (!sub || librarySelected.value.size === 0) {
+    notify(t("libraryNothingSelected"), "error");
+    return;
+  }
+  const names = [...librarySelected.value];
+  libraryImporting.value = true;
+  libraryFailures.value = [];
+  try {
+    const result = await api.importSubscriptionTemplates(sub.id, names);
+    const parts: string[] = [];
+    if (result.imported) parts.push(fmt("libraryImportedCount", { n: result.imported }));
+    if (result.updated) parts.push(fmt("libraryUpdatedCount", { n: result.updated }));
+    if (result.failed.length) parts.push(fmt("libraryFailedCount", { n: result.failed.length }));
+    if (parts.length) notify(parts.join(" · "), result.failed.length ? "error" : "success");
+    libraryFailures.value = result.failed;
+    librarySelected.value = new Set();
+    // Reflect the new installed/update state, and pull the new templates into
+    // the templates list without leaving the library view.
+    await Promise.all([loadLibrary(), loadSubscriptions()]);
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    libraryImporting.value = false;
+  }
 }
 
 // ---------- push ----------
@@ -1791,16 +1917,23 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <section class="task-section">
           <form class="modal inline-modal" @submit.prevent="saveSubscription">
             <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
-            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/owner/repo" /></label>
+            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
+            <label>{{ t('subMode') }}
+              <Dropdown v-model="subForm.mode" :options="subModeOptions" />
+              <small class="muted">{{ subModeHint(subForm.mode) }}</small>
+            </label>
             <button class="primary-button">{{ t('addSub') }}</button>
           </form>
           <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
           <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
             <strong>{{ sub.name }}</strong><span class="muted">{{ sub.url }}</span>
+            <span class="chip" :title="subModeHint(sub.mode)">{{ subModeLabel(sub.mode) }}</span>
             <span v-if="sub.last_synced_at" class="run-time">{{ t('lastSync') }} {{ formatRunTime(sub.last_synced_at) }}</span>
             <span v-if="sub.last_error" class="error-text">{{ sub.last_error }}</span>
-            <button class="secondary-button" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)">{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
+            <button class="primary-button" @click="openLibrary(sub)">{{ t('browseLibrary') }}</button>
+            <button class="secondary-button" v-if="sub.mode === 'all'" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)">{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
             <button class="secondary-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
+            <button class="secondary-button" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
             <button class="secondary-button" @click="toggleSubscription(sub)">{{ sub.enabled ? t('disableSub') : t('enableSub') }}</button>
             <button class="icon-button" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
           </div>
@@ -1809,6 +1942,81 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <span class="run-id">#{{ s.id }}</span><strong :class="runStatusClass(s.status)">{{ s.status }}</strong>
             <span class="muted">{{ s.message }}</span><span class="run-time">{{ formatRunTime(s.created_at) }}</span>
           </div>
+        </section>
+      </div>
+
+      <!-- ===== TEMPLATE LIBRARY ===== -->
+      <div v-else-if="view === 'library'" class="page">
+        <section class="page-heading">
+          <div>
+            <h1>{{ t('libraryTitle') }}</h1>
+            <p>{{ libraryHintText }}</p>
+          </div>
+          <button class="secondary-button" @click="openSubscriptions"><ArrowLeft :size="16" />{{ t('libraryBack') }}</button>
+        </section>
+        <section class="task-section">
+          <div class="toolbar library-toolbar">
+            <input v-model="librarySearch" class="library-search" type="search" :placeholder="t('librarySearchPlaceholder')" />
+            <div class="seg" role="group" :aria-label="t('libraryTitle')">
+              <button
+                v-for="option in libraryFilterOptions"
+                :key="option.value"
+                type="button"
+                :class="{ active: libraryFilter === option.value }"
+                @click="libraryFilter = option.value"
+              >{{ option.label }}<span v-if="option.value === 'updates' && libraryUpdateCount" class="seg-count">{{ libraryUpdateCount }}</span></button>
+            </div>
+            <span class="muted">{{ fmt('libraryEntryCount', { n: libraryEntries.length }) }}</span>
+            <span v-if="librarySelectedCount" class="muted">{{ fmt('librarySelected', { n: librarySelectedCount }) }}</span>
+          </div>
+          <div class="toolbar library-toolbar">
+            <button class="secondary-button" :disabled="libraryEntries.length === 0" @click="selectAllLibraryEntries">{{ t('librarySelectAll') }}</button>
+            <button class="secondary-button" :disabled="librarySelectedCount === 0" @click="clearLibrarySelection">{{ t('libraryClear') }}</button>
+            <button class="primary-button" :disabled="libraryImporting || librarySelectedCount === 0" @click="importSelectedLibraryEntries">
+              <Download :size="16" />{{ libraryImporting ? t('libraryImporting') : t('libraryImport') }}
+            </button>
+            <button class="secondary-button" :disabled="libraryLoading" @click="loadLibrary"><RefreshCw :class="{ spin: libraryLoading }" :size="16" />{{ t('refresh') }}</button>
+          </div>
+
+          <div v-if="libraryImporting || libraryLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ libraryLoading ? t('libraryLoading') : t('libraryImporting') }}</div>
+          <div v-else-if="libraryFilter === 'updates' && libraryEntries.length === 0" class="empty-state">
+            <span><Check :size="25" /></span>
+            <h2>{{ t('libraryEmpty') }}</h2>
+          </div>
+          <div v-else-if="libraryEntries.length === 0" class="empty-state">
+            <span><LibraryIcon :size="25" /></span>
+            <h2>{{ t('libraryEmpty') }}</h2>
+          </div>
+          <div v-else class="library-list" role="group" :aria-label="t('libraryTitle')">
+            <div v-for="entry in libraryEntries" :key="entry.name" class="library-row" :class="{ 'is-installed': entry.installed }">
+              <!-- Only the selection area is a label: the discussion link below
+                   must not toggle the checkbox when it is clicked. -->
+              <label class="library-row-main">
+                <input type="checkbox" :checked="librarySelected.has(entry.name)" @change="toggleLibraryEntry(entry.name)" />
+                <span class="library-row-body">
+                  <span class="library-row-title">
+                    <strong>{{ entry.name }}</strong>
+                    <span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryUpdate') }}</span>
+                    <span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span>
+                  </span>
+                  <span class="library-row-meta">
+                    <span v-if="entry.author">{{ t('libraryAuthor') }}: {{ entry.author }}</span>
+                    <span v-if="entry.version">{{ t('libraryVersion') }}: {{ entry.version }}</span>
+                    <span v-if="entry.date">{{ entry.date }}</span>
+                  </span>
+                  <span v-if="entry.comments" class="library-row-comments" :title="t('libraryComments')">{{ entry.comments }}</span>
+                </span>
+              </label>
+              <a v-if="entry.comment_url" class="library-row-link" :href="entry.comment_url" target="_blank" rel="noopener noreferrer">{{ t('libraryOpenIssue') }}</a>
+            </div>
+          </div>
+
+          <template v-if="libraryFailures.length">
+            <h2>{{ t('libraryFailedTitle') }}</h2>
+            <div v-for="failure in libraryFailures" :key="failure.name" class="run-row">
+              <strong>{{ failure.name }}</strong><span class="error-text">{{ failure.error }}</span>
+            </div>
+          </template>
         </section>
       </div>
 
