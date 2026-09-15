@@ -12,4 +12,3 @@ pub mod push_channels;
 pub mod redis_cache;
 pub mod scheduler;
 pub mod store;
-pub mod subscriptions;

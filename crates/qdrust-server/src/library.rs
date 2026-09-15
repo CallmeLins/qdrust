@@ -906,7 +906,6 @@ fn bounded(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SubscriptionMode;
     use serde_json::json;
 
     /// The shape qd-today/templates publishes: a `har` map keyed by template
@@ -1105,19 +1104,6 @@ mod tests {
             catalogue.entries[0].url.as_deref(),
             Some("https://example.com/naive.har")
         );
-    }
-
-    #[test]
-    fn subscription_modes_parse_and_only_all_auto_syncs() {
-        assert_eq!(
-            SubscriptionMode::parse("select"),
-            Some(SubscriptionMode::Select)
-        );
-        assert_eq!(SubscriptionMode::parse("ALL"), Some(SubscriptionMode::All));
-        assert_eq!(SubscriptionMode::parse("sometimes"), None);
-        assert!(SubscriptionMode::All.auto_syncs());
-        assert!(!SubscriptionMode::Select.auto_syncs());
-        assert_eq!(SubscriptionMode::Select.as_str(), "select");
     }
 
     #[test]

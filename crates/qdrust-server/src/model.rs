@@ -261,6 +261,9 @@ pub struct QdHarValidation {
 
 // ---- P1 features: template subscriptions, push requests, email verification ----
 
+/// A source the user browses and imports templates from on demand. There is no
+/// import mode: a subscription is a library, never something that imports on
+/// its own. See [`crate::library`].
 #[derive(Clone, Debug, Serialize)]
 pub struct TemplateSubscription {
     pub id: i64,
@@ -268,63 +271,14 @@ pub struct TemplateSubscription {
     pub name: String,
     pub url: String,
     pub enabled: bool,
-    /// How the source is consumed: `select` treats it as a browsable library
-    /// whose entries the user imports by hand, `all` imports everything the
-    /// source offers on every sync. See [`SubscriptionMode`].
-    pub mode: String,
-    pub last_synced_at: Option<i64>,
-    pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-/// The two ways a subscription can be consumed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SubscriptionMode {
-    /// Browse the source and import only the entries the user picks.
-    Select,
-    /// Import every template the source offers. A subscription only auto-syncs
-    /// in this mode; `Select` sources are fetched on demand from the library
-    /// browser, so a large public library never lands in the user's list.
-    All,
-}
-
-impl SubscriptionMode {
-    pub const SELECT: &'static str = "select";
-    pub const ALL: &'static str = "all";
-
-    /// Parse a wire value, rejecting anything unknown so a typo cannot silently
-    /// pick the wrong import behaviour.
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            Self::SELECT => Some(Self::Select),
-            Self::ALL => Some(Self::All),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Select => Self::SELECT,
-            Self::All => Self::ALL,
-        }
-    }
-
-    /// Whether the periodic scheduler should sync this subscription on its own.
-    pub fn auto_syncs(self) -> bool {
-        matches!(self, Self::All)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateTemplateSubscription {
     pub name: String,
     pub url: String,
-    /// Defaults to `select`: a source is assumed to be a library the user
-    /// browses, which is the safe default for the hundreds-of-entries public
-    /// libraries.
-    #[serde(default)]
-    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -332,7 +286,6 @@ pub struct UpdateTemplateSubscription {
     pub name: Option<String>,
     pub url: Option<String>,
     pub enabled: Option<bool>,
-    pub mode: Option<String>,
 }
 
 /// One template offered by a subscription source, as seen by the library
@@ -490,16 +443,6 @@ pub struct TemplateImport {
     pub template_id: i64,
     pub entry_name: String,
     pub entry_version: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SubscriptionSync {
-    pub id: i64,
-    pub subscription_id: i64,
-    pub status: String,
-    pub message: Option<String>,
-    pub created_at: i64,
-    pub finished_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]

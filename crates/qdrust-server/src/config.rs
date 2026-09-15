@@ -175,7 +175,6 @@ pub struct Config {
     pub log_retention_days: u64,
     pub ga_key: Option<String>,
     pub require_email_verification: bool,
-    pub subscription_sync_interval: Duration,
     /// IANA timezone applied to cron scheduling when a task does not set its
     /// own `timezone`. Defaults to `Asia/Shanghai` to match a China-first
     /// deployment. Empty means UTC (the previous hardcoded fallback).
@@ -253,10 +252,6 @@ impl Config {
             log_retention_days: parse_env("LOG_RETENTION_DAYS", 0)?,
             ga_key: env::var("GA_KEY").ok().filter(|s| !s.is_empty()),
             require_email_verification: parse_env("REQUIRE_EMAIL_VERIFICATION", false)?,
-            subscription_sync_interval: Duration::from_secs(parse_env(
-                "QDRUST_SUBSCRIPTION_SYNC_INTERVAL_SECONDS",
-                3600,
-            )?),
             default_timezone: env::var("QDRUST_DEFAULT_TIMEZONE")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -420,10 +415,6 @@ impl Config {
                 .or(self.ga_key),
             require_email_verification: get_bool("require_email_verification")
                 .unwrap_or(self.require_email_verification),
-            subscription_sync_interval: get_i64("subscription_sync_interval_seconds")
-                .map_or(self.subscription_sync_interval, |v| {
-                    Duration::from_secs(v.max(1) as u64)
-                }),
             default_timezone: {
                 // Config file is only a fallback; env already won above.
                 let file = get("default_timezone").unwrap_or("");
@@ -798,7 +789,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
@@ -841,7 +831,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -878,7 +867,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: "Not/A_Zone".into(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -923,7 +911,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -964,7 +951,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
@@ -1009,7 +995,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
@@ -1045,7 +1030,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
@@ -1092,7 +1076,6 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
-            subscription_sync_interval: Duration::from_secs(3600),
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,

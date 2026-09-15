@@ -31,7 +31,6 @@ pub fn spawn(
     run_events: RunEventSender,
     email: EmailClient,
     log_retention_days: u64,
-    subscription_sync_interval: Duration,
     browser: Option<Arc<BrowserSessionManager>>,
     default_tz: chrono_tz::Tz,
 ) {
@@ -142,50 +141,6 @@ pub fn spawn(
                     info!(deleted, retention_days = retention, "pruned run logs");
                 }
             }
-        }
-    });
-    // Periodic subscription auto-sync: every enabled subscription is re-synced
-    // on the configured interval. sync_subscription records failures in
-    // subscription_syncs and logs them, so a bad source never panics the loop.
-    // Instances are staggered by a per-subscription offset instead of a
-    // distributed lock: syncs are idempotent upserts, so occasional overlap
-    // between instances is harmless (comment explains the tradeoff).
-    let sync_store = store.clone();
-    let sync_client = client.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(subscription_sync_interval);
-        loop {
-            ticker.tick().await;
-            let subscriptions = match sync_store.list_enabled_subscriptions().await {
-                Ok(subscriptions) => subscriptions,
-                Err(err) => {
-                    error!(%err, "cannot load subscriptions for auto-sync");
-                    continue;
-                }
-            };
-            let mut synced = 0_usize;
-            for subscription in &subscriptions {
-                // Stagger each subscription so multiple instances do not hit the
-                // same source at the same instant.
-                let stagger = Duration::from_secs(subscription.id.unsigned_abs() % 60);
-                tokio::time::sleep(stagger).await;
-                if crate::subscriptions::sync_subscription(
-                    &sync_store,
-                    &sync_client,
-                    subscription,
-                    None,
-                )
-                .await
-                .is_ok()
-                {
-                    synced += 1;
-                }
-            }
-            info!(
-                synced,
-                total = subscriptions.len(),
-                "automatic subscription sync pass completed"
-            );
         }
     });
 }

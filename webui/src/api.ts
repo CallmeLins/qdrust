@@ -23,7 +23,6 @@ export type Plugin = components["schemas"]["Plugin"];
 export type NotificationChannel = components["schemas"]["NotificationChannel"];
 export type NotificationAction = components["schemas"]["NotificationAction"];
 export type TemplateSubscription = components["schemas"]["TemplateSubscription"];
-export type SubscriptionSync = components["schemas"]["SubscriptionSync"];
 export type LibraryEntry = components["schemas"]["LibraryEntry"];
 export type TemplateLibrary = components["schemas"]["TemplateLibrary"];
 export type LibraryImportResult = components["schemas"]["LibraryImportResult"];
@@ -224,11 +223,9 @@ export const api = {
 
   // ---- subscriptions ----
   subscriptions: () => request<TemplateSubscription[]>("/api/v1/subscriptions"),
-  createSubscription: (name: string, url: string, mode: "select" | "all") => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url, mode }) }),
-  updateSubscription: (id: number, patch: { enabled?: boolean; mode?: "select" | "all" }) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  createSubscription: (name: string, url: string) => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url }) }),
+  updateSubscription: (id: number, patch: { name?: string; url?: string; enabled?: boolean }) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteSubscription: (id: number) => request<void>(`/api/v1/subscriptions/${id}`, { method: "DELETE" }),
-  syncSubscription: (id: number) => request<{ status: string }>(`/api/v1/subscriptions/${id}/sync`, { method: "POST" }),
-  subscriptionSyncs: (id: number) => request<SubscriptionSync[]>(`/api/v1/subscriptions/${id}/syncs`),
   /** Catalogue a subscription source: what it offers, what is already imported,
    *  and what has moved on upstream. */
   browseSubscriptionLibrary: (id: number) => request<TemplateLibrary>(`/api/v1/subscriptions/${id}/library`),

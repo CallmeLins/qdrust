@@ -114,7 +114,6 @@ struct AppState {
     auth: AuthConfig,
     login_limiter: LoginRateLimiter,
     run_events: broadcast::Sender<Value>,
-    subscription_events: broadcast::Sender<Value>,
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
@@ -163,12 +162,10 @@ pub fn run_event_channel() -> (RunEventSender, broadcast::Receiver<Value>) {
 
 pub fn router(store: Store) -> Router {
     let (run_events, _) = run_event_channel();
-    let (subscription_events, _) = subscription_event_channel();
     router_with_auth(
         store,
         AuthConfig::default(),
         run_events,
-        subscription_events,
         runtime_settings(),
         reqwest::Client::new(),
         crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
@@ -177,16 +174,11 @@ pub fn router(store: Store) -> Router {
     )
 }
 
-pub fn subscription_event_channel() -> (broadcast::Sender<Value>, broadcast::Receiver<Value>) {
-    broadcast::channel(256)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn router_with_auth(
     store: Store,
     auth: AuthConfig,
     run_events: RunEventSender,
-    subscription_events: broadcast::Sender<Value>,
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
@@ -256,18 +248,6 @@ pub fn router_with_auth(
             get(get_subscription)
                 .put(update_subscription)
                 .delete(delete_subscription),
-        )
-        .route(
-            "/api/v1/subscriptions/{id}/sync",
-            axum::routing::post(sync_subscription_now),
-        )
-        .route(
-            "/api/v1/subscriptions/{id}/syncs",
-            get(list_subscription_syncs),
-        )
-        .route(
-            "/api/v1/subscriptions/{id}/sync/live",
-            get(subscription_sync_websocket),
         )
         .route(
             "/api/v1/subscriptions/{id}/library",
@@ -393,7 +373,6 @@ pub fn router_with_auth(
         auth,
         login_limiter,
         run_events,
-        subscription_events,
         settings,
         http_client,
         session_cache,
@@ -2699,104 +2678,6 @@ async fn delete_subscription(
     }
 }
 
-async fn sync_subscription_now(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, ApiError> {
-    let (_, session) = require_session(&state, &headers).await?;
-    let subscription = state
-        .store
-        .get_subscription(id, session.user.id)
-        .await?
-        .ok_or(ApiError::NotFound(
-            "subscription_not_found",
-            "Subscription not found",
-        ))?;
-    let store = state.store.clone();
-    let client = state.http_client.clone();
-    let events = state.subscription_events.clone();
-    tokio::spawn(async move {
-        match crate::subscriptions::sync_subscription(&store, &client, &subscription, Some(events))
-            .await
-        {
-            Ok(()) => {}
-            Err(err) => {
-                tracing::warn!(%err, "subscription sync failed");
-            }
-        }
-    });
-    Ok(Json(json!({"status": "started"})))
-}
-
-async fn list_subscription_syncs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, ApiError> {
-    let (_, session) = require_session(&state, &headers).await?;
-    state
-        .store
-        .list_subscription_syncs(id, session.user.id)
-        .await?
-        .map(|syncs| Json(json!(syncs)))
-        .ok_or(ApiError::NotFound(
-            "subscription_not_found",
-            "Subscription not found",
-        ))
-}
-
-async fn subscription_sync_websocket(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    ws: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    let (_, session) = require_session(&state, &headers).await?;
-    if state
-        .store
-        .get_subscription(id, session.user.id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::NotFound(
-            "subscription_not_found",
-            "Subscription not found",
-        ));
-    }
-    let events = state.subscription_events.subscribe();
-    Ok(ws.on_upgrade(move |socket| stream_subscription_events(socket, id, events)))
-}
-
-async fn stream_subscription_events(
-    mut socket: axum::extract::ws::WebSocket,
-    subscription_id: i64,
-    mut events: tokio::sync::broadcast::Receiver<Value>,
-) {
-    use futures_util::SinkExt;
-    loop {
-        let event = tokio::select! {
-            _ = socket.recv() => break,
-            event = events.recv() => match event {
-                Ok(value) => value,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            },
-        };
-        if event.get("subscription_id").and_then(|v| v.as_i64()) != Some(subscription_id) {
-            continue;
-        }
-        if socket
-            .send(Message::Text(event.to_string().into()))
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-    let _ = socket.close().await;
-}
-
 /// Catalogue a subscription source so the user can pick what to import. Reads
 /// the source's `tpls_history.json` when it publishes one and otherwise scans
 /// the repository tree.
@@ -3200,7 +3081,6 @@ mod tests {
             store,
             AuthConfig::default(),
             run_event_channel().0,
-            subscription_event_channel().0,
             runtime_settings(),
             reqwest::Client::new(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
@@ -3234,7 +3114,6 @@ mod tests {
                 ..AuthConfig::default()
             },
             run_event_channel().0,
-            subscription_event_channel().0,
             runtime_settings(),
             reqwest::Client::new(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
@@ -4016,7 +3895,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let created: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(created["mode"], json!("select"));
+        assert_eq!(
+            created["url"],
+            json!("https://github.com/qd-today/templates")
+        );
         let id = created["id"].as_i64().unwrap();
 
         // An empty selection is refused before the source is contacted, so this
@@ -4265,7 +4147,6 @@ mod tests {
             store,
             AuthConfig::default(),
             run_event_channel().0,
-            subscription_event_channel().0,
             runtime_settings(),
             reqwest::Client::new(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
@@ -4481,7 +4362,6 @@ mod tests {
                 s.clone(),
                 AuthConfig::default(),
                 run_event_channel().0,
-                subscription_event_channel().0,
                 runtime_settings(),
                 reqwest::Client::new(),
                 crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),

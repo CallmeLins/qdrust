@@ -15,10 +15,9 @@ use crate::model::{
     CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim,
     ExternalLoginResolution, ImportQdHarTemplate, IssuedSession, NotificationAction,
     NotificationChannel, NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run,
-    RunStep, SetSiteSetting, SiteSetting, SubscriptionMode, SubscriptionSync, Task, Template,
-    TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel,
-    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-    UpdateTemplateSubscription, User, UserCredentials,
+    RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
+    UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
+    UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{
     qd_har::QdHar,
@@ -2034,12 +2033,6 @@ macro_rules! define_store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "DELETE FROM subscription_syncs WHERE subscription_id IN (SELECT id FROM template_subscriptions WHERE owner_id=?)",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
         sqlx::query("DELETE FROM template_subscriptions WHERE owner_id=?")
             .bind(id)
             .execute(&mut *tx)
@@ -2306,20 +2299,14 @@ macro_rules! define_store {
             url.starts_with("https://") || url.starts_with("http://"),
             "subscription URL must be http(s)"
         );
-        let mode = match input.mode.as_deref() {
-            Some(value) => SubscriptionMode::parse(value)
-                .context("subscription mode must be `select` or `all`")?,
-            None => SubscriptionMode::Select,
-        };
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO template_subscriptions(owner_id,name,url,enabled,mode,created_at,updated_at) VALUES(?,?,?,1,?,?,?)",
+            "INSERT INTO template_subscriptions(owner_id,name,url,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)",
         )
         .bind(owner_id)
         .bind(&name)
         .bind(&url)
-        .bind(mode.as_str())
         .bind(now)
         .bind(now)
         .execute(&mut *conn)
@@ -2336,19 +2323,6 @@ macro_rules! define_store {
             .bind(owner_id)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(subscription_from_row).collect()
-    }
-
-    /// Enabled subscriptions the periodic scheduler should sync on its own.
-    /// Only `all`-mode sources qualify: a `select`-mode source is a library the
-    /// user browses, and pulling it in wholesale would defeat that.
-    pub async fn list_enabled_subscriptions(&self) -> Result<Vec<TemplateSubscription>> {
-        let rows = sqlx::query(&format!(
-            "{SUBSCRIPTION_FIELDS} WHERE enabled=1 AND mode=? ORDER BY id"
-        ))
-        .bind(SubscriptionMode::ALL)
-        .fetch_all(&self.pool)
-        .await?;
         rows.into_iter().map(subscription_from_row).collect()
     }
 
@@ -2382,18 +2356,12 @@ macro_rules! define_store {
             "subscription URL must be http(s)"
         );
         let enabled = input.enabled.unwrap_or(current.enabled);
-        let mode = match input.mode.as_deref() {
-            Some(value) => SubscriptionMode::parse(value)
-                .context("subscription mode must be `select` or `all`")?,
-            None => SubscriptionMode::parse(&current.mode).unwrap_or(SubscriptionMode::Select),
-        };
         sqlx::query(
-            "UPDATE template_subscriptions SET name=?,url=?,enabled=?,mode=?,updated_at=? WHERE id=? AND owner_id=?",
+            "UPDATE template_subscriptions SET name=?,url=?,enabled=?,updated_at=? WHERE id=? AND owner_id=?",
         )
         .bind(name.trim())
         .bind(url.trim())
         .bind(enabled)
-        .bind(mode.as_str())
         .bind(Utc::now().timestamp())
         .bind(id)
         .bind(owner_id)
@@ -2412,89 +2380,6 @@ macro_rules! define_store {
                 .rows_affected()
                 > 0,
         )
-    }
-
-    pub async fn mark_subscription_synced(
-        &self,
-        id: i64,
-        owner_id: i64,
-        error: Option<&str>,
-    ) -> Result<()> {
-        let now = Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE template_subscriptions SET last_synced_at=?,last_error=?,updated_at=? WHERE id=? AND owner_id=?",
-        )
-        .bind(now)
-        .bind(error)
-        .bind(now)
-        .bind(id)
-        .bind(owner_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn create_subscription_sync(
-        &self,
-        subscription_id: i64,
-    ) -> Result<SubscriptionSync> {
-        let now = Utc::now().timestamp();
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query(
-            "INSERT INTO subscription_syncs(subscription_id,status,created_at) VALUES(?,'pending',?)",
-        )
-        .bind(subscription_id)
-        .bind(now)
-        .execute(&mut *conn)
-        .await?;
-        let id = self.last_insert_id(&mut conn).await?;
-        drop(conn);
-        self.get_subscription_sync(id).await?.context("sync record disappeared")
-    }
-
-    pub async fn get_subscription_sync(&self, id: i64) -> Result<Option<SubscriptionSync>> {
-        let row = sqlx::query(
-            "SELECT id,subscription_id,status,message,created_at,finished_at FROM subscription_syncs WHERE id=?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(subscription_sync_from_row).transpose()
-    }
-
-    pub async fn finish_subscription_sync(
-        &self,
-        id: i64,
-        status: &str,
-        message: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE subscription_syncs SET status=?,message=?,finished_at=? WHERE id=?",
-        )
-        .bind(status)
-        .bind(message)
-        .bind(Utc::now().timestamp())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn list_subscription_syncs(
-        &self,
-        subscription_id: i64,
-        owner_id: i64,
-    ) -> Result<Option<Vec<SubscriptionSync>>> {
-        if self.get_subscription(subscription_id, owner_id).await?.is_none() {
-            return Ok(None);
-        }
-        let rows = sqlx::query(
-            "SELECT id,subscription_id,status,message,created_at,finished_at FROM subscription_syncs WHERE subscription_id=? ORDER BY id DESC LIMIT 50",
-        )
-        .bind(subscription_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(subscription_sync_from_row).collect::<Result<Vec<_>>>().map(Some)
     }
 
     // ---- Template library imports (provenance for subscription sources) ----
@@ -2709,7 +2594,6 @@ macro_rules! define_store {
             "plugins",
             "site_settings",
             "template_subscriptions",
-            "subscription_syncs",
             "push_requests",
         ];
         for table in tables {
@@ -2762,7 +2646,6 @@ macro_rules! define_store {
         let mut tx = self.pool.begin().await?;
         let tables = [
             "push_requests",
-            "subscription_syncs",
             "template_subscriptions",
             "site_settings",
             "plugins",
@@ -2793,7 +2676,6 @@ macro_rules! define_store {
             "plugins",
             "site_settings",
             "template_subscriptions",
-            "subscription_syncs",
             "push_requests",
         ];
         for table in import_order {
@@ -2856,7 +2738,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
-const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,mode,last_synced_at,last_error,created_at,updated_at FROM template_subscriptions";
+const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_at,updated_at FROM template_subscriptions";
 // `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
 // them as well). Every other reference to this column in the file must be
 // quoted the same way or MySQL deployments fail with a 1064 syntax error.
@@ -3119,22 +3001,8 @@ fn subscription_from_row(row: $row) -> Result<TemplateSubscription> {
         name: row.try_get("name")?,
         url: row.try_get("url")?,
         enabled: row.try_get("enabled")?,
-        mode: row.try_get("mode")?,
-        last_synced_at: row.try_get("last_synced_at")?,
-        last_error: row.try_get("last_error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn subscription_sync_from_row(row: $row) -> Result<SubscriptionSync> {
-    Ok(SubscriptionSync {
-        id: row.try_get("id")?,
-        subscription_id: row.try_get("subscription_id")?,
-        status: row.try_get("status")?,
-        message: row.try_get("message")?,
-        created_at: row.try_get("created_at")?,
-        finished_at: row.try_get("finished_at")?,
     })
 }
 
@@ -3365,15 +3233,9 @@ impl Store {
         pub async fn rotate_csrf(session_token: &str, new_csrf_hash: &str) -> Result<bool> { session_token, new_csrf_hash };
         pub async fn create_subscription(owner_id: i64, input: CreateTemplateSubscription) -> Result<TemplateSubscription> { owner_id, input };
         pub async fn list_subscriptions(owner_id: i64) -> Result<Vec<TemplateSubscription>> { owner_id };
-        pub async fn list_enabled_subscriptions() -> Result<Vec<TemplateSubscription>> {  };
         pub async fn get_subscription(id: i64, owner_id: i64) -> Result<Option<TemplateSubscription>> { id, owner_id };
         pub async fn update_subscription(id: i64, owner_id: i64, input: UpdateTemplateSubscription) -> Result<Option<TemplateSubscription>> { id, owner_id, input };
         pub async fn delete_subscription(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
-        pub async fn mark_subscription_synced(id: i64, owner_id: i64, error: Option<&str>) -> Result<()> { id, owner_id, error };
-        pub async fn create_subscription_sync(subscription_id: i64) -> Result<SubscriptionSync> { subscription_id };
-        pub async fn get_subscription_sync(id: i64) -> Result<Option<SubscriptionSync>> { id };
-        pub async fn finish_subscription_sync(id: i64, status: &str, message: Option<&str>) -> Result<()> { id, status, message };
-        pub async fn list_subscription_syncs(subscription_id: i64, owner_id: i64) -> Result<Option<Vec<SubscriptionSync>>> { subscription_id, owner_id };
         pub async fn list_template_imports(subscription_id: i64) -> Result<Vec<TemplateImport>> { subscription_id };
         pub async fn record_template_import(subscription_id: i64, template_id: i64, entry_name: &str, entry_version: Option<&str>, source_url: Option<&str>) -> Result<()> { subscription_id, template_id, entry_name, entry_version, source_url };
         pub async fn create_push_request(owner_id: i64, input: CreatePushRequest) -> Result<Option<PushRequest>> { owner_id, input };
@@ -4873,7 +4735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscriptions_crud_and_sync_records() {
+    async fn subscriptions_crud_and_import_provenance() {
         let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
         let user = store
             .create_user("sub_owner", "$argon2id$test", "user")
@@ -4885,17 +4747,12 @@ mod tests {
                 CreateTemplateSubscription {
                     name: "qd-templates".into(),
                     url: "https://github.com/qd-today/templates".into(),
-                    mode: None,
                 },
             )
             .await
             .unwrap();
         assert_eq!(created.name, "qd-templates");
         assert!(created.enabled);
-        // A new subscription browses its source instead of pulling it in whole,
-        // so the scheduler leaves it alone.
-        assert_eq!(created.mode, SubscriptionMode::SELECT);
-        assert!(store.list_enabled_subscriptions().await.unwrap().is_empty());
         assert_eq!(store.list_subscriptions(user.id).await.unwrap().len(), 1);
         assert!(
             store
@@ -4912,51 +4769,23 @@ mod tests {
                 .is_none()
         );
 
-        // An explicit `all` subscription is the only kind the automatic sync
-        // loop picks up, and switching modes moves it in and out of that set.
-        let automatic = store
-            .create_subscription(
-                user.id,
-                CreateTemplateSubscription {
-                    name: "auto".into(),
-                    url: "https://github.com/example/auto".into(),
-                    mode: Some(SubscriptionMode::ALL.into()),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(automatic.mode, SubscriptionMode::ALL);
-        assert_eq!(store.list_enabled_subscriptions().await.unwrap().len(), 1);
+        // Editing renames the source and disabling hides it from the
+        // aggregate listing without deleting provenance.
         let updated = store
             .update_subscription(
-                automatic.id,
+                created.id,
                 user.id,
                 UpdateTemplateSubscription {
-                    name: None,
+                    name: Some("renamed".into()),
                     url: None,
-                    enabled: None,
-                    mode: Some(SubscriptionMode::SELECT.into()),
+                    enabled: Some(false),
                 },
             )
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(updated.mode, SubscriptionMode::SELECT);
-        assert!(store.list_enabled_subscriptions().await.unwrap().is_empty());
-        // An unknown mode is rejected rather than silently defaulted.
-        assert!(
-            store
-                .create_subscription(
-                    user.id,
-                    CreateTemplateSubscription {
-                        name: "typo".into(),
-                        url: "https://github.com/example/typo".into(),
-                        mode: Some("sometimes".into()),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        assert_eq!(updated.name, "renamed");
+        assert!(!updated.enabled);
 
         // Import provenance: recorded per (subscription, entry) and refreshed
         // on re-import instead of stacking rows.
@@ -5007,23 +4836,8 @@ mod tests {
         assert_eq!(imports.len(), 1, "re-import must refresh, not duplicate");
         assert_eq!(imports[0].entry_version.as_deref(), Some("20260425"));
         // Provenance is scoped to the subscription that imported it.
-        assert!(
-            store
-                .list_template_imports(automatic.id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store.list_template_imports(created.id).await.unwrap().len() == 1);
 
-        let sync = store.create_subscription_sync(created.id).await.unwrap();
-        assert_eq!(sync.status, "pending");
-        store
-            .finish_subscription_sync(sync.id, "succeeded", Some("imported 3"))
-            .await
-            .unwrap();
-        let synced = store.get_subscription_sync(sync.id).await.unwrap().unwrap();
-        assert_eq!(synced.status, "succeeded");
-        assert_eq!(synced.message.as_deref(), Some("imported 3"));
         assert!(
             store
                 .delete_subscription(created.id, user.id)

@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
+import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import { consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
@@ -1155,35 +1155,35 @@ async function saveActionEdit() {
 
 // ---------- subscriptions (a section of the templates page, not a page of its own) ----------
 const subscriptions = ref<TemplateSubscription[]>([]);
-const subSyncs = ref<SubscriptionSync[]>([]);
-const subForm = reactive<{ name: string; url: string; mode: "select" | "all" }>({ name: "", url: "", mode: "select" });
-const syncingId = ref<number | null>(null);
-/** Whether the "import from a subscription" panel is expanded on the templates page. */
-const showSubscriptions = ref(false);
-const subModeOptions = computed(() => [
-  { value: "select" as const, label: t("subModeSelect") },
-  { value: "all" as const, label: t("subModeAll") },
-]);
-function subModeLabel(mode: string): string {
-  return mode === "all" ? t("subModeAll") : t("subModeSelect");
-}
-function subModeHint(mode: string): string {
-  return mode === "all" ? t("subModeAllHint") : t("subModeSelectHint");
-}
+const subForm = reactive<{ name: string; url: string }>({ name: "", url: "" });
+/** Add/edit dialog state: a null edit target means "create". */
+const showSubModal = ref(false);
+const subEditing = ref<TemplateSubscription | null>(null);
 /** Refresh subscriptions and templates without touching the active view, so an
  *  import from the library can pick up the new templates in place. */
 async function loadSubscriptions() {
   [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.templates(undefined, undefined, 200)]);
 }
-async function saveSubscription() {
+function openSubModal(sub?: TemplateSubscription) {
+  subEditing.value = sub ?? null;
+  Object.assign(subForm, { name: sub?.name ?? "", url: sub?.url ?? "" });
+  showSubModal.value = true;
+}
+function closeSubModal() {
+  showSubModal.value = false;
+  subEditing.value = null;
+}
+async function saveSubModal() {
   try {
-    await api.createSubscription(subForm.name, subForm.url, subForm.mode);
-    Object.assign(subForm, { name: "", url: "" });
+    if (subEditing.value) {
+      await api.updateSubscription(subEditing.value.id, { name: subForm.name, url: subForm.url });
+    } else {
+      await api.createSubscription(subForm.name, subForm.url);
+    }
+    closeSubModal();
     await loadSubscriptions();
-    // First subscription on the page: point the public list at it right away.
-    // Otherwise refresh the table, so the new source's catalogue shows up —
-    // sources already in hand come back from the server's cache, only the new
-    // one is read.
+    // A new source changes the aggregate listing (a renamed one changes the
+    // source labels), so refresh it - cached sources come back cheaply.
     if (library.value) await loadLibrary();
     else await ensureLibraryLoaded();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
@@ -1195,11 +1195,6 @@ async function toggleSubscription(sub: TemplateSubscription) {
     // A disabled source drops out of the aggregate, so the table changes with it.
     if (library.value && libraryViewingAll.value) await loadLibrary();
   }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
-async function setSubscriptionMode(sub: TemplateSubscription, mode: "select" | "all") {
-  if (mode === sub.mode) return;
-  try { await api.updateSubscription(sub.id, { mode }); await loadSubscriptions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeSubscription(id: number) {
@@ -1214,22 +1209,6 @@ async function removeSubscription(id: number) {
     await loadSubscriptions();
     await ensureLibraryLoaded();
   }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-}
-async function syncSubscription(id: number) {
-  syncingId.value = id;
-  try {
-    await api.syncSubscription(id);
-    subSyncs.value = await api.subscriptionSyncs(id);
-    await loadSubscriptions();
-    // A sync imports on the server, so the public list's installed/update marks
-    // are stale the moment it returns.
-    if (library.value) await loadLibrary();
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
-  finally { syncingId.value = null; }
-}
-async function showSubSyncs(id: number) {
-  try { subSyncs.value = await api.subscriptionSyncs(id); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
@@ -2158,51 +2137,36 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div><h1>{{ t('templates') }}</h1><p>{{ t('templateHint') }}</p></div>
           <div class="heading-actions">
             <button class="primary-button" @click="openImportModal()"><Plus :size="17" />{{ t('importLocal') }}</button>
-            <button
-              class="secondary-button"
-              :class="{ 'is-active': showSubscriptions }"
-              :aria-expanded="showSubscriptions"
-              @click="showSubscriptions = !showSubscriptions"
-            ><RefreshCw :size="16" />{{ showSubscriptions ? t('collapseSubs') : t('manageSubs') }}</button>
+            <button class="secondary-button" @click="openSubModal()"><RefreshCw :size="16" />{{ t('addSub') }}</button>
           </div>
         </section>
 
-        <!-- Where templates come from. Folded away: it is set up once and then
-             left alone, unlike the two lists below. -->
-        <section v-if="showSubscriptions" class="task-section">
+        <!-- Where the public library below comes from: the subscription
+             sources, managed up here so they sit before the lists they feed. -->
+        <section class="task-section">
           <h2>{{ t('subscriptionsTitle') }}</h2>
           <p class="muted section-hint">{{ t('subHint') }}</p>
-          <form class="modal inline-modal" @submit.prevent="saveSubscription">
-            <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
-            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
-            <label>{{ t('subMode') }}
-              <Dropdown v-model="subForm.mode" :options="subModeOptions" />
-              <small class="muted">{{ subModeHint(subForm.mode) }}</small>
-            </label>
-            <button class="primary-button">{{ t('addSub') }}</button>
-          </form>
           <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
-          <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
-            <strong>{{ sub.name }}</strong><span class="muted row-description">{{ sub.url }}</span>
-            <span class="chip" :title="subModeHint(sub.mode)">{{ subModeLabel(sub.mode) }}</span>
-            <span v-if="sub.last_synced_at" class="run-time">{{ t('lastSync') }} {{ formatRunTime(sub.last_synced_at) }}</span>
-            <span v-if="sub.last_error" class="error-text">{{ sub.last_error }}</span>
-            <div class="row-actions">
-              <button class="secondary-button" @click="selectLibrarySource(sub.id)"><LibraryIcon :size="14" />{{ t('browseLibrary') }}</button>
-              <button v-if="sub.mode === 'all'" class="secondary-button" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)"><RefreshCw :class="{ spin: syncingId === sub.id }" :size="14" />{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
-              <button class="text-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
-              <button class="secondary-button" :title="subModeHint(sub.mode)" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
-              <button class="icon-button" :title="sub.enabled ? t('disableSub') : t('enableSub')" @click="toggleSubscription(sub)"><PowerOff v-if="sub.enabled" :size="15" /><Power v-else :size="15" /></button>
-              <button class="icon-button danger" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
-            </div>
+          <div v-else class="table-wrap">
+            <table class="templates-table">
+              <thead><tr>
+                <th>{{ t('name') }}</th><th>{{ t('subUrl') }}</th><th>{{ t('status') }}</th>
+                <th><span class="sr-only">{{ t('manage') }}</span></th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="sub in subscriptions" :key="sub.id">
+                  <td class="task-name"><strong>{{ sub.name }}</strong></td>
+                  <td><a class="library-row-link" :href="sub.url" target="_blank" rel="noopener noreferrer">{{ sub.url }}</a></td>
+                  <td><span v-if="sub.enabled" class="chip chip-ok">{{ t('subEnabled') }}</span><span v-else class="chip">{{ t('subDisabled') }}</span></td>
+                  <td class="row-actions">
+                    <button class="secondary-button" @click="openSubModal(sub)"><Pencil :size="14" />{{ t('edit') }}</button>
+                    <button class="icon-button" :title="sub.enabled ? t('disableSub') : t('enableSub')" @click="toggleSubscription(sub)"><PowerOff v-if="sub.enabled" :size="15" /><Power v-else :size="15" /></button>
+                    <button class="icon-button danger" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-          <template v-if="subSyncs.length">
-            <h2>{{ t('syncRecords') }}</h2>
-            <div v-for="s in subSyncs" :key="s.id" class="run-row">
-              <span class="run-id">#{{ s.id }}</span><strong :class="runStatusClass(s.status)">{{ s.status }}</strong>
-              <span class="muted">{{ s.message }}</span><span class="run-time">{{ formatRunTime(s.created_at) }}</span>
-            </div>
-          </template>
         </section>
 
         <!-- 1) What is in use. One row per template, columns aligned, every
@@ -2259,7 +2223,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div v-if="subscriptions.length === 0" class="empty-state">
             <span><LibraryIcon :size="25" /></span>
             <h2>{{ t('publicLibraryNoSource') }}</h2>
-            <button class="secondary-button" @click="showSubscriptions = true">{{ t('manageSubs') }}</button>
+            <button class="secondary-button" @click="openSubModal()">{{ t('addSub') }}</button>
           </div>
           <template v-else>
             <div class="toolbar library-toolbar">
@@ -2747,6 +2711,26 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </label>
         </div>
         <HarEditor :model-value="harEditorDoc" @save="saveHar" @cancel="closeHarEditor" />
+      </div>
+    </div>
+
+    <!-- ===== SUBSCRIPTION MODAL ===== -->
+    <div v-if="showSubModal" class="modal-backdrop" @click.self="closeSubModal">
+      <div class="modal">
+        <div class="modal-header">
+          <div><h2>{{ subEditing ? t('editSub') : t('addSub') }}</h2></div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeSubModal"><X :size="20" /></button>
+        </div>
+        <form @submit.prevent="saveSubModal">
+          <div class="har-meta">
+            <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
+            <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
+          </div>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" @click="closeSubModal">{{ t('close') }}</button>
+            <button class="primary-button" type="submit">{{ t('save') }}</button>
+          </div>
+        </form>
       </div>
     </div>
 

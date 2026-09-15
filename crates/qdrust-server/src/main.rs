@@ -30,7 +30,6 @@ async fn main() -> Result<()> {
         .build()?;
     let email = EmailClient::new(EmailConfig::from_env())?;
     let (run_events, _) = api::run_event_channel();
-    let (subscription_events, _) = api::subscription_event_channel();
     let settings = api::runtime_settings();
     {
         let mut runtime = settings.write().unwrap();
@@ -64,7 +63,6 @@ async fn main() -> Result<()> {
         run_events.clone(),
         email,
         config.log_retention_days,
-        config.subscription_sync_interval,
         browser,
         default_tz,
     );
@@ -79,7 +77,6 @@ async fn main() -> Result<()> {
             oidc: config.oidc.clone(),
         },
         run_events,
-        subscription_events,
         settings.clone(),
         client,
         qdrust_server::redis_cache::SessionCache::from_env()?,

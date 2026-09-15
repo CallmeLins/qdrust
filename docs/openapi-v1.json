@@ -1407,63 +1407,6 @@
         }
       }
     },
-    "/api/v1/subscriptions/{id}/sync": {
-      "post": {
-        "operationId": "syncSubscription",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/SubscriptionId"
-          }
-        ],
-        "summary": "Trigger a subscription sync (returns a sync id; progress via WebSocket)",
-        "responses": {
-          "200": {
-            "description": "Sync started"
-          }
-        }
-      }
-    },
-    "/api/v1/subscriptions/{id}/syncs": {
-      "get": {
-        "operationId": "listSubscriptionSyncs",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/SubscriptionId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Sync history",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/SubscriptionSync"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/subscriptions/{id}/sync/live": {
-      "get": {
-        "operationId": "subscriptionSyncWebsocket",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/SubscriptionId"
-          }
-        ],
-        "summary": "WebSocket stream of subscription sync progress",
-        "responses": {
-          "101": {
-            "description": "WebSocket upgrade"
-          }
-        }
-      }
-    },
     "/api/v1/subscriptions/{id}/library": {
       "get": {
         "operationId": "browseSubscriptionLibrary",
@@ -3381,7 +3324,6 @@
           "name",
           "url",
           "enabled",
-          "mode",
           "created_at",
           "updated_at"
         ],
@@ -3402,27 +3344,6 @@
           },
           "enabled": {
             "type": "boolean"
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "select",
-              "all"
-            ],
-            "description": "`select` browses the source and imports only the entries the user picks; `all` imports every template the source offers on each sync"
-          },
-          "last_synced_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
-          },
-          "last_error": {
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "created_at": {
             "type": "integer",
@@ -3446,18 +3367,6 @@
           },
           "url": {
             "type": "string"
-          },
-          "mode": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "enum": [
-              "select",
-              "all",
-              null
-            ],
-            "description": "Defaults to `select`"
           }
         }
       },
@@ -3480,17 +3389,6 @@
             "type": [
               "boolean",
               "null"
-            ]
-          },
-          "mode": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "enum": [
-              "select",
-              "all",
-              null
             ]
           }
         }
@@ -3814,51 +3712,6 @@
             "items": {
               "$ref": "#/components/schemas/LibraryImportOutcome"
             }
-          }
-        }
-      },
-      "SubscriptionSync": {
-        "type": "object",
-        "required": [
-          "id",
-          "subscription_id",
-          "status",
-          "created_at"
-        ],
-        "properties": {
-          "id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "subscription_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "running",
-              "succeeded",
-              "failed"
-            ]
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "created_at": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "finished_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
           }
         }
       },

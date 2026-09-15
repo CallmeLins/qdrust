@@ -809,56 +809,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/subscriptions/{id}/sync": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Trigger a subscription sync (returns a sync id; progress via WebSocket) */
-        post: operations["syncSubscription"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/subscriptions/{id}/syncs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["listSubscriptionSyncs"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/subscriptions/{id}/sync/live": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** WebSocket stream of subscription sync progress */
-        get: operations["subscriptionSyncWebsocket"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/subscriptions/{id}/library": {
         parameters: {
             query?: never;
@@ -1424,14 +1374,6 @@ export interface components {
             name: string;
             url: string;
             enabled: boolean;
-            /**
-             * @description `select` browses the source and imports only the entries the user picks; `all` imports every template the source offers on each sync
-             * @enum {string}
-             */
-            mode: "select" | "all";
-            /** Format: int64 */
-            last_synced_at?: number | null;
-            last_error?: string | null;
             /** Format: int64 */
             created_at: number;
             /** Format: int64 */
@@ -1440,18 +1382,11 @@ export interface components {
         CreateTemplateSubscription: {
             name: string;
             url: string;
-            /**
-             * @description Defaults to `select`
-             * @enum {string|null}
-             */
-            mode?: "select" | "all" | null;
         };
         UpdateTemplateSubscription: {
             name?: string | null;
             url?: string | null;
             enabled?: boolean | null;
-            /** @enum {string|null} */
-            mode?: "select" | "all" | null;
         };
         LibraryEntry: {
             /** @description The entry's identity inside the source, and the local template name */
@@ -1547,19 +1482,6 @@ export interface components {
             failed: components["schemas"]["LibraryImportFailure"][];
             /** @description Every entry this call wrote, in the order it was requested */
             templates: components["schemas"]["LibraryImportOutcome"][];
-        };
-        SubscriptionSync: {
-            /** Format: int64 */
-            id: number;
-            /** Format: int64 */
-            subscription_id: number;
-            /** @enum {string} */
-            status: "pending" | "running" | "succeeded" | "failed";
-            message?: string | null;
-            /** Format: int64 */
-            created_at: number;
-            /** Format: int64 */
-            finished_at?: number | null;
         };
         PushRequest: {
             /** Format: int64 */
@@ -3251,68 +3173,6 @@ export interface operations {
         responses: {
             /** @description Deleted */
             204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    syncSubscription: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["SubscriptionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Sync started */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    listSubscriptionSyncs: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["SubscriptionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Sync history */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SubscriptionSync"][];
-                };
-            };
-        };
-    };
-    subscriptionSyncWebsocket: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                id: components["parameters"]["SubscriptionId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description WebSocket upgrade */
-            101: {
                 headers: {
                     [name: string]: unknown;
                 };
