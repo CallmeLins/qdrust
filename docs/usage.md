@@ -23,6 +23,41 @@ cargo run -p qdrust-cli -- validate .\template.har.json
 
 `native_v1` 模板则直接用定义里声明的变量名。
 
+## 原生模板 schema v1
+
+除导入旧 QD HAR 外，也可以直接写 qdrust 原生模板。它是版本化 JSON，**不执行 Python**，顶层必须包含 `version: 1`、非空 `name` 和 `steps`：
+
+```json
+{
+  "version": 1,
+  "name": "Health check",
+  "variables": {
+    "base_url": "https://example.com"
+  },
+  "steps": [
+    {
+      "type": "request",
+      "name": "Fetch health",
+      "method": "GET",
+      "url": "{{base_url}}/health",
+      "headers": {"accept": "application/json"}
+    },
+    {
+      "type": "extract",
+      "name": "Read status",
+      "source": "status",
+      "selector": "",
+      "target": "status",
+      "required": true
+    }
+  ]
+}
+```
+
+步骤类型：`request`、`extract`、`if`、`for_each`、`delay`；请求 body 支持 `json`、`text` 和 `form`。表达式与 `api://util/*`、`api://browser/*` 的用法见 [模板表达式与内置工具](expressions.md)。
+
+安全限制：最多 1000 个静态步骤、最多 16 层嵌套、单次 delay 最长 5 分钟；运行时还会独立限制请求数、循环次数、响应体和总时长。
+
 ## 创建与运行任务
 
 1. **模板必选**：新建任务时先选模板——任务的请求完全由模板决定（多页模板常混合 GET/POST），任务本身不携带请求方法 / URL / 请求头 / 请求体。

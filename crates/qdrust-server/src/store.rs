@@ -16,9 +16,9 @@ use crate::model::{
     ExternalLoginResolution, ImportQdHarTemplate, IssuedSession, NotificationAction,
     NotificationChannel, NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run,
     RunStep, SetSiteSetting, SiteSetting, SubscriptionMode, SubscriptionSync, Task, Template,
-    TemplateImport, TemplateSubscription, UpdateNotificationChannel, UpdatePluginManifest,
-    UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User,
-    UserCredentials,
+    TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel,
+    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+    UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{
     qd_har::QdHar,
@@ -236,7 +236,7 @@ macro_rules! define_store {
     }
 
     // ---------------------------------------------------------------------
-    // External identity login (OIDC / Header Auth). See EXTERNAL_IDP_PLAN.md.
+    // External identity login (OIDC / Header Auth). See docs/design/EXTERNAL_IDP_PLAN.md.
     // These are backend-agnostic; the macro generates the same impl for both
     // SQLite and MySQL. Security policy (no email auto-merge, conservative
     // role assignment) lives here so it is unit-testable.
@@ -280,7 +280,7 @@ macro_rules! define_store {
 
     /// Map an external identity claim to a local user, provisioning a new
     /// `users` row when needed. Encapsulates the conflict policy from
-    /// EXTERNAL_IDP_PLAN.md §4.3.
+    /// docs/design/EXTERNAL_IDP_PLAN.md §4.3.
     ///
     /// Returns an `ExternalLoginResolution`:
     /// - matched/provisioned user (caller then issues a session), or
@@ -332,7 +332,7 @@ macro_rules! define_store {
             // evaluated only when provisioning). Later changes to the IdP group
             // membership do NOT silently promote/demote an existing external
             // user — an admin must adjust the role explicitly. See
-            // EXTERNAL_IDP_PLAN.md Phase 2 item 3 ("默认首登写死").
+            // docs/design/EXTERNAL_IDP_PLAN.md Phase 2 item 3 ("默认首登写死").
             self.touch_external_identity(identity.id).await?;
             return Ok(ExternalLoginResolution {
                 user: Some(user),
@@ -342,7 +342,7 @@ macro_rules! define_store {
         }
 
         // 2. Not yet linked. Refuse to attach an email that already belongs to
-        //    another local account (account-takeover guard, EXTERNAL_IDP_PLAN §4.3).
+        //    another local account (account-takeover guard, docs/design/EXTERNAL_IDP_PLAN.md §4.3).
         if let Some(email) = claim.email.as_deref() {
             if self.user_id_by_email(email).await?.is_some() {
                 return Ok(ExternalLoginResolution {
@@ -1455,6 +1455,63 @@ macro_rules! define_store {
     pub async fn delete_notification_action(&self, id: i64, owner_id: i64) -> Result<bool> {
         Ok(sqlx::query("DELETE FROM notification_actions WHERE id=? AND task_id IN (SELECT id FROM tasks WHERE owner_id=?)")
             .bind(id).bind(owner_id).execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    /// Update one task↔channel binding in place; an absent field keeps its
+    /// stored value. Rebinding to another channel re-checks ownership, since
+    /// the id in the body is as untrusted as the one in the path.
+    pub async fn update_notification_action(
+        &self,
+        id: i64,
+        owner_id: i64,
+        input: UpdateNotificationAction,
+    ) -> Result<Option<NotificationAction>> {
+        // Validate the payload before resolving ownership, like
+        // `create_notification_action` does: a malformed body is malformed
+        // whoever the caller is, and stored values were validated on the way in.
+        if let Some(event) = input.event.as_deref() {
+            ensure!(
+                matches!(event, "success" | "failure" | "always"),
+                "invalid notification event"
+            );
+        }
+        if let Some(failure_threshold) = input.failure_threshold {
+            ensure!(
+                failure_threshold > 0,
+                "failure threshold must be positive"
+            );
+        }
+        let Some(current) = self.get_notification_action(id, owner_id).await? else {
+            return Ok(None);
+        };
+        let event = input.event.unwrap_or(current.event);
+        let failure_threshold = input
+            .failure_threshold
+            .unwrap_or(current.failure_threshold);
+        let channel_id = input.channel_id.unwrap_or(current.channel_id);
+        if channel_id != current.channel_id {
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM notification_channels WHERE id=? AND owner_id=?)",
+            )
+            .bind(channel_id)
+            .bind(owner_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if !owned {
+                return Ok(None);
+            }
+        }
+        let title_template = match input.title_template {
+            Some(value) => blank_to_none(value),
+            None => current.title_template,
+        };
+        let body_template = match input.body_template {
+            Some(value) => blank_to_none(value),
+            None => current.body_template,
+        };
+        sqlx::query("UPDATE notification_actions SET channel_id=?,event=?,failure_threshold=?,automatic_only=?,title_template=?,body_template=? WHERE id=? AND task_id IN (SELECT id FROM tasks WHERE owner_id=?)")
+            .bind(channel_id).bind(event).bind(failure_threshold).bind(input.automatic_only.unwrap_or(current.automatic_only)).bind(title_template).bind(body_template).bind(id).bind(owner_id).execute(&self.pool).await?;
+        self.get_notification_action(id, owner_id).await
     }
 
     pub async fn notification_channels_for_event(
@@ -3262,6 +3319,7 @@ impl Store {
         pub async fn create_notification_actions_for_tasks(owner_id: i64, task_ids: &[i64], input: CreateNotificationAction) -> Result<usize> { owner_id, task_ids, input };
         pub async fn list_notification_actions(task_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationAction>>> { task_id, owner_id };
         pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn update_notification_action(id: i64, owner_id: i64, input: UpdateNotificationAction) -> Result<Option<NotificationAction>> { id, owner_id, input };
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
@@ -3344,6 +3402,16 @@ fn validate_plugin(name: &str, command: &str, config: &serde_json::Value) -> Res
     // capability-reporting call at run time.
     crate::model::plugin_capabilities(config).map_err(|err| anyhow!(err))?;
     Ok(())
+}
+
+/// A cleared template field means "send the generic message", and the edit form
+/// has no way to say `null` distinctly from "absent" — so treat blank as none.
+fn blank_to_none(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn validate_notification(name: &str, kind: &str, config: &serde_json::Value) -> Result<()> {
@@ -4376,6 +4444,180 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// An edit is a partial merge: every field the body omits keeps its stored
+    /// value, a blank template clears it, and the channel it points at has to
+    /// belong to the same account as the task.
+    #[tokio::test]
+    async fn notification_action_edits_merge_and_respect_ownership() {
+        fn blank() -> UpdateNotificationAction {
+            UpdateNotificationAction {
+                channel_id: None,
+                event: None,
+                failure_threshold: None,
+                automatic_only: None,
+                title_template: None,
+                body_template: None,
+            }
+        }
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let alice = store
+            .create_user("alice-action", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("bob-action", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("notify-me"))
+            .await
+            .unwrap();
+        let webhook = |name: &str| CreateNotificationChannel {
+            name: name.into(),
+            kind: "webhook".into(),
+            config: serde_json::json!({"url":"https://example.com/hook"}),
+            enabled: true,
+        };
+        let first = store
+            .create_notification_channel(alice.id, webhook("first"))
+            .await
+            .unwrap();
+        let second = store
+            .create_notification_channel(alice.id, webhook("second"))
+            .await
+            .unwrap();
+        let bobs = store
+            .create_notification_channel(bob.id, webhook("bobs"))
+            .await
+            .unwrap();
+        let action = store
+            .create_notification_action(
+                task.id,
+                alice.id,
+                CreateNotificationAction {
+                    channel_id: first.id,
+                    event: "failure".into(),
+                    failure_threshold: 3,
+                    automatic_only: false,
+                    title_template: Some("keep {task}".into()),
+                    body_template: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A whitespace-only template clears it; everything else is untouched.
+        let cleared = store
+            .update_notification_action(
+                action.id,
+                alice.id,
+                UpdateNotificationAction {
+                    title_template: Some("   ".into()),
+                    ..blank()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.title_template, None);
+        assert_eq!(cleared.channel_id, first.id);
+        assert_eq!(cleared.event, "failure");
+        assert_eq!(cleared.failure_threshold, 3);
+        assert!(!cleared.automatic_only);
+
+        // Neither another account's channel nor another account's action.
+        assert!(
+            store
+                .update_notification_action(
+                    action.id,
+                    alice.id,
+                    UpdateNotificationAction {
+                        channel_id: Some(bobs.id),
+                        ..blank()
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .update_notification_action(
+                    action.id,
+                    bob.id,
+                    UpdateNotificationAction {
+                        event: Some("always".into()),
+                        ..blank()
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let rebound = store
+            .update_notification_action(
+                action.id,
+                alice.id,
+                UpdateNotificationAction {
+                    channel_id: Some(second.id),
+                    event: Some("always".into()),
+                    failure_threshold: Some(1),
+                    automatic_only: Some(true),
+                    body_template: Some("hi".into()),
+                    ..blank()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.channel_id, second.id);
+        assert_eq!(rebound.event, "always");
+        assert_eq!(rebound.failure_threshold, 1);
+        assert!(rebound.automatic_only);
+        assert_eq!(rebound.body_template.as_deref(), Some("hi"));
+
+        // Rejected before anything is written, so the row keeps the last good
+        // values.
+        assert!(
+            store
+                .update_notification_action(
+                    action.id,
+                    alice.id,
+                    UpdateNotificationAction {
+                        event: Some("maybe".into()),
+                        ..blank()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .update_notification_action(
+                    action.id,
+                    alice.id,
+                    UpdateNotificationAction {
+                        failure_threshold: Some(0),
+                        ..blank()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        // `get_notification_action` is internal to the backend impls (it is not
+        // delegated onto `Store`), so read the row back through the task list.
+        let listed = store
+            .list_notification_actions(task.id, alice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let intact = listed.iter().find(|row| row.id == action.id).unwrap();
+        assert_eq!(intact.event, "always");
+        assert_eq!(intact.failure_threshold, 1);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 -- External identity login (OIDC / Header Auth) for Issue #3.
--- See docs/EXTERNAL_IDP_PLAN.md §3.
+-- See docs/design/EXTERNAL_IDP_PLAN.md §3.
 
 -- Maps an external identity (provider + issuer + subject) to a local user row.
 -- Mapping key is provider+issuer+subject, NOT email (email may change, may be

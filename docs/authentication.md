@@ -116,4 +116,4 @@ location / {
 > 若 IdP 不把组放进 ID token（仅在 userinfo），该 claim 缺失，首登统一落 `default_role`。
 > 组到角色的精细实时同步留待后续按需扩展。
 
-详细的认证改造设计与风险控制见 [认证改造计划](EXTERNAL_IDP_PLAN.md)。
+详细的认证改造设计与风险控制见 [认证改造设计](design/EXTERNAL_IDP_PLAN.md)。

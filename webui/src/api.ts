@@ -184,11 +184,14 @@ export const api = {
   // ---- notifications ----
   notificationChannels: () => request<NotificationChannel[]>("/api/v1/notification-channels"),
   createNotificationChannel: (name: string, kind: NotificationChannel["kind"], config: Record<string, unknown>) => request<NotificationChannel>("/api/v1/notification-channels", { method: "POST", body: JSON.stringify({ name, kind, config, enabled: true }) }),
-  updateNotificationChannel: (id: number, enabled: boolean) => request<NotificationChannel>(`/api/v1/notification-channels/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
+  updateNotificationChannel: (id: number, patch: { name?: string; config?: Record<string, unknown>; enabled?: boolean }) => request<NotificationChannel>(`/api/v1/notification-channels/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteNotificationChannel: (id: number) => request<void>(`/api/v1/notification-channels/${id}`, { method: "DELETE" }),
   testNotificationChannel: (id: number) => request<{ ok: boolean; kind: string }>(`/api/v1/notification-channels/${id}/test`, { method: "POST" }),
   notificationActions: (taskId: number) => request<NotificationAction[]>(`/api/v1/tasks/${taskId}/notification-actions`),
   createNotificationAction: (taskId: number, channelId: number, event: string) => request<NotificationAction>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "POST", body: JSON.stringify({ channel_id: channelId, event }) }),
+  /** Partial edit: keys left out keep their stored value. Send an empty string
+   *  to clear a template — `null` means "unchanged", not "remove". */
+  updateNotificationAction: (id: number, patch: { channel_id?: number; event?: NotificationAction["event"]; failure_threshold?: number; automatic_only?: boolean; title_template?: string; body_template?: string }) => request<NotificationAction>(`/api/v1/notification-actions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteNotificationAction: (id: number) => request<void>(`/api/v1/notification-actions/${id}`, { method: "DELETE" }),
   batchCreateNotificationActions: (taskIds: number[], channelId: number, event: string, failureThreshold = 1, automaticOnly = false, titleTemplate?: string, bodyTemplate?: string) => request<{ created: number }>("/api/v1/notification-actions/batch", { method: "POST", body: JSON.stringify({ task_ids: taskIds, channel_id: channelId, event, failure_threshold: failureThreshold, automatic_only: automaticOnly, title_template: titleTemplate || null, body_template: bodyTemplate || null }) }),
 

@@ -42,9 +42,9 @@ use crate::{
         CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
         DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportLibraryTemplates,
         ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetSiteSetting, TemplateSubscription, UpdateNotificationChannel,
-        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        ResetPassword, SetSiteSetting, TemplateSubscription, UpdateNotificationAction,
+        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
@@ -321,7 +321,7 @@ pub fn router_with_auth(
         )
         .route(
             "/api/v1/notification-actions/{id}",
-            axum::routing::delete(delete_notification_action),
+            axum::routing::put(update_notification_action).delete(delete_notification_action),
         )
         .route("/api/v1/plugins", get(list_plugins).post(create_plugin))
         .route(
@@ -745,7 +745,7 @@ async fn oidc_login_callback(
 /// Persist an audit trail entry for a *successful* external (OIDC / future
 /// header) login. `was_created` distinguishes a brand-new provisioned external
 /// user (whose role was pinned from group membership at first login) from an
-/// existing user being reused. See EXTERNAL_IDP_PLAN.md Phase 2.
+/// existing user being reused. See docs/design/EXTERNAL_IDP_PLAN.md Phase 2.
 pub(crate) async fn record_external_login_audit(
     store: &Store,
     claim: &ExternalIdentityClaim,
@@ -1135,7 +1135,7 @@ fn append_clear_cookies(headers: &mut HeaderMap, secure: bool) {
 
 /// Axum middleware implementing trusted reverse-proxy header authentication
 /// (Phase 4, forward-auth). Returns a `Response` directly; on refusal it
-/// short-circuits with 403 and an audit entry. See EXTERNAL_IDP_PLAN.md Phase 4.
+/// short-circuits with 403 and an audit entry. See docs/design/EXTERNAL_IDP_PLAN.md Phase 4.
 async fn header_auth_middleware(
     State(state): State<AppState>,
     mut request: AxumRequest,
@@ -1754,6 +1754,26 @@ async fn delete_notification_action(
             "Notification action not found",
         ))
     }
+}
+
+/// Edit one binding without re-creating it, so a corrected template or a
+/// re-bound channel keeps its identity and its history.
+async fn update_notification_action(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<UpdateNotificationAction>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    store
+        .update_notification_action(id, session.user.id, input)
+        .await
+        .map_err(ApiError::unprocessable)?
+        .map(|v| Json(json!(v)))
+        .ok_or(ApiError::NotFound(
+            "notification_action_not_found",
+            "Notification action not found",
+        ))
 }
 
 async fn list_templates(
@@ -3633,10 +3653,13 @@ mod tests {
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
         assert!(document["paths"]["/api/v1/tasks"].is_object());
-        // The two endpoints that back the WebUI's aggregated log and the
-        // channel-test button must stay in the published contract.
+        // The endpoints that back the WebUI's aggregated log, the channel-test
+        // button and the notification editors must stay in the published
+        // contract.
         assert!(document["paths"]["/api/v1/runs"]["get"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
+        assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
+        assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());
         assert_eq!(
             document["components"]["schemas"]["ApiError"]["required"]
                 .as_array()
@@ -3710,6 +3733,66 @@ mod tests {
                     .uri("/api/v1/notification-channels/9999/test")
                     .header(COOKIE, &cookie_header)
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Editing a binding validates the body before it resolves ownership, so a
+    /// malformed payload fails the same way for everyone; both behaviours are
+    /// new, which also proves the route is mounted.
+    #[tokio::test]
+    async fn updating_a_notification_action_is_validated_and_owner_scoped() {
+        let app = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/notification-actions/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"event": "sometimes"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = test_auth_cookie(&app).await;
+        for body in [
+            json!({"event": "sometimes"}),   // not one of the three events
+            json!({"failure_threshold": 0}), // threshold must stay >= 1
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/v1/notification-actions/9999")
+                        .header("content-type", "application/json")
+                        .header(COOKIE, &cookie)
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (status, _, payload) = response_json(response).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(payload["code"], "validation_error");
+        }
+
+        // A well-formed body against an id the caller does not have is a 404.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/notification-actions/9999")
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(json!({"event": "success"}).to_string()))
                     .unwrap(),
             )
             .await
@@ -3859,7 +3942,7 @@ mod tests {
         assert_eq!(result["extract_variables"], 1);
     }
 
-    // --- External identity login audit trail (EXTERNAL_IDP_PLAN.md Phase 2) ---
+    // --- External identity login audit trail (docs/design/EXTERNAL_IDP_PLAN.md Phase 2) ---
 
     fn external_claim(subject: &str, email: Option<&str>) -> ExternalIdentityClaim {
         ExternalIdentityClaim {

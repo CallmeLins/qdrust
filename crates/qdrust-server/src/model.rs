@@ -569,6 +569,22 @@ pub struct BatchCreateNotificationAction {
     pub action: CreateNotificationAction,
 }
 
+/// Partial update for one task↔channel binding.
+///
+/// Every field is optional and an absent field keeps its stored value. The two
+/// templates are plain `Option<String>` rather than `Option<Option<String>>`
+/// because JSON cannot tell "absent" from `null` here; sending an empty (or
+/// whitespace-only) string clears a template instead.
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateNotificationAction {
+    pub channel_id: Option<i64>,
+    pub event: Option<String>,
+    pub failure_threshold: Option<i64>,
+    pub automatic_only: Option<bool>,
+    pub title_template: Option<String>,
+    pub body_template: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NotificationDelivery {
     pub channel: NotificationChannel,
@@ -629,7 +645,7 @@ pub fn plugin_capabilities(config: &serde_json::Value) -> Result<Vec<PluginCapab
 }
 
 /// A link between an external identity (provider + issuer + subject) and a
-/// local `users` row. See docs/EXTERNAL_IDP_PLAN.md §3.2.
+/// local `users` row. See docs/design/EXTERNAL_IDP_PLAN.md §3.2.
 #[derive(Clone, Debug)]
 pub struct ExternalIdentity {
     pub id: i64,

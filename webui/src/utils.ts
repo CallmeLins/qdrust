@@ -10,7 +10,7 @@ export function formatRunTime(value: number | null, locale = "zh-CN", timeZone?:
   }).format(value * 1000);
 }
 
-// ---------- external IdP login policy (EXTERNAL_IDP_PLAN.md Phase 3) ----------
+// ---------- external IdP login policy (docs/design/EXTERNAL_IDP_PLAN.md Phase 3) ----------
 
 /** Public auth policy as delivered by GET /api/v1/auth/config. */
 export interface AuthPolicy {

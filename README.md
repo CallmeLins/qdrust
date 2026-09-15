@@ -77,19 +77,18 @@ cargo run -p qdrust-server
 |---|---|
 | [部署](docs/deployment.md) | 环境要求、本地开发、Docker / Compose、反向代理到二级目录、环境变量、数据库、升级与回滚 |
 | [账号与第三方登录](docs/authentication.md) | 初始管理员、开放注册，OIDC（Authorization Code + PKCE）与反向代理 Header 认证 |
-| [使用](docs/usage.md) | 导入 QD HAR、模板变量怎么算、创建与运行任务、HAR 编辑器、调度与时区、运行日志、CLI |
+| [使用](docs/usage.md) | 导入 QD HAR、模板变量怎么算、原生模板 schema v1、创建与运行任务、HAR 编辑器、调度与时区、运行日志、订阅模板库、CLI |
 | [推送 / 通知](docs/notifications.md) | 11 种渠道的配置项、批量绑定、失败阈值、自定义标题/正文模板 |
 | [浏览器插件](docs/browser-plugin.md) | `api://browser/*` 的 action 一览、部署启用、一次性与会话用法、生命周期 |
 | [模板表达式与内置工具](docs/expressions.md) | Jinja2 过滤器 / 函数清单与 `api://util/*` 工具表 |
 | [常见问题](docs/faq.md) | 部署、调度、通知、认证等高频问题 |
-| [原生模板 schema v1](docs/template-schema-v1.md) | `native_v1` 模板的 JSON 结构与安全限制 |
-| [API 错误码](docs/api-error-codes.md) / [OpenAPI 契约](docs/openapi-v1.json) | 服务端错误码约定与完整 API 定义（运行时可取 `GET /api/v1/openapi.json`） |
-| [运维手册](docs/operations.md) | SQLite 备份 / 恢复、升级与回滚操作规范 |
-| [发布检查清单](docs/release-checklist.md) | 本地门禁、浏览器验收与发布门禁 |
+| [运维与发版](docs/operations.md) | SQLite 备份 / 恢复、发布检查清单（本地门禁 / 浏览器验收 / 发布门禁） |
+| [参考](docs/reference.md) | API 错误码约定、与旧 QD 的兼容范围、立项期功能矩阵 |
+| [OpenAPI 契约](docs/openapi-v1.json) | 完整 API 定义（运行时可取 `GET /api/v1/openapi.json`） |
 | [架构决策记录](docs/adr/) | ADR-0001 ~ 0008：workspace、QD HAR 契约、数据库、运行时状态、表达式、插件、WebUI、SSRF/DNS |
-| [迁移计划](docs/migration-plan.md) | 从 QD 迁移的阶段范围、决策与风险控制 |
-| [认证改造设计](docs/EXTERNAL_IDP_PLAN.md) | OIDC / Header 认证的详细设计 |
-| [威胁模型](docs/threat-model.md) / [功能矩阵](docs/feature-matrix.md) / [兼容清单](docs/compatibility-inventory.md) | 安全边界、QD 功能对照与兼容范围 |
+| [设计档案](docs/design/) | 迁移计划、认证改造设计（OIDC / Header）、威胁模型——已完工的历史设计文档 |
+
+> 目录约定：`docs/` 根层只放用户指南与参考；已完工的设计与规划文档归档在 [`docs/design/`](docs/design/)，架构决策记录在 [`docs/adr/`](docs/adr/)。
 
 ---
 
@@ -97,13 +96,13 @@ cargo run -p qdrust-server
 
 旧 QD HAR 是核心兼容契约，兼容样本位于 `tests/fixtures`。WebUI 可导入、校验并保留原始 HAR JSON。
 
-qdrust 不导入旧 QD 数据库，不复用旧登录 Cookie，也不承诺兼容旧 URL、旧 API 或任意 Python 动态表达式。详细决策、阶段范围和风险控制见 [迁移计划](docs/migration-plan.md)。
+qdrust 不导入旧 QD 数据库，不复用旧登录 Cookie，也不承诺兼容旧 URL、旧 API 或任意 Python 动态表达式。详细决策、阶段范围和风险控制见 [迁移计划](docs/design/migration-plan.md)。
 
 ---
 
 ## 项目状态
 
-Phase 0-8 代码与容器已实现完成（Phase 8 状态为 Implementation Complete）；发布前仍待完成浏览器人工验收与首个镜像（amd64 / arm64）发布检查。详见 [发布检查清单](docs/release-checklist.md)。
+Phase 0-8 代码与容器已实现完成（Phase 8 状态为 Implementation Complete）；发布前仍待完成浏览器人工验收与首个镜像（amd64 / arm64）发布检查。详见 [运维与发版](docs/operations.md)。
 
 ---
 
@@ -118,7 +117,7 @@ npm --prefix webui run test
 npm --prefix webui run build
 ```
 
-完整发布验收项目见 [发布检查清单](docs/release-checklist.md)。
+完整发布验收项目见 [运维与发版](docs/operations.md)。
 
 ---
 

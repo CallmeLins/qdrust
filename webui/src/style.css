@@ -449,6 +449,12 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 .run-row.clickable { cursor: pointer; }
 .run-row.clickable:hover { transform: translateY(-2px); }
+/* A notification action row that turned into its own editor. The row already
+   draws the card, so the form only contributes the two-column field grid. */
+.run-row .action-edit {
+  flex: 1 1 100%; width: 100%; margin: 0; padding: 0;
+  border: 0; background: transparent; box-shadow: none;
+}
 .task-section > .run-row code, .run-row code { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-section > .run-row > label { display: grid; gap: 6px; color: var(--ink-2); font-size: 11px; font-weight: 600; letter-spacing: 0.4px; }
 .task-section > .run-row > label input {
@@ -909,7 +915,7 @@ code {
   padding: 4px 10px; border-radius: 999px; font-size: 12px;
 }
 
-/* SSO affordance on the sign-in page (EXTERNAL_IDP_PLAN.md Phase 3). */
+/* SSO affordance on the sign-in page (docs/design/EXTERNAL_IDP_PLAN.md Phase 3). */
 .auth-panel .sso-button { width: 100%; }
 .auth-panel .sso-button .sso-label { overflow: hidden; text-overflow: ellipsis; }
 .auth-error { border-color: rgb(220 38 38 / 0.4); color: var(--bad); background: rgb(220 38 38 / 0.08); }

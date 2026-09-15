@@ -170,4 +170,4 @@ docker compose pull && docker compose up -d
 
 3. 验证 `/health`、`/ready`、登录与至少一个只读流程。
 
-若健康检查失败：停新容器 → 恢复升级前数据库备份 → 启动记录的上一镜像 digest。详见 [运维手册](operations.md) 与 [发布检查清单](release-checklist.md)。
+若健康检查失败：停新容器 → 恢复升级前数据库备份 → 启动记录的上一镜像 digest。详见 [运维与发版](operations.md)。

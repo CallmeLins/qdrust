@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, RefreshCw, Search, Send,
@@ -112,7 +112,7 @@ const ssoError = ref("");
 const verifyResult = ref<"ok" | "fail" | null>(null);
 const forgotResult = ref<{ sent: boolean; token?: string } | null>(null);
 
-// External-IdP policy affordances (EXTERNAL_IDP_PLAN.md Phase 3).
+// External-IdP policy affordances (docs/design/EXTERNAL_IDP_PLAN.md Phase 3).
 const showSso = computed(() => ssoAvailable(authPolicy.value));
 const ssoProviderName = computed(() => authPolicy.value?.oidc_provider_name?.trim() || "SSO");
 const localAuthAvailable = computed(() => localLoginAvailable(authPolicy.value));
@@ -793,13 +793,25 @@ async function invokePlugin(plugin: Plugin) {
 // ---------- notifications ----------
 const channels = ref<NotificationChannel[]>([]);
 const actions = ref<NotificationAction[]>([]);
-const channelForm = reactive({
-  name: "", kind: "webhook" as NotificationChannel["kind"],
-  url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "",
-  dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "",
-  secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "",
-});
+/** One form serves both creating and editing a channel; a non-null `id` is
+ *  what turns it into an edit, the same way the task form works. */
+function blankChannelForm() {
+  return {
+    id: null as number | null,
+    name: "",
+    kind: "webhook" as NotificationChannel["kind"],
+    url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "",
+    dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "",
+    secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "",
+  };
+}
+const channelForm = reactive(blankChannelForm());
+/** The editor sits above the list, so opening it has to bring it into view. */
+const channelFormEl = ref<HTMLElement | null>(null);
 const actionForm = reactive({ taskIds: [] as number[], channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
+/** Inline editor for one saved binding: the row swaps itself for a form. */
+const editingActionId = ref<number | null>(null);
+const actionEdit = reactive({ channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
 // One checkbox list replaces the old single-task <select> + ctrl-click multiple
 // <select>: the same ticks drive both the saved bindings and the list below, so
 // there is no "single vs batch" pair of controls to reconcile.
@@ -884,15 +896,62 @@ function openNotificationsFor(taskIds: number[]) {
   actionForm.taskIds = [...taskIds];
   return openNotifications();
 }
+/** Reverse of `buildChannelConfig`, so the editor shows what is stored. */
+function openEditChannel(channel: NotificationChannel) {
+  const config = (channel.config ?? {}) as Record<string, unknown>;
+  const text = (value: unknown) => (value == null ? "" : String(value));
+  const next = blankChannelForm();
+  next.id = channel.id;
+  next.name = channel.name;
+  next.kind = channel.kind;
+  switch (channel.kind) {
+    case "webhook": next.url = text(config.url); break;
+    case "custom_http":
+      next.url = text(config.url);
+      next.customMethod = text(config.method) || "POST";
+      next.customHeaders = JSON.stringify(config.headers ?? {}, null, 2);
+      next.customBody = text(config.body);
+      break;
+    case "email": next.to = text(config.to); next.subject = text(config.subject); break;
+    case "bark":
+      next.url = text(config.url); next.sound = text(config.sound); next.group = text(config.group);
+      break;
+    case "serverchan": next.sendkey = text(config.sendkey); break;
+    case "telegram":
+      next.tgToken = text(config.token); next.tgChatId = text(config.chat_id); next.tgHost = text(config.host);
+      break;
+    case "dingtalk": next.dingToken = text(config.access_token); break;
+    case "wxpusher": next.wxToken = text(config.app_token); next.wxUid = text(config.uid); break;
+    case "wxpusher_spt": next.spt = text(config.spt); break;
+    case "wecom_app":
+      next.corpId = text(config.corpid); next.agentId = text(config.agentid);
+      next.secret = text(config.secret); next.toUser = text(config.to_user);
+      break;
+    case "wecom_webhook": next.wecomKey = text(config.key); break;
+  }
+  Object.assign(channelForm, next);
+  void nextTick().then(() => channelFormEl.value?.scrollIntoView({ behavior: "smooth", block: "center" }));
+}
+function cancelChannelEdit() {
+  Object.assign(channelForm, blankChannelForm());
+}
 async function saveChannel() {
   try {
-    await api.createNotificationChannel(channelForm.name, channelForm.kind, buildChannelConfig());
-    Object.assign(channelForm, { name: "", kind: "webhook", url: "", sound: "", group: "", sendkey: "", tgToken: "", tgChatId: "", tgHost: "", dingToken: "", wxToken: "", wxUid: "", spt: "", corpId: "", agentId: "", secret: "", toUser: "", wecomKey: "", to: "", subject: "", customMethod: "POST", customHeaders: "{}", customBody: "" });
+    const config = buildChannelConfig();
+    if (channelForm.id != null) {
+      // The type is never sent: the config shape follows from it, so changing
+      // one without the other would store a channel that cannot deliver.
+      await api.updateNotificationChannel(channelForm.id, { name: channelForm.name, config });
+      notify(t("channelUpdated"));
+    } else {
+      await api.createNotificationChannel(channelForm.name, channelForm.kind, config);
+    }
+    Object.assign(channelForm, blankChannelForm());
     await openNotifications();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleChannel(channel: NotificationChannel) {
-  try { await api.updateNotificationChannel(channel.id, !channel.enabled); await openNotifications(); }
+  try { await api.updateNotificationChannel(channel.id, { enabled: !channel.enabled }); await openNotifications(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeChannel(channel: NotificationChannel) {
@@ -916,9 +975,13 @@ async function testChannel(channel: NotificationChannel) {
 }
 async function loadActions() {
   try {
-    if (!actionForm.taskIds.length) { actions.value = []; return; }
+    if (!actionForm.taskIds.length) { actions.value = []; editingActionId.value = null; return; }
     const lists = await Promise.all(actionForm.taskIds.map((id) => api.notificationActions(id)));
     actions.value = lists.flat();
+    // Unticking a task can take the row being edited off the screen with it.
+    if (editingActionId.value != null && !actions.value.some((action) => action.id === editingActionId.value)) {
+      editingActionId.value = null;
+    }
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function saveAction() {
@@ -940,6 +1003,38 @@ async function saveAction() {
 async function removeAction(id: number) {
   try { await api.deleteNotificationAction(id); await loadActions(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+function startEditAction(action: NotificationAction) {
+  editingActionId.value = action.id;
+  Object.assign(actionEdit, {
+    channelId: action.channel_id,
+    event: action.event,
+    failureThreshold: String(action.failure_threshold),
+    automaticOnly: action.automatic_only,
+    titleTemplate: action.title_template ?? "",
+    bodyTemplate: action.body_template ?? "",
+  });
+}
+function cancelEditAction() {
+  editingActionId.value = null;
+}
+async function saveActionEdit() {
+  const id = editingActionId.value;
+  if (id == null) return;
+  try {
+    await api.updateNotificationAction(id, {
+      channel_id: actionEdit.channelId,
+      event: actionEdit.event as NotificationAction["event"],
+      failure_threshold: Math.max(1, Number(actionEdit.failureThreshold) || 1),
+      automatic_only: actionEdit.automaticOnly,
+      // An emptied template clears it; the server keeps whatever is left out.
+      title_template: actionEdit.titleTemplate,
+      body_template: actionEdit.bodyTemplate,
+    });
+    notify(t("actionUpdated"));
+    editingActionId.value = null;
+    await loadActions();
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
 // ---------- subscriptions (a section of the templates page, not a page of its own) ----------
@@ -1862,10 +1957,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       <div v-else-if="view === 'notifications'" class="page">
         <section class="page-heading"><div><h1>{{ t('notificationsTitle') }}</h1><p>{{ t('notificationsHint') }}</p></div></section>
         <section class="task-section">
-          <form class="modal inline-modal" @submit.prevent="saveChannel">
+          <form ref="channelFormEl" class="modal inline-modal" @submit.prevent="saveChannel">
             <label>{{ t('channelName') }}<input v-model="channelForm.name" required /></label>
             <label>{{ t('channelKind') }}
-              <Dropdown v-model="channelForm.kind" :options="channelKindDropdownOptions" />
+              <Dropdown v-model="channelForm.kind" :options="channelKindDropdownOptions" :disabled="channelForm.id != null" />
+              <small v-if="channelForm.id != null" class="kv-hint">{{ t('channelKindLocked') }}</small>
             </label>
             <template v-if="channelForm.kind === 'webhook'">
               <label>{{ t('webhookUrl') }}<input v-model="channelForm.url" required type="url" placeholder="https://example.com/hook" /></label>
@@ -1914,7 +2010,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <template v-else-if="channelForm.kind === 'wecom_webhook'">
               <label>{{ t('wecomWebhookKey') }}<input v-model="channelForm.wecomKey" required /></label>
             </template>
-            <button class="primary-button">{{ t('createChannel') }}</button>
+            <div class="inline-actions">
+              <button class="primary-button">{{ channelForm.id != null ? t('save') : t('createChannel') }}</button>
+              <button v-if="channelForm.id != null" type="button" class="secondary-button" @click="cancelChannelEdit">{{ t('cancel') }}</button>
+            </div>
           </form>
           <div v-if="channels.length === 0" class="muted">{{ t('noChannels') }}</div>
           <div v-for="channel in channels" :key="channel.id" class="run-row">
@@ -1922,6 +2021,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <span class="chip">{{ channelKindLabel(channel.kind) }}</span>
             <button class="secondary-button" :disabled="testingChannelId === channel.id" @click="testChannel(channel)"><Send :size="15" />{{ testingChannelId === channel.id ? t('testingChannel') : t('testChannel') }}</button>
             <button class="secondary-button" @click="toggleChannel(channel)">{{ channel.enabled ? t('disable') : t('enable') }}</button>
+            <button class="secondary-button" @click="openEditChannel(channel)"><Pencil :size="15" />{{ t('edit') }}</button>
             <button class="icon-button" :title="t('deleteChannel')" @click="removeChannel(channel)"><Trash2 :size="16" /></button>
           </div>
           <h2>{{ t('taskActions') }}</h2>
@@ -1957,12 +2057,35 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </form>
           <div v-if="!actionForm.taskIds.length" class="muted">{{ t('notifyPickTasksHint') }}</div>
           <div v-for="action in actions" :key="action.id" class="run-row">
-            <strong>{{ action.event === 'success' ? t('eventSuccess') : action.event === 'failure' ? t('eventFailure') : t('eventAlways') }}</strong>
-            <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
-            <span>{{ t('task') }}: {{ taskName(action.task_id) }}</span>
-            <span v-if="action.failure_threshold > 1" class="chip" :title="t('notifyFailureThreshold')">&ge;{{ action.failure_threshold }}</span>
-            <span v-if="action.automatic_only" class="chip">{{ t('notifyAutomaticOnlyShort') }}</span>
-            <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
+            <template v-if="editingActionId === action.id">
+              <!-- The row becomes its own editor: a binding is too small an
+                   object to justify a second form further up the page. -->
+              <form class="modal inline-modal action-edit" @submit.prevent="saveActionEdit">
+                <label>{{ t('channel') }}
+                  <Dropdown v-model="actionEdit.channelId" :options="actionChannelDropdownOptions" />
+                </label>
+                <label>{{ t('event') }}
+                  <Dropdown v-model="actionEdit.event" :options="eventDropdownOptions" />
+                </label>
+                <label>{{ t('notifyFailureThreshold') }}<input v-model="actionEdit.failureThreshold" type="number" min="1" /></label>
+                <label class="checkbox"><input v-model="actionEdit.automaticOnly" type="checkbox" />{{ t('notifyAutomaticOnly') }}</label>
+                <label class="field-wide">{{ t('notifyTitleTemplate') }}<textarea v-model="actionEdit.titleTemplate" rows="2" spellcheck="false" placeholder="{task} {event}" /></label>
+                <label class="field-wide">{{ t('notifyBodyTemplate') }}<textarea v-model="actionEdit.bodyTemplate" rows="2" spellcheck="false" placeholder="{log} {error}" /></label>
+                <div class="inline-actions">
+                  <button class="primary-button">{{ t('save') }}</button>
+                  <button type="button" class="secondary-button" @click="cancelEditAction">{{ t('cancel') }}</button>
+                </div>
+              </form>
+            </template>
+            <template v-else>
+              <strong>{{ action.event === 'success' ? t('eventSuccess') : action.event === 'failure' ? t('eventFailure') : t('eventAlways') }}</strong>
+              <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
+              <span>{{ t('task') }}: {{ taskName(action.task_id) }}</span>
+              <span v-if="action.failure_threshold > 1" class="chip" :title="t('notifyFailureThreshold')">&ge;{{ action.failure_threshold }}</span>
+              <span v-if="action.automatic_only" class="chip">{{ t('notifyAutomaticOnlyShort') }}</span>
+              <button class="secondary-button" @click="startEditAction(action)"><Pencil :size="15" />{{ t('edit') }}</button>
+              <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
+            </template>
           </div>
         </section>
       </div>

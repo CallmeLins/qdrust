@@ -339,7 +339,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        put: operations["updateNotificationAction"];
         post?: never;
         delete: operations["deleteNotificationAction"];
         options?: never;
@@ -1150,6 +1150,17 @@ export interface components {
             } | null;
             enabled?: boolean | null;
         };
+        UpdateNotificationAction: {
+            /** Format: int64 */
+            channel_id?: number | null;
+            /** @enum {string|null} */
+            event?: "success" | "failure" | "always" | null;
+            /** Format: int64 */
+            failure_threshold?: number | null;
+            automatic_only?: boolean | null;
+            title_template?: string | null;
+            body_template?: string | null;
+        };
         NotificationAction: {
             /** Format: int64 */
             id: number;
@@ -1573,6 +1584,11 @@ export interface components {
         UpdateNotificationChannel: {
             content: {
                 "application/json": components["schemas"]["UpdateNotificationChannel"];
+            };
+        };
+        UpdateNotificationAction: {
+            content: {
+                "application/json": components["schemas"]["UpdateNotificationAction"];
             };
         };
         CreateNotificationAction: {
@@ -2284,6 +2300,28 @@ export interface operations {
         responses: {
             /** @description Notification action created */
             201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
+        };
+    };
+    updateNotificationAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["UpdateNotificationAction"];
+        responses: {
+            /** @description Notification action updated */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
