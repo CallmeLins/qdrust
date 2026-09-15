@@ -876,6 +876,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/subscriptions/{id}/library/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Fetch one entry's content without writing it */
+        get: operations["previewSubscriptionLibraryEntry"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/subscriptions/{id}/library/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Save a template a user edited out of a preview */
+        post: operations["applySubscriptionTemplate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/subscriptions/{id}/import": {
         parameters: {
             query?: never;
@@ -887,6 +921,23 @@ export interface paths {
         put?: never;
         /** Import the selected entries of a subscription source */
         post: operations["importSubscriptionTemplates"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/library": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Every enabled subscription source's catalogue in one list */
+        get: operations["getLibraryOverview"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1418,6 +1469,13 @@ export interface components {
             installed_template_id?: number | null;
             installed_version?: string | null;
             update_available: boolean;
+            /**
+             * Format: int64
+             * @description Which source the entry came from; only the aggregate listing fills it in
+             */
+            source_id?: number | null;
+            /** @description Which source the entry came from; only the aggregate listing fills it in */
+            source_name?: string | null;
         };
         TemplateLibrary: {
             /** Format: int64 */
@@ -1434,9 +1492,46 @@ export interface components {
             /** @description Entry names to import, as returned by the library listing */
             names: string[];
         };
+        ApplyLibraryTemplate: {
+            /** @description Entry identity inside the source, as returned by the listing */
+            entry: string;
+            /**
+             * Format: int64
+             * @description Local template to refresh in place; absent creates one
+             */
+            template_id?: number | null;
+            name: string;
+            description?: string | null;
+            /** @description The HAR document as edited in the browser */
+            har: Record<string, never>;
+        };
         LibraryImportFailure: {
             name: string;
             error: string;
+        };
+        LibraryPreview: {
+            entry: components["schemas"]["LibraryEntry"];
+            /** @description The upstream HAR document, untouched */
+            har: Record<string, never>;
+        };
+        LibraryOverview: {
+            /** @description Entries from every source that could be read, in source order */
+            entries: components["schemas"]["LibraryEntry"][];
+            /** @description How each source contributed, including the ones that failed */
+            sources: components["schemas"]["LibrarySourceStatus"][];
+            /** @description True when the total entry cap was hit */
+            truncated: boolean;
+        };
+        LibrarySourceStatus: {
+            /** Format: int64 */
+            subscription_id: number;
+            name: string;
+            /** @description `manifest` or `files`; absent when the source could not be read */
+            source_kind?: string | null;
+            entries: number;
+            /** @description True when the catalogue was reused instead of fetched again */
+            cached: boolean;
+            error?: string | null;
         };
         /** @description One entry that landed in the store during an import, so the caller can act on what it just pulled in (open the editor prefilled, build a task) instead of only reading counters. */
         LibraryImportOutcome: {
@@ -1711,6 +1806,11 @@ export interface components {
         ImportLibraryTemplates: {
             content: {
                 "application/json": components["schemas"]["ImportLibraryTemplates"];
+            };
+        };
+        ApplyLibraryTemplate: {
+            content: {
+                "application/json": components["schemas"]["ApplyLibraryTemplate"];
             };
         };
         CreatePushRequest: {
@@ -3256,6 +3356,85 @@ export interface operations {
             };
         };
     };
+    previewSubscriptionLibraryEntry: {
+        parameters: {
+            query: {
+                /** @description Entry name as returned by the listing. A query parameter because the name is a free-form string from the source and may contain a slash. */
+                entry: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The entry and its upstream HAR */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryPreview"];
+                };
+            };
+            /** @description Subscription not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The source does not offer that entry, or it is unreadable */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    applySubscriptionTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["SubscriptionId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["requestBodies"]["ApplyLibraryTemplate"];
+            };
+        };
+        responses: {
+            /** @description The template that was written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryImportOutcome"];
+                };
+            };
+            /** @description Subscription not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid template, or the source no longer offers that entry */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     importSubscriptionTemplates: {
         parameters: {
             query?: never;
@@ -3293,6 +3472,29 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    getLibraryOverview: {
+        parameters: {
+            query?: {
+                /** @description Re-read every source instead of reusing a recent catalogue */
+                refresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aggregated catalogue, with a per-source outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryOverview"];
+                };
             };
         };
     };

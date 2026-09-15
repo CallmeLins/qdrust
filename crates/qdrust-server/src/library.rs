@@ -15,6 +15,8 @@
 //! the same provenance row and updates in place.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
@@ -22,10 +24,12 @@ use qdrust_core::qd_har::QdHar;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::model::{
-    ImportQdHarTemplate, LibraryEntry, LibraryImportFailure, LibraryImportOutcome,
-    LibraryImportResult, TemplateImport, TemplateLibrary, TemplateSubscription,
+    ApplyLibraryTemplate, ImportQdHarTemplate, LibraryEntry, LibraryImportFailure,
+    LibraryImportOutcome, LibraryImportResult, LibraryOverview, LibraryPreview,
+    LibrarySourceStatus, TemplateImport, TemplateLibrary, TemplateSubscription,
     UpdateQdHarTemplate,
 };
 use crate::store::Store;
@@ -34,6 +38,74 @@ use crate::store::Store;
 /// with a runaway tree (or a hostile manifest) cannot blow up memory or a
 /// response. Comfortably above the several hundred the official library ships.
 const MAX_LIBRARY_ENTRIES: usize = 2000;
+
+/// Upper bound on the aggregate listing, which sums every subscribed source.
+/// Four times one source, so a handful of ordinary libraries fit and only a
+/// pathological set of subscriptions is cut short — and when it is, the
+/// response says so rather than quietly dropping templates.
+const MAX_OVERVIEW_ENTRIES: usize = 4 * MAX_LIBRARY_ENTRIES;
+
+/// How long a fetched catalogue stays usable before it is read again.
+///
+/// One catalogue costs two or three requests to GitHub, and the aggregate
+/// listing reads every source at once on each visit to the page, so it cannot
+/// pay that every time. The cache holds the catalogue only: "installed" and
+/// "update available" are resolved from the store on every call, which is what
+/// lets an import show up immediately instead of after the cache expires.
+const CATALOGUE_TTL: Duration = Duration::from_secs(90);
+
+/// Catalogues shared across subscriptions, owners and requests.
+///
+/// Keyed by source URL rather than by subscription: a catalogue is the upstream
+/// repository's content, so two subscriptions pointing at the same library
+/// share one fetch and a user who subscribes twice pays once.
+#[derive(Clone, Default)]
+pub struct CatalogueCache {
+    entries: Arc<Mutex<HashMap<String, CachedCatalogue>>>,
+}
+
+struct CachedCatalogue {
+    fetched_at: Instant,
+    catalogue: Catalogue,
+}
+
+impl CatalogueCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The source's catalogue, reusing a recent fetch unless `max_age` is zero.
+    /// The bool reports whether the result was reused, so a caller can say
+    /// where the listing came from.
+    async fn catalogue(
+        &self,
+        client: &Client,
+        url: &str,
+        max_age: Duration,
+    ) -> Result<(Catalogue, bool)> {
+        if !max_age.is_zero() {
+            let entries = self.entries.lock().await;
+            if let Some(hit) = entries.get(url)
+                && hit.fetched_at.elapsed() < max_age
+            {
+                return Ok((hit.catalogue.clone(), true));
+            }
+        }
+        // Fetch without the lock held: two sources are read concurrently, and
+        // neither should wait on the other's network round trip.
+        let fetched = catalogue(client, url).await?;
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_, hit| hit.fetched_at.elapsed() < CATALOGUE_TTL);
+        entries.insert(
+            url.to_string(),
+            CachedCatalogue {
+                fetched_at: Instant::now(),
+                catalogue: fetched.clone(),
+            },
+        );
+        Ok((fetched, false))
+    }
+}
 
 /// The manifest file a library publishes to describe its templates. Part of the
 /// QD third-party-library contract (https://github.com/qd-today/templates).
@@ -110,7 +182,9 @@ pub(crate) struct RawEntry {
     pub(crate) content: Option<String>,
 }
 
-/// A source's catalogue plus how it was obtained.
+/// A source's catalogue plus how it was obtained. `Clone` because the cache
+/// hands out a copy rather than holding the lock across the caller's work.
+#[derive(Clone)]
 pub(crate) struct Catalogue {
     /// `manifest` or `files`.
     pub(crate) source_kind: &'static str,
@@ -244,7 +318,7 @@ pub async fn import_selected(
     Ok(result)
 }
 
-/// Import (or refresh) one entry and record where it came from.
+/// Import (or refresh) one entry with the bytes the source publishes itself.
 /// Returns the template's id and whether an existing row was updated in place.
 pub(crate) async fn import_entry(
     store: &Store,
@@ -257,14 +331,181 @@ pub(crate) async fn import_entry(
     let har = resolve_har(client, source, entry).await?;
     QdHar::parse_qd(har.clone())
         .with_context(|| format!("{} is not a valid QD HAR template", entry.name))?;
-    let description = entry.comments.as_deref().map(plain_text);
+    persist_entry(
+        store,
+        subscription,
+        entry,
+        entry.name.clone(),
+        entry.comments.as_deref().map(plain_text),
+        har,
+        linked_template_id,
+    )
+    .await
+}
+
+/// One entry's upstream content, plus its place in the local library.
+///
+/// Reads the source and nothing else. No template is created, so looking at
+/// what a library offers cannot change what the user already has — the point
+/// of previewing, and the reason a subscription no longer needs to be a
+/// decision made before the content is visible.
+pub async fn preview(
+    store: &Store,
+    client: &Client,
+    cache: &CatalogueCache,
+    subscription: &TemplateSubscription,
+    name: &str,
+) -> Result<LibraryPreview> {
+    let (catalogue, _) = cache
+        .catalogue(client, &subscription.url, CATALOGUE_TTL)
+        .await?;
+    let index = catalogue.by_name();
+    let entry = index
+        .get(name)
+        .with_context(|| format!("this source does not offer {name}"))?;
+    let har = resolve_har(client, parse_github_url(&subscription.url).as_ref(), entry).await?;
+    // Checked before it reaches the editor: a template that does not parse is
+    // worthless to look at, and the reason belongs beside the row that was
+    // clicked rather than at save time.
+    QdHar::parse_qd(har.clone())
+        .with_context(|| format!("{name} is not a valid QD HAR template"))?;
+    let installed = installed_index(store.list_template_imports(subscription.id).await?);
+    Ok(LibraryPreview {
+        entry: library_entry(entry, installed.get(name)),
+        har,
+    })
+}
+
+/// Save a template a user edited out of a preview.
+///
+/// The bytes come from the browser rather than the source, but the catalogue is
+/// still read: the provenance row needs the upstream version, and an entry the
+/// source no longer offers is refused instead of being recorded as a link that
+/// points nowhere.
+pub async fn apply(
+    store: &Store,
+    client: &Client,
+    cache: &CatalogueCache,
+    subscription: &TemplateSubscription,
+    input: ApplyLibraryTemplate,
+) -> Result<LibraryImportOutcome> {
+    ensure!(!input.name.trim().is_empty(), "the template needs a name");
+    let (catalogue, _) = cache
+        .catalogue(client, &subscription.url, CATALOGUE_TTL)
+        .await?;
+    let index = catalogue.by_name();
+    let entry = index
+        .get(input.entry.as_str())
+        .with_context(|| format!("this source does not offer {}", input.entry))?;
+    QdHar::parse_qd(input.har.clone())
+        .with_context(|| format!("{} is not a valid QD HAR template", input.name))?;
+    let (template_id, updated) = persist_entry(
+        store,
+        subscription,
+        entry,
+        input.name,
+        input.description,
+        input.har,
+        input.template_id,
+    )
+    .await?;
+    Ok(LibraryImportOutcome {
+        name: entry.name.clone(),
+        template_id,
+        updated,
+    })
+}
+
+/// Every enabled source's catalogue as one list.
+///
+/// Sources are read concurrently, because each is a network round trip and the
+/// listing is rebuilt every time the user arrives. One unreachable repository
+/// reports its own error instead of taking the listing down with it.
+pub async fn overview(
+    store: &Store,
+    client: &Client,
+    cache: &CatalogueCache,
+    subscriptions: &[TemplateSubscription],
+    refresh: bool,
+) -> Result<LibraryOverview> {
+    let max_age = if refresh {
+        Duration::ZERO
+    } else {
+        CATALOGUE_TTL
+    };
+    let catalogues = futures::future::join_all(
+        subscriptions
+            .iter()
+            .map(|subscription| cache.catalogue(client, &subscription.url, max_age)),
+    )
+    .await;
+    let mut entries = Vec::new();
+    let mut sources = Vec::with_capacity(subscriptions.len());
+    let mut truncated = false;
+    for (subscription, result) in subscriptions.iter().zip(catalogues) {
+        match result {
+            Ok((catalogue, cached)) => {
+                let installed =
+                    installed_index(store.list_template_imports(subscription.id).await?);
+                let mut contributed = 0;
+                for entry in &catalogue.entries {
+                    if entries.len() >= MAX_OVERVIEW_ENTRIES {
+                        truncated = true;
+                        break;
+                    }
+                    let mut row = library_entry(entry, installed.get(entry.name.as_str()));
+                    row.source_id = Some(subscription.id);
+                    row.source_name = Some(subscription.name.clone());
+                    entries.push(row);
+                    contributed += 1;
+                }
+                sources.push(LibrarySourceStatus {
+                    subscription_id: subscription.id,
+                    name: subscription.name.clone(),
+                    source_kind: Some(catalogue.source_kind.to_string()),
+                    entries: contributed,
+                    cached,
+                    error: None,
+                });
+            }
+            Err(err) => sources.push(LibrarySourceStatus {
+                subscription_id: subscription.id,
+                name: subscription.name.clone(),
+                source_kind: None,
+                entries: 0,
+                cached: false,
+                error: Some(bounded(&err.to_string())),
+            }),
+        }
+    }
+    Ok(LibraryOverview {
+        entries,
+        sources,
+        truncated,
+    })
+}
+
+/// Write a HAR into the owner's templates under `name` and record where it came
+/// from. Shared by the two ways a source's template arrives: the bytes upstream
+/// publishes (`import_entry`) and the bytes the user edited (`apply`).
+async fn persist_entry(
+    store: &Store,
+    subscription: &TemplateSubscription,
+    entry: &RawEntry,
+    name: String,
+    description: Option<String>,
+    har: Value,
+    linked_template_id: Option<i64>,
+) -> Result<(i64, bool)> {
     let owner_id = subscription.owner_id;
     // Prefer the recorded provenance. Fall back to matching by name so
     // templates imported before provenance existed are refreshed in place
     // rather than duplicated — the same rule the automatic sync always used.
+    // The name compared is the one being saved, which for `apply` is what the
+    // user typed and for `import_entry` is the entry's own name.
     let existing = match linked_template_id {
         Some(id) => Some(id),
-        None => store.find_template_by_name(owner_id, &entry.name).await?,
+        None => store.find_template_by_name(owner_id, &name).await?,
     };
     let (template_id, updated) = match existing {
         Some(id) => {
@@ -273,7 +514,7 @@ pub(crate) async fn import_entry(
                     id,
                     owner_id,
                     UpdateQdHarTemplate {
-                        name: entry.name.clone(),
+                        name,
                         description,
                         har,
                     },
@@ -287,7 +528,7 @@ pub(crate) async fn import_entry(
                 .import_qd_har_for_owner(
                     owner_id,
                     ImportQdHarTemplate {
-                        name: entry.name.clone(),
+                        name,
                         description,
                         har,
                     },
@@ -547,6 +788,10 @@ fn library_entry(entry: &RawEntry, installed: Option<&TemplateImport>) -> Librar
         update_available: installed.is_some()
             && version_is_newer(entry.version.as_deref(), installed_version.as_deref()),
         installed_version,
+        // Filled in by the aggregate listing, which puts several sources in one
+        // list and so has to say which is which.
+        source_id: None,
+        source_name: None,
     }
 }
 
@@ -930,5 +1175,107 @@ mod tests {
         assert_eq!(value["templates"][0]["updated"], json!(false));
         assert_eq!(value["templates"][1]["template_id"], json!(9));
         assert_eq!(value["templates"][1]["updated"], json!(true));
+    }
+
+    fn raw_entry(name: &str) -> RawEntry {
+        RawEntry {
+            name: name.into(),
+            author: Some("loveyanglove".into()),
+            comments: None,
+            version: Some("20260425".into()),
+            date: Some("2026-04-25 10:00:03".into()),
+            filename: format!("{name}.har"),
+            url: None,
+            comment_url: None,
+            content: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_catalogue_cache_reuses_a_recent_read_and_a_refresh_skips_it() {
+        // A non-GitHub URL is a one-entry source and that branch reads nothing,
+        // so this exercises the cache itself rather than the network: the
+        // aggregate listing leans on reuse here to stay cheap, and on the
+        // zero-max-age path to be able to bypass it on demand.
+        let client = Client::new();
+        let cache = CatalogueCache::new();
+        let url = "https://example.com/naive.har";
+
+        let (_, cached) = cache.catalogue(&client, url, CATALOGUE_TTL).await.unwrap();
+        assert!(!cached, "the first read has nothing to reuse");
+        let (_, cached) = cache.catalogue(&client, url, CATALOGUE_TTL).await.unwrap();
+        assert!(cached, "the second read must reuse the first");
+        let (_, cached) = cache.catalogue(&client, url, Duration::ZERO).await.unwrap();
+        assert!(!cached, "max_age zero must bypass the cache");
+    }
+
+    #[test]
+    fn aggregate_rows_name_their_source_and_a_single_source_row_does_not() {
+        // The browser resolves a row's action against `source_id`, so the
+        // aggregate listing has to carry it — while a single-source listing
+        // omits it instead of repeating the source on every row, which is what
+        // the frontend keys off to know which request a row belongs to.
+        let row = |source: Option<(i64, &str)>| {
+            let mut row = library_entry(&raw_entry("雨晨分享站"), None);
+            if let Some((id, name)) = source {
+                row.source_id = Some(id);
+                row.source_name = Some(name.to_string());
+            }
+            row
+        };
+
+        let single = serde_json::to_value(row(None)).unwrap();
+        assert!(single.get("source_id").is_none());
+        assert!(single.get("source_name").is_none());
+
+        let overview = LibraryOverview {
+            entries: vec![row(Some((3, "official")))],
+            sources: vec![
+                LibrarySourceStatus {
+                    subscription_id: 3,
+                    name: "official".into(),
+                    source_kind: Some("manifest".into()),
+                    entries: 1,
+                    cached: true,
+                    error: None,
+                },
+                // A source that could not be read contributes nothing and says
+                // why, rather than blanking the entries that did arrive.
+                LibrarySourceStatus {
+                    subscription_id: 4,
+                    name: "third-party".into(),
+                    source_kind: None,
+                    entries: 0,
+                    cached: false,
+                    error: Some("cannot reach GitHub API".into()),
+                },
+            ],
+            truncated: false,
+        };
+        let value = serde_json::to_value(&overview).unwrap();
+        assert_eq!(value["entries"][0]["source_id"], json!(3));
+        assert_eq!(value["entries"][0]["source_name"], json!("official"));
+        assert_eq!(value["sources"][0]["cached"], json!(true));
+        assert_eq!(value["sources"][1]["entries"], json!(0));
+        assert_eq!(
+            value["sources"][1]["error"],
+            json!("cannot reach GitHub API")
+        );
+        // No kind rather than a wrong one: the source was never read.
+        assert_eq!(value["sources"][1]["source_kind"], Value::Null);
+        assert_eq!(value["truncated"], json!(false));
+    }
+
+    #[test]
+    fn preview_carries_the_entry_and_the_upstream_document() {
+        let preview = LibraryPreview {
+            entry: library_entry(&raw_entry("雨晨分享站"), None),
+            har: json!({ "log": { "version": "1.2", "entries": [] } }),
+        };
+        let value = serde_json::to_value(&preview).unwrap();
+        assert_eq!(value["entry"]["name"], json!("雨晨分享站"));
+        assert_eq!(value["entry"]["version"], json!("20260425"));
+        assert_eq!(value["har"]["log"]["version"], json!("1.2"));
+        assert_eq!(value["har"]["log"]["entries"], json!([]));
     }
 }

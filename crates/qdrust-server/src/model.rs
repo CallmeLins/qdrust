@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use qdrust_core::plugin::PluginCapability;
 use qdrust_core::template::TemplateDefinition;
@@ -359,6 +360,14 @@ pub struct LibraryEntry {
     /// True when the entry is installed at an older version than the source
     /// now offers.
     pub update_available: bool,
+    /// Which source the entry came from. Only the aggregate listing fills these
+    /// in — a single-source listing already knows, and its rows act against
+    /// that source — so they stay absent there rather than repeating it on
+    /// every row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 /// A subscription source's catalogue.
@@ -373,10 +382,74 @@ pub struct TemplateLibrary {
     pub entries: Vec<LibraryEntry>,
 }
 
+/// Every subscribed source's catalogue in one list, which is what a QD user
+/// means by "public templates": one page of everything on offer, not one page
+/// per repository.
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryOverview {
+    /// Entries from every source that could be read, in source order.
+    pub entries: Vec<LibraryEntry>,
+    /// How each source contributed, including the ones that failed. A single
+    /// unreachable repository must not blank the whole page, so its error is
+    /// reported here instead of failing the request.
+    pub sources: Vec<LibrarySourceStatus>,
+    /// True when the total entry cap was hit, so the list is short of what the
+    /// sources actually offer.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LibrarySourceStatus {
+    pub subscription_id: i64,
+    pub name: String,
+    /// `manifest` or `files`; absent when the source could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    /// Entries this source contributed to the response, after the cap.
+    pub entries: usize,
+    /// True when the catalogue was reused instead of fetched again.
+    pub cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One entry fetched for inspection but deliberately not written yet.
+///
+/// This is the difference that keeps subscribing from littering the template
+/// list: the user sees the upstream template, edits it, and only a save writes
+/// anything.
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryPreview {
+    /// The entry's metadata resolved against local state, exactly as the
+    /// listing shows it.
+    pub entry: LibraryEntry,
+    /// The upstream HAR document, untouched.
+    pub har: Value,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ImportLibraryTemplates {
     /// Entry names to import, as returned by the library listing.
     pub names: Vec<String>,
+}
+
+/// Save the template a user edited out of a preview.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ApplyLibraryTemplate {
+    /// Entry identity inside the source, as returned by the listing.
+    pub entry: String,
+    /// Local template to refresh in place. Absent creates one, falling back to
+    /// a name match so an entry that was imported before provenance existed is
+    /// refreshed rather than duplicated.
+    #[serde(default)]
+    pub template_id: Option<i64>,
+    /// Name to save under. The editor allows changing it, so this can differ
+    /// from the entry's own name.
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The HAR document as edited in the browser.
+    pub har: Value,
 }
 
 #[derive(Clone, Debug, Serialize)]

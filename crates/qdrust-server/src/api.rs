@@ -24,6 +24,7 @@ use qdrust_core::plugin::{
     SubprocessPlugin,
 };
 use qdrust_core::qd_har::{QdHar, QdProgram};
+use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -36,7 +37,7 @@ use crate::auth::{hash_password, token_hash, verify_password};
 use crate::oidc;
 use crate::{
     model::{
-        AdminUserUpdate, AuthCredentials, AuthResponse, AuthenticatedSession,
+        AdminUserUpdate, ApplyLibraryTemplate, AuthCredentials, AuthResponse, AuthenticatedSession,
         BatchCreateNotificationAction, BatchTaskOperation, BatchTaskResult, ChangePassword,
         ClearLogs, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest,
         CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
@@ -117,6 +118,10 @@ struct AppState {
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
     http_client: reqwest::Client,
     session_cache: crate::redis_cache::SessionCache,
+    /// Catalogues shared between requests, so the aggregate listing does not
+    /// re-read every source on each visit. Owned by the router rather than a
+    /// process-wide global, which also keeps the tests below from sharing state.
+    catalogue_cache: crate::library::CatalogueCache,
     /// The URL sub-path the site is served under (e.g. "/qd" or ""). Threaded
     /// into handlers so OIDC redirect URIs can be derived consistently.
     base_path: String,
@@ -269,6 +274,15 @@ pub fn router_with_auth(
             get(browse_subscription_library),
         )
         .route(
+            "/api/v1/subscriptions/{id}/library/preview",
+            get(preview_subscription_library),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/library/apply",
+            axum::routing::post(apply_subscription_library),
+        )
+        .route("/api/v1/library", get(library_overview))
+        .route(
             "/api/v1/subscriptions/{id}/import",
             axum::routing::post(import_subscription_library),
         )
@@ -383,6 +397,7 @@ pub fn router_with_auth(
         settings,
         http_client,
         session_cache,
+        catalogue_cache: crate::library::CatalogueCache::new(),
         base_path: base_path.to_string(),
         header_auth,
     };
@@ -2821,6 +2836,99 @@ async fn import_subscription_library(
     Ok(Json(json!(result)))
 }
 
+/// One entry to fetch, named by the listing.
+///
+/// The name is a query parameter rather than a path segment because it is a
+/// free-form string chosen by the source: a manifest key, or a repository file
+/// path for a source with no manifest. A `/` in one would not survive a path
+/// segment, and a reverse proxy is free to normalise an escaped one.
+#[derive(Deserialize)]
+struct LibraryEntryQuery {
+    entry: String,
+}
+
+/// Fetch one entry's content without writing anything, so a template can be
+/// read before it is worth a place in the user's library. This is the "look
+/// first" half of subscribing; `apply_subscription_library` is the save.
+#[derive(Deserialize, Default)]
+struct RefreshQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn preview_subscription_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(params): Query<LibraryEntryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = owned_subscription(&state, id, session.user.id).await?;
+    let preview = crate::library::preview(
+        &state.store,
+        &state.http_client,
+        &state.catalogue_cache,
+        &subscription,
+        &params.entry,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(preview)))
+}
+
+/// Save the template a user edited out of a preview. Runs inline because the
+/// caller is waiting on exactly one template and wants its id back.
+async fn apply_subscription_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<ApplyLibraryTemplate>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscription = owned_subscription(&state, id, session.user.id).await?;
+    let outcome = crate::library::apply(
+        &state.store,
+        &state.http_client,
+        &state.catalogue_cache,
+        &subscription,
+        input,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(outcome)))
+}
+
+/// Every subscribed source in one list, which is what a QD user means by the
+/// public templates page. Disabled subscriptions are left out — a source the
+/// user turned off should not keep contributing rows they cannot act on.
+///
+/// `?refresh=true` re-reads the sources instead of reusing a recent catalogue,
+/// for the user who just changed something upstream.
+async fn library_overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<RefreshQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let subscriptions: Vec<TemplateSubscription> = state
+        .store
+        .list_subscriptions(session.user.id)
+        .await?
+        .into_iter()
+        .filter(|subscription| subscription.enabled)
+        .collect();
+    let overview = crate::library::overview(
+        &state.store,
+        &state.http_client,
+        &state.catalogue_cache,
+        &subscriptions,
+        params.refresh,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(overview)))
+}
+
 async fn owned_subscription(
     state: &AppState,
     id: i64,
@@ -3667,6 +3775,20 @@ mod tests {
                 ["$ref"],
             json!("#/components/schemas/LibraryImportOutcome")
         );
+        // Looking before keeping: preview reads the entry, apply saves it, and
+        // the aggregate listing is what puts every source on one page.
+        assert!(document["paths"]["/api/v1/subscriptions/{id}/library/preview"]["get"].is_object());
+        assert!(document["paths"]["/api/v1/subscriptions/{id}/library/apply"]["post"].is_object());
+        assert!(document["paths"]["/api/v1/library"]["get"].is_object());
+        assert_eq!(
+            document["components"]["schemas"]["LibraryPreview"]["properties"]["har"]["type"],
+            json!("object")
+        );
+        assert_eq!(
+            document["components"]["schemas"]["LibraryOverview"]["properties"]["sources"]["items"]
+                ["$ref"],
+            json!("#/components/schemas/LibrarySourceStatus")
+        );
         assert_eq!(
             document["components"]["schemas"]["ApiError"]["required"]
                 .as_array()
@@ -3921,6 +4043,70 @@ mod tests {
                 .unwrap()
                 .contains("no templates selected")
         );
+
+        // Preview and apply resolve ownership before the source is contacted
+        // too, so an unknown id answers 404 with no outbound request. The
+        // bodies are well formed on purpose: extractors run before the handler,
+        // and a malformed one would answer 422 instead of exercising this.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/subscriptions/9999/library/preview?entry=whatever")
+                    .header(COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/subscriptions/9999/library/apply")
+                    .header(COOKIE, &cookie_header)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"entry": "whatever", "name": "whatever", "har": {}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The entry name is required, and it travels as a query parameter
+        // rather than a path segment so a name containing a slash survives.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/subscriptions/{id}/library/preview"))
+                    .header(COOKIE, &cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The aggregate listing is session-gated. It is deliberately not called
+        // with a session here: this account now owns a subscription, and that
+        // request would read GitHub.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/library")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

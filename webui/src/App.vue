@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LibraryEntry, type TemplateLibrary } from "./api";
+import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import { consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
@@ -622,7 +622,7 @@ type SortDir = "asc" | "desc";
  *  scanned for: what changed last, first. */
 const templateSort = reactive<{ key: "name" | "grp" | "variables" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
 const publicSort = reactive<{ key: "name" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
-const librarySort = reactive<{ key: "name" | "author" | "version" | "date"; dir: SortDir }>({ key: "date", dir: "desc" });
+const librarySort = reactive<{ key: "name" | "author" | "source" | "version" | "date"; dir: SortDir }>({ key: "date", dir: "desc" });
 
 /** Flip the sort column, or reverse it when the same header is clicked again.
  *  Text columns open ascending (A→Z is what a name column means to a reader),
@@ -744,9 +744,22 @@ async function removeTemplate(id: number, name: string) {
 }
 function openImportModal(template?: Template) {
   editingTemplateId.value = template?.id ?? null;
+  // Every other way into this editor comes through here, so clearing the
+  // library link here is what keeps them all writing to the local templates.
+  libraryPreview.value = null;
   Object.assign(importForm, { name: template?.name ?? "", description: template?.description ?? "" });
   harEditorDoc.value = template?.qd_har ?? { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
   showImport.value = true;
+}
+
+/** Close the editor and drop everything it was holding, so the next open starts
+ *  from nothing rather than from whatever was being previewed. */
+function closeHarEditor() {
+  showImport.value = false;
+  editingTemplateId.value = null;
+  libraryPreview.value = null;
+  Object.assign(importForm, { name: "", description: "" });
+  harEditorDoc.value = null;
 }
 
 /** "New task" on a templates-page row: the create dialog opens with this
@@ -831,14 +844,29 @@ async function onHarFile(event: Event) {
 }
 async function saveHar(doc: object) {
   if (!importForm.name.trim()) { notify(t("templateName"), "error"); return; }
+  const preview = libraryPreview.value;
   try {
-    if (editingTemplateId.value) await api.updateQdHar(editingTemplateId.value, importForm.name, importForm.description, doc);
-    else await api.importQdHar(importForm.name, importForm.description, doc);
-    notify(t("importDone"));
-    showImport.value = false;
-    editingTemplateId.value = null;
-    Object.assign(importForm, { name: "", description: "" });
-    harEditorDoc.value = null;
+    if (preview) {
+      // Saving from a library preview writes back through `apply`, which also
+      // records the provenance row: that is what marks the entry imported and
+      // lets a later upstream revision show up as an update. `templateId` is
+      // the local copy being refreshed, absent the first time.
+      const outcome = await api.applySubscriptionTemplate(preview.subscriptionId, {
+        entry: preview.entry,
+        template_id: preview.templateId,
+        name: importForm.name,
+        description: importForm.description.trim() || null,
+        har: doc,
+      });
+      notify(outcome.updated ? fmt("libraryUpdatedCount", { n: 1 }) : fmt("libraryImportedCount", { n: 1 }));
+    } else if (editingTemplateId.value) {
+      await api.updateQdHar(editingTemplateId.value, importForm.name, importForm.description, doc);
+      notify(t("importDone"));
+    } else {
+      await api.importQdHar(importForm.name, importForm.description, doc);
+      notify(t("importDone"));
+    }
+    closeHarEditor();
     await openTemplates();
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
@@ -1153,11 +1181,20 @@ async function saveSubscription() {
     Object.assign(subForm, { name: "", url: "" });
     await loadSubscriptions();
     // First subscription on the page: point the public list at it right away.
-    await ensureLibraryLoaded();
+    // Otherwise refresh the table, so the new source's catalogue shows up —
+    // sources already in hand come back from the server's cache, only the new
+    // one is read.
+    if (library.value) await loadLibrary();
+    else await ensureLibraryLoaded();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleSubscription(sub: TemplateSubscription) {
-  try { await api.updateSubscription(sub.id, { enabled: !sub.enabled }); await loadSubscriptions(); }
+  try {
+    await api.updateSubscription(sub.id, { enabled: !sub.enabled });
+    await loadSubscriptions();
+    // A disabled source drops out of the aggregate, so the table changes with it.
+    if (library.value && libraryViewingAll.value) await loadLibrary();
+  }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function setSubscriptionMode(sub: TemplateSubscription, mode: "select" | "all") {
@@ -1197,37 +1234,82 @@ async function showSubSyncs(id: number) {
 }
 
 // ---------- template library (the public half of the templates page) ----------
-const library = ref<TemplateLibrary | null>(null);
-/** Source currently being browsed. Only the dropdown moves it: browsing used to
- *  be a page of its own, which is what made the trip go templates → library →
- *  back; now it is a selection inside the page. */
-const librarySourceId = ref<number | null>(null);
+/** One shape for both ways of listing a library: a single source, and every
+ *  source at once. The aggregate endpoint already answers in this shape and a
+ *  single-source response is folded into it, so the table below renders one
+ *  thing rather than branching on which request produced it. */
+interface LibraryView {
+  entries: LibraryEntry[];
+  sources: LibrarySourceStatus[];
+  truncated: boolean;
+}
+const library = ref<LibraryView | null>(null);
+/** Which source the table shows: a subscription id, or `all` for the sum of
+ *  every source. `all` is the default because "what is on offer" is one
+ *  question; answering it one repository at a time is what made browsing feel
+ *  like filing. */
+const librarySourceId = ref<number | "all" | null>(null);
 const libraryLoading = ref(false);
 const libraryImporting = ref(false);
 const librarySearch = ref("");
 const libraryFilter = ref<"" | "installed" | "updates">("");
 const librarySelected = ref<Set<string>>(new Set());
 const libraryFailures = ref<{ name: string; error: string }[]>([]);
-/** Entry whose per-row action is in flight, so one row shows progress instead
- *  of the whole table. */
-const libraryBusyName = ref("");
+/** Entry whose per-row action is in flight — held as the row's selection key,
+ *  because the aggregate can show the same name from two sources — so one row
+ *  shows progress instead of the whole table. */
+const libraryBusyKey = ref("");
 /** Ticking entries is the exception, not the path (a source in "import all"
  *  mode needs no ticking at all), so the checkbox column only appears when the
  *  user asks for it. */
 const libraryBatch = ref(false);
+/** The library entry the open editor came from. While this is set, saving goes
+ *  through `apply` — which also records the provenance row that marks the entry
+ *  imported — instead of the local-file path. Cleared by `openImportModal`, so
+ *  every other way into that editor is unaffected. */
+const libraryPreview = ref<{ subscriptionId: number; entry: string; templateId: number | null } | null>(null);
 const libraryFilterOptions = computed(() => [
   { value: "" as const, label: t("libraryFilterAll") },
   { value: "installed" as const, label: t("libraryFilterInstalled") },
   { value: "updates" as const, label: t("libraryFilterUpdates") },
 ]);
-const librarySource = computed(() => subscriptions.value.find((sub) => sub.id === librarySourceId.value) ?? null);
-const librarySourceOptions = computed(() => subscriptions.value.map((sub) => ({ value: sub.id, label: sub.name })));
+const libraryViewingAll = computed(() => librarySourceId.value === "all");
+const librarySource = computed(() =>
+  typeof librarySourceId.value === "number"
+    ? subscriptions.value.find((sub) => sub.id === librarySourceId.value) ?? null
+    : null,
+);
+const librarySourceOptions = computed(() => [
+  { value: "all" as const, label: t("libraryAllSources") },
+  ...subscriptions.value.map((sub) => ({ value: sub.id, label: sub.name })),
+]);
 /** How the source's catalogue was read, so a plain repository (no manifest) is
- *  not mistaken for a broken library. */
+ *  not mistaken for a broken library. Only meaningful for one source: across
+ *  several, each reads its own way. */
 const librarySourceKind = computed(() => {
-  if (!library.value) return "";
-  return library.value.source_kind === "files" ? t("librarySourceFiles") : t("librarySourceManifest");
+  if (!library.value || libraryViewingAll.value) return "";
+  const kind = library.value.sources[0]?.source_kind;
+  if (!kind) return "";
+  return kind === "files" ? t("librarySourceFiles") : t("librarySourceManifest");
 });
+/** Sources that could not be read. Listed so a dead repository explains itself
+ *  instead of only contributing no rows. */
+const librarySourceFaults = computed(() => (library.value?.sources ?? []).filter((source) => source.error));
+/** The server caps how many entries it will put in one aggregate response; when
+ *  the cap is hit the list is short of what the sources offer, which is worth
+ *  saying rather than showing a silently incomplete table. */
+const libraryTruncated = computed(() => library.value?.truncated === true);
+/** A row's source: the aggregate fills it in per entry, and a single-source
+ *  listing *is* the selection. */
+function entrySourceId(entry: LibraryEntry): number | null {
+  if (entry.source_id != null) return entry.source_id;
+  return typeof librarySourceId.value === "number" ? librarySourceId.value : null;
+}
+/** Selection identity. A name is only unique inside one source — two libraries
+ *  can each offer one — so the key carries the source as well. */
+function libraryKey(entry: LibraryEntry): string {
+  return `${entrySourceId(entry) ?? 0}:${entry.name}`;
+}
 /** Entries matching the current search and filter, in the clicked sort order. */
 const libraryEntries = computed<LibraryEntry[]>(() => {
   const entries = library.value?.entries ?? [];
@@ -1236,12 +1318,13 @@ const libraryEntries = computed<LibraryEntry[]>(() => {
     if (libraryFilter.value === "installed" && !entry.installed) return false;
     if (libraryFilter.value === "updates" && !entry.update_available) return false;
     if (!query) return true;
-    return `${entry.name} ${entry.author ?? ""}`.toLowerCase().includes(query);
+    return `${entry.name} ${entry.author ?? ""} ${entry.source_name ?? ""}`.toLowerCase().includes(query);
   });
   return sortRows(matched, librarySort, (entry, key) => {
     switch (key) {
       case "name": return entry.name;
       case "author": return entry.author ?? "";
+      case "source": return entry.source_name ?? "";
       case "version": return entry.version ?? "";
       default: return entry.date ?? "";
     }
@@ -1251,14 +1334,16 @@ const librarySelectedCount = computed(() => librarySelected.value.size);
 /** Only entries currently visible can be selected, so a filter never hides an
  *  unintended part of the selection. */
 const libraryAllVisibleSelected = computed(
-  () => libraryEntries.value.length > 0 && libraryEntries.value.every((entry) => librarySelected.value.has(entry.name)),
+  () => libraryEntries.value.length > 0 && libraryEntries.value.every((entry) => librarySelected.value.has(libraryKey(entry))),
 );
 const libraryUpdateCount = computed(() => (library.value?.entries ?? []).filter((entry) => entry.update_available).length);
 /** Headers of the library table; `date` is the manifest's own timestamp, which
- *  is why it — not our `imported_at` — is what the rows are ordered by. */
+ *  is why it — not our `imported_at` — is what the rows are ordered by. The
+ *  source column appears only where more than one source can appear in it. */
 const libraryColumns = computed(() => [
   { key: "name" as const, label: t("name"), text: true },
   { key: "author" as const, label: t("libraryAuthor"), text: true },
+  ...(libraryViewingAll.value ? [{ key: "source" as const, label: t("librarySource"), text: true }] : []),
   { key: "version" as const, label: t("libraryVersion"), text: true },
   { key: "date" as const, label: t("libraryDate"), text: false },
 ]);
@@ -1267,31 +1352,47 @@ const libraryColumns = computed(() => [
  *  fetch just because a publish/unpublish refreshed the page. */
 async function ensureLibraryLoaded() {
   if (library.value || librarySourceId.value != null) return;
-  const first = subscriptions.value[0];
-  if (!first) return;
-  librarySourceId.value = first.id;
+  if (subscriptions.value.length === 0) return;
+  librarySourceId.value = "all";
   await loadLibrary();
 }
-/** Point the section at another source. `null` clears it back to the prompt. */
-async function selectLibrarySource(id: number | null) {
+/** Point the section at another source, or at all of them. */
+async function selectLibrarySource(id: number | "all") {
   if (id === librarySourceId.value && library.value) return;
   librarySourceId.value = id;
   library.value = null;
   librarySelected.value = new Set();
   libraryFailures.value = [];
-  if (id == null) return;
   await loadLibrary();
 }
-async function loadLibrary() {
-  const source = librarySource.value;
-  if (!source) return;
+async function loadLibrary(refresh = false) {
+  const source = librarySourceId.value;
+  if (source == null) return;
   libraryLoading.value = true;
   try {
-    const result = await api.browseSubscriptionLibrary(source.id);
-    library.value = result;
+    // Both responses land in one shape, so the table has a single input.
+    if (source === "all") {
+      const result = await api.libraryOverview(refresh);
+      library.value = { entries: result.entries, sources: result.sources, truncated: result.truncated };
+    } else {
+      const result = await api.browseSubscriptionLibrary(source);
+      library.value = {
+        entries: result.entries,
+        sources: [
+          {
+            subscription_id: result.subscription_id,
+            name: librarySource.value?.name ?? "",
+            source_kind: result.source_kind,
+            entries: result.entries.length,
+            cached: false,
+          },
+        ],
+        truncated: false,
+      };
+    }
     // Drop selections the source no longer offers.
-    const names = new Set(result.entries.map((entry) => entry.name));
-    librarySelected.value = new Set([...librarySelected.value].filter((name) => names.has(name)));
+    const keys = new Set(library.value.entries.map(libraryKey));
+    librarySelected.value = new Set([...librarySelected.value].filter((key) => keys.has(key)));
   } catch (cause) {
     library.value = null;
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
@@ -1299,83 +1400,104 @@ async function loadLibrary() {
     libraryLoading.value = false;
   }
 }
-function toggleLibraryEntry(name: string) {
+function toggleLibraryEntry(entry: LibraryEntry) {
   const next = new Set(librarySelected.value);
-  if (next.has(name)) next.delete(name); else next.add(name);
+  const key = libraryKey(entry);
+  if (next.has(key)) next.delete(key); else next.add(key);
   librarySelected.value = next;
 }
 function toggleLibraryAllVisible() {
   librarySelected.value = libraryAllVisibleSelected.value
     ? new Set()
-    : new Set(libraryEntries.value.map((entry) => entry.name));
+    : new Set(libraryEntries.value.map(libraryKey));
 }
 function clearLibrarySelection() {
   librarySelected.value = new Set();
 }
-/** The row action: pull this entry in and open it for editing.
+/** The row action: fetch this entry and hand it to the editor, writing nothing.
  *
- *  This is the whole point of folding the library into the page. The import
- *  response now carries the id of every template it wrote, so subscribing can
- *  hand the editor exactly what was just saved — the old page could only count
- *  what it imported, which is why "import" looked like it did nothing and the
- *  template had to be hunted down in another list afterwards. */
-async function subscribeLibraryEntry(entry: LibraryEntry) {
-  const source = librarySource.value;
-  if (!source) return;
-  libraryBusyName.value = entry.name;
+ *  This is the whole point of the page. What a library offers is upstream
+ *  content the user has not chosen yet, so it is shown first and only a save
+ *  puts it among their templates — the old "import" was a black box that
+ *  reported a count and left nothing to act on. */
+async function previewLibraryEntry(entry: LibraryEntry) {
+  const sourceId = entrySourceId(entry);
+  if (sourceId == null) return;
+  libraryBusyKey.value = libraryKey(entry);
   libraryFailures.value = [];
   try {
-    const result = await api.importSubscriptionTemplates(source.id, [entry.name]);
-    const failure = result.failed.find((item) => item.name === entry.name);
-    if (failure) {
-      libraryFailures.value = result.failed;
-      notify(failure.error, "error");
-      return;
-    }
-    const outcome = result.templates.find((item) => item.name === entry.name);
-    await Promise.all([loadSubscriptions(), loadLibrary()]);
-    notify(outcome?.updated ? fmt("libraryUpdatedCount", { n: 1 }) : fmt("libraryImportedCount", { n: 1 }));
-    const template = outcome ? templates.value.find((item) => item.id === outcome.template_id) : undefined;
-    if (template) openImportModal(template);
+    const preview = await api.previewSubscriptionEntry(sourceId, entry.name);
+    openImportModal();
+    importForm.name = preview.entry.name;
+    // The manifest's variable notes are what a reader wants as the description,
+    // and the field is a single line, so fold them onto one.
+    importForm.description = (preview.entry.comments ?? "").replace(/\s+/g, " ").trim();
+    harEditorDoc.value = preview.har;
+    // Set after `openImportModal`, which clears it along with every other entry
+    // point into this editor.
+    libraryPreview.value = {
+      subscriptionId: sourceId,
+      entry: preview.entry.name,
+      templateId: preview.entry.installed_template_id ?? null,
+    };
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
   } finally {
-    libraryBusyName.value = "";
+    libraryBusyKey.value = "";
   }
 }
 /** Entries already in sync have nothing to fetch, so their row opens the local
- *  copy straight away. A missing local copy falls back to the import path, which
- *  keeps the row honest when a template was deleted here while the provenance
- *  row survived. */
+ *  copy straight away. A missing local copy falls back to the preview path,
+ *  which keeps the row honest when a template was deleted here while the
+ *  provenance row survived. */
 function openLibraryEntry(entry: LibraryEntry) {
   const local = entry.installed_template_id != null
     ? templates.value.find((item) => item.id === entry.installed_template_id)
     : undefined;
   if (local) openImportModal(local);
-  else void subscribeLibraryEntry(entry);
+  else void previewLibraryEntry(entry);
 }
-/** The bulk path, kept as a secondary way in: a source in "import all" mode syncs
- *  by itself, so ticking entries is only ever needed to pre-load a handful.
+/** The bulk path, kept as a secondary way in: a source in "import all" mode
+ *  syncs by itself, so ticking entries is only ever needed to pre-load a
+ *  handful.
  *
- *  Unlike `subscribeLibraryEntry` this does not open the editor — a batch has no
- *  single template to open — so it only reports what happened, per entry. */
+ *  Unlike the row action this does not open the editor — a batch has no single
+ *  template to open — so it only reports what happened, per entry. A selection
+ *  can span sources when the table shows all of them and the import endpoint is
+ *  per source, so the calls are grouped and the totals reported together. */
 async function importSelectedLibraryEntries() {
-  const source = librarySource.value;
-  if (!source || librarySelected.value.size === 0) {
+  const selected = new Set(librarySelected.value);
+  const bySource = new Map<number, string[]>();
+  for (const entry of library.value?.entries ?? []) {
+    if (!selected.has(libraryKey(entry))) continue;
+    const sourceId = entrySourceId(entry);
+    if (sourceId == null) continue;
+    const names = bySource.get(sourceId) ?? [];
+    names.push(entry.name);
+    bySource.set(sourceId, names);
+  }
+  if (bySource.size === 0) {
     notify(t("libraryNothingSelected"), "error");
     return;
   }
-  const names = [...librarySelected.value];
   libraryImporting.value = true;
   libraryFailures.value = [];
   try {
-    const result = await api.importSubscriptionTemplates(source.id, names);
+    let imported = 0;
+    let updated = 0;
+    const failed: { name: string; error: string }[] = [];
+    for (const [sourceId, names] of bySource) {
+      const result = await api.importSubscriptionTemplates(sourceId, names);
+      imported += result.imported;
+      updated += result.updated;
+      failed.push(...result.failed);
+    }
     const parts: string[] = [];
-    if (result.imported) parts.push(fmt("libraryImportedCount", { n: result.imported }));
-    if (result.updated) parts.push(fmt("libraryUpdatedCount", { n: result.updated }));
-    if (result.failed.length) parts.push(fmt("libraryFailedCount", { n: result.failed.length }));
-    if (parts.length) notify(parts.join(" · "), result.failed.length ? "error" : "success");
-    libraryFailures.value = result.failed;
+    if (imported) parts.push(fmt("libraryImportedCount", { n: imported }));
+    if (updated) parts.push(fmt("libraryUpdatedCount", { n: updated }));
+    if (failed.length) parts.push(fmt("libraryFailedCount", { n: failed.length }));
+    if (parts.length) notify(parts.join(" · "), failed.length ? "error" : "success");
+    libraryFailures.value = failed;
     librarySelected.value = new Set();
     // Reflect the new installed/update state, and pull the new templates into
     // the list above without leaving the page.
@@ -1655,7 +1777,7 @@ onMounted(async () => {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       if (showCreate.value) showCreate.value = false;
-      if (showImport.value) showImport.value = false;
+      if (showImport.value) closeHarEditor();
       if (showHelp.value) showHelp.value = false;
       menuOpen.value = false;
     }
@@ -2128,8 +2250,9 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </section>
 
         <!-- 2) What can be taken: every subscribed library in one list, newest
-             first, one action per row. Subscribing imports and opens the editor,
-             so this is where the click that used to cost four now stops. -->
+             first, one action per row. Subscribing opens the entry for review
+             and the save is what files it, so this is where the click that used
+             to cost four now stops. -->
         <section class="task-section">
           <h2>{{ t('publicLibrary') }}</h2>
           <p class="muted section-hint">{{ t('publicLibraryHint') }}</p>
@@ -2142,10 +2265,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <div class="toolbar library-toolbar">
               <label class="group-filter">
                 <span>{{ t('librarySource') }}</span>
-                <Dropdown :model-value="librarySourceId" :options="librarySourceOptions" compact @change="selectLibrarySource($event as number | null)" />
+                <Dropdown :model-value="librarySourceId" :options="librarySourceOptions" compact @change="selectLibrarySource($event as number | 'all')" />
               </label>
               <span v-if="librarySourceKind" class="chip">{{ librarySourceKind }}</span>
-              <button class="icon-button" :title="t('refresh')" :disabled="libraryLoading" @click="loadLibrary()"><RefreshCw :class="{ spin: libraryLoading }" :size="18" /></button>
+              <button class="icon-button" :title="t('refresh')" :disabled="libraryLoading" @click="loadLibrary(true)"><RefreshCw :class="{ spin: libraryLoading }" :size="18" /></button>
               <input v-model="librarySearch" class="library-search" type="search" :placeholder="t('librarySearchPlaceholder')" />
               <div class="seg" role="group" :aria-label="t('libraryTitle')">
                 <button
@@ -2171,6 +2294,16 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </button>
             </div>
 
+            <!-- One dead repository must not read as an empty library, so the
+                 sources that failed say so next to the entries that arrived. -->
+            <div v-if="librarySourceFaults.length" class="source-faults">
+              <span class="muted">{{ t('librarySourceErrors') }}</span>
+              <span v-for="fault in librarySourceFaults" :key="fault.subscription_id" class="error-text">
+                <strong>{{ fault.name }}</strong> · {{ fault.error }}
+              </span>
+            </div>
+            <p v-if="libraryTruncated" class="muted section-hint">{{ t('libraryTruncated') }}</p>
+
             <div v-if="libraryLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('libraryLoading') }}</div>
             <div v-else-if="libraryFilter === 'updates' && libraryEntries.length === 0" class="empty-state">
               <span><Check :size="25" /></span>
@@ -2191,21 +2324,22 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   <th><span class="sr-only">{{ t('manage') }}</span></th>
                 </tr></thead>
                 <tbody>
-                  <tr v-for="entry in libraryEntries" :key="entry.name">
-                    <td v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="librarySelected.has(entry.name)" :aria-label="entry.name" @change="toggleLibraryEntry(entry.name)" /></td>
+                  <tr v-for="entry in libraryEntries" :key="libraryKey(entry)">
+                    <td v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="librarySelected.has(libraryKey(entry))" :aria-label="entry.name" @change="toggleLibraryEntry(entry)" /></td>
                     <td class="task-name">
                       <strong>{{ entry.name }}</strong>
                       <a v-if="entry.comment_url" class="library-row-link" :href="entry.comment_url" target="_blank" rel="noopener noreferrer">{{ t('libraryOpenIssue') }}</a>
                       <span v-if="entry.comments" class="muted row-description" :title="t('libraryComments')">{{ entry.comments }}</span>
                     </td>
                     <td>{{ entry.author ?? '—' }}</td>
+                    <td v-if="libraryViewingAll" class="library-source-cell">{{ entry.source_name ?? '—' }}</td>
                     <td class="num">{{ entry.version ?? '—' }}</td>
                     <td class="run-time">{{ entry.date ?? '—' }}</td>
                     <td><span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryFilterUpdates') }}</span><span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span><span v-else class="muted">—</span></td>
                     <td class="row-actions">
-                      <button v-if="libraryBusyName === entry.name" class="primary-button" disabled><Loader2 class="spin" :size="14" />{{ t('libraryImporting') }}</button>
-                      <button v-else-if="!entry.installed" class="primary-button" :title="t('librarySubscribeHint')" @click="subscribeLibraryEntry(entry)"><Plus :size="14" />{{ t('librarySubscribe') }}</button>
-                      <button v-else-if="entry.update_available" class="primary-button" :title="t('librarySubscribeHint')" @click="subscribeLibraryEntry(entry)"><Download :size="14" />{{ t('libraryUpdate') }}</button>
+                      <button v-if="libraryBusyKey === libraryKey(entry)" class="primary-button" disabled><Loader2 class="spin" :size="14" />{{ t('libraryFetching') }}</button>
+                      <button v-else-if="!entry.installed" class="primary-button" :title="t('librarySubscribeHint')" @click="previewLibraryEntry(entry)"><Plus :size="14" />{{ t('librarySubscribe') }}</button>
+                      <button v-else-if="entry.update_available" class="primary-button" :title="t('librarySubscribeHint')" @click="previewLibraryEntry(entry)"><Download :size="14" />{{ t('libraryUpdate') }}</button>
                       <button v-else class="secondary-button" @click="openLibraryEntry(entry)"><Pencil :size="14" />{{ t('openTemplate') }}</button>
                     </td>
                   </tr>
@@ -2595,12 +2729,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     </div>
 
     <!-- ===== IMPORT / EDIT HAR MODAL ===== -->
-    <div v-if="showImport" class="modal-backdrop modal-backdrop-wide" @click.self="showImport = false">
+    <div v-if="showImport" class="modal-backdrop modal-backdrop-wide" @click.self="closeHarEditor()">
       <div class="modal modal-har">
         <div class="modal-header">
-          <div><h2>{{ t('importHarTitle') }}</h2></div>
-          <button class="icon-button" type="button" :title="t('close')" @click="showImport = false"><X :size="20" /></button>
+          <div><h2>{{ libraryPreview ? t('libraryPreviewTitle') : t('importHarTitle') }}</h2></div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeHarEditor"><X :size="20" /></button>
         </div>
+        <!-- Opened from a library row: say plainly that nothing has been saved
+             yet, because the old flow imported on click and this one does not. -->
+        <p v-if="libraryPreview" class="muted section-hint">{{ t('libraryPreviewHint') }}</p>
         <div class="har-meta">
           <label>{{ t('templateName') }}<input v-model="importForm.name" required placeholder="my-template" /></label>
           <label>{{ t('description') }}<input v-model="importForm.description" /></label>
@@ -2609,7 +2746,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <input type="file" accept=".har,.json,application/json" @change="onHarFile" />
           </label>
         </div>
-        <HarEditor :model-value="harEditorDoc" @save="saveHar" @cancel="showImport = false" />
+        <HarEditor :model-value="harEditorDoc" @save="saveHar" @cancel="closeHarEditor" />
       </div>
     </div>
 

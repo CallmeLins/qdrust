@@ -1133,6 +1133,18 @@ th.sortable .sort-idle { opacity: 0.3; }
 .templates-table .num,
 .library-table .num { width: 72px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
+/* The aggregate table holds several libraries at once, so a row says which one
+   it came from and a repository that could not be read says so, rather than
+   reading as a source that simply offers nothing. */
+.library-table .library-source-cell {
+  max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-3); font-size: 12px;
+}
+.source-faults {
+  display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline;
+  margin: 0 0 14px; font-size: 12px;
+}
+
 /* These action cells hold real buttons rather than the links the shared
    `.row-actions` rule was written for, so they stay table cells and align the
    buttons to the right edge of the column. */

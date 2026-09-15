@@ -27,6 +27,10 @@ export type SubscriptionSync = components["schemas"]["SubscriptionSync"];
 export type LibraryEntry = components["schemas"]["LibraryEntry"];
 export type TemplateLibrary = components["schemas"]["TemplateLibrary"];
 export type LibraryImportResult = components["schemas"]["LibraryImportResult"];
+export type LibraryImportOutcome = components["schemas"]["LibraryImportOutcome"];
+export type LibraryPreview = components["schemas"]["LibraryPreview"];
+export type LibraryOverview = components["schemas"]["LibraryOverview"];
+export type LibrarySourceStatus = components["schemas"]["LibrarySourceStatus"];
 export type PushRequest = components["schemas"]["PushRequest"];
 export type SiteSetting = components["schemas"]["SiteSetting"];
 export type BatchTaskResult = components["schemas"]["BatchTaskResult"];
@@ -231,6 +235,17 @@ export const api = {
   /** Import the named entries of a source. Per-entry failures come back in the
    *  result rather than failing the whole call. */
   importSubscriptionTemplates: (id: number, names: string[]) => request<LibraryImportResult>(`/api/v1/subscriptions/${id}/import`, { method: "POST", body: JSON.stringify({ names }) }),
+  /** Fetch one entry without writing it, so a template can be read — and
+   *  edited — before it earns a place in the user's library. The entry name is
+   *  a query parameter because it is free-form and may contain a slash. */
+  previewSubscriptionEntry: (id: number, entry: string) => request<LibraryPreview>(`/api/v1/subscriptions/${id}/library/preview?entry=${encodeURIComponent(entry)}`),
+  /** Save what the editor produced, recording the provenance row that marks the
+   *  entry imported. `template_id` refreshes a local copy in place; omitting it
+   *  creates one. */
+  applySubscriptionTemplate: (id: number, input: { entry: string; template_id: number | null; name: string; description: string | null; har: object }) => request<LibraryImportOutcome>(`/api/v1/subscriptions/${id}/library/apply`, { method: "POST", body: JSON.stringify(input) }),
+  /** Every enabled source in one list, which is what the page shows by default.
+   *  `refresh` re-reads the sources instead of reusing a recent catalogue. */
+  libraryOverview: (refresh = false) => request<LibraryOverview>(`/api/v1/library${refresh ? "?refresh=true" : ""}`),
 
   // ---- push requests ----
   myPushRequests: () => request<PushRequest[]>("/api/v1/push-requests"),

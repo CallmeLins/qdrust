@@ -375,7 +375,10 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["items", "has_more"],
+                  "required": [
+                    "items",
+                    "has_more"
+                  ],
                   "properties": {
                     "items": {
                       "type": "array",
@@ -387,7 +390,10 @@
                       "type": "boolean"
                     },
                     "next_cursor": {
-                      "type": ["integer", "null"]
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   }
                 }
@@ -1487,6 +1493,83 @@
         }
       }
     },
+    "/api/v1/subscriptions/{id}/library/preview": {
+      "get": {
+        "operationId": "previewSubscriptionLibraryEntry",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          },
+          {
+            "name": "entry",
+            "in": "query",
+            "required": true,
+            "description": "Entry name as returned by the listing. A query parameter because the name is a free-form string from the source and may contain a slash.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Fetch one entry's content without writing it",
+        "responses": {
+          "200": {
+            "description": "The entry and its upstream HAR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryPreview"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found"
+          },
+          "422": {
+            "description": "The source does not offer that entry, or it is unreadable"
+          }
+        }
+      }
+    },
+    "/api/v1/subscriptions/{id}/library/apply": {
+      "post": {
+        "operationId": "applySubscriptionTemplate",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SubscriptionId"
+          }
+        ],
+        "summary": "Save a template a user edited out of a preview",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/requestBodies/ApplyLibraryTemplate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The template that was written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryImportOutcome"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Subscription not found"
+          },
+          "422": {
+            "description": "Invalid template, or the source no longer offers that entry"
+          }
+        }
+      }
+    },
     "/api/v1/subscriptions/{id}/import": {
       "post": {
         "operationId": "importSubscriptionTemplates",
@@ -1522,6 +1605,36 @@
           },
           "422": {
             "description": "Nothing selected, or the source could not be read"
+          }
+        }
+      }
+    },
+    "/api/v1/library": {
+      "get": {
+        "operationId": "getLibraryOverview",
+        "parameters": [
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "description": "Re-read every source instead of reusing a recent catalogue",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "summary": "Every enabled subscription source's catalogue in one list",
+        "responses": {
+          "200": {
+            "description": "Aggregated catalogue, with a per-source outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryOverview"
+                }
+              }
+            }
           }
         }
       }
@@ -1946,6 +2059,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/ImportLibraryTemplates"
+            }
+          }
+        }
+      },
+      "ApplyLibraryTemplate": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApplyLibraryTemplate"
             }
           }
         }
@@ -2646,10 +2769,27 @@
               "always"
             ]
           },
-          "failure_threshold": { "type": "integer", "format": "int64", "default": 1 },
-          "automatic_only": { "type": "boolean", "default": false },
-          "title_template": { "type": ["string", "null"] },
-          "body_template": { "type": ["string", "null"] },
+          "failure_threshold": {
+            "type": "integer",
+            "format": "int64",
+            "default": 1
+          },
+          "automatic_only": {
+            "type": "boolean",
+            "default": false
+          },
+          "title_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "integer",
             "format": "int64"
@@ -2676,11 +2816,28 @@
               "failure",
               "always"
             ]
+          },
+          "failure_threshold": {
+            "type": "integer",
+            "format": "int64",
+            "default": 1
+          },
+          "automatic_only": {
+            "type": "boolean",
+            "default": false
+          },
+          "title_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_template": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
-          ,"failure_threshold": { "type": "integer", "format": "int64", "default": 1 },
-          "automatic_only": { "type": "boolean", "default": false },
-          "title_template": { "type": ["string", "null"] },
-          "body_template": { "type": ["string", "null"] }
         }
       },
       "Plugin": {
@@ -3409,6 +3566,21 @@
           },
           "update_available": {
             "type": "boolean"
+          },
+          "source_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Which source the entry came from; only the aggregate listing fills it in"
+          },
+          "source_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which source the entry came from; only the aggregate listing fills it in"
           }
         }
       },
@@ -3461,6 +3633,41 @@
           }
         }
       },
+      "ApplyLibraryTemplate": {
+        "type": "object",
+        "required": [
+          "entry",
+          "name",
+          "har"
+        ],
+        "properties": {
+          "entry": {
+            "type": "string",
+            "description": "Entry identity inside the source, as returned by the listing"
+          },
+          "template_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Local template to refresh in place; absent creates one"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "har": {
+            "type": "object",
+            "description": "The HAR document as edited in the browser"
+          }
+        }
+      },
       "LibraryImportFailure": {
         "type": "object",
         "required": [
@@ -3473,6 +3680,88 @@
           },
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "LibraryPreview": {
+        "type": "object",
+        "required": [
+          "entry",
+          "har"
+        ],
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/LibraryEntry"
+          },
+          "har": {
+            "type": "object",
+            "description": "The upstream HAR document, untouched"
+          }
+        }
+      },
+      "LibraryOverview": {
+        "type": "object",
+        "required": [
+          "entries",
+          "sources",
+          "truncated"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "description": "Entries from every source that could be read, in source order",
+            "items": {
+              "$ref": "#/components/schemas/LibraryEntry"
+            }
+          },
+          "sources": {
+            "type": "array",
+            "description": "How each source contributed, including the ones that failed",
+            "items": {
+              "$ref": "#/components/schemas/LibrarySourceStatus"
+            }
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when the total entry cap was hit"
+          }
+        }
+      },
+      "LibrarySourceStatus": {
+        "type": "object",
+        "required": [
+          "subscription_id",
+          "name",
+          "entries",
+          "cached"
+        ],
+        "properties": {
+          "subscription_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source_kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`manifest` or `files`; absent when the source could not be read"
+          },
+          "entries": {
+            "type": "integer"
+          },
+          "cached": {
+            "type": "boolean",
+            "description": "True when the catalogue was reused instead of fetched again"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
