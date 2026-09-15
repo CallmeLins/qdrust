@@ -470,16 +470,17 @@ const zh = {
   runStRunning: "运行中",
   runStPending: "等待中",
   runStCancelled: "已取消",
-  // aggregated log ("all runs" page)
+  // aggregated log (modal)
   runLogTitle: "运行日志",
-  collapseRunLog: "收起运行日志",
   runLogHint: "所有任务的运行日志总览，可按状态与任务筛选。",
   runLogAll: "全部",
   runLogTask: "任务",
   runLogAllTasks: "全部任务",
   runLogEmpty: "所选条件下没有运行记录",
-  runLogLoadMore: "加载更多",
-  runLogShown: "已显示 {n} 条",
+  runLogPageNo: "第 {n} 页",
+  prevPage: "上一页",
+  nextPage: "下一页",
+  pageOf: "第 {n} / {total} 页",
   // help
   helpTitle: "帮助",
   helpIntro: "qdrust 使用说明",
@@ -959,16 +960,17 @@ const en: Record<MessageKey, string> = {
   runStRunning: "Running",
   runStPending: "Pending",
   runStCancelled: "Cancelled",
-  // aggregated log ("all runs" page)
+  // aggregated log (modal)
   runLogTitle: "Run log",
-  collapseRunLog: "Hide run log",
   runLogHint: "Every task's runs in one place, filterable by status and task.",
   runLogAll: "All",
   runLogTask: "Task",
   runLogAllTasks: "All tasks",
   runLogEmpty: "No runs match the current filter",
-  runLogLoadMore: "Load more",
-  runLogShown: "{n} shown",
+  runLogPageNo: "Page {n}",
+  prevPage: "Previous",
+  nextPage: "Next",
+  pageOf: "Page {n} of {total}",
   // help
   helpTitle: "Help",
   helpIntro: "qdrust quick guide",

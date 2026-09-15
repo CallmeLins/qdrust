@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Copy, Download, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
@@ -493,6 +493,11 @@ function openRunHistoryById(taskId: number) {
   const task = tasks.value.find((x) => x.id === taskId);
   if (task) void openRunHistory(task);
 }
+/** The task-name cell in the run-log modal leaves it for the history page. */
+function openRunLogHistory(taskId: number) {
+  showRunLog.value = false;
+  openRunHistoryById(taskId);
+}
 async function cancelRun(run: Run) {
   try {
     await api.cancelRun(run.id);
@@ -550,15 +555,20 @@ function runStatusClass(status: string): string {
 // ---------- aggregated run log ----------
 // "Are all 30 tasks still green?" used to mean opening 30 run-history pages.
 // One filtered list answers it instead; the per-task page stays for depth.
-const RUN_LOG_PAGE = 100;
+const RUN_LOG_PAGE = 20;
 const allRuns = ref<Run[]>([]);
 const runLogStatus = ref<"" | "succeeded" | "failed">("");
 const runLogTaskId = ref(0);
 const runLogLoading = ref(false);
-/** Whether the run-log panel is expanded on the tasks page. */
+/** Whether the run-log modal is open. */
 const showRunLog = ref(false);
+/** Cursor paging as prev/next: the stack's last entry is the `beforeId` the
+ *  current page was fetched with, so "previous page" is a pop and "next" a
+ *  push — no page numbers to invent on a cursor API. */
+const runLogCursors = ref<(number | null)[]>([]);
+const runLogNextCursor = ref<number | null>(null);
 const runLogHasMore = ref(false);
-const runLogCursor = ref<number | null>(null);
+const runLogPageNo = computed(() => runLogCursors.value.length + 1);
 const runLogStatusOptions = computed(() => [
   { value: "" as const, label: t("runLogAll") },
   { value: "succeeded" as const, label: t("runStSucceeded") },
@@ -574,30 +584,40 @@ function runTaskName(taskId: number): string {
 function taskTimezone(taskId: number): string | undefined {
   return tasks.value.find((task) => task.id === taskId)?.timezone ?? undefined;
 }
-/** Expand/collapse the run-log panel; opening it (re)loads the first page. */
-async function toggleRunLog() {
-  showRunLog.value = !showRunLog.value;
-  if (showRunLog.value) await loadRunLog();
+/** Open the run-log modal and fetch its first page. */
+async function openRunLog() {
+  showRunLog.value = true;
+  runLogCursors.value = [];
+  await loadRunLog();
 }
-/** Load the first page, or append the next one when `reset` is false. */
-async function loadRunLog(reset = true) {
+/** Fetch the page the cursor stack currently points at. */
+async function loadRunLog() {
   runLogLoading.value = true;
   try {
-    if (reset) runLogCursor.value = null;
     const page = await api.runs({
       status: runLogStatus.value || undefined,
       taskId: runLogTaskId.value || undefined,
-      beforeId: reset ? undefined : runLogCursor.value ?? undefined,
+      beforeId: runLogCursors.value[runLogCursors.value.length - 1] ?? undefined,
       limit: RUN_LOG_PAGE,
     });
-    allRuns.value = reset ? page.items : [...allRuns.value, ...page.items];
+    allRuns.value = page.items;
     runLogHasMore.value = page.has_more;
-    runLogCursor.value = page.next_cursor;
+    runLogNextCursor.value = page.next_cursor;
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
   } finally {
     runLogLoading.value = false;
   }
+}
+async function nextRunLogPage() {
+  if (!runLogHasMore.value || runLogLoading.value) return;
+  runLogCursors.value = [...runLogCursors.value, runLogNextCursor.value];
+  await loadRunLog();
+}
+async function prevRunLogPage() {
+  if (runLogCursors.value.length === 0 || runLogLoading.value) return;
+  runLogCursors.value = runLogCursors.value.slice(0, -1);
+  await loadRunLog();
 }
 function setRunLogStatus(status: "" | "succeeded" | "failed") {
   runLogStatus.value = status;
@@ -1310,10 +1330,23 @@ const libraryEntries = computed<LibraryEntry[]>(() => {
   });
 });
 const librarySelectedCount = computed(() => librarySelected.value.size);
-/** Only entries currently visible can be selected, so a filter never hides an
- *  unintended part of the selection. */
+/** Client-side paging over the filtered list: a catalogue can run to hundreds
+ *  of entries and one long table is unreadable. Any change to the list
+ *  underneath (search, filter, sort, source, refresh) restarts at page 1. */
+const LIBRARY_PAGE_SIZE = 20;
+const libraryPage = ref(1);
+const libraryTotalPages = computed(() => Math.max(1, Math.ceil(libraryEntries.value.length / LIBRARY_PAGE_SIZE)));
+const pagedLibraryEntries = computed(() => {
+  const start = (libraryPage.value - 1) * LIBRARY_PAGE_SIZE;
+  return libraryEntries.value.slice(start, start + LIBRARY_PAGE_SIZE);
+});
+watch(libraryEntries, () => { libraryPage.value = 1; });
+function libraryPrevPage() { if (libraryPage.value > 1) libraryPage.value -= 1; }
+function libraryNextPage() { if (libraryPage.value < libraryTotalPages.value) libraryPage.value += 1; }
+/** Only entries currently visible — the page on screen — can be selected, so a
+ *  filter or a page turn never hides part of the selection. */
 const libraryAllVisibleSelected = computed(
-  () => libraryEntries.value.length > 0 && libraryEntries.value.every((entry) => librarySelected.value.has(libraryKey(entry))),
+  () => pagedLibraryEntries.value.length > 0 && pagedLibraryEntries.value.every((entry) => librarySelected.value.has(libraryKey(entry))),
 );
 const libraryUpdateCount = computed(() => (library.value?.entries ?? []).filter((entry) => entry.update_available).length);
 /** Headers of the library table; `date` is the manifest's own timestamp, which
@@ -1388,7 +1421,7 @@ function toggleLibraryEntry(entry: LibraryEntry) {
 function toggleLibraryAllVisible() {
   librarySelected.value = libraryAllVisibleSelected.value
     ? new Set()
-    : new Set(libraryEntries.value.map(libraryKey));
+    : new Set(pagedLibraryEntries.value.map(libraryKey));
 }
 function clearLibrarySelection() {
   librarySelected.value = new Set();
@@ -1967,63 +2000,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div><h1>{{ t('tasks') }}</h1><p>{{ t('createFirst') }}</p></div>
           <div class="heading-actions">
             <button class="primary-button" @click="openCreateTask"><Plus :size="17" />{{ t('createTaskShort') }}</button>
-            <button
-              class="secondary-button"
-              :class="{ 'is-active': showRunLog }"
-              :aria-expanded="showRunLog"
-              @click="toggleRunLog"
-            ><Activity :size="16" />{{ showRunLog ? t('collapseRunLog') : t('runLogTitle') }}</button>
+            <button class="secondary-button" @click="openRunLog"><Activity :size="16" />{{ t('runLogTitle') }}</button>
           </div>
-        </section>
-
-        <!-- Every task's runs in one place; the per-task history page stays for depth. -->
-        <section v-if="showRunLog" class="task-section">
-          <h2>{{ t('runLogTitle') }}</h2>
-          <p class="muted section-hint">{{ t('runLogHint') }}</p>
-          <div class="toolbar">
-            <div class="seg" role="group" :aria-label="t('status')">
-              <button
-                v-for="option in runLogStatusOptions"
-                :key="option.value"
-                type="button"
-                :class="{ active: runLogStatus === option.value }"
-                @click="setRunLogStatus(option.value)"
-              >{{ option.label }}</button>
-            </div>
-            <label class="group-filter">
-              <span>{{ t('runLogTask') }}</span>
-              <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
-            </label>
-            <span v-if="allRuns.length" class="muted">{{ fmt('runLogShown', { n: allRuns.length }) }}</span>
-            <button class="icon-button" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
-          </div>
-          <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
-          <div v-else-if="allRuns.length === 0" class="empty-state">
-            <span><Activity :size="25" /></span>
-            <h2>{{ t('runLogEmpty') }}</h2>
-          </div>
-          <div v-else class="table-wrap">
-            <table class="runs-table">
-              <thead><tr>
-                <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
-              </tr></thead>
-              <tbody>
-                <tr v-for="run in allRuns" :key="run.id">
-                  <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
-                  <td><button class="text-button" @click="openRunHistoryById(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
-                  <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
-                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
-                  <td class="row-actions">
-                    <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
-                    <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <button v-if="runLogHasMore" class="secondary-button" :disabled="runLogLoading" @click="loadRunLog(false)">
-            {{ runLogLoading ? t('loading') : t('runLogLoadMore') }}
-          </button>
         </section>
 
         <section class="stats" aria-label="任务概览">
@@ -2251,7 +2229,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                  syncs itself, so ticking entries is only for pre-loading a few. -->
             <div v-if="libraryBatch" class="batch-bar">
               <span>{{ fmt('librarySelected', { n: librarySelectedCount }) }}</span>
-              <button class="secondary-button" :disabled="libraryEntries.length === 0" @click="toggleLibraryAllVisible">{{ t('librarySelectAll') }}</button>
+              <button class="secondary-button" :disabled="pagedLibraryEntries.length === 0" @click="toggleLibraryAllVisible">{{ t('librarySelectAll') }}</button>
               <button class="secondary-button" :disabled="librarySelectedCount === 0" @click="clearLibrarySelection">{{ t('libraryClear') }}</button>
               <button class="primary-button" :disabled="libraryImporting || librarySelectedCount === 0" @click="importSelectedLibraryEntries">
                 <Download :size="16" />{{ libraryImporting ? t('libraryImporting') : t('libraryImport') }}
@@ -2288,7 +2266,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   <th><span class="sr-only">{{ t('manage') }}</span></th>
                 </tr></thead>
                 <tbody>
-                  <tr v-for="entry in libraryEntries" :key="libraryKey(entry)">
+                  <tr v-for="entry in pagedLibraryEntries" :key="libraryKey(entry)">
                     <td v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="librarySelected.has(libraryKey(entry))" :aria-label="entry.name" @change="toggleLibraryEntry(entry)" /></td>
                     <td class="task-name">
                       <strong>{{ entry.name }}</strong>
@@ -2309,6 +2287,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <div v-if="libraryTotalPages > 1" class="pager">
+              <button class="secondary-button" :disabled="libraryPage <= 1" @click="libraryPrevPage"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
+              <span class="muted">{{ fmt('pageOf', { n: libraryPage, total: libraryTotalPages }) }}</span>
+              <button class="secondary-button" :disabled="libraryPage >= libraryTotalPages" @click="libraryNextPage">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
             </div>
 
             <template v-if="libraryFailures.length">
@@ -2731,6 +2715,62 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <button class="primary-button" type="submit">{{ t('save') }}</button>
           </div>
         </form>
+      </div>
+    </div>
+
+    <!-- ===== RUN LOG MODAL ===== -->
+    <div v-if="showRunLog" class="modal-backdrop modal-backdrop-wide" @click.self="showRunLog = false">
+      <div class="modal modal-har">
+        <div class="modal-header">
+          <div><h2>{{ t('runLogTitle') }}</h2></div>
+          <button class="icon-button" type="button" :title="t('close')" @click="showRunLog = false"><X :size="20" /></button>
+        </div>
+        <p class="muted section-hint">{{ t('runLogHint') }}</p>
+        <div class="toolbar">
+          <div class="seg" role="group" :aria-label="t('status')">
+            <button
+              v-for="option in runLogStatusOptions"
+              :key="option.value"
+              type="button"
+              :class="{ active: runLogStatus === option.value }"
+              @click="setRunLogStatus(option.value)"
+            >{{ option.label }}</button>
+          </div>
+          <label class="group-filter">
+            <span>{{ t('runLogTask') }}</span>
+            <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
+          </label>
+          <button class="icon-button" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
+        </div>
+        <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
+        <div v-else-if="allRuns.length === 0" class="empty-state">
+          <span><Activity :size="25" /></span>
+          <h2>{{ t('runLogEmpty') }}</h2>
+        </div>
+        <div v-else class="table-wrap">
+          <table class="runs-table">
+            <thead><tr>
+              <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="run in allRuns" :key="run.id">
+                <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
+                <td><button class="text-button" @click="openRunLogHistory(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
+                <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
+                <td class="row-actions">
+                  <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
+                  <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button class="secondary-button" :disabled="runLogCursors.length === 0 || runLogLoading" @click="prevRunLogPage"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
+          <span class="muted">{{ fmt('runLogPageNo', { n: runLogPageNo }) }}</span>
+          <button class="secondary-button" :disabled="!runLogHasMore || runLogLoading" @click="nextRunLogPage">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
+        </div>
       </div>
     </div>
 

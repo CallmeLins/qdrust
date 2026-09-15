@@ -528,6 +528,13 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 .batch-bar span { margin-right: auto; font-weight: 650; color: var(--accent); }
 
+/* pager: prev/next row under paged tables (library, run-log modal) */
+.pager {
+  display: flex; align-items: center; justify-content: center;
+  gap: 12px; margin-top: 12px; font-size: 13px;
+}
+.pager .muted { min-width: 88px; text-align: center; }
+
 /* ============================================================
    tables
    ============================================================ */
