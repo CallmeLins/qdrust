@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
-  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, RefreshCw, Search, Send,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
+  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type SubscriptionSync, type PushRequest, type SiteSetting, type LibraryEntry, type TemplateLibrary } from "./api";
@@ -127,7 +127,7 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "library" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
@@ -135,7 +135,7 @@ const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
   tasks: t("tasks"), taskRuns: t("runHistory"), templates: t("templates"), plugins: t("pluginsTitle"),
-  notifications: t("notificationsTitle"), library: t("libraryTitle"),
+  notifications: t("notificationsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
 
@@ -611,10 +611,84 @@ const templateSearch = ref("");
 const editingTemplateId = ref<number | null>(null);
 const importForm = reactive({ name: "", description: "" });
 const harEditorDoc = ref<object | null>(null);
+/** The "published by others" list is secondary to the two lists the page is
+ *  for, so it stays folded away until asked for. */
+const showPublicTemplates = ref(false);
+
+type SortDir = "asc" | "desc";
+/** Sort state per table. Both lists used to arrive in source order — the
+ *  templates by creation id, the library in manifest order — so the newest
+ *  thing was never anywhere in particular. Defaults follow what these lists are
+ *  scanned for: what changed last, first. */
+const templateSort = reactive<{ key: "name" | "grp" | "variables" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
+const publicSort = reactive<{ key: "name" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
+const librarySort = reactive<{ key: "name" | "author" | "version" | "date"; dir: SortDir }>({ key: "date", dir: "desc" });
+
+/** Flip the sort column, or reverse it when the same header is clicked again.
+ *  Text columns open ascending (A→Z is what a name column means to a reader),
+ *  date and count columns descending. */
+function toggleSort<T extends string>(sort: { key: T; dir: SortDir }, key: T, text = false) {
+  if (sort.key === key) {
+    sort.dir = sort.dir === "asc" ? "desc" : "asc";
+  } else {
+    sort.key = key;
+    sort.dir = text ? "asc" : "desc";
+  }
+}
+function sortAria(sort: { key: string; dir: SortDir }, key: string): "ascending" | "descending" | "none" {
+  if (sort.key !== key) return "none";
+  return sort.dir === "asc" ? "ascending" : "descending";
+}
+function sortDir(sort: { key: string; dir: SortDir }, key: string): SortDir | null {
+  return sort.key === key ? sort.dir : null;
+}
+/** Sort a copy by the clicked header. Numbers compare as numbers (so 10 follows
+ *  9 rather than 1), everything else through `localeCompare` with `numeric` on,
+ *  which is what keeps QD's `20230112`-style versions and `v9`/`v10` names in a
+ *  believable order. Rows with no value sort last in both directions. */
+function sortRows<T>(
+  rows: T[],
+  sort: { key: string; dir: SortDir },
+  pick: (row: T, key: string) => string | number | null,
+): T[] {
+  const factor = sort.dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const left = pick(a, sort.key);
+    const right = pick(b, sort.key);
+    if (left == null || right == null) {
+      if (left == null && right == null) return 0;
+      return left == null ? 1 : -1;
+    }
+    if (typeof left === "number" && typeof right === "number") return (left - right) * factor;
+    return String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: "base" }) * factor;
+  });
+}
+
 const filteredTemplates = computed(() => {
   const term = templateSearch.value.trim().toLowerCase();
-  return term ? templates.value.filter((x) => `${x.name} ${x.description ?? ""}`.toLowerCase().includes(term)) : templates.value;
+  const matched = term
+    ? templates.value.filter((x) => `${x.name} ${x.description ?? ""} ${x.grp ?? ""}`.toLowerCase().includes(term))
+    : templates.value;
+  return sortRows(matched, templateSort, (item, key) => {
+    switch (key) {
+      case "name": return item.name;
+      case "grp": return item.grp ?? "";
+      case "variables": return item.variables?.length ?? 0;
+      default: return item.updated_at;
+    }
+  });
 });
+const sortedPublicTemplates = computed(() =>
+  sortRows(publicTemplates.value, publicSort, (item, key) => (key === "name" ? item.name : item.updated_at)),
+);
+/** Headers of the "my templates" table. `text` marks the columns whose natural
+ *  first order is A→Z rather than newest-first. */
+const templateColumns = computed(() => [
+  { key: "name" as const, label: t("name"), text: true },
+  { key: "grp" as const, label: t("group"), text: true },
+  { key: "variables" as const, label: t("variables"), text: false },
+  { key: "updated_at" as const, label: t("updatedAt"), text: false },
+]);
 /** The public list is every published template, so it doubles as the publish-state index. */
 const publishedTemplateIds = computed(() => new Set(publicTemplates.value.map((x) => x.id)));
 async function openTemplates() {
@@ -629,6 +703,10 @@ async function openTemplates() {
     publicTemplates.value = pub;
     subscriptions.value = subs;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+  // The library half of the page is what makes this page the entry point, so it
+  // fills itself in on arrival — but only once: a later visit (or the refresh
+  // after a publish) reuses the catalogue instead of hitting GitHub again.
+  await ensureLibraryLoaded();
 }
 function onTemplatePicked() {
   const tmpl = templatesForSelect.value.find((x) => x.id === taskForm.templateId);
@@ -669,6 +747,16 @@ function openImportModal(template?: Template) {
   Object.assign(importForm, { name: template?.name ?? "", description: template?.description ?? "" });
   harEditorDoc.value = template?.qd_har ?? { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
   showImport.value = true;
+}
+
+/** "New task" on a templates-page row: the create dialog opens with this
+ *  template already chosen, which also fills in the task name and one variable
+ *  row per variable the template expects (see `onTemplatePicked`). Picking a
+ *  template and filling its variables is what a QD user actually came to do, so
+ *  it is one click from the list rather than a detour through the task page. */
+function createTaskFromTemplate(item: Template) {
+  openCreateTask();
+  taskForm.templateId = item.id;
 }
 
 /**
@@ -1064,6 +1152,8 @@ async function saveSubscription() {
     await api.createSubscription(subForm.name, subForm.url, subForm.mode);
     Object.assign(subForm, { name: "", url: "" });
     await loadSubscriptions();
+    // First subscription on the page: point the public list at it right away.
+    await ensureLibraryLoaded();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleSubscription(sub: TemplateSubscription) {
@@ -1077,7 +1167,16 @@ async function setSubscriptionMode(sub: TemplateSubscription, mode: "select" | "
 }
 async function removeSubscription(id: number) {
   if (!window.confirm(t("deleteSubConfirm"))) return;
-  try { await api.deleteSubscription(id); await loadSubscriptions(); }
+  try {
+    await api.deleteSubscription(id);
+    // A deleted source must not leave the public list showing its catalogue.
+    if (librarySourceId.value === id) {
+      librarySourceId.value = null;
+      library.value = null;
+    }
+    await loadSubscriptions();
+    await ensureLibraryLoaded();
+  }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function syncSubscription(id: number) {
@@ -1086,6 +1185,9 @@ async function syncSubscription(id: number) {
     await api.syncSubscription(id);
     subSyncs.value = await api.subscriptionSyncs(id);
     await loadSubscriptions();
+    // A sync imports on the server, so the public list's installed/update marks
+    // are stale the moment it returns.
+    if (library.value) await loadLibrary();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
   finally { syncingId.value = null; }
 }
@@ -1094,29 +1196,55 @@ async function showSubSyncs(id: number) {
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
-// ---------- template library (browsing a subscription source) ----------
+// ---------- template library (the public half of the templates page) ----------
 const library = ref<TemplateLibrary | null>(null);
-const librarySubscription = ref<TemplateSubscription | null>(null);
+/** Source currently being browsed. Only the dropdown moves it: browsing used to
+ *  be a page of its own, which is what made the trip go templates → library →
+ *  back; now it is a selection inside the page. */
+const librarySourceId = ref<number | null>(null);
 const libraryLoading = ref(false);
 const libraryImporting = ref(false);
 const librarySearch = ref("");
 const libraryFilter = ref<"" | "installed" | "updates">("");
 const librarySelected = ref<Set<string>>(new Set());
 const libraryFailures = ref<{ name: string; error: string }[]>([]);
+/** Entry whose per-row action is in flight, so one row shows progress instead
+ *  of the whole table. */
+const libraryBusyName = ref("");
+/** Ticking entries is the exception, not the path (a source in "import all"
+ *  mode needs no ticking at all), so the checkbox column only appears when the
+ *  user asks for it. */
+const libraryBatch = ref(false);
 const libraryFilterOptions = computed(() => [
   { value: "" as const, label: t("libraryFilterAll") },
   { value: "installed" as const, label: t("libraryFilterInstalled") },
   { value: "updates" as const, label: t("libraryFilterUpdates") },
 ]);
-/** Entries matching the current search and filter, in source order. */
+const librarySource = computed(() => subscriptions.value.find((sub) => sub.id === librarySourceId.value) ?? null);
+const librarySourceOptions = computed(() => subscriptions.value.map((sub) => ({ value: sub.id, label: sub.name })));
+/** How the source's catalogue was read, so a plain repository (no manifest) is
+ *  not mistaken for a broken library. */
+const librarySourceKind = computed(() => {
+  if (!library.value) return "";
+  return library.value.source_kind === "files" ? t("librarySourceFiles") : t("librarySourceManifest");
+});
+/** Entries matching the current search and filter, in the clicked sort order. */
 const libraryEntries = computed<LibraryEntry[]>(() => {
   const entries = library.value?.entries ?? [];
   const query = librarySearch.value.trim().toLowerCase();
-  return entries.filter((entry) => {
+  const matched = entries.filter((entry) => {
     if (libraryFilter.value === "installed" && !entry.installed) return false;
     if (libraryFilter.value === "updates" && !entry.update_available) return false;
     if (!query) return true;
     return `${entry.name} ${entry.author ?? ""}`.toLowerCase().includes(query);
+  });
+  return sortRows(matched, librarySort, (entry, key) => {
+    switch (key) {
+      case "name": return entry.name;
+      case "author": return entry.author ?? "";
+      case "version": return entry.version ?? "";
+      default: return entry.date ?? "";
+    }
   });
 });
 const librarySelectedCount = computed(() => librarySelected.value.size);
@@ -1126,33 +1254,40 @@ const libraryAllVisibleSelected = computed(
   () => libraryEntries.value.length > 0 && libraryEntries.value.every((entry) => librarySelected.value.has(entry.name)),
 );
 const libraryUpdateCount = computed(() => (library.value?.entries ?? []).filter((entry) => entry.update_available).length);
-/** Names the source being browsed and how its catalogue was read, so a missing
- *  manifest (a plain repository) is not mistaken for a broken library. */
-const libraryHintText = computed(() => {
-  const sub = librarySubscription.value;
-  if (!sub) return t("libraryHint");
-  const source = library.value?.source_kind === "files" ? t("librarySourceFiles") : library.value ? t("librarySourceManifest") : "";
-  return [`${sub.name} · ${sub.url}`, source, t("libraryHint")].filter(Boolean).join(" — ");
-});
-async function openLibrary(sub: TemplateSubscription) {
-  view.value = "library";
-  // Keep the subscription panel expanded so "back" returns to the list the user
-  // came from rather than a collapsed templates page.
-  showSubscriptions.value = true;
-  librarySubscription.value = sub;
+/** Headers of the library table; `date` is the manifest's own timestamp, which
+ *  is why it — not our `imported_at` — is what the rows are ordered by. */
+const libraryColumns = computed(() => [
+  { key: "name" as const, label: t("name"), text: true },
+  { key: "author" as const, label: t("libraryAuthor"), text: true },
+  { key: "version" as const, label: t("libraryVersion"), text: true },
+  { key: "date" as const, label: t("libraryDate"), text: false },
+]);
+/** Read the source list into the section on arrival, so the catalogue is there
+ *  without a navigation — but never re-fetch a source already in hand, and never
+ *  fetch just because a publish/unpublish refreshed the page. */
+async function ensureLibraryLoaded() {
+  if (library.value || librarySourceId.value != null) return;
+  const first = subscriptions.value[0];
+  if (!first) return;
+  librarySourceId.value = first.id;
+  await loadLibrary();
+}
+/** Point the section at another source. `null` clears it back to the prompt. */
+async function selectLibrarySource(id: number | null) {
+  if (id === librarySourceId.value && library.value) return;
+  librarySourceId.value = id;
   library.value = null;
   librarySelected.value = new Set();
   libraryFailures.value = [];
-  librarySearch.value = "";
-  libraryFilter.value = "";
+  if (id == null) return;
   await loadLibrary();
 }
 async function loadLibrary() {
-  const sub = librarySubscription.value;
-  if (!sub) return;
+  const source = librarySource.value;
+  if (!source) return;
   libraryLoading.value = true;
   try {
-    const result = await api.browseSubscriptionLibrary(sub.id);
+    const result = await api.browseSubscriptionLibrary(source.id);
     library.value = result;
     // Drop selections the source no longer offers.
     const names = new Set(result.entries.map((entry) => entry.name));
@@ -1169,15 +1304,64 @@ function toggleLibraryEntry(name: string) {
   if (next.has(name)) next.delete(name); else next.add(name);
   librarySelected.value = next;
 }
-function selectAllLibraryEntries() {
-  librarySelected.value = new Set(libraryEntries.value.map((entry) => entry.name));
+function toggleLibraryAllVisible() {
+  librarySelected.value = libraryAllVisibleSelected.value
+    ? new Set()
+    : new Set(libraryEntries.value.map((entry) => entry.name));
 }
 function clearLibrarySelection() {
   librarySelected.value = new Set();
 }
+/** The row action: pull this entry in and open it for editing.
+ *
+ *  This is the whole point of folding the library into the page. The import
+ *  response now carries the id of every template it wrote, so subscribing can
+ *  hand the editor exactly what was just saved — the old page could only count
+ *  what it imported, which is why "import" looked like it did nothing and the
+ *  template had to be hunted down in another list afterwards. */
+async function subscribeLibraryEntry(entry: LibraryEntry) {
+  const source = librarySource.value;
+  if (!source) return;
+  libraryBusyName.value = entry.name;
+  libraryFailures.value = [];
+  try {
+    const result = await api.importSubscriptionTemplates(source.id, [entry.name]);
+    const failure = result.failed.find((item) => item.name === entry.name);
+    if (failure) {
+      libraryFailures.value = result.failed;
+      notify(failure.error, "error");
+      return;
+    }
+    const outcome = result.templates.find((item) => item.name === entry.name);
+    await Promise.all([loadSubscriptions(), loadLibrary()]);
+    notify(outcome?.updated ? fmt("libraryUpdatedCount", { n: 1 }) : fmt("libraryImportedCount", { n: 1 }));
+    const template = outcome ? templates.value.find((item) => item.id === outcome.template_id) : undefined;
+    if (template) openImportModal(template);
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    libraryBusyName.value = "";
+  }
+}
+/** Entries already in sync have nothing to fetch, so their row opens the local
+ *  copy straight away. A missing local copy falls back to the import path, which
+ *  keeps the row honest when a template was deleted here while the provenance
+ *  row survived. */
+function openLibraryEntry(entry: LibraryEntry) {
+  const local = entry.installed_template_id != null
+    ? templates.value.find((item) => item.id === entry.installed_template_id)
+    : undefined;
+  if (local) openImportModal(local);
+  else void subscribeLibraryEntry(entry);
+}
+/** The bulk path, kept as a secondary way in: a source in "import all" mode syncs
+ *  by itself, so ticking entries is only ever needed to pre-load a handful.
+ *
+ *  Unlike `subscribeLibraryEntry` this does not open the editor — a batch has no
+ *  single template to open — so it only reports what happened, per entry. */
 async function importSelectedLibraryEntries() {
-  const sub = librarySubscription.value;
-  if (!sub || librarySelected.value.size === 0) {
+  const source = librarySource.value;
+  if (!source || librarySelected.value.size === 0) {
     notify(t("libraryNothingSelected"), "error");
     return;
   }
@@ -1185,7 +1369,7 @@ async function importSelectedLibraryEntries() {
   libraryImporting.value = true;
   libraryFailures.value = [];
   try {
-    const result = await api.importSubscriptionTemplates(sub.id, names);
+    const result = await api.importSubscriptionTemplates(source.id, names);
     const parts: string[] = [];
     if (result.imported) parts.push(fmt("libraryImportedCount", { n: result.imported }));
     if (result.updated) parts.push(fmt("libraryUpdatedCount", { n: result.updated }));
@@ -1194,7 +1378,7 @@ async function importSelectedLibraryEntries() {
     libraryFailures.value = result.failed;
     librarySelected.value = new Set();
     // Reflect the new installed/update state, and pull the new templates into
-    // the templates list without leaving the library view.
+    // the list above without leaving the page.
     await Promise.all([loadLibrary(), loadSubscriptions()]);
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
@@ -1857,11 +2041,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               :class="{ 'is-active': showSubscriptions }"
               :aria-expanded="showSubscriptions"
               @click="showSubscriptions = !showSubscriptions"
-            ><RefreshCw :size="16" />{{ showSubscriptions ? t('collapseSubs') : t('importFromSubscription') }}</button>
+            ><RefreshCw :size="16" />{{ showSubscriptions ? t('collapseSubs') : t('manageSubs') }}</button>
           </div>
         </section>
 
-        <!-- The second import source: add a GitHub template library and pick from it. -->
+        <!-- Where templates come from. Folded away: it is set up once and then
+             left alone, unlike the two lists below. -->
         <section v-if="showSubscriptions" class="task-section">
           <h2>{{ t('subscriptionsTitle') }}</h2>
           <p class="muted section-hint">{{ t('subHint') }}</p>
@@ -1876,16 +2061,18 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </form>
           <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
           <div v-for="sub in subscriptions" :key="sub.id" class="run-row">
-            <strong>{{ sub.name }}</strong><span class="muted">{{ sub.url }}</span>
+            <strong>{{ sub.name }}</strong><span class="muted row-description">{{ sub.url }}</span>
             <span class="chip" :title="subModeHint(sub.mode)">{{ subModeLabel(sub.mode) }}</span>
             <span v-if="sub.last_synced_at" class="run-time">{{ t('lastSync') }} {{ formatRunTime(sub.last_synced_at) }}</span>
             <span v-if="sub.last_error" class="error-text">{{ sub.last_error }}</span>
-            <button class="primary-button" @click="openLibrary(sub)">{{ t('browseLibrary') }}</button>
-            <button class="secondary-button" v-if="sub.mode === 'all'" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)">{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
-            <button class="secondary-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
-            <button class="secondary-button" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
-            <button class="secondary-button" @click="toggleSubscription(sub)">{{ sub.enabled ? t('disableSub') : t('enableSub') }}</button>
-            <button class="icon-button" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
+            <div class="row-actions">
+              <button class="secondary-button" @click="selectLibrarySource(sub.id)"><LibraryIcon :size="14" />{{ t('browseLibrary') }}</button>
+              <button v-if="sub.mode === 'all'" class="secondary-button" :disabled="syncingId === sub.id" @click="syncSubscription(sub.id)"><RefreshCw :class="{ spin: syncingId === sub.id }" :size="14" />{{ syncingId === sub.id ? t('syncing') : t('sync') }}</button>
+              <button class="text-button" @click="showSubSyncs(sub.id)">{{ t('syncs') }}</button>
+              <button class="secondary-button" :title="subModeHint(sub.mode)" @click="setSubscriptionMode(sub, sub.mode === 'all' ? 'select' : 'all')">{{ sub.mode === 'all' ? t('subModeSelect') : t('subModeAll') }}</button>
+              <button class="icon-button" :title="sub.enabled ? t('disableSub') : t('enableSub')" @click="toggleSubscription(sub)"><PowerOff v-if="sub.enabled" :size="15" /><Power v-else :size="15" /></button>
+              <button class="icon-button danger" :title="t('deleteSub')" @click="removeSubscription(sub.id)"><Trash2 :size="16" /></button>
+            </div>
           </div>
           <template v-if="subSyncs.length">
             <h2>{{ t('syncRecords') }}</h2>
@@ -1896,35 +2083,177 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </template>
         </section>
 
+        <!-- 1) What is in use. One row per template, columns aligned, every
+             header clickable, and the one action a reader wants (build a task)
+             first. -->
         <section class="task-section">
           <div class="toolbar">
             <label class="search"><Search :size="17" /><input v-model="templateSearch" type="search" :placeholder="t('templateSearch')" /></label>
+            <span v-if="filteredTemplates.length" class="muted">{{ fmt('libraryEntryCount', { n: filteredTemplates.length }) }}</span>
           </div>
           <h2>{{ t('myTemplates') }}</h2>
-          <div v-if="filteredTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
-          <div v-for="item in filteredTemplates" :key="item.id" class="run-row">
-            <strong>{{ item.name }}</strong>
-            <span>{{ item.source_format }}</span>
-            <span v-if="item.grp" class="chip">{{ item.grp }}</span>
-            <span v-if="publishedTemplateIds.has(item.id)" class="chip chip-published">{{ t('published') }}</span>
-            <span v-if="item.description" class="muted row-description">{{ item.description }}</span>
-            <div class="row-actions">
-              <button v-if="item.source_format === 'qd_har'" class="secondary-button" @click="openImportModal(item)"><Pencil :size="14" />{{ t('editTemplate') }}</button>
-              <button v-if="publishedTemplateIds.has(item.id)" class="secondary-button" @click="unpublishTemplate(item.id)"><Undo2 :size="14" />{{ t('unpublish') }}</button>
-              <button v-else class="secondary-button" @click="publishTemplate(item.id)"><Upload :size="14" />{{ t('publish') }}</button>
-              <button class="icon-button danger" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name)"><Trash2 :size="16" /></button>
-            </div>
+          <div v-if="filteredTemplates.length === 0" class="empty-state">
+            <span><FileJson2 :size="25" /></span>
+            <h2>{{ templateSearch ? t('noTemplates') : t('templateEmptyHint') }}</h2>
           </div>
-          <h2>{{ t('publicTemplates') }}</h2>
-          <div v-if="publicTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
-          <div v-for="item in publicTemplates" :key="item.id" class="run-row">
-            <strong>{{ item.name }}</strong>
-            <span>{{ item.source_format }}</span>
-            <span v-if="item.description" class="muted row-description">{{ item.description }}</span>
-            <div class="row-actions">
-              <button class="secondary-button" @click="copyTemplate(item.id)"><Copy :size="14" />{{ t('copy') }}</button>
-            </div>
+          <div v-else class="table-wrap">
+            <table class="templates-table">
+              <thead><tr>
+                <th v-for="column in templateColumns" :key="column.key" class="sortable" :aria-sort="sortAria(templateSort, column.key)">
+                  <button type="button" @click="toggleSort(templateSort, column.key, column.text)">{{ column.label }}<ChevronUp v-if="sortDir(templateSort, column.key) === 'asc'" :size="13" /><ChevronDown v-else-if="sortDir(templateSort, column.key) === 'desc'" :size="13" /><ArrowUpDown v-else :size="13" class="sort-idle" /></button>
+                </th>
+                <th><span class="sr-only">{{ t('manage') }}</span></th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="item in filteredTemplates" :key="item.id">
+                  <td class="task-name">
+                    <strong>{{ item.name }}</strong>
+                    <span v-if="publishedTemplateIds.has(item.id)" class="chip chip-published">{{ t('published') }}</span>
+                    <span v-if="item.description" class="muted row-description">{{ item.description }}</span>
+                  </td>
+                  <td><span v-if="item.grp" class="chip">{{ item.grp }}</span><span v-else class="muted">—</span></td>
+                  <td class="num">{{ item.variables?.length ?? 0 }}</td>
+                  <td class="run-time">{{ formatRunTime(item.updated_at) }}</td>
+                  <td class="row-actions">
+                    <button class="primary-button" :title="t('useTemplateTitle')" @click="createTaskFromTemplate(item)"><Play :size="14" />{{ t('useTemplate') }}</button>
+                    <button v-if="item.source_format === 'qd_har'" class="secondary-button" @click="openImportModal(item)"><Pencil :size="14" />{{ t('editTemplate') }}</button>
+                    <button v-if="publishedTemplateIds.has(item.id)" class="secondary-button" @click="unpublishTemplate(item.id)"><Undo2 :size="14" />{{ t('unpublish') }}</button>
+                    <button v-else class="secondary-button" @click="publishTemplate(item.id)"><Upload :size="14" />{{ t('publish') }}</button>
+                    <button class="icon-button danger" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name)"><Trash2 :size="16" /></button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
+        </section>
+
+        <!-- 2) What can be taken: every subscribed library in one list, newest
+             first, one action per row. Subscribing imports and opens the editor,
+             so this is where the click that used to cost four now stops. -->
+        <section class="task-section">
+          <h2>{{ t('publicLibrary') }}</h2>
+          <p class="muted section-hint">{{ t('publicLibraryHint') }}</p>
+          <div v-if="subscriptions.length === 0" class="empty-state">
+            <span><LibraryIcon :size="25" /></span>
+            <h2>{{ t('publicLibraryNoSource') }}</h2>
+            <button class="secondary-button" @click="showSubscriptions = true">{{ t('manageSubs') }}</button>
+          </div>
+          <template v-else>
+            <div class="toolbar library-toolbar">
+              <label class="group-filter">
+                <span>{{ t('librarySource') }}</span>
+                <Dropdown :model-value="librarySourceId" :options="librarySourceOptions" compact @change="selectLibrarySource($event as number | null)" />
+              </label>
+              <span v-if="librarySourceKind" class="chip">{{ librarySourceKind }}</span>
+              <button class="icon-button" :title="t('refresh')" :disabled="libraryLoading" @click="loadLibrary()"><RefreshCw :class="{ spin: libraryLoading }" :size="18" /></button>
+              <input v-model="librarySearch" class="library-search" type="search" :placeholder="t('librarySearchPlaceholder')" />
+              <div class="seg" role="group" :aria-label="t('libraryTitle')">
+                <button
+                  v-for="option in libraryFilterOptions"
+                  :key="option.value"
+                  type="button"
+                  :class="{ active: libraryFilter === option.value }"
+                  @click="libraryFilter = option.value"
+                >{{ option.label }}<span v-if="option.value === 'updates' && libraryUpdateCount" class="seg-count">{{ libraryUpdateCount }}</span></button>
+              </div>
+              <span class="muted">{{ fmt('libraryEntryCount', { n: libraryEntries.length }) }}</span>
+              <button class="text-button" :aria-expanded="libraryBatch" @click="libraryBatch = !libraryBatch">{{ libraryBatch ? t('libraryBatchOff') : t('libraryBatchOn') }}</button>
+            </div>
+
+            <!-- Bulk import, kept but demoted: a source in "import all" mode
+                 syncs itself, so ticking entries is only for pre-loading a few. -->
+            <div v-if="libraryBatch" class="batch-bar">
+              <span>{{ fmt('librarySelected', { n: librarySelectedCount }) }}</span>
+              <button class="secondary-button" :disabled="libraryEntries.length === 0" @click="toggleLibraryAllVisible">{{ t('librarySelectAll') }}</button>
+              <button class="secondary-button" :disabled="librarySelectedCount === 0" @click="clearLibrarySelection">{{ t('libraryClear') }}</button>
+              <button class="primary-button" :disabled="libraryImporting || librarySelectedCount === 0" @click="importSelectedLibraryEntries">
+                <Download :size="16" />{{ libraryImporting ? t('libraryImporting') : t('libraryImport') }}
+              </button>
+            </div>
+
+            <div v-if="libraryLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('libraryLoading') }}</div>
+            <div v-else-if="libraryFilter === 'updates' && libraryEntries.length === 0" class="empty-state">
+              <span><Check :size="25" /></span>
+              <h2>{{ t('libraryEmpty') }}</h2>
+            </div>
+            <div v-else-if="libraryEntries.length === 0" class="empty-state">
+              <span><LibraryIcon :size="25" /></span>
+              <h2>{{ t('libraryEmpty') }}</h2>
+            </div>
+            <div v-else class="table-wrap">
+              <table class="library-table">
+                <thead><tr>
+                  <th v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="libraryAllVisibleSelected" :aria-label="t('librarySelectAll')" @change="toggleLibraryAllVisible" /></th>
+                  <th v-for="column in libraryColumns" :key="column.key" class="sortable" :aria-sort="sortAria(librarySort, column.key)">
+                    <button type="button" @click="toggleSort(librarySort, column.key, column.text)">{{ column.label }}<ChevronUp v-if="sortDir(librarySort, column.key) === 'asc'" :size="13" /><ChevronDown v-else-if="sortDir(librarySort, column.key) === 'desc'" :size="13" /><ArrowUpDown v-else :size="13" class="sort-idle" /></button>
+                  </th>
+                  <th>{{ t('status') }}</th>
+                  <th><span class="sr-only">{{ t('manage') }}</span></th>
+                </tr></thead>
+                <tbody>
+                  <tr v-for="entry in libraryEntries" :key="entry.name">
+                    <td v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="librarySelected.has(entry.name)" :aria-label="entry.name" @change="toggleLibraryEntry(entry.name)" /></td>
+                    <td class="task-name">
+                      <strong>{{ entry.name }}</strong>
+                      <a v-if="entry.comment_url" class="library-row-link" :href="entry.comment_url" target="_blank" rel="noopener noreferrer">{{ t('libraryOpenIssue') }}</a>
+                      <span v-if="entry.comments" class="muted row-description" :title="t('libraryComments')">{{ entry.comments }}</span>
+                    </td>
+                    <td>{{ entry.author ?? '—' }}</td>
+                    <td class="num">{{ entry.version ?? '—' }}</td>
+                    <td class="run-time">{{ entry.date ?? '—' }}</td>
+                    <td><span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryFilterUpdates') }}</span><span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span><span v-else class="muted">—</span></td>
+                    <td class="row-actions">
+                      <button v-if="libraryBusyName === entry.name" class="primary-button" disabled><Loader2 class="spin" :size="14" />{{ t('libraryImporting') }}</button>
+                      <button v-else-if="!entry.installed" class="primary-button" :title="t('librarySubscribeHint')" @click="subscribeLibraryEntry(entry)"><Plus :size="14" />{{ t('librarySubscribe') }}</button>
+                      <button v-else-if="entry.update_available" class="primary-button" :title="t('librarySubscribeHint')" @click="subscribeLibraryEntry(entry)"><Download :size="14" />{{ t('libraryUpdate') }}</button>
+                      <button v-else class="secondary-button" @click="openLibraryEntry(entry)"><Pencil :size="14" />{{ t('openTemplate') }}</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <template v-if="libraryFailures.length">
+              <h2>{{ t('libraryFailedTitle') }}</h2>
+              <div v-for="failure in libraryFailures" :key="failure.name" class="run-row">
+                <strong>{{ failure.name }}</strong><span class="error-text">{{ failure.error }}</span>
+              </div>
+            </template>
+          </template>
+        </section>
+
+        <!-- 3) Templates other people published to this instance. Not the
+             "public templates" of QD's vocabulary, hence the separate name. -->
+        <section class="task-section">
+          <div class="toolbar">
+            <h2>{{ t('publicTemplates') }}</h2>
+            <button class="secondary-button" :aria-expanded="showPublicTemplates" @click="showPublicTemplates = !showPublicTemplates">{{ showPublicTemplates ? t('collapse') : t('expand') }}</button>
+          </div>
+          <template v-if="showPublicTemplates">
+            <div v-if="sortedPublicTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
+            <div v-else class="table-wrap">
+              <table class="templates-table">
+                <thead><tr>
+                  <th class="sortable" :aria-sort="sortAria(publicSort, 'name')">
+                    <button type="button" @click="toggleSort(publicSort, 'name', true)">{{ t('name') }}<ChevronUp v-if="sortDir(publicSort, 'name') === 'asc'" :size="13" /><ChevronDown v-else-if="sortDir(publicSort, 'name') === 'desc'" :size="13" /><ArrowUpDown v-else :size="13" class="sort-idle" /></button>
+                  </th>
+                  <th>{{ t('description') }}</th>
+                  <th class="sortable" :aria-sort="sortAria(publicSort, 'updated_at')">
+                    <button type="button" @click="toggleSort(publicSort, 'updated_at')">{{ t('updatedAt') }}<ChevronUp v-if="sortDir(publicSort, 'updated_at') === 'asc'" :size="13" /><ChevronDown v-else-if="sortDir(publicSort, 'updated_at') === 'desc'" :size="13" /><ArrowUpDown v-else :size="13" class="sort-idle" /></button>
+                  </th>
+                  <th><span class="sr-only">{{ t('manage') }}</span></th>
+                </tr></thead>
+                <tbody>
+                  <tr v-for="item in sortedPublicTemplates" :key="item.id">
+                    <td class="task-name"><strong>{{ item.name }}</strong></td>
+                    <td class="muted row-description">{{ item.description ?? '—' }}</td>
+                    <td class="run-time">{{ formatRunTime(item.updated_at) }}</td>
+                    <td class="row-actions"><button class="secondary-button" @click="copyTemplate(item.id)"><Copy :size="14" />{{ t('copy') }}</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
         </section>
       </div>
 
@@ -2087,81 +2416,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
             </template>
           </div>
-        </section>
-      </div>
-
-      <!-- ===== TEMPLATE LIBRARY ===== -->
-      <div v-else-if="view === 'library'" class="page">
-        <section class="page-heading">
-          <div>
-            <h1>{{ t('libraryTitle') }}</h1>
-            <p>{{ libraryHintText }}</p>
-          </div>
-          <button class="secondary-button" @click="openTemplates"><ArrowLeft :size="16" />{{ t('libraryBack') }}</button>
-        </section>
-        <section class="task-section">
-          <div class="toolbar library-toolbar">
-            <input v-model="librarySearch" class="library-search" type="search" :placeholder="t('librarySearchPlaceholder')" />
-            <div class="seg" role="group" :aria-label="t('libraryTitle')">
-              <button
-                v-for="option in libraryFilterOptions"
-                :key="option.value"
-                type="button"
-                :class="{ active: libraryFilter === option.value }"
-                @click="libraryFilter = option.value"
-              >{{ option.label }}<span v-if="option.value === 'updates' && libraryUpdateCount" class="seg-count">{{ libraryUpdateCount }}</span></button>
-            </div>
-            <span class="muted">{{ fmt('libraryEntryCount', { n: libraryEntries.length }) }}</span>
-            <span v-if="librarySelectedCount" class="muted">{{ fmt('librarySelected', { n: librarySelectedCount }) }}</span>
-          </div>
-          <div class="toolbar library-toolbar">
-            <button class="secondary-button" :disabled="libraryEntries.length === 0" @click="selectAllLibraryEntries">{{ t('librarySelectAll') }}</button>
-            <button class="secondary-button" :disabled="librarySelectedCount === 0" @click="clearLibrarySelection">{{ t('libraryClear') }}</button>
-            <button class="primary-button" :disabled="libraryImporting || librarySelectedCount === 0" @click="importSelectedLibraryEntries">
-              <Download :size="16" />{{ libraryImporting ? t('libraryImporting') : t('libraryImport') }}
-            </button>
-            <button class="secondary-button" :disabled="libraryLoading" @click="loadLibrary"><RefreshCw :class="{ spin: libraryLoading }" :size="16" />{{ t('refresh') }}</button>
-          </div>
-
-          <div v-if="libraryImporting || libraryLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ libraryLoading ? t('libraryLoading') : t('libraryImporting') }}</div>
-          <div v-else-if="libraryFilter === 'updates' && libraryEntries.length === 0" class="empty-state">
-            <span><Check :size="25" /></span>
-            <h2>{{ t('libraryEmpty') }}</h2>
-          </div>
-          <div v-else-if="libraryEntries.length === 0" class="empty-state">
-            <span><LibraryIcon :size="25" /></span>
-            <h2>{{ t('libraryEmpty') }}</h2>
-          </div>
-          <div v-else class="library-list" role="group" :aria-label="t('libraryTitle')">
-            <div v-for="entry in libraryEntries" :key="entry.name" class="library-row" :class="{ 'is-installed': entry.installed }">
-              <!-- Only the selection area is a label: the discussion link below
-                   must not toggle the checkbox when it is clicked. -->
-              <label class="library-row-main">
-                <input type="checkbox" :checked="librarySelected.has(entry.name)" @change="toggleLibraryEntry(entry.name)" />
-                <span class="library-row-body">
-                  <span class="library-row-title">
-                    <strong>{{ entry.name }}</strong>
-                    <span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryUpdate') }}</span>
-                    <span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span>
-                  </span>
-                  <span class="library-row-meta">
-                    <span v-if="entry.author">{{ t('libraryAuthor') }}: {{ entry.author }}</span>
-                    <span v-if="entry.version">{{ t('libraryVersion') }}: {{ entry.version }}</span>
-                    <span v-if="entry.date">{{ entry.date }}</span>
-                  </span>
-                  <span v-if="entry.comments" class="library-row-comments" :title="t('libraryComments')">{{ entry.comments }}</span>
-                </span>
-              </label>
-              <a v-if="entry.comment_url" class="library-row-link" :href="entry.comment_url" target="_blank" rel="noopener noreferrer">{{ t('libraryOpenIssue') }}</a>
-            </div>
-          </div>
-
-          <template v-if="libraryFailures.length">
-            <h2>{{ t('libraryFailedTitle') }}</h2>
-            <div v-for="failure in libraryFailures" :key="failure.name" class="run-row">
-              <strong>{{ failure.name }}</strong><span class="error-text">{{ failure.error }}</span>
-            </div>
-          </template>
         </section>
       </div>
 

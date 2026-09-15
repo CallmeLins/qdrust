@@ -1,5 +1,5 @@
 -- Parity with the SQLite 202609060001_external_identities migration
--- (Issue #3, see docs/design/EXTERNAL_IDP_PLAN.md §3).
+-- (Issue #3, see docs/EXTERNAL_IDP_PLAN.md §3).
 -- SQLite uses dynamic-typed columns; here we use explicit MySQL types:
 --   unix-epoch timestamps -> BIGINT, strings -> VARCHAR/TEXT, booleans -> TINYINT(1).
 

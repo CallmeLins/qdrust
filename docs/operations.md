@@ -17,6 +17,32 @@ After restore, start the server and verify `/ready`. The migration runner is for
 
 Release tags matching `v*` publish `linux/amd64` and `linux/arm64` images to GHCR with provenance and SBOM attestations. CI rejects images with known fixed HIGH or CRITICAL vulnerabilities.
 
+## 数据库迁移
+
+Migrations live in `migrations/` (SQLite) and `migrations-mysql/` (MySQL), and sqlx records
+a sha384 checksum of every file it applies in `_sqlx_migrations`. A file whose bytes change
+after it has been applied makes that deployment refuse to start:
+
+```
+Error: migration 202609060001 was previously applied but has been modified
+```
+
+Nothing relaxes that check at runtime, so **a migration is frozen the moment a release tag
+contains it**: change the schema with a new dated file, never by editing or deleting an
+existing one. Comments are content too — a stale doc path in a migration header is not worth
+breaking every upgrade, and a docs reshuffle that rewrites one in place is enough to do it
+(202609060001 shipped in v0.1.10 through v0.1.12, so editing its header comment would have
+broken all three).
+
+For the same reason `.gitattributes` pins `*.sql` to `text eol=lf`: the working copy, a fresh
+clone, and the Linux image build must hash identical bytes, and `core.autocrlf=true` would
+otherwise materialise CRLF on Windows and give one migration two different checksums.
+
+`python3 scripts/check-migrations.py` enforces this against the newest `v*` tag and runs in CI.
+To repair a released migration that was edited by mistake, restore the bytes it shipped with
+(`git checkout <tag> -- <path>`); rewriting the stored checksum instead only unblocks the one
+machine that was patched and leaves every other deployment failing.
+
 ## 发布检查清单
 
 ### 本地门禁
@@ -24,6 +50,7 @@ Release tags matching `v*` publish `linux/amd64` and `linux/arm64` images to GHC
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace --all-targets`
+- `python scripts/check-migrations.py`
 - `npm --prefix webui ci`
 - `npm --prefix webui run generate:api`
 - `npm --prefix webui run lint`

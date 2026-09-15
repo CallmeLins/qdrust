@@ -144,8 +144,8 @@ async fn sync_subscription_inner(
         )
         .await
         {
-            Ok(true) => updated += 1,
-            Ok(false) => imported += 1,
+            Ok((_, true)) => updated += 1,
+            Ok((_, false)) => imported += 1,
             Err(err) => warn!(
                 subscription_id = subscription.id,
                 entry = %name,

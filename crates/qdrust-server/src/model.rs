@@ -387,6 +387,20 @@ pub struct LibraryImportResult {
     /// aborting the batch, so one broken upstream template does not block the
     /// rest of the selection.
     pub failed: Vec<LibraryImportFailure>,
+    /// Every entry this call wrote, in the order it was requested. Counters
+    /// alone left the caller unable to act on what it just pulled in, so the
+    /// id travels with the name (open the editor prefilled, build a task).
+    pub templates: Vec<LibraryImportOutcome>,
+}
+
+/// One entry that landed in the store during an import.
+#[derive(Clone, Debug, Serialize)]
+pub struct LibraryImportOutcome {
+    pub name: String,
+    pub template_id: i64,
+    /// `true` when an existing template was refreshed in place rather than
+    /// created.
+    pub updated: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

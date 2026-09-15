@@ -31,6 +31,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # A migration that already shipped may not change: sqlx checksums each file
+  # and every deployment that ran it will refuse to start. See
+  # scripts/check-migrations.py for why a comment counts as content.
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needs the release tags to know what has already shipped, so the
+          # default single-commit clone is not enough.
+          fetch-depth: 0
+      - run: python3 scripts/check-migrations.py
+
   webui:
     runs-on: ubuntu-latest
     defaults:

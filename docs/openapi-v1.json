@@ -576,6 +576,24 @@
           "$ref": "#/components/parameters/Id"
         }
       ],
+      "put": {
+        "operationId": "updateNotificationAction",
+        "description": "Partially update one notification action. Absent fields keep their stored value; the two templates treat an empty or whitespace-only string as \"clear\".",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/UpdateNotificationAction"
+        },
+        "responses": {
+          "200": {
+            "description": "Notification action updated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      },
       "delete": {
         "operationId": "deleteNotificationAction",
         "responses": {
@@ -1712,6 +1730,16 @@
           }
         }
       },
+      "UpdateNotificationAction": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/UpdateNotificationAction"
+            }
+          }
+        }
+      },
       "CreatePlugin": {
         "required": true,
         "content": {
@@ -2531,6 +2559,56 @@
           "enabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "UpdateNotificationAction": {
+        "type": "object",
+        "description": "Partial update of one notification action; an absent field keeps its stored value.",
+        "properties": {
+          "channel_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "event": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "success",
+              "failure",
+              "always",
+              null
+            ]
+          },
+          "failure_threshold": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "automatic_only": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "title_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_template": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -3398,12 +3476,35 @@
           }
         }
       },
+      "LibraryImportOutcome": {
+        "type": "object",
+        "description": "One entry that landed in the store during an import, so the caller can act on what it just pulled in (open the editor prefilled, build a task) instead of only reading counters.",
+        "required": [
+          "name",
+          "template_id",
+          "updated"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "template_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated": {
+            "type": "boolean",
+            "description": "`true` when an existing template was refreshed in place rather than created"
+          }
+        }
+      },
       "LibraryImportResult": {
         "type": "object",
         "required": [
           "imported",
           "updated",
-          "failed"
+          "failed",
+          "templates"
         ],
         "properties": {
           "imported": {
@@ -3416,6 +3517,13 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/LibraryImportFailure"
+            }
+          },
+          "templates": {
+            "type": "array",
+            "description": "Every entry this call wrote, in the order it was requested",
+            "items": {
+              "$ref": "#/components/schemas/LibraryImportOutcome"
             }
           }
         }

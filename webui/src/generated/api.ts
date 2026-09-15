@@ -339,6 +339,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
+        /** @description Partially update one notification action. Absent fields keep their stored value; the two templates treat an empty or whitespace-only string as "clear". */
         put: operations["updateNotificationAction"];
         post?: never;
         delete: operations["deleteNotificationAction"];
@@ -1150,6 +1151,7 @@ export interface components {
             } | null;
             enabled?: boolean | null;
         };
+        /** @description Partial update of one notification action; an absent field keeps its stored value. */
         UpdateNotificationAction: {
             /** Format: int64 */
             channel_id?: number | null;
@@ -1436,10 +1438,20 @@ export interface components {
             name: string;
             error: string;
         };
+        /** @description One entry that landed in the store during an import, so the caller can act on what it just pulled in (open the editor prefilled, build a task) instead of only reading counters. */
+        LibraryImportOutcome: {
+            name: string;
+            /** Format: int64 */
+            template_id: number;
+            /** @description `true` when an existing template was refreshed in place rather than created */
+            updated: boolean;
+        };
         LibraryImportResult: {
             imported: number;
             updated: number;
             failed: components["schemas"]["LibraryImportFailure"][];
+            /** @description Every entry this call wrote, in the order it was requested */
+            templates: components["schemas"]["LibraryImportOutcome"][];
         };
         SubscriptionSync: {
             /** Format: int64 */
@@ -1586,14 +1598,14 @@ export interface components {
                 "application/json": components["schemas"]["UpdateNotificationChannel"];
             };
         };
-        UpdateNotificationAction: {
-            content: {
-                "application/json": components["schemas"]["UpdateNotificationAction"];
-            };
-        };
         CreateNotificationAction: {
             content: {
                 "application/json": components["schemas"]["CreateNotificationAction"];
+            };
+        };
+        UpdateNotificationAction: {
+            content: {
+                "application/json": components["schemas"]["UpdateNotificationAction"];
             };
         };
         CreatePlugin: {

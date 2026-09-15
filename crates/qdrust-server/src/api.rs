@@ -3660,6 +3660,13 @@ mod tests {
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());
+        // Importing from a library returns the ids it wrote, so the WebUI can
+        // open the editor on the template it just pulled in.
+        assert_eq!(
+            document["components"]["schemas"]["LibraryImportResult"]["properties"]["templates"]["items"]
+                ["$ref"],
+            json!("#/components/schemas/LibraryImportOutcome")
+        );
         assert_eq!(
             document["components"]["schemas"]["ApiError"]["required"]
                 .as_array()

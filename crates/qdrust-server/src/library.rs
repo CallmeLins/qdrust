@@ -24,8 +24,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::model::{
-    ImportQdHarTemplate, LibraryEntry, LibraryImportFailure, LibraryImportResult, TemplateImport,
-    TemplateLibrary, TemplateSubscription, UpdateQdHarTemplate,
+    ImportQdHarTemplate, LibraryEntry, LibraryImportFailure, LibraryImportOutcome,
+    LibraryImportResult, TemplateImport, TemplateLibrary, TemplateSubscription,
+    UpdateQdHarTemplate,
 };
 use crate::store::Store;
 
@@ -196,6 +197,7 @@ pub async fn import_selected(
         imported: 0,
         updated: 0,
         failed: Vec::new(),
+        templates: Vec::new(),
     };
     let mut seen = HashSet::new();
     for name in names {
@@ -221,8 +223,18 @@ pub async fn import_selected(
         )
         .await
         {
-            Ok(true) => result.updated += 1,
-            Ok(false) => result.imported += 1,
+            Ok((template_id, updated)) => {
+                if updated {
+                    result.updated += 1;
+                } else {
+                    result.imported += 1;
+                }
+                result.templates.push(LibraryImportOutcome {
+                    name: entry.name.clone(),
+                    template_id,
+                    updated,
+                });
+            }
             Err(err) => result.failed.push(LibraryImportFailure {
                 name: name.clone(),
                 error: bounded(&err.to_string()),
@@ -233,7 +245,7 @@ pub async fn import_selected(
 }
 
 /// Import (or refresh) one entry and record where it came from.
-/// Returns `true` when an existing template was updated in place.
+/// Returns the template's id and whether an existing row was updated in place.
 pub(crate) async fn import_entry(
     store: &Store,
     client: &Client,
@@ -241,7 +253,7 @@ pub(crate) async fn import_entry(
     source: Option<&GitHubSource>,
     entry: &RawEntry,
     linked_template_id: Option<i64>,
-) -> Result<bool> {
+) -> Result<(i64, bool)> {
     let har = resolve_har(client, source, entry).await?;
     QdHar::parse_qd(har.clone())
         .with_context(|| format!("{} is not a valid QD HAR template", entry.name))?;
@@ -293,7 +305,7 @@ pub(crate) async fn import_entry(
             entry.url.as_deref(),
         )
         .await?;
-    Ok(updated)
+    Ok((template_id, updated))
 }
 
 /// Resolve an entry's HAR document, preferring the inlined base64 `content`
@@ -886,5 +898,37 @@ mod tests {
         assert_eq!(value["installed"], json!(false));
         assert_eq!(value["update_available"], json!(false));
         assert_eq!(value["installed_template_id"], Value::Null);
+    }
+
+    #[test]
+    fn import_result_carries_the_ids_the_browser_acts_on() {
+        // The WebUI opens the editor on whatever an import just produced, so the
+        // template id has to survive serialisation; these field names are the
+        // contract the browser reads (see `LibraryImportOutcome`).
+        let result = LibraryImportResult {
+            imported: 1,
+            updated: 1,
+            failed: Vec::new(),
+            templates: vec![
+                LibraryImportOutcome {
+                    name: "S1论坛签到".into(),
+                    template_id: 7,
+                    updated: false,
+                },
+                LibraryImportOutcome {
+                    name: "雨晨分享站".into(),
+                    template_id: 9,
+                    updated: true,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["imported"], json!(1));
+        assert_eq!(value["updated"], json!(1));
+        assert_eq!(value["templates"][0]["name"], json!("S1论坛签到"));
+        assert_eq!(value["templates"][0]["template_id"], json!(7));
+        assert_eq!(value["templates"][0]["updated"], json!(false));
+        assert_eq!(value["templates"][1]["template_id"], json!(9));
+        assert_eq!(value["templates"][1]["updated"], json!(true));
     }
 }

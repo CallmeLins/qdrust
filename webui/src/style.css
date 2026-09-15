@@ -1089,47 +1089,63 @@ code {
 .chip-ok { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
 .chip-warn { color: var(--warn); border-color: rgb(180 83 9 / 0.35); background: rgb(180 83 9 / 0.12); }
 
-.library-list { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
-.library-row {
-  display: flex; align-items: flex-start; gap: 12px;
-  padding: 13px 16px; border-radius: var(--r-m);
-  background-color: rgb(var(--card-surface));
-  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
-  box-shadow: var(--card-shadow);
-  transition: border-color var(--t-fast), background-color var(--t-fast), box-shadow var(--t-fast);
-}
-.library-row:hover {
-  background-color: rgb(var(--card-surface-hover));
-  box-shadow: var(--card-shadow-hover);
-}
-.library-row.is-installed { border-color: rgb(22 163 74 / 0.28); }
-/* The label is only the selection area, so the sibling discussion link stays a
-   plain link instead of toggling the checkbox. */
-.library-row-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: flex-start; gap: 12px; cursor: pointer; }
-.library-row input {
-  width: 16px; height: 16px; margin-top: 2px; flex: none;
-  accent-color: var(--primary);
-}
-
-.library-row-body { flex: 1 1 auto; min-width: 0; display: grid; gap: 4px; }
-.library-row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.library-row-title strong { color: var(--ink); font-size: 13.5px; overflow-wrap: anywhere; }
-.library-row-meta { display: flex; flex-wrap: wrap; gap: 3px 12px; color: var(--ink-3); font-size: 11.5px; }
-/* The manifest documents each template's variables in HTML-ish text, already
-   reduced to plain text server-side. `pre-line` keeps its line breaks. */
-.library-row-comments {
-  color: var(--ink-2); font-size: 12px; line-height: 1.5;
-  white-space: pre-line; overflow-wrap: anywhere;
-}
 .library-row-link {
-  flex: none; align-self: center;
+  margin-left: 8px;
   color: var(--accent); font-size: 11.5px; text-decoration: none;
 }
 .library-row-link:hover { text-decoration: underline; }
 
-@media (max-width: 560px) {
-  .library-row { flex-wrap: wrap; }
-  .library-row-link { margin-left: 28px; }
-  .library-search { max-width: none; }
+/* ---------- templates page ---------- */
+/* Two tables on one page: what is in use, and what can be taken. Both are wider
+   than the content column on a laptop, so they keep the shared horizontal
+   scroll and set their own minimum instead of squeezing the actions into two
+   lines. */
+.templates-table { min-width: 1020px; }
+.library-table { min-width: 880px; }
+
+/* The whole header cell is the sort control, so the click target is the column
+   rather than the label. The idle arrow stays dim: only the sorted column
+   should draw the eye. */
+th.sortable { padding: 0; }
+th.sortable button {
+  width: 100%; height: 44px; padding: 0 18px; border: 0; background: transparent;
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit;
+  transition: color var(--t-fast);
 }
+th.sortable button:hover { color: var(--ink); }
+th.sortable button:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+th.sortable .sort-idle { opacity: 0.3; }
+
+/* The library table only grows its checkbox column in bulk mode; a fixed width
+   keeps the other columns from shifting when it appears. */
+.library-table .col-check { width: 40px; }
+.library-table .col-check input { width: 16px; height: 16px; accent-color: var(--primary); vertical-align: middle; }
+
+/* A row's description belongs under its name, not stretched across the row. */
+.templates-table .row-description,
+.library-table .row-description {
+  display: block; max-width: 36ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px;
+}
+/* Counts are read down the column, so they get tabular figures. */
+.templates-table .num,
+.library-table .num { width: 72px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+/* These action cells hold real buttons rather than the links the shared
+   `.row-actions` rule was written for, so they stay table cells and align the
+   buttons to the right edge of the column. */
+.templates-table td.row-actions,
+.library-table td.row-actions {
+  margin-left: 0; display: table-cell; text-align: right; white-space: nowrap;
+}
+.templates-table td.row-actions .primary-button,
+.templates-table td.row-actions .secondary-button,
+.library-table td.row-actions .primary-button,
+.library-table td.row-actions .secondary-button {
+  height: 32px; min-height: 32px; padding: 0 11px; margin-left: 6px; font-size: 12.5px;
+}
+.templates-table td.row-actions .icon-button,
+.library-table td.row-actions .icon-button { margin-left: 6px; }
 

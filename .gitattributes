@@ -1,0 +1,14 @@
+# Migration files carry a sqlx checksum: `sqlx::migrate!` hashes each file's
+# bytes at build time and the runner compares that hash against what it recorded
+# in `_sqlx_migrations`. Any byte that moves -- including an EOL conversion --
+# makes a deployment that already ran the migration refuse to start with
+# "migration <version> was previously applied but has been modified".
+#
+# Pin them to LF so the working copy, a fresh clone, and the Linux image build
+# all see identical bytes. Without this, core.autocrlf=true materialises CRLF on
+# Windows and the same migration has two different hashes depending on the
+# machine that ran it.
+#
+# What may not change is the content: see scripts/check-migrations.py, which
+# fails CI when a migration that already shipped was edited or deleted.
+*.sql text eol=lf
