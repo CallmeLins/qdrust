@@ -25,7 +25,21 @@ COPY docs/openapi-v1.json docs/openapi-v1.json
 RUN cargo build --locked --release -p qdrust-server
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
+# The tag only ships the packages of its last rebuild, so a fix published in
+# bookworm-security (e.g. libpcre2-8-0 10.42-1 -> 10.42-1+deb12u1) does not
+# reach us until Debian cuts the next point release. That window is enough to
+# fail the release image's Trivy gate, which blocks on any vulnerability that
+# has a fixed version. Upgrade in place rather than trusting the tag; the
+# archive and its -security/-updates suites are live mirrors in the official
+# image, so this picks the fixes up. DEBIAN_SECURITY_REFRESH is a cache-buster
+# (the release workflow passes a per-build value): without it buildx would keep
+# serving the layer cached on the first build and the image would stay frozen
+# on whatever was current then — red gate, nothing a rebuild could fix.
+ARG DEBIAN_SECURITY_REFRESH=local
+RUN echo "debian archive refresh: $DEBIAN_SECURITY_REFRESH" \
+    && export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get -y upgrade \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 qdrust \

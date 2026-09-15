@@ -53,6 +53,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Cache-buster for the runtime stage's apt layer (see Dockerfile): a
+          # per-build value forces that layer to re-run so the image always
+          # carries the current Debian security packages. Without it the layer
+          # is reused from the build cache and a stale package can keep the
+          # Trivy gate red no matter how many times the release is re-run.
+          build-args: |
+            DEBIAN_SECURITY_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -70,6 +77,10 @@ jobs:
           context: .
           load: true
           tags: qdrust:smoke
+          # Same value as the image job so this build shares that cache and
+          # scans exactly the runtime layer that was pushed.
+          build-args: |
+            DEBIAN_SECURITY_REFRESH=${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Container smoke test
