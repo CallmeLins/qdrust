@@ -13,7 +13,7 @@ resolver = "3"
 # package + OpenAPI document + lockfiles in sync (CI runs the same script with
 # --check as a drift gate).
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 license = "MIT"
 
@@ -25,5 +25,5 @@ license = "MIT"
 #    bug diagnostic). scripts/bump-version.py rewrites these together with
 #    [workspace.package], so they never drift in practice.
 [workspace.dependencies]
-qdrust-core = { path = "crates/qdrust-core", version = "0.1.12" }
-qdrust-plugin-browser = { path = "crates/qdrust-plugin-browser", version = "0.1.12" }
+qdrust-core = { path = "crates/qdrust-core", version = "0.1.13" }
+qdrust-plugin-browser = { path = "crates/qdrust-plugin-browser", version = "0.1.13" }

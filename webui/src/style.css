@@ -621,8 +621,13 @@ code {
 .chip-published { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
 .muted { color: var(--ink-3); font-size: 12px; }
 
-/* trailing action group so rows read as "content ... actions" */
-.row-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* trailing action group so rows read as "content ... actions".
+   It is a flex container so a squeezed cell can wrap its buttons onto a second
+   line. `align-content: center` keeps the wrapped lines at their natural height
+   (the default `stretch` pads them out and doubles the visible gap), and the
+   row gap stays tighter than the column gap because two lines of icon buttons
+   read as one group. */
+.row-actions { margin-left: auto; display: flex; align-items: center; align-content: center; gap: 6px 8px; flex-wrap: wrap; }
 .row-actions .secondary-button { height: 34px; min-height: 34px; padding: 0 12px; font-size: 12.5px; }
 .row-actions .icon-button { width: 34px; height: 34px; }
 .row-description { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
@@ -1061,6 +1066,20 @@ code {
   /* Swap the four inline actions for the overflow menu. */
   .tasks-table .row-act { display: none; }
   .tasks-table .row-more { display: inline-flex; }
+}
+
+/* Wide screens: the tasks table stays a table and the four icon actions stay
+   inline, but the actions cell is often squeezed by the columns before it, so
+   they wrap onto a second line. The cell must then size to its content —
+   the shared `td { height: 68px }` is a fixed box, and two lines (34 + 6 + 34)
+   overflow it and land on the row border. `height: auto` lets the row grow and
+   the padding keeps the wrapped line off the border, while `min-height` keeps
+   single-line rows at the usual 68px rhythm. */
+@media (min-width: 1025px) {
+  .tasks-table .row-actions {
+    height: auto; min-height: 68px;
+    padding-top: 10px; padding-bottom: 10px;
+  }
 }
 
 /* Small phones: the meta row no longer fits on one line, so give each value
