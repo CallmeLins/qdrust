@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Copy, Download, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
+import Pager from "./Pager.vue";
 import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
-import { locale, t, toggleLocale } from "./i18n";
+import { readPageSize, usePager, writePageSize } from "./pagination";
+import { fmt, locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
 type ToastKind = "success" | "error" | "pending";
@@ -53,10 +55,20 @@ function updateToast(id: number, patch: Partial<Toast>) {
     scheduleDismiss(id, toast.detail || toast.meta ? 9000 : 4000);
   }
 }
-function fmt(key: Parameters<typeof t>[0], params?: Record<string, string | number>): string {
-  let s = t(key);
-  if (params) for (const [k, v] of Object.entries(params)) s = s.replace(`{${k}}`, String(v));
-  return s;
+/** Rows per page, shared by every paged list (see pagination.ts).
+ *
+ *  Stored rather than held in memory: a reader who wants 50 rows wants them
+ *  on the next visit too. It is a per-browser preference, not a site
+ *  setting, so it needs no round trip and no server state.
+ *
+ *  Set from the pager footer under the list it applies to — that is where a
+ *  reader notices the row count, and sending them to a settings page to
+ *  change it would lose their place. */
+const pageSize = ref(readPageSize(localStorage));
+function setPageSize(value: number) {
+  if (value === pageSize.value) return;
+  pageSize.value = value;
+  writePageSize(localStorage, value);
 }
 
 // ---------- theme (light / dark / system, mirrors collector) ----------
@@ -274,6 +286,16 @@ const filteredTasks = computed(() => {
     return `${task.name} ${task.url}`.toLowerCase().includes(term);
   });
 });
+/** One page of the filtered list. The summary tiles below stay account-wide,
+ *  so they never report a page's worth as if it were the whole picture. */
+const {
+  page: tasksPage, pages: tasksTotalPages, items: pagedTasks,
+  prev: tasksPrevPage, next: tasksNextPage, reset: resetTasksPage,
+} = usePager(() => filteredTasks.value, () => pageSize.value);
+// A new search term or group is a different list rather than a later page of
+// the same one, so it starts over.
+watch([search, groupFilter], resetTasksPage);
+
 const activeCount = computed(() => tasks.value.filter((task) => !task.disabled).length);
 const successCount = computed(() => tasks.value.filter((task) => task.last_status != null && task.last_status < 400).length);
 const taskName = (taskId: number) => tasks.value.find((task) => task.id === taskId)?.name ?? `#${taskId}`;
@@ -462,8 +484,11 @@ async function batchTasks(action: "enable" | "disable" | "delete" | "run") {
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 function toggleSelect(id: number) { selected.has(id) ? selected.delete(id) : selected.add(id); }
+/** Select-all covers the page on screen, not the whole filtered set: the rows
+ *  it can reach are exactly the ones the reader can watch it tick, and no row
+ *  hidden on another page is swept into a batch action. */
 function selectAllVisible() {
-  const ids = filteredTasks.value.map((x) => x.id);
+  const ids = pagedTasks.value.map((x) => x.id);
   const allSelected = ids.length > 0 && ids.every((id) => selected.has(id));
   for (const id of ids) allSelected ? selected.delete(id) : selected.add(id);
 }
@@ -555,7 +580,8 @@ function runStatusClass(status: string): string {
 // ---------- aggregated run log ----------
 // "Are all 30 tasks still green?" used to mean opening 30 run-history pages.
 // One filtered list answers it instead; the per-task page stays for depth.
-const RUN_LOG_PAGE = 20;
+// Rows per fetch follow the app-wide page size (see pagination.ts): the run
+// log is a list like any other, and it holds the longest rows in the app.
 const allRuns = ref<Run[]>([]);
 const runLogStatus = ref<"" | "succeeded" | "failed">("");
 const runLogTaskId = ref(0);
@@ -598,7 +624,7 @@ async function loadRunLog() {
       status: runLogStatus.value || undefined,
       taskId: runLogTaskId.value || undefined,
       beforeId: runLogCursors.value[runLogCursors.value.length - 1] ?? undefined,
-      limit: RUN_LOG_PAGE,
+      limit: pageSize.value,
     });
     allRuns.value = page.items;
     runLogHasMore.value = page.has_more;
@@ -621,6 +647,13 @@ async function prevRunLogPage() {
 }
 function setRunLogStatus(status: "" | "succeeded" | "failed") {
   runLogStatus.value = status;
+  void loadRunLog();
+}
+/** A different row count makes the cursor stack meaningless — those cursors
+ *  were cut for pages of the old size — so the paging starts over. */
+function setRunLogPageSize(value: number) {
+  setPageSize(value);
+  runLogCursors.value = [];
   void loadRunLog();
 }
 
@@ -701,6 +734,19 @@ const filteredTemplates = computed(() => {
 const sortedPublicTemplates = computed(() =>
   sortRows(publicTemplates.value, publicSort, (item, key) => (key === "name" ? item.name : item.updated_at)),
 );
+/** Both template lists are paged like everything else. This is the list that
+ *  most often runs into the hundreds, and the one whose rows are tallest —
+ *  name, description and four buttons each. */
+const {
+  page: templatesPage, pages: templatesTotalPages, items: pagedTemplates,
+  prev: templatesPrevPage, next: templatesNextPage, reset: resetTemplatesPage,
+} = usePager(() => filteredTemplates.value, () => pageSize.value);
+const {
+  page: publicTemplatesPage, pages: publicTemplatesTotalPages, items: pagedPublicTemplates,
+  prev: publicTemplatesPrevPage, next: publicTemplatesNextPage,
+} = usePager(() => sortedPublicTemplates.value, () => pageSize.value);
+watch(templateSearch, resetTemplatesPage);
+
 /** Headers of the "my templates" table. `text` marks the columns whose natural
  *  first order is A→Z rather than newest-first. */
 const templateColumns = computed(() => [
@@ -1130,6 +1176,10 @@ async function saveActionEdit() {
 
 // ---------- subscriptions (a section of the templates page, not a page of its own) ----------
 const subscriptions = ref<TemplateSubscription[]>([]);
+const {
+  page: subsPage, pages: subsTotalPages, items: pagedSubscriptions,
+  prev: subsPrevPage, next: subsNextPage,
+} = usePager(() => subscriptions.value, () => pageSize.value);
 const subForm = reactive<{ name: string; url: string }>({ name: "", url: "" });
 /** Add/edit dialog state: a null edit target means "create". */
 const showSubModal = ref(false);
@@ -1285,19 +1335,14 @@ const libraryEntries = computed<LibraryEntry[]>(() => {
   });
 });
 const librarySelectedCount = computed(() => librarySelected.value.size);
-/** Client-side paging over the filtered list: a catalogue can run to hundreds
- *  of entries and one long table is unreadable. Any change to the list
+/** Paging over the filtered catalogue: a library can run to hundreds of
+ *  entries and one long table is unreadable. Any change to the list
  *  underneath (search, filter, sort, source, refresh) restarts at page 1. */
-const LIBRARY_PAGE_SIZE = 20;
-const libraryPage = ref(1);
-const libraryTotalPages = computed(() => Math.max(1, Math.ceil(libraryEntries.value.length / LIBRARY_PAGE_SIZE)));
-const pagedLibraryEntries = computed(() => {
-  const start = (libraryPage.value - 1) * LIBRARY_PAGE_SIZE;
-  return libraryEntries.value.slice(start, start + LIBRARY_PAGE_SIZE);
-});
-watch(libraryEntries, () => { libraryPage.value = 1; });
-function libraryPrevPage() { if (libraryPage.value > 1) libraryPage.value -= 1; }
-function libraryNextPage() { if (libraryPage.value < libraryTotalPages.value) libraryPage.value += 1; }
+const {
+  page: libraryPage, pages: libraryTotalPages, items: pagedLibraryEntries,
+  prev: libraryPrevPage, next: libraryNextPage, reset: resetLibraryPage,
+} = usePager(() => libraryEntries.value, () => pageSize.value);
+watch(libraryEntries, resetLibraryPage);
 /** Only entries currently visible — the page on screen — can be selected, so a
  *  filter or a page turn never hides part of the selection. */
 const libraryAllVisibleSelected = computed(
@@ -2003,11 +2048,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div v-else class="table-wrap tasks-wrap">
             <table class="tasks-table">
               <thead><tr>
-                <th class="col-check"><input type="checkbox" :checked="filteredTasks.length > 0 && filteredTasks.every(x => selected.has(x.id))" :title="t('selectAll')" @change="selectAllVisible" /></th>
+                <th class="col-check"><input type="checkbox" :checked="pagedTasks.length > 0 && pagedTasks.every(x => selected.has(x.id))" :title="t('selectAll')" @change="selectAllVisible" /></th>
                 <th>{{ t('name') }}</th><th class="col-schedule">{{ t('schedule') }}</th><th>{{ t('lastRunAt') }}</th><th>{{ t('status') }}</th><th class="col-group">{{ t('group') }}</th><th><span class="sr-only">{{ t('more') }}</span></th>
               </tr></thead>
               <tbody>
-                <template v-for="task in filteredTasks" :key="task.id">
+                <template v-for="task in pagedTasks" :key="task.id">
                   <tr>
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
                     <td class="col-name"><div class="task-name"><strong>{{ task.name }}</strong></div></td>
@@ -2035,6 +2080,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          <Pager
+            :page="tasksPage"
+            :pages="tasksTotalPages"
+            :total="filteredTasks.length"
+            :page-size="pageSize"
+            @prev="tasksPrevPage"
+            @next="tasksNextPage"
+            @update:page-size="setPageSize"
+          />
         </section>
       </div>
 
@@ -2096,7 +2150,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <th><span class="sr-only">{{ t('manage') }}</span></th>
               </tr></thead>
               <tbody>
-                <tr v-for="sub in subscriptions" :key="sub.id">
+                <tr v-for="sub in pagedSubscriptions" :key="sub.id">
                   <td class="task-name"><strong>{{ sub.name }}</strong></td>
                   <td><a class="library-row-link" :href="sub.url" target="_blank" rel="noopener noreferrer">{{ sub.url }}</a></td>
                   <td><span v-if="sub.enabled" class="chip chip-ok">{{ t('subEnabled') }}</span><span v-else class="chip">{{ t('subDisabled') }}</span></td>
@@ -2109,6 +2163,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          <Pager
+            :page="subsPage"
+            :pages="subsTotalPages"
+            :total="subscriptions.length"
+            :page-size="pageSize"
+            @prev="subsPrevPage"
+            @next="subsNextPage"
+            @update:page-size="setPageSize"
+          />
         </section>
 
         <!-- 1) What is in use. One row per template, columns aligned, every
@@ -2133,7 +2196,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <th><span class="sr-only">{{ t('manage') }}</span></th>
               </tr></thead>
               <tbody>
-                <tr v-for="item in filteredTemplates" :key="item.id">
+                <tr v-for="item in pagedTemplates" :key="item.id">
                   <td class="task-name">
                     <strong>{{ item.name }}</strong>
                     <span v-if="publishedTemplateIds.has(item.id)" class="chip chip-published">{{ t('published') }}</span>
@@ -2153,6 +2216,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          <Pager
+            :page="templatesPage"
+            :pages="templatesTotalPages"
+            :total="filteredTemplates.length"
+            :page-size="pageSize"
+            @prev="templatesPrevPage"
+            @next="templatesNextPage"
+            @update:page-size="setPageSize"
+          />
         </section>
 
         <!-- 2) What can be taken: every subscribed library in one list, newest
@@ -2253,11 +2325,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </table>
             </div>
 
-            <div v-if="libraryTotalPages > 1" class="pager">
-              <button class="secondary-button" :disabled="libraryPage <= 1" @click="libraryPrevPage"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
-              <span class="muted">{{ fmt('pageOf', { n: libraryPage, total: libraryTotalPages }) }}</span>
-              <button class="secondary-button" :disabled="libraryPage >= libraryTotalPages" @click="libraryNextPage">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
-            </div>
+            <Pager
+              :page="libraryPage"
+              :pages="libraryTotalPages"
+              :total="libraryEntries.length"
+              :page-size="pageSize"
+              @prev="libraryPrevPage"
+              @next="libraryNextPage"
+              @update:page-size="setPageSize"
+            />
 
             <template v-if="libraryFailures.length">
               <h2>{{ t('libraryFailedTitle') }}</h2>
@@ -2290,7 +2366,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   <th><span class="sr-only">{{ t('manage') }}</span></th>
                 </tr></thead>
                 <tbody>
-                  <tr v-for="item in sortedPublicTemplates" :key="item.id">
+                  <tr v-for="item in pagedPublicTemplates" :key="item.id">
                     <td class="task-name"><strong>{{ item.name }}</strong></td>
                     <td class="muted row-description">{{ item.description ?? '—' }}</td>
                     <td class="run-time">{{ formatRunTime(item.updated_at) }}</td>
@@ -2299,6 +2375,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 </tbody>
               </table>
             </div>
+            <Pager
+              :page="publicTemplatesPage"
+              :pages="publicTemplatesTotalPages"
+              :total="sortedPublicTemplates.length"
+              :page-size="pageSize"
+              @prev="publicTemplatesPrevPage"
+              @next="publicTemplatesNextPage"
+              @update:page-size="setPageSize"
+            />
           </template>
         </section>
       </div>
@@ -2730,11 +2815,16 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </tbody>
           </table>
         </div>
-        <div class="pager">
-          <button class="secondary-button" :disabled="runLogCursors.length === 0 || runLogLoading" @click="prevRunLogPage"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
-          <span class="muted">{{ fmt('runLogPageNo', { n: runLogPageNo }) }}</span>
-          <button class="secondary-button" :disabled="!runLogHasMore || runLogLoading" @click="nextRunLogPage">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
-        </div>
+        <Pager
+          :page="runLogPageNo"
+          :page-size="pageSize"
+          :busy="runLogLoading"
+          :prev-disabled="runLogCursors.length === 0"
+          :next-disabled="!runLogHasMore"
+          @prev="prevRunLogPage"
+          @next="nextRunLogPage"
+          @update:page-size="setRunLogPageSize"
+        />
       </div>
     </div>
 

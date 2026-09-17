@@ -528,12 +528,17 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 .batch-bar span { margin-right: auto; font-weight: 650; color: var(--accent); }
 
-/* pager: prev/next row under paged tables (library, run-log modal) */
+/* pager: the footer under a paged list (tasks, subscriptions, both template
+   lists, the library tables, the run-log modal). Row count on the left, the
+   page controls centred, the page-size picker on the right — and it wraps
+   instead of overflowing once a narrow screen runs out of width. */
 .pager {
-  display: flex; align-items: center; justify-content: center;
-  gap: 12px; margin-top: 12px; font-size: 13px;
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+  gap: 8px 12px; margin-top: 12px; font-size: 13px;
 }
-.pager .muted { min-width: 88px; text-align: center; }
+.pager .pager-position { min-width: 88px; text-align: center; }
+.pager-total { margin-right: auto; }
+.pager-size { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--ink-3); font-size: 12px; }
 
 /* ============================================================
    tables

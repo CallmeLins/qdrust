@@ -454,6 +454,10 @@ const zh = {
   localeLabel: "界面语言",
   roleAdmin: "管理员",
   roleUser: "普通用户",
+  // paging (a stored preference, set from the pager footers, not a site setting)
+  pageSizeLabel: "每页",
+  pageSizeUnit: "{n} 条",
+  pageTotal: "共 {n} 条",
   // runs
   back: "返回",
   time: "时间",
@@ -944,6 +948,10 @@ const en: Record<MessageKey, string> = {
   localeLabel: "Language",
   roleAdmin: "Admin",
   roleUser: "User",
+  // paging (a stored preference, set from the pager footers, not a site setting)
+  pageSizeLabel: "Per page",
+  pageSizeUnit: "{n}",
+  pageTotal: "{n} rows",
   // runs
   back: "Back",
   time: "Time",
@@ -982,6 +990,12 @@ const en: Record<MessageKey, string> = {
 };
 
 export function t(key: MessageKey): string { return (locale.value === "zh-CN" ? zh : en)[key]; }
+/** `t()` with `{name}` placeholders filled in. */
+export function fmt(key: MessageKey, params?: Record<string, string | number>): string {
+  let message = t(key);
+  if (params) for (const [name, value] of Object.entries(params)) message = message.replace(`{${name}}`, String(value));
+  return message;
+}
 function applyDocumentLang(): void {
   if (typeof document !== "undefined") document.documentElement.lang = locale.value;
 }
