@@ -8,7 +8,7 @@ import {
 import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
-import { consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
+import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
 import { locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -768,7 +768,11 @@ function openImportModal(template?: Template) {
   // library link here is what keeps them all writing to the local templates.
   libraryPreview.value = null;
   Object.assign(importForm, { name: template?.name ?? "", description: template?.description ?? "" });
-  harEditorDoc.value = template?.qd_har ?? { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
+  // A stored template is not necessarily a HAR document: one imported from a
+  // subscription keeps whatever shape the source published, which for the QD
+  // libraries is a bare request array. Normalise on the way in, or the editor
+  // opens empty on a template that runs perfectly well.
+  harEditorDoc.value = harDocumentFrom(template?.qd_har) ?? emptyHarDoc();
   showImport.value = true;
 }
 
@@ -792,44 +796,7 @@ function createTaskFromTemplate(item: Template) {
   taskForm.templateId = item.id;
 }
 
-/**
- * QD 旧版模板数组（[{comment, request:{method,url,headers,cookies,data,mimeType}, rule:{...}}]）
- * 转 QD HAR 文档，与 QD 前端 utils.tpl2har 行为一致：
- * request.data → postData.text、mimeType → postData.mimeType、rule.* 平铺到条目上，
- * headers/cookies/条目一律 checked: true。
- */
-function qdTplToHar(tpl: unknown[]): object {
-  const entries = tpl.map((item) => {
-    const raw = (item && typeof item === "object" && !Array.isArray(item) ? item : {}) as Record<string, unknown>;
-    const req = (raw.request && typeof raw.request === "object" && !Array.isArray(raw.request) ? raw.request : {}) as Record<string, unknown>;
-    const rule = (raw.rule && typeof raw.rule === "object" && !Array.isArray(raw.rule) ? raw.rule : {}) as Record<string, unknown>;
-    const data = typeof req.data === "string" ? req.data : undefined;
-    const mimeType = typeof req.mimeType === "string" ? req.mimeType : undefined;
-    const entry: Record<string, unknown> = {
-      checked: true,
-      request: {
-        method: typeof req.method === "string" && req.method.trim() ? req.method : "GET",
-        url: typeof req.url === "string" ? req.url : "",
-        headers: Array.isArray(req.headers)
-          ? req.headers.map((h) => ({ name: String((h as Record<string, unknown>)?.name ?? ""), value: String((h as Record<string, unknown>)?.value ?? ""), checked: true }))
-          : [],
-        cookies: Array.isArray(req.cookies)
-          ? req.cookies.map((c) => ({ name: String((c as Record<string, unknown>)?.name ?? ""), value: String((c as Record<string, unknown>)?.value ?? ""), checked: true }))
-          : [],
-        queryString: [],
-        ...(data !== undefined || mimeType !== undefined ? { postData: { mimeType: mimeType ?? "", ...(data !== undefined ? { text: data } : {}) } } : {}),
-      },
-      success_asserts: Array.isArray(rule.success_asserts) ? rule.success_asserts : [],
-      failed_asserts: Array.isArray(rule.failed_asserts) ? rule.failed_asserts : [],
-      extract_variables: Array.isArray(rule.extract_variables) ? rule.extract_variables : [],
-    };
-    if (typeof raw.comment === "string" && raw.comment) entry.comment = raw.comment;
-    return entry;
-  });
-  return { log: { version: "1.2", creator: { name: "binux", version: "QD" }, entries } };
-}
-
-/** 导入本地模板文件：兼容标准 HAR（{log:{entries}}）与 QD 导出的请求数组两种格式 */
+/** 导入本地模板文件：兼容标准 HAR 与 QD 导出的请求数组两种格式 */
 async function onHarFile(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
@@ -842,17 +809,7 @@ async function onHarFile(event: Event) {
     notify(t("harJsonError"), "error");
     return;
   }
-  let doc: object | null = null;
-  if (Array.isArray(parsed)) {
-    doc = qdTplToHar(parsed);
-  } else if (parsed && typeof parsed === "object" && (parsed as Record<string, unknown>).log) {
-    // 标准 HAR 文档；后端执行要求 version 1.2，导入时统一归一化
-    const log = ((parsed as Record<string, unknown>).log && typeof (parsed as Record<string, unknown>).log === "object"
-      ? { ...((parsed as Record<string, unknown>).log as Record<string, unknown>) }
-      : {});
-    log.version = "1.2";
-    doc = { log };
-  }
+  const doc = harDocumentFrom(parsed);
   if (!doc) {
     notify(t("harJsonError"), "error");
     return;
@@ -1439,12 +1396,21 @@ async function previewLibraryEntry(entry: LibraryEntry) {
   libraryFailures.value = [];
   try {
     const preview = await api.previewSubscriptionEntry(sourceId, entry.name);
+    // The source publishes a bare request array, the endpoint hands it back
+    // untouched, and the editor only reads HAR documents — this is the step
+    // that used to be missing, which is why the editor opened empty and had
+    // nothing to save.
+    const doc = harDocumentFrom(preview.har);
+    if (!doc) {
+      notify(t("harJsonError"), "error");
+      return;
+    }
     openImportModal();
     importForm.name = preview.entry.name;
     // The manifest's variable notes are what a reader wants as the description,
     // and the field is a single line, so fold them onto one.
     importForm.description = (preview.entry.comments ?? "").replace(/\s+/g, " ").trim();
-    harEditorDoc.value = preview.har;
+    harEditorDoc.value = doc;
     // Set after `openImportModal`, which clears it along with every other entry
     // point into this editor.
     libraryPreview.value = {

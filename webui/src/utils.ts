@@ -10,6 +10,76 @@ export function formatRunTime(value: number | null, locale = "zh-CN", timeZone?:
   }).format(value * 1000);
 }
 
+// ---------- QD 模板 → HAR 文档 ----------
+
+/** 编辑器在所有输入之前的起点：一个空的 HAR 文档。 */
+export function emptyHarDoc(): object {
+  return { log: { version: "1.2", creator: { name: "qdrust", version: "1" }, entries: [] as unknown[] } };
+}
+
+/**
+ * QD 旧版模板数组（`[{comment, request:{method,url,headers,cookies,data,mimeType}, rule:{…}}]`）
+ * 转 QD HAR 文档，与 QD 前端 `utils.tpl2har` 行为一致：
+ * `request.data` → `postData.text`、`mimeType` → `postData.mimeType`、`rule.*` 平铺到条目上，
+ * headers/cookies/条目一律 `checked: true`。
+ */
+export function qdTplToHar(tpl: unknown[]): object {
+  const entries = tpl.map((item) => {
+    const raw = (item && typeof item === "object" && !Array.isArray(item) ? item : {}) as Record<string, unknown>;
+    const req = (raw.request && typeof raw.request === "object" && !Array.isArray(raw.request) ? raw.request : {}) as Record<string, unknown>;
+    const rule = (raw.rule && typeof raw.rule === "object" && !Array.isArray(raw.rule) ? raw.rule : {}) as Record<string, unknown>;
+    const data = typeof req.data === "string" ? req.data : undefined;
+    const mimeType = typeof req.mimeType === "string" ? req.mimeType : undefined;
+    const entry: Record<string, unknown> = {
+      checked: true,
+      request: {
+        method: typeof req.method === "string" && req.method.trim() ? req.method : "GET",
+        url: typeof req.url === "string" ? req.url : "",
+        headers: Array.isArray(req.headers)
+          ? req.headers.map((h) => ({ name: String((h as Record<string, unknown>)?.name ?? ""), value: String((h as Record<string, unknown>)?.value ?? ""), checked: true }))
+          : [],
+        cookies: Array.isArray(req.cookies)
+          ? req.cookies.map((c) => ({ name: String((c as Record<string, unknown>)?.name ?? ""), value: String((c as Record<string, unknown>)?.value ?? ""), checked: true }))
+          : [],
+        queryString: [],
+        ...(data !== undefined || mimeType !== undefined ? { postData: { mimeType: mimeType ?? "", ...(data !== undefined ? { text: data } : {}) } } : {}),
+      },
+      success_asserts: Array.isArray(rule.success_asserts) ? rule.success_asserts : [],
+      failed_asserts: Array.isArray(rule.failed_asserts) ? rule.failed_asserts : [],
+      extract_variables: Array.isArray(rule.extract_variables) ? rule.extract_variables : [],
+    };
+    if (typeof raw.comment === "string" && raw.comment) entry.comment = raw.comment;
+    return entry;
+  });
+  return { log: { version: "1.2", creator: { name: "binux", version: "QD" }, entries } };
+}
+
+/**
+ * 把拿到的模板数据归一化成编辑器能读的 HAR 文档。
+ *
+ * 两种形状都要认：标准 HAR（`{log:{entries}}`）和 QD 导出的请求数组
+ * （见 `qdTplToHar`）。订阅源（qd-today/templates 及其兼容库）发布的正是后者，
+ * 而 `GET …/library/preview` 按契约返回**上游原文**、`Template.qd_har` 也是库里
+ * 存什么回什么，所以转换在客户端做——本地文件导入、模板库预览、打开已有模板
+ * 三条路因此共用同一条转换。
+ *
+ * 两条路都漏掉这个转换时，编辑器只会拿到一个数组：它认不出 `log`，退回空文档，
+ * 于是"点导入 → 编辑器全空 → 保存被后端拒绝"。
+ *
+ * 两种形状都不像时返回 null，交给调用方报错。
+ */
+export function harDocumentFrom(parsed: unknown): object | null {
+  if (Array.isArray(parsed)) return qdTplToHar(parsed);
+  if (parsed && typeof parsed === "object") {
+    const log = (parsed as Record<string, unknown>).log;
+    if (log && typeof log === "object" && !Array.isArray(log)) {
+      // 标准 HAR 文档；后端执行要求 version 1.2，导入时统一归一化
+      return { log: { ...(log as Record<string, unknown>), version: "1.2" } };
+    }
+  }
+  return null;
+}
+
 // ---------- external IdP login policy (docs/design/EXTERNAL_IDP_PLAN.md Phase 3) ----------
 
 /** Public auth policy as delivered by GET /api/v1/auth/config. */

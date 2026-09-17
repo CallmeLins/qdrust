@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, type AuthPolicy, type StorageLike } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -8,6 +8,69 @@ describe("formatRunTime", () => {
 
   it("formats unix timestamps", () => {
     expect(formatRunTime(1_700_000_000, "en-GB", "UTC")).toMatch(/14\/11.*22:13/);
+  });
+});
+
+describe("harDocumentFrom", () => {
+  // The shape qd-today/templates publishes (base64 `content` in tpls_history.json,
+  // and the repository's *.har files): a bare request array, no `log` wrapper.
+  const qdEntry = {
+    comment: "获取token",
+    request: {
+      method: "GET",
+      url: "https://example.com/login",
+      headers: [{ name: "Host", value: "example.com" }],
+      cookies: [],
+      data: "",
+      mimeType: "",
+    },
+    rule: {
+      success_asserts: [{ re: "200", from: "status" }],
+      failed_asserts: [],
+      extract_variables: [{ name: "token", re: 'name="token" value="(.+)"', from: "content" }],
+    },
+  };
+
+  it("turns a QD request array into a HAR document the editor can read", () => {
+    const doc = harDocumentFrom([qdEntry]) as any;
+    expect(doc.log.version).toBe("1.2");
+    expect(doc.log.entries).toHaveLength(1);
+    const entry = doc.log.entries[0];
+    expect(entry.checked).toBe(true);
+    expect(entry.request.method).toBe("GET");
+    expect(entry.request.url).toBe("https://example.com/login");
+    expect(entry.request.headers).toEqual([{ name: "Host", value: "example.com", checked: true }]);
+    expect(entry.comment).toBe("获取token");
+  });
+
+  it("flattens the QD `rule` object onto the entry", () => {
+    const entry = (harDocumentFrom([qdEntry]) as any).log.entries[0];
+    expect(entry.success_asserts).toEqual([{ re: "200", from: "status" }]);
+    expect(entry.failed_asserts).toEqual([]);
+    expect(entry.extract_variables).toEqual([{ name: "token", re: 'name="token" value="(.+)"', from: "content" }]);
+  });
+
+  it("maps a QD body onto postData", () => {
+    const withBody = { ...qdEntry, request: { ...qdEntry.request, data: "a=1", mimeType: "application/x-www-form-urlencoded" } };
+    const entry = (harDocumentFrom([withBody]) as any).log.entries[0];
+    expect(entry.request.postData).toEqual({ mimeType: "application/x-www-form-urlencoded", text: "a=1" });
+  });
+
+  it("passes a HAR document through and normalises the version", () => {
+    const har = { log: { version: "1.1", creator: { name: "x" }, entries: [{ request: { method: "GET", url: "https://a/" } }] } };
+    const doc = harDocumentFrom(har) as any;
+    expect(doc.log.version).toBe("1.2");
+    expect(doc.log.entries[0].request.url).toBe("https://a/");
+    // The log wrapper must not be wrapped a second time.
+    expect(doc.log.log).toBeUndefined();
+  });
+
+  it("returns null for anything that is neither shape", () => {
+    expect(harDocumentFrom(null)).toBeNull();
+    expect(harDocumentFrom("{}")).toBeNull();
+    expect(harDocumentFrom({ foo: 1 })).toBeNull();
+    // A `log` that is not an object is not a HAR document either.
+    expect(harDocumentFrom({ log: "nope" })).toBeNull();
   });
 });
 
