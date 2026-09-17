@@ -906,8 +906,9 @@ const actionForm = reactive({ taskIds: [] as number[], channelId: 0, event: "fai
 const editingActionId = ref<number | null>(null);
 const actionEdit = reactive({ channelId: 0, event: "failure", failureThreshold: "1", automaticOnly: false, titleTemplate: "", bodyTemplate: "" });
 // One checkbox list replaces the old single-task <select> + ctrl-click multiple
-// <select>: the same ticks drive both the saved bindings and the list below, so
-// there is no "single vs batch" pair of controls to reconcile.
+// <select>: the ticks pick which tasks a new binding is written to, while the
+// list below reads the whole account, so a rule you just saved is never hidden
+// behind an empty selection.
 const actionTaskFilter = ref("");
 const actionTasks = computed(() => {
   const needle = actionTaskFilter.value.trim().toLowerCase();
@@ -921,14 +922,12 @@ const allActionTasksChecked = computed(() => actionTasks.value.length > 0 && act
 function toggleActionTask(id: number) {
   const at = actionForm.taskIds.indexOf(id);
   if (at >= 0) actionForm.taskIds.splice(at, 1); else actionForm.taskIds.push(id);
-  void loadActions();
 }
 function toggleAllActionTasks() {
   const ids = actionTasks.value.map((task) => task.id);
   actionForm.taskIds = allActionTasksChecked.value
     ? actionForm.taskIds.filter((id) => !ids.includes(id))
     : [...new Set([...actionForm.taskIds, ...ids])];
-  void loadActions();
 }
 const actionChannelDropdownOptions = computed(() => [
   { value: 0, label: t("chooseChannel"), disabled: true },
@@ -1068,10 +1067,8 @@ async function testChannel(channel: NotificationChannel) {
 }
 async function loadActions() {
   try {
-    if (!actionForm.taskIds.length) { actions.value = []; editingActionId.value = null; return; }
-    const lists = await Promise.all(actionForm.taskIds.map((id) => api.notificationActions(id)));
-    actions.value = lists.flat();
-    // Unticking a task can take the row being edited off the screen with it.
+    actions.value = await api.allNotificationActions();
+    // A row can vanish under the editor — deleted here or in another tab.
     if (editingActionId.value != null && !actions.value.some((action) => action.id === editingActionId.value)) {
       editingActionId.value = null;
     }
@@ -1082,8 +1079,9 @@ async function saveAction() {
     if (!actionForm.taskIds.length) { notify(t("chooseTask"), "error"); return; }
     if (!actionForm.channelId) { notify(t("chooseChannel"), "error"); return; }
     const threshold = Math.max(1, Number(actionForm.failureThreshold) || 1);
-    // The ticks survive a save (the list below keeps showing the bindings), so
-    // filter out the pairs that already exist instead of inserting duplicates.
+    // The ticks survive a save, so filter out the pairs that already exist
+    // instead of inserting duplicates. The list covers the whole account now,
+    // so a duplicate is caught even on a task the form is not showing.
     const bound = new Set(actions.value.map((action) => `${action.task_id}:${action.channel_id}:${action.event}`));
     const pending = actionForm.taskIds.filter((id) => !bound.has(`${id}:${actionForm.channelId}:${actionForm.event}`));
     if (!pending.length) { notify(t("notifyAlreadyBound"), "error"); return; }
@@ -2432,7 +2430,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <small class="kv-hint field-wide">{{ t('notifyVarsHint') }}</small>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
-          <div v-if="!actionForm.taskIds.length" class="muted">{{ t('notifyPickTasksHint') }}</div>
+          <div v-if="actions.length === 0" class="muted">{{ t('noActions') }}</div>
           <div v-for="action in actions" :key="action.id" class="run-row">
             <template v-if="editingActionId === action.id">
               <!-- The row becomes its own editor: a binding is too small an

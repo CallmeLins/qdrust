@@ -576,6 +576,17 @@
         }
       }
     },
+    "/api/v1/notification-actions": {
+      "get": {
+        "operationId": "listAllNotificationActions",
+        "description": "Every notification action the caller owns, across all of their tasks.",
+        "responses": {
+          "200": {
+            "description": "Notification action list"
+          }
+        }
+      }
+    },
     "/api/v1/notification-actions/{id}": {
       "parameters": [
         {

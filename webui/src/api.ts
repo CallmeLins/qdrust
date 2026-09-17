@@ -191,6 +191,8 @@ export const api = {
   deleteNotificationChannel: (id: number) => request<void>(`/api/v1/notification-channels/${id}`, { method: "DELETE" }),
   testNotificationChannel: (id: number) => request<{ ok: boolean; kind: string }>(`/api/v1/notification-channels/${id}/test`, { method: "POST" }),
   notificationActions: (taskId: number) => request<NotificationAction[]>(`/api/v1/tasks/${taskId}/notification-actions`),
+  /** Every binding the caller owns, across every task: what the notify page lists. */
+  allNotificationActions: () => request<NotificationAction[]>("/api/v1/notification-actions"),
   createNotificationAction: (taskId: number, channelId: number, event: string) => request<NotificationAction>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "POST", body: JSON.stringify({ channel_id: channelId, event }) }),
   /** Partial edit: keys left out keep their stored value. Send an empty string
    *  to clear a template — `null` means "unchanged", not "remove". */

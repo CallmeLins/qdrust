@@ -1451,6 +1451,21 @@ macro_rules! define_store {
         ))
     }
 
+    /// Every binding one account owns, across all of its tasks. The notify page
+    /// lists them as a whole, so it must not depend on which tasks the create
+    /// form happens to have ticked — a rule you just saved is exactly the one
+    /// you want to see, and it would otherwise be invisible.
+    pub async fn list_all_notification_actions(
+        &self,
+        owner_id: i64,
+    ) -> Result<Vec<NotificationAction>> {
+        let rows = sqlx::query("SELECT a.id,a.task_id,a.channel_id,a.event,a.failure_threshold,a.automatic_only,a.title_template,a.body_template,a.created_at FROM notification_actions a JOIN tasks t ON t.id=a.task_id WHERE t.owner_id=? ORDER BY t.name,a.id")
+            .bind(owner_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(notification_action_from_row).collect()
+    }
+
     pub async fn delete_notification_action(&self, id: i64, owner_id: i64) -> Result<bool> {
         Ok(sqlx::query("DELETE FROM notification_actions WHERE id=? AND task_id IN (SELECT id FROM tasks WHERE owner_id=?)")
             .bind(id).bind(owner_id).execute(&self.pool).await?.rows_affected() > 0)
@@ -3186,6 +3201,7 @@ impl Store {
         pub async fn create_notification_action(task_id: i64, owner_id: i64, input: CreateNotificationAction) -> Result<Option<NotificationAction>> { task_id, owner_id, input };
         pub async fn create_notification_actions_for_tasks(owner_id: i64, task_ids: &[i64], input: CreateNotificationAction) -> Result<usize> { owner_id, task_ids, input };
         pub async fn list_notification_actions(task_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationAction>>> { task_id, owner_id };
+        pub async fn list_all_notification_actions(owner_id: i64) -> Result<Vec<NotificationAction>> { owner_id };
         pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
         pub async fn update_notification_action(id: i64, owner_id: i64, input: UpdateNotificationAction) -> Result<Option<NotificationAction>> { id, owner_id, input };
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
@@ -4480,6 +4496,78 @@ mod tests {
         let intact = listed.iter().find(|row| row.id == action.id).unwrap();
         assert_eq!(intact.event, "always");
         assert_eq!(intact.failure_threshold, 1);
+    }
+
+    /// The notify page lists every binding an account owns in one request, so
+    /// the listing has to span all of that account's tasks — the point being
+    /// that a saved rule is visible even when nothing is selected — while
+    /// still stopping at the account boundary.
+    #[tokio::test]
+    async fn all_notification_actions_span_tasks_and_scope_owners() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let alice = store
+            .create_user("alice-all-actions", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("bob-all-actions", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let webhook = |name: &str| CreateNotificationChannel {
+            name: name.into(),
+            kind: "webhook".into(),
+            config: serde_json::json!({"url":"https://example.com/hook"}),
+            enabled: true,
+        };
+        let alice_channel = store
+            .create_notification_channel(alice.id, webhook("alice-hook"))
+            .await
+            .unwrap();
+        let bob_channel = store
+            .create_notification_channel(bob.id, webhook("bob-hook"))
+            .await
+            .unwrap();
+        let binding = |channel_id: i64| CreateNotificationAction {
+            channel_id,
+            event: "failure".into(),
+            failure_threshold: 1,
+            automatic_only: false,
+            title_template: None,
+            body_template: None,
+        };
+        // Deliberately out of alphabetical order, and one task each for the
+        // second account, whose rows must not leak in.
+        let mut alice_tasks = Vec::new();
+        for name in ["zeta", "alpha"] {
+            let task = store.create_for_owner(alice.id, input(name)).await.unwrap();
+            store
+                .create_notification_action(task.id, alice.id, binding(alice_channel.id))
+                .await
+                .unwrap()
+                .unwrap();
+            alice_tasks.push((name, task.id));
+        }
+        let bobs_task = store
+            .create_for_owner(bob.id, input("bob-task"))
+            .await
+            .unwrap();
+        store
+            .create_notification_action(bobs_task.id, bob.id, binding(bob_channel.id))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let listed = store.list_all_notification_actions(alice.id).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|row| row.task_id != bobs_task.id));
+        // Sorted by task name so the page can render them grouped without
+        // re-sorting, and the task ids are both of alice's.
+        let by_task: Vec<i64> = listed.iter().map(|row| row.task_id).collect();
+        assert_eq!(by_task, vec![alice_tasks[1].1, alice_tasks[0].1]);
+        // Bob only ever sees his own.
+        let bobs = store.list_all_notification_actions(bob.id).await.unwrap();
+        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs[0].task_id, bobs_task.id);
     }
 
     #[tokio::test]

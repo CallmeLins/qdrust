@@ -310,6 +310,10 @@ pub fn router_with_auth(
             get(list_notification_actions).post(create_notification_action),
         )
         .route(
+            "/api/v1/notification-actions",
+            axum::routing::get(list_all_notification_actions),
+        )
+        .route(
             "/api/v1/notification-actions/batch",
             axum::routing::post(batch_create_notification_actions),
         )
@@ -1697,6 +1701,18 @@ async fn list_notification_actions(
         .list_notification_actions(id, session.user.id)
         .await?
         .ok_or(ApiError::NotFound("task_not_found", "Task not found"))?;
+    Ok(Json(json!(actions)))
+}
+
+/// Every binding the caller owns, across all of their tasks. The notify page
+/// wants one list of what is configured, so this replaces fanning out a
+/// per-task request for whichever tasks happened to be ticked.
+async fn list_all_notification_actions(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let actions = store.list_all_notification_actions(session.user.id).await?;
     Ok(Json(json!(actions)))
 }
 
@@ -3647,6 +3663,9 @@ mod tests {
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());
+        // The notify page reads its whole binding list from here rather than
+        // one request per task.
+        assert!(document["paths"]["/api/v1/notification-actions"]["get"].is_object());
         // Importing from a library returns the ids it wrote, so the WebUI can
         // open the editor on the template it just pulled in.
         assert_eq!(
@@ -3806,6 +3825,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The notify page reads its whole binding list from this one endpoint, so
+    /// it has to exist — and, since it is a collection of the caller's own rows
+    /// rather than a task's, it must refuse an anonymous caller.
+    #[tokio::test]
+    async fn all_notification_actions_route_is_wired_and_authenticated() {
+        let app = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notification-actions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = test_auth_cookie(&app).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notification-actions")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
     }
 
     #[tokio::test]
