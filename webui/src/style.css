@@ -667,13 +667,26 @@ code {
   animation: fade-in 0.2s var(--ease);
 }
 .modal {
-  width: min(560px, 100%); overflow-y: auto;
-  max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px);
+  width: min(560px, 100%);
   padding: 26px; border: 1px solid var(--line-strong); border-radius: var(--r-l);
   background: rgb(var(--card-surface));
   box-shadow: var(--shadow-l);
   display: grid; gap: 18px;
   animation: modal-in 0.24s var(--ease);
+}
+/* The height cap and the scrollbar belong to the *dialog*, not to the card.
+   Only a dialog the backdrop centres has to be capped to the viewport; an
+   `.inline-modal` is a card in the page flow and should scroll with the page,
+   like every other block in it. Handing it the same cap made the action form
+   scroll inside a page that also scrolls, on top of the `.check-list` box it
+   already carries -- three nested scroll containers. It is also what kept
+   issue #12 alive: a scroll container counts an absolutely positioned dropdown
+   list as scrollable overflow, which pushed that list below the fold. Scoping
+   this to `.modal-backdrop > .modal` (0,2,0, so it still beats the
+   narrow-screen rule far below) leaves inline cards scrolling with the page. */
+.modal-backdrop > .modal {
+  overflow-y: auto;
+  max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px);
 }
 @keyframes modal-in { from { transform: translateY(12px) scale(0.99); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -1010,7 +1023,7 @@ code {
   .toolbar { align-items: center; }
   .modal { padding: 20px; }
   .modal-backdrop { padding: 10px; }
-  .modal { max-height: calc(100dvh - 20px); }
+  .modal-backdrop > .modal { max-height: calc(100dvh - 20px); }
   .modal-actions { flex-wrap: wrap; }
   .modal-actions > button { flex: 1 1 auto; }
   .form-row-4 { grid-template-columns: 1fr; }
