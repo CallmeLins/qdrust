@@ -1256,7 +1256,6 @@ const librarySourceId = ref<number | "all" | null>(null);
 const libraryLoading = ref(false);
 const libraryImporting = ref(false);
 const librarySearch = ref("");
-const libraryFilter = ref<"" | "installed" | "updates">("");
 const librarySelected = ref<Set<string>>(new Set());
 const libraryFailures = ref<{ name: string; error: string }[]>([]);
 /** Entry whose per-row action is in flight — held as the row's selection key,
@@ -1272,11 +1271,6 @@ const libraryBatch = ref(false);
  *  imported — instead of the local-file path. Cleared by `openImportModal`, so
  *  every other way into that editor is unaffected. */
 const libraryPreview = ref<{ subscriptionId: number; entry: string; templateId: number | null } | null>(null);
-const libraryFilterOptions = computed(() => [
-  { value: "" as const, label: t("libraryFilterAll") },
-  { value: "installed" as const, label: t("libraryFilterInstalled") },
-  { value: "updates" as const, label: t("libraryFilterUpdates") },
-]);
 const libraryViewingAll = computed(() => librarySourceId.value === "all");
 const librarySource = computed(() =>
   typeof librarySourceId.value === "number"
@@ -1314,13 +1308,11 @@ function entrySourceId(entry: LibraryEntry): number | null {
 function libraryKey(entry: LibraryEntry): string {
   return `${entrySourceId(entry) ?? 0}:${entry.name}`;
 }
-/** Entries matching the current search and filter, in the clicked sort order. */
+/** Entries matching the current search, in the clicked sort order. */
 const libraryEntries = computed<LibraryEntry[]>(() => {
   const entries = library.value?.entries ?? [];
   const query = librarySearch.value.trim().toLowerCase();
   const matched = entries.filter((entry) => {
-    if (libraryFilter.value === "installed" && !entry.installed) return false;
-    if (libraryFilter.value === "updates" && !entry.update_available) return false;
     if (!query) return true;
     return `${entry.name} ${entry.author ?? ""} ${entry.source_name ?? ""}`.toLowerCase().includes(query);
   });
@@ -1348,7 +1340,6 @@ watch(libraryEntries, resetLibraryPage);
 const libraryAllVisibleSelected = computed(
   () => pagedLibraryEntries.value.length > 0 && pagedLibraryEntries.value.every((entry) => librarySelected.value.has(libraryKey(entry))),
 );
-const libraryUpdateCount = computed(() => (library.value?.entries ?? []).filter((entry) => entry.update_available).length);
 /** Headers of the library table; `date` is the manifest's own timestamp, which
  *  is why it — not our `imported_at` — is what the rows are ordered by. The
  *  source column appears only where more than one source can appear in it. */
@@ -2248,15 +2239,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <span v-if="librarySourceKind" class="chip">{{ librarySourceKind }}</span>
               <button class="icon-button" :title="t('refresh')" :disabled="libraryLoading" @click="loadLibrary(true)"><RefreshCw :class="{ spin: libraryLoading }" :size="18" /></button>
               <input v-model="librarySearch" class="library-search" type="search" :placeholder="t('librarySearchPlaceholder')" />
-              <div class="seg" role="group" :aria-label="t('libraryTitle')">
-                <button
-                  v-for="option in libraryFilterOptions"
-                  :key="option.value"
-                  type="button"
-                  :class="{ active: libraryFilter === option.value }"
-                  @click="libraryFilter = option.value"
-                >{{ option.label }}<span v-if="option.value === 'updates' && libraryUpdateCount" class="seg-count">{{ libraryUpdateCount }}</span></button>
-              </div>
               <span class="muted">{{ fmt('libraryEntryCount', { n: libraryEntries.length }) }}</span>
               <button class="text-button" :aria-expanded="libraryBatch" @click="libraryBatch = !libraryBatch">{{ libraryBatch ? t('libraryBatchOff') : t('libraryBatchOn') }}</button>
             </div>
@@ -2283,10 +2265,6 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <p v-if="libraryTruncated" class="muted section-hint">{{ t('libraryTruncated') }}</p>
 
             <div v-if="libraryLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('libraryLoading') }}</div>
-            <div v-else-if="libraryFilter === 'updates' && libraryEntries.length === 0" class="empty-state">
-              <span><Check :size="25" /></span>
-              <h2>{{ t('libraryEmpty') }}</h2>
-            </div>
             <div v-else-if="libraryEntries.length === 0" class="empty-state">
               <span><LibraryIcon :size="25" /></span>
               <h2>{{ t('libraryEmpty') }}</h2>
@@ -2313,7 +2291,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                     <td v-if="libraryViewingAll" class="library-source-cell">{{ entry.source_name ?? '—' }}</td>
                     <td class="num">{{ entry.version ?? '—' }}</td>
                     <td class="run-time">{{ entry.date ?? '—' }}</td>
-                    <td><span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryFilterUpdates') }}</span><span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span><span v-else class="muted">—</span></td>
+                    <td><span v-if="entry.update_available" class="chip chip-warn">{{ t('libraryUpdates') }}</span><span v-else-if="entry.installed" class="chip chip-ok">{{ t('libraryInstalled') }}</span><span v-else class="muted">—</span></td>
                     <td class="row-actions">
                       <button v-if="libraryBusyKey === libraryKey(entry)" class="primary-button" disabled><Loader2 class="spin" :size="14" />{{ t('libraryFetching') }}</button>
                       <button v-else-if="!entry.installed" class="primary-button" :title="t('librarySubscribeHint')" @click="previewLibraryEntry(entry)"><Plus :size="14" />{{ t('librarySubscribe') }}</button>

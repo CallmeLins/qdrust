@@ -54,6 +54,28 @@ const MAX_OVERVIEW_ENTRIES: usize = 4 * MAX_LIBRARY_ENTRIES;
 /// lets an import show up immediately instead of after the cache expires.
 const CATALOGUE_TTL: Duration = Duration::from_secs(90);
 
+/// How many times one library request is attempted before the source is called
+/// unreachable.
+///
+/// GitHub's raw host drops connections often enough that a single attempt is
+/// not enough: a 3 MB manifest would fail outright, the source would contribute
+/// no entries at all, and the page would read "this library is broken" when
+/// the network merely hiccuped. Retrying turns that into a slow read.
+const FETCH_ATTEMPTS: u32 = 3;
+
+/// Backoff between attempts, multiplied by the attempt number. Short, because
+/// the failure this covers is a dropped connection rather than a busy server.
+const FETCH_BACKOFF: Duration = Duration::from_millis(300);
+
+/// Room given to one library request, over the client's default.
+///
+/// The default request timeout is sized for API calls, but a catalogue is a
+/// multi-megabyte download — the official manifest alone is 3 MB, and 93% of it
+/// is inlined HAR. On a slow link the default expires mid-body, which is
+/// indistinguishable from an unreachable source from here. Applied per request
+/// so task runs and notifications keep the tighter bound.
+const LIBRARY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Catalogues shared across subscriptions, owners and requests.
 ///
 /// Keyed by source URL rather than by subscription: a catalogue is the upstream
@@ -83,7 +105,28 @@ impl CatalogueCache {
         url: &str,
         max_age: Duration,
     ) -> Result<(Catalogue, bool)> {
-        if !max_age.is_zero() {
+        self.catalogue_via(url, max_age, || catalogue(client, url))
+            .await
+    }
+
+    /// The cache policy, kept apart from where a catalogue comes from so the
+    /// fallback below can be exercised without a live source.
+    ///
+    /// `max_age` doubles as "may this read be answered from a copy the reader
+    /// has already seen". Zero is the refresh path: the reader asked for the
+    /// current state, so it either reaches the source or says why it could not.
+    async fn catalogue_via<F, Fut>(
+        &self,
+        url: &str,
+        max_age: Duration,
+        fetch: F,
+    ) -> Result<(Catalogue, bool)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Catalogue>>,
+    {
+        let cacheable = !max_age.is_zero();
+        if cacheable {
             let entries = self.entries.lock().await;
             if let Some(hit) = entries.get(url)
                 && hit.fetched_at.elapsed() < max_age
@@ -93,7 +136,28 @@ impl CatalogueCache {
         }
         // Fetch without the lock held: two sources are read concurrently, and
         // neither should wait on the other's network round trip.
-        let fetched = catalogue(client, url).await?;
+        let fetched = match fetch().await {
+            Ok(fetched) => fetched,
+            // One unreachable moment must not empty the page. A failing raw-host
+            // request used to take the whole source down to zero entries, which
+            // reads as a broken library rather than a hiccup. The copy from a
+            // few minutes ago is what the reader was already looking at, so
+            // serving it again is the smaller lie. This deliberately does not
+            // apply to a reader's refresh — see `max_age`.
+            Err(err) if cacheable => {
+                let entries = self.entries.lock().await;
+                let Some(hit) = entries.get(url) else {
+                    return Err(err);
+                };
+                tracing::warn!(
+                    url,
+                    error = %err,
+                    "source unreachable; serving the last good catalogue"
+                );
+                return Ok((hit.catalogue.clone(), true));
+            }
+            Err(err) => return Err(err),
+        };
         let mut entries = self.entries.lock().await;
         entries.retain(|_, hit| hit.fetched_at.elapsed() < CATALOGUE_TTL);
         entries.insert(
@@ -715,19 +779,26 @@ async fn scan_tree(client: &Client, source: &GitHubSource) -> Result<Vec<RawEntr
         "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
         source.owner, source.repo, source.branch
     );
-    let response = client
-        .get(&api_url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .context("cannot reach GitHub API")?
-        .error_for_status()
-        .context("GitHub API returned an error")?;
-    let body: Value = response
-        .json()
-        .await
-        .context("invalid GitHub API response")?;
+    let body: Value = retrying(
+        |_| async {
+            let response = client
+                .get(&api_url)
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/vnd.github+json")
+                .timeout(LIBRARY_TIMEOUT)
+                .send()
+                .await
+                .context("cannot reach GitHub API")?
+                .error_for_status()
+                .context("GitHub API returned an error")?;
+            response
+                .json()
+                .await
+                .context("invalid GitHub API response")
+        },
+        is_transient,
+    )
+    .await?;
     let Some(tree) = body.get("tree").and_then(Value::as_array) else {
         anyhow::bail!("GitHub tree response has no entries");
     };
@@ -877,21 +948,75 @@ fn plain_text(html: &str) -> String {
 }
 
 async fn fetch_text(client: &Client, url: &str) -> Result<Option<String>> {
-    let response = client
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .await
-        .with_context(|| format!("cannot reach {url}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+    // The body is read inside the retry, not after it: a dropped connection
+    // surfaces as often while the body streams as it does on connect, and a
+    // retry that only covered `send` would miss exactly the failure this exists
+    // for. A 404 is returned as `Ok(None)` from inside, so "no manifest here"
+    // stays an answer rather than becoming a retried error.
+    retrying(
+        |_| async {
+            let response = client
+                .get(url)
+                .header("User-Agent", USER_AGENT)
+                .timeout(LIBRARY_TIMEOUT)
+                .send()
+                .await
+                .map_err(anyhow::Error::from)?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            let response = response
+                .error_for_status()
+                .with_context(|| format!("{url} returned an error"))?;
+            Ok(Some(response.text().await.with_context(|| {
+                format!("cannot read the body of {url}")
+            })?))
+        },
+        is_transient,
+    )
+    .await
+    .with_context(|| format!("cannot reach {url}"))
+}
+
+/// Run a fallible fetch until it answers or the attempts run out.
+///
+/// `retryable` decides what counts as a hiccup: production passes
+/// [`is_transient`], and a test passes its own so the loop can be exercised
+/// without a live (or deliberately broken) source.
+async fn retrying<T, F, Fut>(mut fetch: F, retryable: impl Fn(&anyhow::Error) -> bool) -> Result<T>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last: Option<anyhow::Error> = None;
+    for round in 0..FETCH_ATTEMPTS {
+        if round > 0 {
+            tokio::time::sleep(FETCH_BACKOFF * round).await;
+        }
+        match fetch(round).await {
+            Ok(value) => return Ok(value),
+            Err(err) if retryable(&err) => {
+                tracing::debug!(attempt = round + 1, error = %err, "library request failed; retrying");
+                last = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
     }
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("{url} returned an error"))?;
-    Ok(Some(response.text().await.with_context(|| {
-        format!("cannot read the body of {url}")
-    })?))
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("library request failed")))
+}
+
+/// Whether a failed request is worth repeating.
+///
+/// Only transport-level failures count: a dropped connection, a timeout, a body
+/// that stops mid-transfer. An HTTP status is the server's answer, and asking
+/// again just gets the same one — a 404 for a manifest is how a source says it
+/// publishes no manifest, which is a normal branch here, not an error to retry.
+fn is_transient(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(|err| {
+            err.is_timeout() || err.is_connect() || err.is_body() || err.is_request()
+        })
 }
 
 fn bounded(message: &str) -> String {
@@ -1193,6 +1318,130 @@ mod tests {
         assert!(cached, "the second read must reuse the first");
         let (_, cached) = cache.catalogue(&client, url, Duration::ZERO).await.unwrap();
         assert!(!cached, "max_age zero must bypass the cache");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_source_keeps_serving_the_last_good_catalogue() {
+        // The failure this guards against: the raw host drops one connection,
+        // the source contributes nothing, and the page reads "0 templates" as
+        // if the library were broken. The copy from minutes ago is what the
+        // reader was already looking at, so it is served again instead.
+        let cache = CatalogueCache::new();
+        let url = "https://example.com/library";
+        let seeded = || Catalogue {
+            source_kind: "manifest",
+            manifest_version: None,
+            entries: vec![raw_entry("雨晨分享站")],
+        };
+        // A copy that has aged past the TTL, which is the state a real one is
+        // in by the time the refresh fails.
+        cache.entries.lock().await.insert(
+            url.to_string(),
+            CachedCatalogue {
+                fetched_at: Instant::now()
+                    .checked_sub(CATALOGUE_TTL * 2)
+                    .expect("the test clock is past the epoch"),
+                catalogue: seeded(),
+            },
+        );
+
+        let (catalogue, cached) = cache
+            .catalogue_via(url, CATALOGUE_TTL, || async {
+                anyhow::bail!("connection closed")
+            })
+            .await
+            .unwrap();
+        assert_eq!(catalogue.entries.len(), 1, "the old listing survives");
+        assert!(cached, "the fallback is still a cached read");
+
+        // A refresh the reader asked for is the exception: it has to report the
+        // failure, because silently serving the old copy would make the button
+        // look like it worked.
+        let error = match cache
+            .catalogue_via(url, Duration::ZERO, || async {
+                anyhow::bail!("connection closed")
+            })
+            .await
+        {
+            Ok(_) => panic!("a refresh that cannot reach the source must say so"),
+            Err(err) => err,
+        };
+        assert!(error.to_string().contains("connection closed"));
+
+        // With nothing cached, the failure is the answer.
+        assert!(
+            CatalogueCache::new()
+                .catalogue_via(url, CATALOGUE_TTL, || async {
+                    anyhow::bail!("connection closed")
+                })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_fetch_is_retried_until_it_answers() {
+        // Retrying is what turns "one dropped connection empties the source"
+        // into "the read was slow". `retryable` is injected, so the loop is
+        // exercised without a network at all.
+        let mut attempts = 0;
+        let value: u32 = retrying(
+            |_| {
+                attempts += 1;
+                let round = attempts;
+                async move {
+                    if round < FETCH_ATTEMPTS {
+                        anyhow::bail!("connection closed")
+                    } else {
+                        Ok(round)
+                    }
+                }
+            },
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, FETCH_ATTEMPTS);
+        assert_eq!(value, FETCH_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_not_retried() {
+        // A 404 is how a source says it publishes no manifest, which is a
+        // branch here rather than an error: asking again gets the same answer,
+        // so the loop gives up on the first one.
+        let mut attempts = 0;
+        let error = retrying(
+            |_| {
+                attempts += 1;
+                async { Err::<u32, _>(anyhow::anyhow!("404 Not Found")) }
+            },
+            |_| false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_never_answers_reports_the_last_error() {
+        let mut attempts = 0;
+        let error = retrying(
+            |_| {
+                attempts += 1;
+                let round = attempts;
+                async move { Err::<u32, _>(anyhow::anyhow!("attempt {round}")) }
+            },
+            |_| true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, FETCH_ATTEMPTS, "every attempt is spent");
+        assert!(
+            error.to_string().contains(&format!("attempt {FETCH_ATTEMPTS}")),
+            "the caller sees why the last one failed, not the first: {error}"
+        );
     }
 
     #[test]

@@ -1124,12 +1124,6 @@ code {
 }
 .library-search:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow); }
 
-.seg button .seg-count {
-  margin-left: 6px; padding: 0 5px; border-radius: 999px;
-  background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
-  font-size: 10.5px; font-variant-numeric: tabular-nums;
-}
-
 .chip-ok { color: var(--ok); border-color: rgb(22 163 74 / 0.35); background: rgb(22 163 74 / 0.1); }
 .chip-warn { color: var(--warn); border-color: rgb(180 83 9 / 0.35); background: rgb(180 83 9 / 0.12); }
 
