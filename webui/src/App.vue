@@ -10,7 +10,7 @@ import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
 import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
-import { usePager, usePageSize } from "./pagination";
+import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -592,13 +592,15 @@ const runLogTaskId = ref(0);
 const runLogLoading = ref(false);
 /** Whether the run-log modal is open. */
 const showRunLog = ref(false);
-/** Cursor paging as prev/next: the stack's last entry is the `beforeId` the
- *  current page was fetched with, so "previous page" is a pop and "next" a
- *  push — no page numbers to invent on a cursor API. */
-const runLogCursors = ref<(number | null)[]>([]);
 const runLogNextCursor = ref<number | null>(null);
 const runLogHasMore = ref(false);
-const runLogPageNo = computed(() => runLogCursors.value.length + 1);
+/** Cursor paging as prev/next (see `useCursorPager`): the stack's last entry is
+ *  the `beforeId` the current page was fetched with, so "previous page" is a pop
+ *  and "next" a push — no page numbers to invent on a cursor API. */
+const {
+  cursor: runLogCursor, pageNo: runLogPageNo, canGoBack: runLogCanGoBack,
+  advance: runLogAdvance, back: runLogBack, reset: resetRunLogPaging,
+} = useCursorPager();
 const runLogStatusOptions = computed(() => [
   { value: "" as const, label: t("runLogAll") },
   { value: "succeeded" as const, label: t("runStSucceeded") },
@@ -617,7 +619,7 @@ function taskTimezone(taskId: number): string | undefined {
 /** Open the run-log modal and fetch its first page. */
 async function openRunLog() {
   showRunLog.value = true;
-  runLogCursors.value = [];
+  resetRunLogPaging();
   await loadRunLog();
 }
 /** Fetch the page the cursor stack currently points at. */
@@ -627,7 +629,7 @@ async function loadRunLog() {
     const page = await api.runs({
       status: runLogStatus.value || undefined,
       taskId: runLogTaskId.value || undefined,
-      beforeId: runLogCursors.value[runLogCursors.value.length - 1] ?? undefined,
+      beforeId: runLogCursor.value,
       limit: runLogPageSize.value,
     });
     allRuns.value = page.items;
@@ -641,27 +643,34 @@ async function loadRunLog() {
 }
 async function nextRunLogPage() {
   if (!runLogHasMore.value || runLogLoading.value) return;
-  runLogCursors.value = [...runLogCursors.value, runLogNextCursor.value];
+  runLogAdvance(runLogNextCursor.value);
   await loadRunLog();
 }
 async function prevRunLogPage() {
-  if (runLogCursors.value.length === 0 || runLogLoading.value) return;
-  runLogCursors.value = runLogCursors.value.slice(0, -1);
+  if (!runLogCanGoBack.value || runLogLoading.value) return;
+  runLogBack();
   await loadRunLog();
 }
+/** The status is set on its ref and nothing else: the watch below is what
+ *  refetches, so this stays a setter and there is one reload path, not two. */
 function setRunLogStatus(status: "" | "succeeded" | "failed") {
   runLogStatus.value = status;
-  void loadRunLog();
 }
-/** A different row count makes the cursor stack meaningless — those cursors
- *  were cut for pages of the old size — so the paging starts over.
+/** Anything that changes *which* runs match — the status, the task, the row
+ *  count — starts the paging over.
  *
- *  A watch, not a step in the setter: the row count is the reader's, the setter
- *  only stores it, and any later control that changes it inherits this without
- *  having to remember to. The guard covers the size being changed while the
- *  modal is shut, where the next open fetches anyway. */
-watch(runLogPageSize, () => {
-  runLogCursors.value = [];
+ *  The cursors were cut for the previous result set, so keeping them asks for
+ *  "the page after X" of a list that no longer exists: the filtered runs sit
+ *  mostly above the old cursor, and the modal comes back empty. That is what
+ *  "filter by task does nothing" looked like — the filter worked, the cursor
+ *  was answering for a different list.
+ *
+ *  A watch rather than a step in each setter — the row count's reset used to be
+ *  one — because it covers the dropdown's keyboard path (which only updates the
+ *  model), and any control added later inherits it without having to remember.
+ *  The guard skips the fetch while the modal is shut: opening it fetches anyway. */
+watch([runLogStatus, runLogTaskId, runLogPageSize], () => {
+  resetRunLogPaging();
   if (showRunLog.value) void loadRunLog();
 });
 
@@ -2773,7 +2782,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           <label class="group-filter">
             <span>{{ t('runLogTask') }}</span>
-            <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact @change="loadRunLog()" />
+            <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact />
           </label>
           <button class="icon-button" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
         </div>
@@ -2805,7 +2814,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           :page="runLogPageNo"
           :page-size="runLogPageSize"
           :busy="runLogLoading"
-          :prev-disabled="runLogCursors.length === 0"
+          :prev-disabled="!runLogCanGoBack"
           :next-disabled="!runLogHasMore"
           @prev="prevRunLogPage"
           @next="nextRunLogPage"

@@ -4610,11 +4610,17 @@ mod tests {
             .await
             .unwrap();
         // `idx_runs_active_task` allows one active run per task, so each seeded
-        // run is closed before the next one opens.
-        for _ in 0..5 {
+        // run is closed before the next one opens. One of them fails, so the
+        // status filter has something to separate.
+        for _ in 0..4 {
             let run = store.start_run(task.id).await.unwrap();
             store.finish_run(run.id, Some(200), None).await.unwrap();
         }
+        let failed = store.start_run(task.id).await.unwrap();
+        store
+            .finish_run(failed.id, None, Some("upstream refused"))
+            .await
+            .unwrap();
         let run = store.start_run(other.id).await.unwrap();
         store.finish_run(run.id, Some(200), None).await.unwrap();
 
@@ -4639,6 +4645,27 @@ mod tests {
         // `task_id` reaches the filter rather than being dropped on the floor.
         let filtered = get_runs(&app, &cookie, &format!("task_id={}&limit=50", task.id)).await;
         assert_eq!(run_ids(&filtered).len(), 5, "{filtered}");
+
+        // `status` reaches it too — and always did, which is part of the reason
+        // the numbers beside it went unnoticed for so long.
+        let failures = get_runs(&app, &cookie, "status=failed").await;
+        assert_eq!(run_ids(&failures), vec![failed.id], "{failures}");
+        assert_eq!(
+            run_ids(&get_runs(&app, &cookie, "status=succeeded").await).len(),
+            5
+        );
+        // Filters combine rather than the last one winning.
+        let both = get_runs(
+            &app,
+            &cookie,
+            &format!("status=failed&task_id={}", other.id),
+        )
+        .await;
+        assert!(run_ids(&both).is_empty(), "{both}");
+        assert!(
+            run_ids(&get_runs(&app, &cookie, &format!("status=failed&task_id={}", task.id)).await)
+                == vec![failed.id]
+        );
 
         // And the documented default is still "everything, up to a hundred".
         let all = get_runs(&app, &cookie, "").await;

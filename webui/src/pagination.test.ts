@@ -12,6 +12,7 @@ import {
   pageSlice,
   readPageSize,
   showsNav,
+  useCursorPager,
   usePageSize,
   usePager,
   writePageSize,
@@ -250,12 +251,33 @@ describe("footer wiring in App.vue", () => {
     );
   });
 
-  it("restarts the run log's cursors when its row count changes", () => {
-    // Cursors were cut for pages of the old size, so they cannot be reused. It is
-    // a watch rather than a step in a setter, so no caller has to remember it.
-    const reaction = app.match(/watch\(runLogPageSize,[\s\S]*?\n\}\);/)?.[0] ?? "";
-    expect(reaction, "the run log has to react to its own count").toContain("runLogCursors.value = []");
+  it("restarts the run log's paging when a filter or the row count changes", () => {
+    // A cursor is a key into one result set: cut for pages of the old size, or
+    // for the unfiltered log, it names runs that are not in that list any more.
+    // Reusing it makes a working filter look broken — the rows it matches sit
+    // above the old cursor, so the fetch comes back empty. One watch over all
+    // three inputs, so no individual control has to remember to reset.
+    const reaction =
+      app.match(/watch\(\[runLogStatus, runLogTaskId, runLogPageSize\][\s\S]*?\n\}\);/)?.[0] ?? "";
+    expect(reaction, "every input that changes which runs match resets the paging").toContain(
+      "resetRunLogPaging()",
+    );
     expect(reaction).toContain("loadRunLog()");
+  });
+
+  it("changes the run log's filters through the refs that watch reads", () => {
+    // The task filter is a `v-model` dropdown and the status filter a plain
+    // setter. Neither fetches on its own, so the one path that only updates the
+    // model — a keyboard pick — cannot be the path that never reloads.
+    expect(app, "a filter that fetches on its own duplicates the watch").not.toMatch(
+      /@change="loadRunLog\(\)"/,
+    );
+    const setter = app.match(/function setRunLogStatus[\s\S]*?\n\}/)?.[0] ?? "";
+    expect(setter, "the status setter only sets the status").not.toContain("loadRunLog");
+    expect(setter).toContain("runLogStatus.value = status");
+    expect(app, "the task filter has to be wired to the watched ref").toMatch(
+      /<Dropdown v-model="runLogTaskId"/,
+    );
   });
 });
 
@@ -312,5 +334,71 @@ describe("usePager", () => {
     pager.next();
     pager.reset();
     expect(pager.page.value).toBe(1);
+  });
+});
+
+describe("useCursorPager", () => {
+  it("starts on page one, with no cursor to send", () => {
+    const pager = useCursorPager();
+    expect(pager.pageNo.value).toBe(1);
+    expect(pager.cursor.value).toBeUndefined();
+    expect(pager.canGoBack.value).toBe(false);
+  });
+
+  it("advances onto the server's cursor and counts the pages", () => {
+    const pager = useCursorPager();
+    pager.advance(7);
+    expect(pager.cursor.value).toBe(7);
+    expect(pager.pageNo.value).toBe(2);
+    expect(pager.canGoBack.value).toBe(true);
+    pager.advance(3);
+    expect(pager.cursor.value).toBe(3);
+    expect(pager.pageNo.value).toBe(3);
+  });
+
+  it("goes back a page at a time and stops at the first", () => {
+    const pager = useCursorPager();
+    pager.advance(7);
+    pager.advance(3);
+    pager.back();
+    expect(pager.cursor.value).toBe(7);
+    expect(pager.pageNo.value).toBe(2);
+    pager.back();
+    expect(pager.cursor.value).toBeUndefined();
+    expect(pager.canGoBack.value).toBe(false);
+    pager.back();
+    expect(pager.pageNo.value).toBe(1);
+  });
+
+  it("starts over on reset, which is what a filter change needs", () => {
+    // The regression this exists for: a cursor cut for the unfiltered log names
+    // runs the filtered list does not contain, so a fetch that keeps it comes
+    // back empty — a working "filter by task" that looks like it does nothing.
+    const pager = useCursorPager();
+    pager.advance(7);
+    pager.advance(3);
+    pager.reset();
+    expect(pager.cursor.value).toBeUndefined();
+    expect(pager.pageNo.value).toBe(1);
+    expect(pager.canGoBack.value).toBe(false);
+  });
+
+  it("ignores a 'there is more' that came without a cursor", () => {
+    // Pushing it would put a hole in the stack: reading it back would look like
+    // page one, and the footer would count a page nobody can reach.
+    const pager = useCursorPager();
+    pager.advance(7);
+    pager.advance(null);
+    expect(pager.cursor.value).toBe(7);
+    expect(pager.pageNo.value).toBe(2);
+  });
+
+  it("keeps one stack per caller", () => {
+    const first = useCursorPager();
+    const second = useCursorPager();
+    first.advance(7);
+    expect(first.pageNo.value).toBe(2);
+    expect(second.pageNo.value).toBe(1);
+    expect(second.cursor.value).toBeUndefined();
   });
 });

@@ -12,7 +12,9 @@ import type { StorageLike } from "./utils";
  *
  * The run log is the exception: its pages are fetched, because the aggregated
  * log is the one list the API serves a page at a time. It keeps its row count
- * here anyway, so every list answers to the same control.
+ * here anyway, so every list answers to the same control, and its cursors are
+ * kept by `useCursorPager` — the fetched counterpart of `usePager`, where
+ * "start over" is a reset rather than a clamped page number.
  */
 
 /** Row counts a reader can choose from. */
@@ -202,4 +204,58 @@ export function usePager<T>(source: () => readonly T[], pageSize: () => number):
     page.value = 1;
   }
   return { page, pages, items, total, prev, next, reset };
+}
+
+export interface CursorPager {
+  /** The `beforeId` the page on screen was fetched with; `undefined` on page one. */
+  cursor: ComputedRef<number | undefined>;
+  /** 1-based page number. A cursor API has no last page, so this is all a footer
+   *  can honestly show — "第 N 页", never "N of M". */
+  pageNo: ComputedRef<number>;
+  canGoBack: ComputedRef<boolean>;
+  /** Move to the page after this one, given the `next_cursor` the server returned. */
+  advance: (nextCursor: number | null) => void;
+  back: () => void;
+  /** Back to page one, for a caller whose result set is about to change. */
+  reset: () => void;
+}
+
+/**
+ * Cursor paging for the one list the server pages (the aggregated run log).
+ *
+ * Same shape as `usePager` where it can be — `pageNo` for the footer, `back`
+ * and `advance` for its two buttons — but the state is a stack of cursors
+ * rather than a page number: the server hands out an opaque `next_cursor`, and
+ * the page on screen is identified by the cursor it was fetched with. Going
+ * back is therefore a pop, and there is no way to jump to page N.
+ *
+ * There is no "clamp into range" here, and that is the whole point of keeping
+ * this in one place: a client-paged list re-chunks itself when its source
+ * changes, so a stale page number is corrected on the next render. A cursor
+ * cannot be corrected — it is a key into a result set that no longer exists —
+ * so **every** change to the filters or the row count has to call `reset()`,
+ * or the next fetch asks for "the page after X" of a different list and comes
+ * back empty. App.vue wires that to a single watch over all three inputs, so no
+ * individual control has to remember to.
+ */
+export function useCursorPager(): CursorPager {
+  const cursors = ref<number[]>([]);
+  return {
+    cursor: computed(() => cursors.value[cursors.value.length - 1]),
+    pageNo: computed(() => cursors.value.length + 1),
+    canGoBack: computed(() => cursors.value.length > 0),
+    advance(nextCursor: number | null): void {
+      // "There is more" without a cursor cannot be paged. Staying put beats
+      // pushing a hole: reading it back later would look like page one, and the
+      // footer would count a page nobody can reach.
+      if (nextCursor == null) return;
+      cursors.value = [...cursors.value, nextCursor];
+    },
+    back(): void {
+      cursors.value = cursors.value.slice(0, -1);
+    },
+    reset(): void {
+      cursors.value = [];
+    },
+  };
 }
