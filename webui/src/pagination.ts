@@ -10,10 +10,9 @@ import type { StorageLike } from "./utils";
  * point is not to fetch less, it is that a list of two hundred rows is
  * unreadable and pushing the rest of the page below the fold.
  *
- * The page size is a single stored preference rather than a per-list constant,
- * because the reader's appetite for density is a property of the reader, not of
- * the list. Lists opt in by asking for a pager; the count applies to all of
- * them, and a new list gets it for free.
+ * The run log is the exception: its pages are fetched, because the aggregated
+ * log is the one list the API serves a page at a time. It keeps its row count
+ * here anyway, so every list answers to the same control.
  */
 
 /** Row counts a reader can choose from. */
@@ -21,25 +20,88 @@ export const PAGE_SIZE_OPTIONS: readonly number[] = [10, 20, 50, 100];
 export type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
 /** Ten rows: enough to see a list's shape, few enough that one screen holds it. */
 export const DEFAULT_PAGE_SIZE = 10;
-export const PAGE_SIZE_STORAGE_KEY = "qdrust.pageSize";
 
-function isPageSize(value: number): value is PageSize {
+/**
+ * The lists that remember a row count of their own.
+ *
+ * Each keeps its own, because density is an appetite for *this* list: a reader
+ * may want the task table dense and the subscription list short. One shared
+ * count meant the footer of any list silently re-chunked every other one, so a
+ * number picked while reading one table rearranged four others — and, because
+ * the shared value is what every list then inherited, the change was hard to
+ * reason about, let alone undo.
+ */
+export const PAGE_SIZE_SCOPES = [
+  "tasks",
+  "subscriptions",
+  "templates",
+  "publicTemplates",
+  "library",
+  "runLog",
+] as const;
+export type PageSizeScope = (typeof PAGE_SIZE_SCOPES)[number];
+
+export const PAGE_SIZE_STORAGE_PREFIX = "qdrust.pageSize";
+
+/** The key the single shared count used to live under.
+ *
+ *  Still read, never written: a reader who had settled on 50 keeps 50 in every
+ *  list they have not since touched, rather than being reset by the upgrade.
+ *  Each scope stops consulting it the moment it stores a value of its own. */
+export const LEGACY_PAGE_SIZE_STORAGE_KEY = "qdrust.pageSize";
+
+/** Where one list's row count is kept. */
+export function pageSizeKey(scope: PageSizeScope): string {
+  return `${PAGE_SIZE_STORAGE_PREFIX}.${scope}`;
+}
+
+/** Whether a number is one of the offered row counts.
+ *
+ *  Exported because two layers need the same answer: what may be *stored* (a
+ *  hand-edited localStorage entry should not be able to make a list render one
+ *  row per page) and what may be *held* in the ref the footer shows. Letting
+ *  those disagree means the footer displays a count that will not survive the
+ *  next visit. */
+export function isPageSize(value: number): value is PageSize {
   return PAGE_SIZE_OPTIONS.includes(value);
 }
 
-/** The stored page size, or the default when nothing usable is stored. */
-export function readPageSize(storage: StorageLike | null | undefined): number {
-  const raw = storage?.getItem(PAGE_SIZE_STORAGE_KEY);
-  const size = raw == null ? Number.NaN : Number(raw);
-  return isPageSize(size) ? size : DEFAULT_PAGE_SIZE;
+/** One list's stored row count: its own if it has one, otherwise the count every
+ *  list used to share, otherwise the default. */
+export function readPageSize(
+  storage: StorageLike | null | undefined,
+  scope: PageSizeScope,
+): number {
+  const raw = [pageSizeKey(scope), LEGACY_PAGE_SIZE_STORAGE_KEY]
+    .map((key) => storage?.getItem(key))
+    .find((value) => value != null && isPageSize(Number(value)));
+  return raw == null ? DEFAULT_PAGE_SIZE : Number(raw);
 }
 
-/** Persist a page size. A value outside the offered set is dropped rather than
- *  stored: a hand-edited localStorage entry should not be able to make every
- *  list in the app render a single row per page. */
-export function writePageSize(storage: StorageLike | null | undefined, size: number): void {
+/** Persist one list's row count. A value outside the offered set is dropped
+ *  rather than stored: a hand-edited localStorage entry should not be able to
+ *  make a list render a single row per page. */
+export function writePageSize(
+  storage: StorageLike | null | undefined,
+  scope: PageSizeScope,
+  size: number,
+): void {
   if (!isPageSize(size)) return;
-  storage?.setItem(PAGE_SIZE_STORAGE_KEY, String(size));
+  storage?.setItem(pageSizeKey(scope), String(size));
+}
+
+/** One list's row count, remembered per browser and per list.
+ *
+ *  Not a per-list constant, and not a site setting either: it is the reader's
+ *  choice about their own screen, so it needs no round trip and no server state. */
+export function usePageSize(storage: StorageLike | null | undefined, scope: PageSizeScope) {
+  const size = ref(readPageSize(storage, scope));
+  function setSize(value: number): void {
+    if (!isPageSize(value) || value === size.value) return;
+    size.value = value;
+    writePageSize(storage, scope, value);
+  }
+  return { size, setSize };
 }
 
 /** Coerce a page size into something the arithmetic below can use. */
@@ -98,8 +160,9 @@ export interface Pager<T> {
  *
  * `source` is a getter rather than a ref so the caller keeps ownership of
  * filtering and sorting: pass `() => filteredTasks.value` and the pager pages
- * whatever the filters left. `pageSize` is a getter too, so the one stored
- * preference flows into every list without them having to know about it.
+ * whatever the filters left. `pageSize` is a getter because the count is the
+ * reader's and can change while the list is on screen — each list passes its own
+ * (see `usePageSize`), so re-chunking one leaves the others alone.
  *
  * Note the absence of a `show`: callers render their footer unconditionally.
  * The footer is the only place the page size is set, so any rule that made the

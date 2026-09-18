@@ -1329,6 +1329,8 @@ async fn record_header_refused(
 async fn list_tasks(
     State(store): State<Store>,
     headers: HeaderMap,
+    // Safe only while every parameter here is read as text: a number would
+    // arrive as a string and `as_i64` would find nothing — see `RunsQuery`.
     Query(params): Query<serde_json::Value>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
@@ -1402,6 +1404,29 @@ async fn list_task_runs(
     Ok(Json(json!(runs)))
 }
 
+/// The aggregated run log's query string.
+///
+/// Typed, rather than read off a `serde_json::Value`. A query string carries
+/// every value as text and `Value` keeps it that way, so `as_i64` found nothing:
+/// `limit` fell back to the default 100 rows whatever the reader picked,
+/// `before_id` was always absent — which made the cursor a no-op, so "next page"
+/// re-served the first one — and `task_id` never filtered. Only `status` worked,
+/// because `as_str` is the one reading a text value can satisfy, and that is
+/// what kept the others quiet for so long. Typed extraction parses the numbers.
+/// `#[serde(default)]` on every field: the WebUI omits a filter it is not using,
+/// and a query string is allowed to leave any of them out.
+#[derive(Deserialize, Default)]
+struct RunsQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    task_id: Option<i64>,
+    #[serde(default)]
+    before_id: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 /// Every run the caller owns, newest first — the aggregated log view.
 ///
 /// Query parameters: `status` (exact match), `task_id`, `limit` (default 100,
@@ -1410,23 +1435,19 @@ async fn list_task_runs(
 async fn list_runs(
     State(store): State<Store>,
     headers: HeaderMap,
-    Query(params): Query<Value>,
+    Query(query): Query<RunsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    let limit = params
-        .get("limit")
-        .and_then(Value::as_i64)
-        .unwrap_or(100)
-        .clamp(1, 500);
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let filter = crate::store::RunFilter {
-        status: params
-            .get("status")
-            .and_then(Value::as_str)
+        status: query
+            .status
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string),
-        task_id: params.get("task_id").and_then(Value::as_i64),
-        before_id: params.get("before_id").and_then(Value::as_i64),
+        task_id: query.task_id,
+        before_id: query.before_id,
         limit,
     };
     let mut runs = store
@@ -1786,18 +1807,37 @@ async fn update_notification_action(
         ))
 }
 
+/// The template list's query string — typed for the same reason as
+/// [`RunsQuery`]: `cursor` and `limit` were read with `as_i64` off a
+/// `serde_json::Value`, so both were always `None` and the cursor paging this
+/// endpoint advertises never advanced.
+#[derive(Deserialize, Default)]
+struct TemplatesQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    grp: Option<String>,
+    #[serde(default)]
+    cursor: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 async fn list_templates(
     State(store): State<Store>,
     headers: HeaderMap,
-    Query(params): Query<serde_json::Value>,
+    Query(query): Query<TemplatesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    let query = params.get("q").and_then(|v| v.as_str());
-    let grp = params.get("grp").and_then(|v| v.as_str());
-    let cursor = params.get("cursor").and_then(|v| v.as_i64());
-    let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let limit = query.limit.unwrap_or(50);
     let templates = store
-        .search_templates_for_owner(session.user.id, query, grp, cursor, limit)
+        .search_templates_for_owner(
+            session.user.id,
+            query.q.as_deref(),
+            query.grp.as_deref(),
+            query.cursor,
+            limit,
+        )
         .await?;
     let has_more = templates.len() as i64 > limit;
     let items: Vec<Value> = if has_more {
@@ -2886,6 +2926,8 @@ async fn list_my_push_requests(
 async fn list_admin_push_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
+    // Safe only while every parameter here is read as text: a number would
+    // arrive as a string and `as_i64` would find nothing — see `RunsQuery`.
     Query(params): Query<serde_json::Value>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
@@ -4480,5 +4522,128 @@ mod tests {
             .unwrap();
         let after_resp = app.clone().oneshot(after).await.unwrap();
         assert_eq!(after_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A task with nothing but an identity: enough for tests that seed their own
+    /// runs rather than going through the executor.
+    fn seeded_task(name: &str) -> crate::model::CreateTask {
+        crate::model::CreateTask {
+            name: name.into(),
+            cron: "0 * * * * *".into(),
+            method: Some("GET".into()),
+            url: "https://example.com/health".into(),
+            headers: serde_json::Map::new(),
+            body: None,
+            disabled: false,
+            template_id: None,
+            grp: None,
+            timeout_seconds: None,
+            retry_count: None,
+            retry_interval_seconds: None,
+            priority: None,
+            timezone: None,
+            random_delay_max_seconds: None,
+            variables: None,
+        }
+    }
+
+    /// Read the run log through its raw query string, so the parsing is exercised
+    /// the way a browser exercises it.
+    async fn get_runs(app: &Router, cookie: &str, query: &str) -> Value {
+        let uri = if query.is_empty() {
+            "/api/v1/runs".to_string()
+        } else {
+            format!("/api/v1/runs?{query}")
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn run_ids(page: &Value) -> Vec<i64> {
+        page["items"]
+            .as_array()
+            .expect("a page of runs")
+            .iter()
+            .map(|run| run["id"].as_i64().expect("every run has an id"))
+            .collect()
+    }
+
+    /// The aggregated run log is the one list the *server* pages, so its query
+    /// string has to be read as numbers.
+    ///
+    /// It was read off a `serde_json::Value`, where a query value stays the text
+    /// it arrived as: `limit` fell back to the default 100 rows however many the
+    /// reader asked for, `task_id` was dropped, and `before_id` was always absent
+    /// so the cursor was a no-op and "next page" re-served the first one. Only
+    /// `status` behaved, because `as_str` is the reading a text value can satisfy
+    /// — which is exactly what made the others look fine.
+    #[tokio::test]
+    async fn run_log_honours_its_row_count_and_cursor() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let cookie = test_auth_cookie(&app).await;
+        let owner = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "route_admin")
+            .expect("bootstrap created the owner");
+        let task = store
+            .create_for_owner(owner.id, seeded_task("paged-logs"))
+            .await
+            .unwrap();
+        let other = store
+            .create_for_owner(owner.id, seeded_task("other-logs"))
+            .await
+            .unwrap();
+        // `idx_runs_active_task` allows one active run per task, so each seeded
+        // run is closed before the next one opens.
+        for _ in 0..5 {
+            let run = store.start_run(task.id).await.unwrap();
+            store.finish_run(run.id, Some(200), None).await.unwrap();
+        }
+        let run = store.start_run(other.id).await.unwrap();
+        store.finish_run(run.id, Some(200), None).await.unwrap();
+
+        // The row count is the reader's, not the default.
+        let first = get_runs(&app, &cookie, "limit=2").await;
+        assert_eq!(run_ids(&first).len(), 2, "{first}");
+        assert_eq!(first["has_more"], json!(true), "{first}");
+        let cursor = first["next_cursor"]
+            .as_i64()
+            .expect("a cursor for the second page");
+
+        // The cursor moves the window instead of repeating it.
+        let second = get_runs(&app, &cookie, &format!("limit=2&before_id={cursor}")).await;
+        assert_eq!(run_ids(&second).len(), 2, "{second}");
+        assert!(run_ids(&second).iter().all(|id| *id < cursor), "{second}");
+        let overlap = run_ids(&second)
+            .into_iter()
+            .filter(|id| run_ids(&first).contains(id))
+            .count();
+        assert_eq!(overlap, 0, "the second page repeats the first: {second}");
+
+        // `task_id` reaches the filter rather than being dropped on the floor.
+        let filtered = get_runs(&app, &cookie, &format!("task_id={}&limit=50", task.id)).await;
+        assert_eq!(run_ids(&filtered).len(), 5, "{filtered}");
+
+        // And the documented default is still "everything, up to a hundred".
+        let all = get_runs(&app, &cookie, "").await;
+        assert_eq!(run_ids(&all).len(), 6, "{all}");
+        assert_eq!(all["has_more"], json!(false), "{all}");
+        assert_eq!(all["next_cursor"], Value::Null, "{all}");
     }
 }

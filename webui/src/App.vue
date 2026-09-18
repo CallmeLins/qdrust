@@ -10,7 +10,7 @@ import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
 import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
-import { readPageSize, usePager, writePageSize } from "./pagination";
+import { usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -55,21 +55,25 @@ function updateToast(id: number, patch: Partial<Toast>) {
     scheduleDismiss(id, toast.detail || toast.meta ? 9000 : 4000);
   }
 }
-/** Rows per page, shared by every paged list (see pagination.ts).
+/** Rows per page, one count per list (see `usePageSize`).
  *
  *  Stored rather than held in memory: a reader who wants 50 rows wants them
  *  on the next visit too. It is a per-browser preference, not a site
  *  setting, so it needs no round trip and no server state.
  *
- *  Set from the pager footer under the list it applies to — that is where a
- *  reader notices the row count, and sending them to a settings page to
- *  change it would lose their place. */
-const pageSize = ref(readPageSize(localStorage));
-function setPageSize(value: number) {
-  if (value === pageSize.value) return;
-  pageSize.value = value;
-  writePageSize(localStorage, value);
-}
+ *  Each list is set from its own pager footer — that is where a reader
+ *  notices the row count, and sending them to a settings page to change it
+ *  would lose their place. Keeping one count per list means the footer they
+ *  use is the only thing it rearranges. */
+const { size: tasksPageSize, setSize: setTasksPageSize } = usePageSize(localStorage, "tasks");
+const { size: subsPageSize, setSize: setSubsPageSize } = usePageSize(localStorage, "subscriptions");
+const { size: templatesPageSize, setSize: setTemplatesPageSize } = usePageSize(localStorage, "templates");
+const { size: publicTemplatesPageSize, setSize: setPublicTemplatesPageSize } = usePageSize(
+  localStorage,
+  "publicTemplates",
+);
+const { size: libraryPageSize, setSize: setLibraryPageSize } = usePageSize(localStorage, "library");
+const { size: runLogPageSize, setSize: setRunLogPageSize } = usePageSize(localStorage, "runLog");
 
 // ---------- theme (light / dark / system, mirrors collector) ----------
 type ThemeMode = "light" | "dark" | "system";
@@ -291,7 +295,7 @@ const filteredTasks = computed(() => {
 const {
   page: tasksPage, pages: tasksTotalPages, items: pagedTasks,
   prev: tasksPrevPage, next: tasksNextPage, reset: resetTasksPage,
-} = usePager(() => filteredTasks.value, () => pageSize.value);
+} = usePager(() => filteredTasks.value, () => tasksPageSize.value);
 // A new search term or group is a different list rather than a later page of
 // the same one, so it starts over.
 watch([search, groupFilter], resetTasksPage);
@@ -624,7 +628,7 @@ async function loadRunLog() {
       status: runLogStatus.value || undefined,
       taskId: runLogTaskId.value || undefined,
       beforeId: runLogCursors.value[runLogCursors.value.length - 1] ?? undefined,
-      limit: pageSize.value,
+      limit: runLogPageSize.value,
     });
     allRuns.value = page.items;
     runLogHasMore.value = page.has_more;
@@ -650,12 +654,16 @@ function setRunLogStatus(status: "" | "succeeded" | "failed") {
   void loadRunLog();
 }
 /** A different row count makes the cursor stack meaningless — those cursors
- *  were cut for pages of the old size — so the paging starts over. */
-function setRunLogPageSize(value: number) {
-  setPageSize(value);
+ *  were cut for pages of the old size — so the paging starts over.
+ *
+ *  A watch, not a step in the setter: the row count is the reader's, the setter
+ *  only stores it, and any later control that changes it inherits this without
+ *  having to remember to. The guard covers the size being changed while the
+ *  modal is shut, where the next open fetches anyway. */
+watch(runLogPageSize, () => {
   runLogCursors.value = [];
-  void loadRunLog();
-}
+  if (showRunLog.value) void loadRunLog();
+});
 
 // ---------- templates ----------
 const templates = ref<Template[]>([]);
@@ -740,11 +748,11 @@ const sortedPublicTemplates = computed(() =>
 const {
   page: templatesPage, pages: templatesTotalPages, items: pagedTemplates,
   prev: templatesPrevPage, next: templatesNextPage, reset: resetTemplatesPage,
-} = usePager(() => filteredTemplates.value, () => pageSize.value);
+} = usePager(() => filteredTemplates.value, () => templatesPageSize.value);
 const {
   page: publicTemplatesPage, pages: publicTemplatesTotalPages, items: pagedPublicTemplates,
   prev: publicTemplatesPrevPage, next: publicTemplatesNextPage,
-} = usePager(() => sortedPublicTemplates.value, () => pageSize.value);
+} = usePager(() => sortedPublicTemplates.value, () => publicTemplatesPageSize.value);
 watch(templateSearch, resetTemplatesPage);
 
 /** Headers of the "my templates" table. `text` marks the columns whose natural
@@ -1179,7 +1187,7 @@ const subscriptions = ref<TemplateSubscription[]>([]);
 const {
   page: subsPage, pages: subsTotalPages, items: pagedSubscriptions,
   prev: subsPrevPage, next: subsNextPage,
-} = usePager(() => subscriptions.value, () => pageSize.value);
+} = usePager(() => subscriptions.value, () => subsPageSize.value);
 const subForm = reactive<{ name: string; url: string }>({ name: "", url: "" });
 /** Add/edit dialog state: a null edit target means "create". */
 const showSubModal = ref(false);
@@ -1333,7 +1341,7 @@ const librarySelectedCount = computed(() => librarySelected.value.size);
 const {
   page: libraryPage, pages: libraryTotalPages, items: pagedLibraryEntries,
   prev: libraryPrevPage, next: libraryNextPage, reset: resetLibraryPage,
-} = usePager(() => libraryEntries.value, () => pageSize.value);
+} = usePager(() => libraryEntries.value, () => libraryPageSize.value);
 watch(libraryEntries, resetLibraryPage);
 /** Only entries currently visible — the page on screen — can be selected, so a
  *  filter or a page turn never hides part of the selection. */
@@ -2075,10 +2083,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             :page="tasksPage"
             :pages="tasksTotalPages"
             :total="filteredTasks.length"
-            :page-size="pageSize"
+            :page-size="tasksPageSize"
             @prev="tasksPrevPage"
             @next="tasksNextPage"
-            @update:page-size="setPageSize"
+            @update:page-size="setTasksPageSize"
           />
         </section>
       </div>
@@ -2158,10 +2166,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             :page="subsPage"
             :pages="subsTotalPages"
             :total="subscriptions.length"
-            :page-size="pageSize"
+            :page-size="subsPageSize"
             @prev="subsPrevPage"
             @next="subsNextPage"
-            @update:page-size="setPageSize"
+            @update:page-size="setSubsPageSize"
           />
         </section>
 
@@ -2211,10 +2219,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             :page="templatesPage"
             :pages="templatesTotalPages"
             :total="filteredTemplates.length"
-            :page-size="pageSize"
+            :page-size="templatesPageSize"
             @prev="templatesPrevPage"
             @next="templatesNextPage"
-            @update:page-size="setPageSize"
+            @update:page-size="setTemplatesPageSize"
           />
         </section>
 
@@ -2307,10 +2315,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               :page="libraryPage"
               :pages="libraryTotalPages"
               :total="libraryEntries.length"
-              :page-size="pageSize"
+              :page-size="libraryPageSize"
               @prev="libraryPrevPage"
               @next="libraryNextPage"
-              @update:page-size="setPageSize"
+              @update:page-size="setLibraryPageSize"
             />
 
             <template v-if="libraryFailures.length">
@@ -2357,10 +2365,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               :page="publicTemplatesPage"
               :pages="publicTemplatesTotalPages"
               :total="sortedPublicTemplates.length"
-              :page-size="pageSize"
+              :page-size="publicTemplatesPageSize"
               @prev="publicTemplatesPrevPage"
               @next="publicTemplatesNextPage"
-              @update:page-size="setPageSize"
+              @update:page-size="setPublicTemplatesPageSize"
             />
           </template>
         </section>
@@ -2795,7 +2803,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
         <Pager
           :page="runLogPageNo"
-          :page-size="pageSize"
+          :page-size="runLogPageSize"
           :busy="runLogLoading"
           :prev-disabled="runLogCursors.length === 0"
           :next-disabled="!runLogHasMore"

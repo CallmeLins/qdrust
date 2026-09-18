@@ -791,10 +791,7 @@ async fn scan_tree(client: &Client, source: &GitHubSource) -> Result<Vec<RawEntr
                 .context("cannot reach GitHub API")?
                 .error_for_status()
                 .context("GitHub API returned an error")?;
-            response
-                .json()
-                .await
-                .context("invalid GitHub API response")
+            response.json().await.context("invalid GitHub API response")
         },
         is_transient,
     )
@@ -1439,7 +1436,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(attempts, FETCH_ATTEMPTS, "every attempt is spent");
         assert!(
-            error.to_string().contains(&format!("attempt {FETCH_ATTEMPTS}")),
+            error
+                .to_string()
+                .contains(&format!("attempt {FETCH_ATTEMPTS}")),
             "the caller sees why the last one failed, not the first: {error}"
         );
     }

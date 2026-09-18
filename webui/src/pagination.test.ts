@@ -3,13 +3,16 @@ import { describe, expect, it } from "vitest";
 import { ref } from "vue";
 import {
   DEFAULT_PAGE_SIZE,
+  LEGACY_PAGE_SIZE_STORAGE_KEY,
   PAGE_SIZE_OPTIONS,
-  PAGE_SIZE_STORAGE_KEY,
+  PAGE_SIZE_SCOPES,
   clampPage,
   pageCount,
+  pageSizeKey,
   pageSlice,
   readPageSize,
   showsNav,
+  usePageSize,
   usePager,
   writePageSize,
 } from "./pagination";
@@ -31,30 +34,86 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("page size preference", () => {
   it("falls back to the default when nothing is stored", () => {
-    expect(readPageSize(memoryStorage())).toBe(DEFAULT_PAGE_SIZE);
-    expect(readPageSize(null)).toBe(DEFAULT_PAGE_SIZE);
+    expect(readPageSize(memoryStorage(), "tasks")).toBe(DEFAULT_PAGE_SIZE);
+    expect(readPageSize(null, "tasks")).toBe(DEFAULT_PAGE_SIZE);
   });
 
-  it("reads back a stored size", () => {
-    expect(readPageSize(memoryStorage({ [PAGE_SIZE_STORAGE_KEY]: "50" }))).toBe(50);
+  it("reads back a size stored for that list", () => {
+    expect(readPageSize(memoryStorage({ [pageSizeKey("tasks")]: "50" }), "tasks")).toBe(50);
+  });
+
+  it("keeps one count per list, so changing one leaves the others alone", () => {
+    // The behaviour this replaced: a single shared count meant the footer of any
+    // list silently re-chunked every other one.
+    const storage = memoryStorage();
+    writePageSize(storage, "tasks", 50);
+    writePageSize(storage, "library", 20);
+    expect(readPageSize(storage, "tasks")).toBe(50);
+    expect(readPageSize(storage, "library")).toBe(20);
+    expect(readPageSize(storage, "subscriptions")).toBe(DEFAULT_PAGE_SIZE);
+  });
+
+  it("gives every list its own key, none of them the shared one", () => {
+    const keys = PAGE_SIZE_SCOPES.map(pageSizeKey);
+    expect(new Set(keys).size).toBe(PAGE_SIZE_SCOPES.length);
+    expect(keys).not.toContain(LEGACY_PAGE_SIZE_STORAGE_KEY);
+  });
+
+  it("carries a count stored before the lists were separated into each of them", () => {
+    // An upgrade, not a fresh browser: the reader's single old choice is the
+    // starting point for every list, and each one moves off it independently.
+    const storage = memoryStorage({ [LEGACY_PAGE_SIZE_STORAGE_KEY]: "50" });
+    expect(readPageSize(storage, "tasks")).toBe(50);
+    expect(readPageSize(storage, "runLog")).toBe(50);
+    writePageSize(storage, "tasks", 10);
+    expect(readPageSize(storage, "tasks")).toBe(10);
+    expect(readPageSize(storage, "runLog")).toBe(50);
   });
 
   it("ignores a stored value that is not one of the offered sizes", () => {
     for (const stored of ["0", "-10", "7", "1000", "abc", ""]) {
-      expect(readPageSize(memoryStorage({ [PAGE_SIZE_STORAGE_KEY]: stored }))).toBe(DEFAULT_PAGE_SIZE);
+      expect(readPageSize(memoryStorage({ [pageSizeKey("tasks")]: stored }), "tasks")).toBe(DEFAULT_PAGE_SIZE);
+    }
+    for (const stored of ["0", "-10", "7", "abc"]) {
+      expect(readPageSize(memoryStorage({ [LEGACY_PAGE_SIZE_STORAGE_KEY]: stored }), "tasks")).toBe(
+        DEFAULT_PAGE_SIZE,
+      );
     }
   });
 
   it("only stores offered sizes", () => {
     const storage = memoryStorage();
-    writePageSize(storage, 100);
-    expect(storage.getItem(PAGE_SIZE_STORAGE_KEY)).toBe("100");
-    writePageSize(storage, 7);
-    expect(storage.getItem(PAGE_SIZE_STORAGE_KEY)).toBe("100");
+    writePageSize(storage, "tasks", 100);
+    expect(storage.getItem(pageSizeKey("tasks"))).toBe("100");
+    writePageSize(storage, "tasks", 7);
+    expect(storage.getItem(pageSizeKey("tasks"))).toBe("100");
   });
 
   it("offers ten as the smallest size", () => {
     expect(PAGE_SIZE_OPTIONS[0]).toBe(DEFAULT_PAGE_SIZE);
+  });
+});
+
+describe("usePageSize", () => {
+  it("starts from what the list stored and writes back only its own", () => {
+    const storage = memoryStorage({ [pageSizeKey("runLog")]: "20" });
+    const { size, setSize } = usePageSize(storage, "runLog");
+    expect(size.value).toBe(20);
+    setSize(100);
+    expect(size.value).toBe(100);
+    expect(storage.getItem(pageSizeKey("runLog"))).toBe("100");
+    expect(storage.getItem(pageSizeKey("tasks"))).toBeNull();
+  });
+
+  it("ignores a repeated value and a value it does not offer", () => {
+    const storage = memoryStorage();
+    const { size, setSize } = usePageSize(storage, "tasks");
+    setSize(50);
+    setSize(50);
+    expect(storage.entries[pageSizeKey("tasks")]).toBe("50");
+    setSize(7);
+    expect(size.value).toBe(50);
+    expect(storage.entries[pageSizeKey("tasks")]).toBe("50");
   });
 });
 
@@ -145,17 +204,25 @@ describe("footer reachability", () => {
 });
 
 /**
- * The rule that keeps the picker reachable is structural, so it is checked in
- * the template rather than in a function. Two ways to break it: put a footer
- * behind a `v-if` (the picker leaves with it), or give one list a private page
- * size (its footer then offers a different setting from every other list).
+ * The rules that keep a row count both reachable and private are structural, so
+ * they are checked in the template rather than in a function. Three ways to
+ * break them: put a footer behind a `v-if` (the picker leaves with it), let two
+ * lists share a count (their footers then fight -- the behaviour this replaced),
+ * or bind a footer to another list's setter (it shows one number and writes
+ * another).
+ *
+ * The run log is the one list the *server* pages, so its own count also has to
+ * reach the request, and changing it has to invalidate the cursors that were cut
+ * for pages of the old size.
  */
 describe("footer wiring in App.vue", () => {
   const app = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
   const footers = app.match(/<Pager\b[\s\S]*?\/>/g) ?? [];
+  const sizes = footers.map((footer) => footer.match(/:page-size="(\w+)"/)?.[1] ?? "");
 
   it("finds the footers, so the checks below are not vacuous", () => {
     expect(footers.length).toBeGreaterThan(0);
+    expect(sizes.every(Boolean), "every footer names the count it shows").toBe(true);
   });
 
   it("renders every footer unconditionally", () => {
@@ -164,10 +231,31 @@ describe("footer wiring in App.vue", () => {
     }
   });
 
-  it("drives every footer's picker from the one stored page size", () => {
-    for (const footer of footers) {
-      expect(footer, "every footer has to write the shared page size").toMatch(/:page-size="pageSize"/);
+  it("gives every footer a row count of its own", () => {
+    expect(new Set(sizes).size).toBe(sizes.length);
+  });
+
+  it("writes back through the setter that belongs to its own count", () => {
+    for (const size of sizes) {
+      const setter = "set" + size.charAt(0).toUpperCase() + size.slice(1);
+      const footer = footers[sizes.indexOf(size)];
+      const writes = '@update:page-size="' + setter + '"';
+      expect(footer, size + " has to be written through " + setter).toContain(writes);
     }
+  });
+
+  it("sends the run log's own row count to the server", () => {
+    expect(app, "the run log is fetched, so its count has to reach the request").toMatch(
+      /limit: runLogPageSize\.value/,
+    );
+  });
+
+  it("restarts the run log's cursors when its row count changes", () => {
+    // Cursors were cut for pages of the old size, so they cannot be reused. It is
+    // a watch rather than a step in a setter, so no caller has to remember it.
+    const reaction = app.match(/watch\(runLogPageSize,[\s\S]*?\n\}\);/)?.[0] ?? "";
+    expect(reaction, "the run log has to react to its own count").toContain("runLogCursors.value = []");
+    expect(reaction).toContain("loadRunLog()");
   });
 });
 
