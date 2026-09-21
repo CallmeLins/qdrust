@@ -20,7 +20,7 @@
   | `string/replace` | 正则替换，支持组引用与文本模式 |
   | `rsa` (encode / decode) | PKCS1 v1.5 加解密 |
   | `json` (parse / stringify / pretty) | JSON 处理 |
-  | `dddd/*` | OCR / 验证码识别，转发到外部 DdddOCR 服务 |
+  | `dddd/*` | OCR / 验证码识别，转发到外部 DdddOCR 服务（目标由 `_server` 参数或 `QDRUST_DDDDOCR_SERVER` 指定）。这是唯一会出网的 `util` 动作，因此和模板请求走同一道闸门：默认拒绝内网 / 回环地址，见[出站请求访问内网地址](usage.md#出站请求访问内网地址高风险开关) |
 
   外部插件二进制（带 manifest、API 版本校验与能力声明 network / read_file / write_file / environment）通过子进程 JSON 协议调用，WebUI 提供插件管理页。
 

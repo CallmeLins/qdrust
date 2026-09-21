@@ -142,7 +142,7 @@ QDRUST_BASE_PATH=/qd
 | `REDIS_URL` | 空 | 可选 Redis 会话缓存 |
 | `QDRUST_CONFIG_FILE` | 空 | 运行时可调配置的 JSON 文件路径（热更新站点设置） |
 | `QDRUST_BROWSER_URL` | 空 | 浏览器插件端点，配置后启用 `api://browser/*`（进程内 chromiumoxide，CDP：`http://localhost:9222` / `ws://localhost:3000` / `wss://chrome.browserless.io?token=...`） |
-| `QDRUST_ALLOW_PRIVATE_NETWORK` | `false` | **高风险**：允许**全部出站请求**（模板运行、直接填 URL 的任务、通知渠道、订阅抓取）访问内网 / 回环 / 链路本地地址。仅在确实依赖内网服务（如自建 flaresolverr、内网 ntfy）时开启，理由、风控与升级影响见[出站请求访问内网地址](usage.md#出站请求访问内网地址高风险开关)。也可在管理页「站点设置」里运行时开关，优先级高于本变量 |
+| `QDRUST_ALLOW_PRIVATE_NETWORK` | `false` | **高风险**：允许**全部出站请求**（模板运行、直接填 URL 的任务、通知渠道、订阅抓取、模板里的 `api://util/dddd` 转发）访问内网 / 回环 / 链路本地地址。仅在确实依赖内网服务（如自建 flaresolverr、内网 ntfy、内网 DdddOCR）时开启，理由、风控与升级影响见[出站请求访问内网地址](usage.md#出站请求访问内网地址高风险开关)。也可在管理页「站点设置」里运行时开关，优先级高于本变量 |
 | `QDRUST_ALLOW_INVALID_CERTIFICATES` | `false` | **高风险**：不再校验证书（自签名 / 过期 / 域名不匹配都接受）。与上一个开关互相独立，理由见[接受无效证书](usage.md#接受无效证书高风险开关)。同样可在管理页运行时开关，优先级高于本变量 |
 
 第三方登录（OIDC / 反向代理 Header）另有一组变量，见 [账号与第三方登录](authentication.md)。

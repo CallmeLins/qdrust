@@ -75,6 +75,24 @@ impl Default for ExecutorOptions {
     }
 }
 
+impl ExecutorOptions {
+    /// The part of these options that decides whether a request may happen at
+    /// all, in the form [`guarded_client_for_url`] takes.
+    ///
+    /// Separate from `ExecutorOptions` because the request/loop/plugin limits
+    /// are meaningless to an outbound fetch that is not a template run — the
+    /// server makes those fetches too, and handing it the whole options struct
+    /// would invite it to think the limits applied.
+    pub fn outbound_policy(&self) -> OutboundPolicy {
+        OutboundPolicy {
+            timeout: self.timeout,
+            allow_private_network: self.allow_private_network,
+            allow_invalid_certificates: self.allow_invalid_certificates,
+            proxy: self.proxy.clone(),
+        }
+    }
+}
+
 /// How one outbound request is allowed to be made.
 ///
 /// The two `allow_*` switches are the ADR-0008 relaxations and default off;
@@ -147,18 +165,18 @@ pub struct StepResult {
 
 pub struct QdExecutor {
     cookies: Arc<Jar>,
-    timeout: Duration,
-    allow_invalid_certificates: bool,
+    /// Everything the SSRF guard reads, in one place. Held as the policy rather
+    /// than as loose `timeout`/`allow_*`/`proxy` fields so the executor and the
+    /// built-in `util` plugin cannot drift apart: they are handed the same
+    /// value at construction, which is what keeps the plugin's DdddOCR forward
+    /// under the same gate as every request the executor makes itself.
+    policy: OutboundPolicy,
     expressions: QdExpressionEngine,
     response_limit: usize,
-    allow_private_network: bool,
     plugins: PluginRegistry,
     plugin_timeout: Duration,
     request_limit: usize,
     loop_limit: usize,
-    /// Kept as the configured URL rather than a parsed proxy: the client that
-    /// carries it is built per request, so the URL is parsed there too.
-    proxy: Option<String>,
 }
 
 impl QdExecutor {
@@ -172,20 +190,21 @@ impl QdExecutor {
     pub fn with_options(options: ExecutorOptions) -> Result<Self> {
         ensure!(options.request_limit > 0, "request limit must be positive");
         ensure!(options.loop_limit > 0, "loop limit must be positive");
+        let policy = options.outbound_policy();
         let mut plugins = PluginRegistry::default();
-        plugins.register(std::sync::Arc::new(UtilityPlugin::default()))?;
+        // The built-in plugin is handed the same policy. Its DdddOCR forward
+        // leaves this process, and a second copy of the switches is exactly how
+        // that forward ends up unguarded while everything else is guarded.
+        plugins.register(Arc::new(UtilityPlugin::with_policy(policy.clone())))?;
         Ok(Self {
             cookies: Arc::new(Jar::default()),
-            timeout: options.timeout,
-            allow_invalid_certificates: options.allow_invalid_certificates,
+            policy,
             expressions: QdExpressionEngine::default(),
             response_limit: options.response_limit,
-            allow_private_network: options.allow_private_network,
             plugins,
             plugin_timeout: options.plugin_timeout,
             request_limit: options.request_limit,
             loop_limit: options.loop_limit,
-            proxy: options.proxy,
         })
     }
 
@@ -847,21 +866,8 @@ impl QdExecutor {
     /// The part of this executor that decides whether a request may happen at
     /// all, in the form [`guarded_client_for_url`] takes.
     ///
-    /// Built here rather than at construction, and deliberately not the whole
-    /// options struct: the request/loop/plugin limits mean nothing to an
-    /// outbound fetch that is not a template run, and a caller handed all of
-    /// them would invite the belief that they applied.
-    fn outbound_policy(&self) -> OutboundPolicy {
-        OutboundPolicy {
-            timeout: self.timeout,
-            allow_private_network: self.allow_private_network,
-            allow_invalid_certificates: self.allow_invalid_certificates,
-            proxy: self.proxy.clone(),
-        }
-    }
-
     async fn client_for_url(&self, url: &str) -> Result<Client> {
-        guarded_client_for_url(url, &self.outbound_policy(), Some(self.cookies.clone())).await
+        guarded_client_for_url(url, &self.policy, Some(self.cookies.clone())).await
     }
 
     #[cfg(test)]
@@ -869,8 +875,8 @@ impl QdExecutor {
         Client::builder()
             .cookie_provider(self.cookies.clone())
             .redirect(Policy::none())
-            .danger_accept_invalid_certs(self.allow_invalid_certificates)
-            .timeout(self.timeout)
+            .danger_accept_invalid_certs(self.policy.allow_invalid_certificates)
+            .timeout(self.policy.timeout)
             .resolve(host, address)
             .build()
             .context("cannot build pinned HTTP client")
@@ -1610,17 +1616,59 @@ mod tests {
     #[test]
     fn the_executor_reaches_a_client_only_through_the_shared_constructor() {
         let source = include_str!("executor.rs").replace("\r\n", "\n");
+        // Cut at the test module rather than at the first `#[cfg(test)]`. The
+        // pinned-client helper carries that attribute from the middle of the
+        // file, so the first-marker rule ended this half at the helper and left
+        // everything below it — the shared constructor and every free function
+        // after it — unexamined.
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the file is never empty");
+        assert!(
+            production.contains("guarded_client_for_url("),
+            "the executor no longer calls the shared constructor"
+        );
+        // Exactly two builder chains belong in this half, and naming both is
+        // what lets a third one fail with a message that says which two were
+        // expected: the shared constructor, which *is* the gate and has to
+        // build a client, and the `#[cfg(test)]` helper that proves address
+        // pinning works. "No builder at all" cannot be true here, and checking
+        // only the full `reqwest::Client` path would miss a `Client::new()`
+        // written against the imported type.
+        let builder = ["Client::", "builder()"].concat();
+        assert_eq!(
+            production.matches(&builder).count(),
+            2,
+            "a client is being built outside guarded_client_for_url and the pinned helper"
+        );
+        assert!(
+            !production.contains("Client::new()"),
+            "the executor builds its own client; every request goes through guarded_client_for_url"
+        );
+    }
+
+    /// The plugin's own test proves the guard works once a policy reaches it.
+    /// This proves a policy reaches it. The executor could keep a correct
+    /// `UtilityPlugin` wired to a closed default while opening its own posture,
+    /// and the DdddOCR forward would be unguarded again — which is the shape of
+    /// the hole this replaced, so the wiring gets its own assertion rather than
+    /// resting on the plugin's.
+    #[test]
+    fn the_executor_hands_its_policy_to_the_builtin_plugin() {
+        let source = include_str!("executor.rs").replace("\r\n", "\n");
         let production = source
             .split("#[cfg(test)]")
             .next()
             .expect("the file is never empty");
         assert!(
-            !production.contains("Client::builder()"),
-            "the executor builds its own client; every request goes through guarded_client_for_url"
+            production.contains("UtilityPlugin::with_policy("),
+            "the built-in plugin is registered without this run's policy"
         );
         assert!(
-            production.contains("guarded_client_for_url("),
-            "the executor no longer calls the shared constructor"
+            !production.contains("UtilityPlugin::default()"),
+            "the built-in plugin falls back to a closed default, so its DdddOCR \
+             forward ignores the switches"
         );
     }
 

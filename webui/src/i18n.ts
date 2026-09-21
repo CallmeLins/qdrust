@@ -433,7 +433,7 @@ const zh = {
   retentionDays: "日志保留天数",
   allowPrivateNetwork: "允许出站请求访问内网地址",
   allowPrivateNetworkRisk:
-    "高风险：开启后**任何出站请求**都能访问本机网络内的服务（内网设备、回环地址、云元数据端点）——模板运行、直接填 URL 的任务、通知渠道、订阅抓取都包括——不只是你信任的那一个。仅在确实依赖内网服务（例如自建的 flaresolverr、内网 ntfy）时开启；不用时请关掉。修改记入审计日志。",
+    "高风险：开启后**任何出站请求**都能访问本机网络内的服务（内网设备、回环地址、云元数据端点）——模板运行、直接填 URL 的任务、通知渠道、订阅抓取、模板里的 api://util/dddd 转发都包括——不只是你信任的那一个。仅在确实依赖内网服务（例如自建的 flaresolverr、内网 ntfy、内网 DdddOCR）时开启；不用时请关掉。修改记入审计日志。",
   allowInvalidCertificates: "接受无效证书",
   allowInvalidCertificatesRisk:
     "高风险：开启后不再校验证书，自签名、过期、域名不匹配的证书都会被接受，中间人也因此可以冒充目标站点。与上一项彼此独立——需要访问内网并不代表需要放弃证书校验。仅在目标只在内网可达、且确实没配证书时开启；不用时请关掉。修改记入审计日志。",
@@ -931,7 +931,7 @@ const en: Record<MessageKey, string> = {
   retentionDays: "Log retention (days)",
   allowPrivateNetwork: "Let outbound requests reach private network addresses",
   allowPrivateNetworkRisk:
-    "High risk: with this on, every outbound request can reach services on this host's network — intranet devices, loopback addresses, cloud metadata endpoints — and that means template runs, tasks that are just a URL, notification channels and library fetches, not only the target you trust. Leave it on only while something genuinely depends on an internal service (a self-hosted flaresolverr, an intranet ntfy), and turn it back off afterwards. Changes are recorded in the audit log.",
+    "High risk: with this on, every outbound request can reach services on this host's network — intranet devices, loopback addresses, cloud metadata endpoints — and that means template runs, tasks that are just a URL, notification channels, library fetches and the template's own api://util/dddd forward, not only the target you trust. Leave it on only while something genuinely depends on an internal service (a self-hosted flaresolverr, an intranet ntfy, an internal DdddOCR), and turn it back off afterwards. Changes are recorded in the audit log.",
   allowInvalidCertificates: "Accept invalid certificates",
   allowInvalidCertificatesRisk:
     "High risk: with this on, certificates are no longer verified — self-signed, expired or mismatched ones are all accepted, which is what lets a machine in the middle impersonate the target. It is independent of the switch above: reaching an intranet host is no reason to stop checking certificates. Leave it on only while a target is reachable solely from the intranet and genuinely has no certificate, and turn it back off afterwards. Changes are recorded in the audit log.",

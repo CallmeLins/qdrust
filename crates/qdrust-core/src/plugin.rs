@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
+use crate::executor::{OutboundPolicy, guarded_client_for_url};
+
 pub const PLUGIN_API_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -311,12 +313,24 @@ fn capability_list(capabilities: &[PluginCapability]) -> String {
         .join(",")
 }
 
+/// The built-in `util` plugin: every QD `api://util/...` route that is not
+/// handled by a registered plugin.
+///
+/// All but one action are pure computation. The exception is `dddd/*`, which
+/// forwards to a DdddOCR server the template names through `_server` — that
+/// forward leaves this process, so it carries the shared guard rather than a
+/// client of this module's own.
 pub struct UtilityPlugin {
     manifest: PluginManifest,
+    /// Snapshotted at construction, because the executor is built per run from
+    /// the live settings: the snapshot *is* that run's posture. Read per run
+    /// for the same reason the run policy is — a switch that needs a restart
+    /// reads as a switch that does not work.
+    policy: OutboundPolicy,
 }
 
-impl Default for UtilityPlugin {
-    fn default() -> Self {
+impl UtilityPlugin {
+    pub fn with_policy(policy: OutboundPolicy) -> Self {
         Self {
             manifest: PluginManifest {
                 api_version: PLUGIN_API_VERSION,
@@ -325,7 +339,18 @@ impl Default for UtilityPlugin {
                 version: env!("CARGO_PKG_VERSION").into(),
                 capabilities: Vec::new(),
             },
+            policy,
         }
+    }
+}
+
+impl Default for UtilityPlugin {
+    /// Closed posture — every relaxation off, which is also
+    /// [`OutboundPolicy::default`]. The executor builds this plugin from its
+    /// own options every time, so reaching this implementation means a caller
+    /// with no policy to offer: tests, and the CLI's `QdExecutor::new`.
+    fn default() -> Self {
+        Self::with_policy(OutboundPolicy::default())
     }
 }
 
@@ -653,7 +678,20 @@ impl Plugin for UtilityPlugin {
                         .context("invalid DdddOCR server URL")?
                         .join(action.trim_start_matches("dddd/"))
                         .context("invalid DdddOCR route")?;
-                    let client = reqwest::Client::new();
+                    // The target arrives from the template (`_server`), so it
+                    // goes through the same gate as every other outbound
+                    // request: address classification, the admin switches, and
+                    // a pinned address. Three of those were absent while this
+                    // built its own client — including the redirect policy, so
+                    // this path followed up to ten hops where the rest of the
+                    // process followed none.
+                    //
+                    // No context wrapper on the failure: the guard's own
+                    // sentence is the one that tells an operator what happened,
+                    // and burying it under "server is not reachable" would read
+                    // as a network problem instead of a refusal.
+                    let client =
+                        guarded_client_for_url(server.as_str(), &self.policy, None).await?;
                     let mut request_builder = client.request(
                         reqwest::Method::from_bytes(
                             request
@@ -956,6 +994,90 @@ fn translate_python_replacement(replacement: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::net::SocketAddr;
+
+    use axum::{Router, routing::post};
+
+    /// Answer one DdddOCR route, so that "the request actually arrived" can be
+    /// asserted instead of inferred from the absence of an error.
+    async fn serve_ddddocr() -> SocketAddr {
+        let app = Router::new().route("/ocr", post(|| async { "recognized" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address
+    }
+
+    async fn forward_to_ddddocr(
+        policy: OutboundPolicy,
+        address: SocketAddr,
+    ) -> Result<PluginResponse> {
+        let plugin = UtilityPlugin::with_policy(policy);
+        let request =
+            PluginRequest::from_api_url(&format!("api://util/dddd/ocr?_server=http://{address}/"))?;
+        plugin.call(&request).await
+    }
+
+    /// `dddd/*` is the only `util` action that leaves this process, and its
+    /// target comes from the template through `_server`. It used to build its
+    /// own client, so a template could aim it at the loopback address the guard
+    /// exists to refuse while the switches said no — one hole in an otherwise
+    /// uniform gate, and one a template author could reach on purpose.
+    ///
+    /// Both directions are pinned. The allowed one asserts the response body:
+    /// a guard that refused everything would pass a test that only looked for
+    /// the refusal.
+    #[tokio::test]
+    async fn a_dddd_forward_goes_through_the_shared_guard() {
+        let address = serve_ddddocr().await;
+
+        let refused = forward_to_ddddocr(OutboundPolicy::default(), address)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("private or special-use network target is blocked"),
+            "a template must not reach loopback through this forward while the switch is off: \
+             {refused:#}"
+        );
+
+        let opened = OutboundPolicy {
+            allow_private_network: true,
+            ..OutboundPolicy::default()
+        };
+        let response = forward_to_ddddocr(opened, address).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"recognized");
+    }
+
+    /// The guard above is only as good as its exclusivity: a client built here
+    /// would route around it, and `_server` is template-controlled, so that is
+    /// a live SSRF rather than a hypothetical.
+    ///
+    /// Structural, and it reads the production half only — a needle that also
+    /// matched this assertion's own wording would never fail and would assert
+    /// nothing.
+    #[test]
+    fn no_bare_client_in_this_module() {
+        let source = include_str!("plugin.rs").replace("\r\n", "\n");
+        // Cut at the test module, not at the first `#[cfg(test)]`. This file
+        // carries a `#[cfg(test)]` accessor inside `SubprocessPlugin` near the
+        // top, so the first-marker rule ended the "production" half at line
+        // 147 — above the DdddOCR branch this assertion exists to protect, and
+        // a mutation that restored a bare client there was reported MISSED
+        // rather than caught. An assertion whose range is decided by whichever
+        // marker happens to come first stops covering the code it names.
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .expect("the file is never empty");
+        let needle = ["reqwest::", "Client"].concat();
+        assert!(
+            !production.contains(&needle),
+            "plugin.rs builds its own client; the DdddOCR forward goes through \
+             guarded_client_for_url"
+        );
+    }
 
     fn echo_manifest() -> PluginManifest {
         PluginManifest {
