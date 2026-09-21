@@ -8,10 +8,13 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{TimeZone, Utc};
-use reqwest::{Client, Method};
+use reqwest::Method;
 use serde_json::Value;
 
-use crate::email::{EmailClient, normalize_recipient};
+use crate::{
+    email::{EmailClient, normalize_recipient},
+    outbound::OutboundHttp,
+};
 
 /// Render an epoch-seconds timestamp in the task's own IANA timezone (UTC when
 /// the task has none, or when the stored name no longer parses). Backs the
@@ -96,8 +99,12 @@ pub struct Message<'a> {
 /// environment-configured client instead (the API router carries no mail client).
 /// A missing or malformed config yields an error rather than silence, so a
 /// broken channel reports why.
+///
+/// The channel's URL is the user's to choose, so every request goes through
+/// [`OutboundHttp`] — the same guard a template run gets. Turning the
+/// private-network switch off closes this path too, which it did not before.
 pub async fn deliver(
-    client: &Client,
+    outbound: &OutboundHttp,
     kind: &str,
     config: &Value,
     message: &Message<'_>,
@@ -110,8 +117,9 @@ pub async fn deliver(
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("webhook channel requires a url"))?;
-            client
+            outbound
                 .post(url)
+                .await?
                 .json(message.payload)
                 .send()
                 .await
@@ -131,7 +139,9 @@ pub async fn deliver(
             let method: Method = method
                 .parse()
                 .with_context(|| format!("custom HTTP channel has an invalid method: {method}"))?;
-            let mut request = client.request(method, render(url));
+            // Rendered first: the guard has to see the URL that will actually be
+            // requested, not the template with a `{run_id}` in the host.
+            let mut request = outbound.request(method, &render(url)).await?;
             if let Some(headers) = config.get("headers").and_then(Value::as_object) {
                 for (name, value) in headers {
                     if let Some(value) = value.as_str() {
@@ -171,7 +181,7 @@ pub async fn deliver(
         }
         other if crate::push_channels::is_push_channel(other) => {
             crate::push_channels::push_to_channel(
-                client,
+                outbound,
                 other,
                 config,
                 message.title,
@@ -187,6 +197,8 @@ pub async fn deliver(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn message<'a>(title: &'a str, body: &'a str, payload: &'a Value) -> Message<'a> {
         Message {
@@ -194,6 +206,15 @@ mod tests {
             body,
             payload,
         }
+    }
+
+    /// An `OutboundHttp` with the private-network switch set the way the test
+    /// needs it. A fresh settings handle per call, so one test cannot leave a
+    /// posture behind for another.
+    fn guarded(allow_private_network: bool) -> OutboundHttp {
+        let settings = crate::api::runtime_settings();
+        settings.write().unwrap().allow_private_network = allow_private_network;
+        OutboundHttp::new(settings, Duration::from_secs(30))
     }
 
     #[test]
@@ -214,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_channel_kind_is_reported_not_ignored() {
-        let client = Client::new();
+        let client = OutboundHttp::standalone();
         let payload = json!({});
         let err = deliver(
             &client,
@@ -234,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_channel_missing_required_config_fails_loudly() {
-        let client = Client::new();
+        let client = OutboundHttp::standalone();
         let payload = json!({});
         let err = deliver(
             &client,
@@ -247,5 +268,55 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("webhook channel requires a url"));
+    }
+
+    /// A channel URL is the user's to choose, and this path used to have no
+    /// guard at all: the private-network switch closed template runs while a
+    /// channel could still reach anything the host could.
+    ///
+    /// The request count is the assertion that matters, because delivery
+    /// reports nothing but success or failure — the refusal has to leave the
+    /// count at zero, which no status comparison could establish.
+    #[tokio::test]
+    async fn a_channel_url_goes_through_the_same_guard_as_a_template() {
+        let (address, served) = crate::test_support::serve_counting_loopback().await;
+        let config = json!({ "url": format!("http://{address}/hook") });
+        let payload = json!({});
+
+        let blocked = deliver(
+            &guarded(false),
+            "webhook",
+            &config,
+            &message("t", "b", &payload),
+            &|value| value.to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{blocked:#}").contains("private or special-use network target is blocked"),
+            "a channel pointing at loopback must be refused while the switch is off: {blocked:#}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            0,
+            "a refused delivery must not reach the network at all"
+        );
+
+        deliver(
+            &guarded(true),
+            "webhook",
+            &config,
+            &message("t", "b", &payload),
+            &|value| value.to_string(),
+            None,
+        )
+        .await
+        .expect("with the switch on the same channel must deliver");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the allowed delivery must have reached this socket"
+        );
     }
 }

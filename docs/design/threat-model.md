@@ -26,3 +26,5 @@
 当前 Core 已默认启用 TLS 校验，在请求前阻止私网/loopback/链路本地地址，并将已校验地址固定到实际 Reqwest 连接。重定向默认关闭；未来启用时必须逐跳复检。
 
 ADR-0008 承诺的两个开关都已落地：管理员在「站点设置」里**分别**开启 `security.allow_private_network` 与 `security.allow_invalid_certificates`（或部署时设 `QDRUST_ALLOW_PRIVATE_NETWORK=true` / `QDRUST_ALLOW_INVALID_CERTIFICATES=true`），WebUI 各配一条高风险说明，每次修改写一条 `admin.setting_changed` 审计记录，保存后下一次运行即生效。私网开关只放宽「地址是否公网」这一项判断——解析校验、已校验地址固定、超时与重定向策略都不变；证书开关只把 Reqwest 的 `danger_accept_invalid_certs` 打开，不触及地址校验。两者互相独立、可分别开启；非布尔取值一律忽略，失败方向都是保持关闭。
+
+这道闸门现在覆盖**全部出站请求**：模板运行、不绑模板的任务、通知渠道与渠道测试、模板订阅抓取都走 `qdrust_core::executor::guarded_client_for_url`，服务端不再持有裸 `reqwest::Client`（唯一例外是 OIDC，它连的是管理员在配置文件里写明的身份提供方，不是用户填的地址）。此前只有模板受防护，其余三条路径——包括最普通的「用 URL 建个任务」——可以直连内网，使「没开开关就谁都打不到内网」这个判断对它们不成立。开关按请求读实时设置，不在启动时快照。

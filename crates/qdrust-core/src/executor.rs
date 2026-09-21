@@ -75,6 +75,31 @@ impl Default for ExecutorOptions {
     }
 }
 
+/// How one outbound request is allowed to be made.
+///
+/// The two `allow_*` switches are the ADR-0008 relaxations and default off;
+/// everything the SSRF guard reads lives here, so a caller either states its
+/// whole posture or takes [`OutboundPolicy::default`].
+#[derive(Clone, Debug)]
+pub struct OutboundPolicy {
+    pub timeout: Duration,
+    pub allow_private_network: bool,
+    pub allow_invalid_certificates: bool,
+    /// Optional HTTP/SOCKS5 proxy URL applied to outbound requests.
+    pub proxy: Option<String>,
+}
+
+impl Default for OutboundPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            allow_private_network: false,
+            allow_invalid_certificates: false,
+            proxy: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ExecutionContext {
     pub variables: BTreeMap<String, Value>,
@@ -131,7 +156,9 @@ pub struct QdExecutor {
     plugin_timeout: Duration,
     request_limit: usize,
     loop_limit: usize,
-    proxy: Option<reqwest::Proxy>,
+    /// Kept as the configured URL rather than a parsed proxy: the client that
+    /// carries it is built per request, so the URL is parsed there too.
+    proxy: Option<String>,
 }
 
 impl QdExecutor {
@@ -147,12 +174,6 @@ impl QdExecutor {
         ensure!(options.loop_limit > 0, "loop limit must be positive");
         let mut plugins = PluginRegistry::default();
         plugins.register(std::sync::Arc::new(UtilityPlugin::default()))?;
-        let proxy = options
-            .proxy
-            .as_deref()
-            .map(reqwest::Proxy::all)
-            .transpose()
-            .context("invalid proxy URL")?;
         Ok(Self {
             cookies: Arc::new(Jar::default()),
             timeout: options.timeout,
@@ -164,7 +185,7 @@ impl QdExecutor {
             plugin_timeout: options.plugin_timeout,
             request_limit: options.request_limit,
             loop_limit: options.loop_limit,
-            proxy,
+            proxy: options.proxy,
         })
     }
 
@@ -823,25 +844,24 @@ impl QdExecutor {
         Ok(form)
     }
 
-    async fn client_for_url(&self, url: &str) -> Result<Client> {
-        let (parsed, addresses) = resolve_target(url, self.allow_private_network).await?;
-        let host = parsed.host_str().context("URL host is missing")?;
-        let builder = Client::builder()
-            .cookie_provider(self.cookies.clone())
-            .redirect(Policy::none())
-            .danger_accept_invalid_certs(self.allow_invalid_certificates)
-            .timeout(self.timeout);
-        if let Some(proxy) = self.proxy.clone() {
-            // With a proxy, DNS is delegated to the proxy; do not pin the host.
-            return builder
-                .proxy(proxy)
-                .build()
-                .context("cannot build proxied HTTP client");
+    /// The part of this executor that decides whether a request may happen at
+    /// all, in the form [`guarded_client_for_url`] takes.
+    ///
+    /// Built here rather than at construction, and deliberately not the whole
+    /// options struct: the request/loop/plugin limits mean nothing to an
+    /// outbound fetch that is not a template run, and a caller handed all of
+    /// them would invite the belief that they applied.
+    fn outbound_policy(&self) -> OutboundPolicy {
+        OutboundPolicy {
+            timeout: self.timeout,
+            allow_private_network: self.allow_private_network,
+            allow_invalid_certificates: self.allow_invalid_certificates,
+            proxy: self.proxy.clone(),
         }
-        builder
-            .resolve(host, addresses[0])
-            .build()
-            .context("cannot build pinned HTTP client")
+    }
+
+    async fn client_for_url(&self, url: &str) -> Result<Client> {
+        guarded_client_for_url(url, &self.outbound_policy(), Some(self.cookies.clone())).await
     }
 
     #[cfg(test)]
@@ -1123,6 +1143,46 @@ fn set_loop_variables(variables: &mut BTreeMap<String, Value>, index: usize, len
         "loop_revindex".into(),
         Value::String((length - index).to_string()),
     );
+}
+
+/// Build the client one outbound request uses, pinned to the addresses `url`
+/// just resolved to.
+///
+/// This is the only place the SSRF policy becomes a client. The executor and
+/// every server-side fetch (task targets, notification channels, library
+/// sources) go through it, so hardening cannot land on one caller and miss
+/// another, and a new relaxation is added to [`OutboundPolicy`] where both
+/// sides have to see it rather than to one caller's builder chain.
+///
+/// The client is per request, not per process: pinning is a client-wide
+/// `host -> address` mapping, so a shared client could only ever pin one
+/// host. The cost is a connection pool per request, which the executor has
+/// always paid.
+pub async fn guarded_client_for_url(
+    url: &str,
+    policy: &OutboundPolicy,
+    cookies: Option<Arc<Jar>>,
+) -> Result<Client> {
+    let (parsed, addresses) = resolve_target(url, policy.allow_private_network).await?;
+    let host = parsed.host_str().context("URL host is missing")?;
+    let mut builder = Client::builder()
+        .redirect(Policy::none())
+        .danger_accept_invalid_certs(policy.allow_invalid_certificates)
+        .timeout(policy.timeout);
+    if let Some(cookies) = cookies {
+        builder = builder.cookie_provider(cookies);
+    }
+    if let Some(proxy) = policy.proxy.as_deref() {
+        // With a proxy, DNS is delegated to the proxy; do not pin the host.
+        return builder
+            .proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?)
+            .build()
+            .context("cannot build proxied HTTP client");
+    }
+    builder
+        .resolve(host, addresses[0])
+        .build()
+        .context("cannot build pinned HTTP client")
 }
 
 async fn resolve_target(
@@ -1501,6 +1561,74 @@ mod tests {
             .to_string();
         assert!(error.contains("private or special-use"));
         resolve_target("http://127.0.0.1:8080", true).await.unwrap();
+    }
+
+    /// The shared constructor is where the guard becomes a client, so the two
+    /// switches have to be readable from it — not only from an executor built
+    /// with the same options.
+    #[tokio::test]
+    async fn the_shared_constructor_applies_the_same_guard() {
+        let url = format!("http://{}", loopback_address());
+        let blocked = guarded_client_for_url(&url, &OutboundPolicy::default(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            blocked.contains("private or special-use network target is blocked"),
+            "a default policy must refuse a loopback target: {blocked}"
+        );
+        guarded_client_for_url(
+            &url,
+            &OutboundPolicy {
+                allow_private_network: true,
+                ..OutboundPolicy::default()
+            },
+            None,
+        )
+        .await
+        .expect("the relaxation must let the same URL through");
+    }
+
+    /// The executor must reach a client only through the shared constructor: a
+    /// second builder chain is how a hardening lands on the server fetches and
+    /// misses template runs, or the reverse. Structural because the
+    /// alternative — reaching a private address from a template — is exactly
+    /// what the guard prevents.
+    ///
+    /// Formatting-independent on purpose. An earlier version of this test
+    /// matched the call site's line breaks and a refactor moved the call onto
+    /// one line, which would have left it green on a file it no longer
+    /// examined; a needle that can be reflowed out from under the assertion is
+    /// not an assertion. This reads the production half of the file — cut at
+    /// the first `#[cfg(test)]`, which is the pinned-client helper used by the
+    /// tests below — and checks the two facts that matter: the executor calls
+    /// the shared constructor, and it does not build a client itself.
+    ///
+    /// The needle carries no `reqwest::` prefix, because this file imports the
+    /// type: a builder chain written here reads `Client::builder()`, and a
+    /// prefix-anchored needle would wave exactly that through.
+    #[test]
+    fn the_executor_reaches_a_client_only_through_the_shared_constructor() {
+        let source = include_str!("executor.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file is never empty");
+        assert!(
+            !production.contains("Client::builder()"),
+            "the executor builds its own client; every request goes through guarded_client_for_url"
+        );
+        assert!(
+            production.contains("guarded_client_for_url("),
+            "the executor no longer calls the shared constructor"
+        );
+    }
+
+    /// A bound-but-unconnected loopback port: enough for the guard, which
+    /// classifies the address before anything is sent.
+    fn loopback_address() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
     }
 
     #[tokio::test]

@@ -109,8 +109,10 @@ pub fn apply_runtime_setting(runtime: &mut RuntimeSettings, key: &str, value: &V
                 runtime.log_retention_days = v.max(0) as u64;
             }
         }
-        // ADR-0008: private-network access for template runs. Off by default;
-        // audited like every other setting (`admin.setting_changed`).
+        // ADR-0008: private-network access for **every** outbound request the
+        // server makes, not only template runs — the same client serves a task
+        // with a plain URL, a notification channel and a library fetch. Off by
+        // default; audited like every other setting (`admin.setting_changed`).
         ALLOW_PRIVATE_NETWORK_SETTING => {
             if let Some(v) = value.as_bool() {
                 runtime.allow_private_network = v;
@@ -177,7 +179,9 @@ struct AppState {
     login_limiter: LoginRateLimiter,
     run_events: broadcast::Sender<Value>,
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
-    http_client: reqwest::Client,
+    /// The only way this crate makes an outbound request. See
+    /// [`crate::outbound`] for why it is a type rather than a shared client.
+    outbound: crate::outbound::OutboundHttp,
     session_cache: crate::redis_cache::SessionCache,
     /// Catalogues shared between requests, so the aggregate listing does not
     /// re-read every source on each visit. Owned by the router rather than a
@@ -229,7 +233,7 @@ pub fn router(store: Store) -> Router {
         AuthConfig::default(),
         run_events,
         runtime_settings(),
-        reqwest::Client::new(),
+        crate::outbound::OutboundHttp::standalone(),
         crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
         "",
         None,
@@ -242,7 +246,7 @@ pub fn router_with_auth(
     auth: AuthConfig,
     run_events: RunEventSender,
     settings: std::sync::Arc<std::sync::RwLock<RuntimeSettings>>,
-    http_client: reqwest::Client,
+    outbound: crate::outbound::OutboundHttp,
     session_cache: crate::redis_cache::SessionCache,
     base_path: &str,
     header_auth: Option<std::sync::Arc<crate::config::HeaderAuthConfig>>,
@@ -440,7 +444,7 @@ pub fn router_with_auth(
         login_limiter,
         run_events,
         settings,
-        http_client,
+        outbound,
         session_cache,
         catalogue_cache: crate::library::CatalogueCache::new(),
         base_path: base_path.to_string(),
@@ -1762,7 +1766,7 @@ async fn test_notification_channel(
         payload: &payload,
     };
     crate::delivery::deliver(
-        &state.http_client,
+        &state.outbound,
         &channel.kind,
         &channel.config,
         &message,
@@ -2812,7 +2816,7 @@ async fn browse_subscription_library(
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session(&state, &headers).await?;
     let subscription = owned_subscription(&state, id, session.user.id).await?;
-    let library = crate::library::browse(&state.store, &state.http_client, &subscription)
+    let library = crate::library::browse(&state.store, &state.outbound, &subscription)
         .await
         .map_err(ApiError::unprocessable)?;
     Ok(Json(json!(library)))
@@ -2830,14 +2834,10 @@ async fn import_subscription_library(
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session(&state, &headers).await?;
     let subscription = owned_subscription(&state, id, session.user.id).await?;
-    let result = crate::library::import_selected(
-        &state.store,
-        &state.http_client,
-        &subscription,
-        &input.names,
-    )
-    .await
-    .map_err(ApiError::unprocessable)?;
+    let result =
+        crate::library::import_selected(&state.store, &state.outbound, &subscription, &input.names)
+            .await
+            .map_err(ApiError::unprocessable)?;
     Ok(Json(json!(result)))
 }
 
@@ -2871,7 +2871,7 @@ async fn preview_subscription_library(
     let subscription = owned_subscription(&state, id, session.user.id).await?;
     let preview = crate::library::preview(
         &state.store,
-        &state.http_client,
+        &state.outbound,
         &state.catalogue_cache,
         &subscription,
         &params.entry,
@@ -2893,7 +2893,7 @@ async fn apply_subscription_library(
     let subscription = owned_subscription(&state, id, session.user.id).await?;
     let outcome = crate::library::apply(
         &state.store,
-        &state.http_client,
+        &state.outbound,
         &state.catalogue_cache,
         &subscription,
         input,
@@ -2924,7 +2924,7 @@ async fn library_overview(
         .collect();
     let overview = crate::library::overview(
         &state.store,
-        &state.http_client,
+        &state.outbound,
         &state.catalogue_cache,
         &subscriptions,
         params.refresh,
@@ -3208,7 +3208,7 @@ mod tests {
             AuthConfig::default(),
             run_event_channel().0,
             runtime_settings(),
-            reqwest::Client::new(),
+            crate::outbound::OutboundHttp::standalone(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             base_path,
             None,
@@ -3332,7 +3332,7 @@ mod tests {
             },
             run_event_channel().0,
             runtime_settings(),
-            reqwest::Client::new(),
+            crate::outbound::OutboundHttp::standalone(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             "",
             None,
@@ -4403,7 +4403,7 @@ mod tests {
             AuthConfig::default(),
             run_event_channel().0,
             runtime_settings(),
-            reqwest::Client::new(),
+            crate::outbound::OutboundHttp::standalone(),
             crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
             "",
             Some(std::sync::Arc::new(cfg)),
@@ -4618,7 +4618,7 @@ mod tests {
                 AuthConfig::default(),
                 run_event_channel().0,
                 runtime_settings(),
-                reqwest::Client::new(),
+                crate::outbound::OutboundHttp::standalone(),
                 crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
                 "",
                 Some(std::sync::Arc::new(header_cfg(true))),

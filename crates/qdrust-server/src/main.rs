@@ -25,12 +25,15 @@ async fn main() -> Result<()> {
         config.database_idle_timeout,
     )
     .await?;
-    let client = reqwest::Client::builder()
-        .timeout(config.request_timeout)
-        .build()?;
+    // The one outbound client. Every request the server makes — a task's URL, a
+    // notification channel, a library source — is built through it, which is
+    // what puts the SSRF guard and the two ADR-0008 switches on all of them
+    // rather than on template runs alone.
+    let settings = api::runtime_settings();
+    let outbound =
+        qdrust_server::outbound::OutboundHttp::new(settings.clone(), config.request_timeout);
     let email = EmailClient::new(EmailConfig::from_env())?;
     let (run_events, _) = api::run_event_channel();
-    let settings = api::runtime_settings();
     {
         let mut runtime = settings.write().unwrap();
         runtime.require_email_verification = config.require_email_verification;
@@ -60,7 +63,7 @@ async fn main() -> Result<()> {
     let base_path = config.base_path.clone();
     scheduler::spawn(
         store.clone(),
-        client.clone(),
+        outbound.clone(),
         config.scheduler_interval,
         run_events.clone(),
         email,
@@ -81,7 +84,7 @@ async fn main() -> Result<()> {
         },
         run_events,
         settings.clone(),
-        client,
+        outbound,
         qdrust_server::redis_cache::SessionCache::from_env()?,
         &base_path,
         // Header auth is only active when explicitly enabled (backward

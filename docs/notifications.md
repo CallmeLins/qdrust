@@ -6,8 +6,8 @@
 
 | 渠道 | 所需配置 | 说明 |
 |---|---|---|
-| **Webhook** | `url` | 向该 URL `POST` JSON（含 `event` / `task_name` / `run_id` / `http_status` / `error`），仅接受 HTTPS |
-| **自定义 HTTP** | `url`, `method`(默认 `POST`), `headers`(JSON, 可选), `body`(可选模板) | 完全自定义的请求，可指向自建的 ntfy、Gotify 等；**`http` 与 `https` 均可**（便于内网服务） |
+| **Webhook** | `url` | 向该 URL `POST` JSON（含 `event` / `task_name` / `run_id` / `http_status` / `error`） |
+| **自定义 HTTP** | `url`, `method`(默认 `POST`), `headers`(JSON, 可选), `body`(可选模板) | 完全自定义的请求，可指向自建的 ntfy、Gotify 等；`http` 与 `https` 均可 |
 | **Email** | `to` | 经 SMTP 发送，需先配置 `QDRUST_SMTP_*` 环境变量 |
 | **Bark** | `url` | iOS 推送，设备地址形如 `https://api.day.app/你的Key` |
 | **Server 酱** | `sendkey` | 微信推送 SendKey |
@@ -19,6 +19,8 @@
 | **企业微信群机器人** | `key` | 群机器人 webhook key |
 
 通知标题与正文由调度器统一渲染，并在 Email、自定义 HTTP 与推送渠道间共享；单个渠道投递失败只记录日志，不会中断任务执行。
+
+**地址范围**：渠道配置里由你填写的地址（自定义 HTTP 与 Webhook 的 `url`、Telegram 的 `host`、企业微信应用的 `proxy`）和模板运行共用同一道出站闸门——默认只允许公网地址，解析结果是内网 / 回环 / 链路本地时会在发请求**之前**被拒，错误信息里会点名 `security.allow_private_network`。要打内网（自建 ntfy、内网 GitLab 机器人）需在管理页开启[出站请求访问内网地址](usage.md#出站请求访问内网地址高风险开关)；`http` 与 `https` 都允许，但**不跟随重定向**。SMTP 投递与 OIDC 不在其中。
 
 **测试渠道**：通知页每个渠道行都有「测试」按钮，点击会立刻用真实配置发一条测试消息（`POST /api/v1/notification-channels/{id}/test`）。它走的是调度器同一条投递路径，所以测试通过就说明凭据与传输都正常；失败时错误原因会直接显示在提示条里。注意标题/正文模板挂在「任务↔渠道」的动作上而不是渠道上，因此渠道级测试只能验证凭据，不能验证某个动作的模板。
 

@@ -10,7 +10,7 @@ use qdrust_core::{
 };
 use qdrust_plugin_browser::{BrowserSessionManager, BrowserSessionPlugin};
 use rand::Rng;
-use reqwest::{Client, Method};
+use reqwest::Method;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -20,13 +20,14 @@ use crate::{
     delivery::{Message, TemplateVars, format_notification_time},
     email::EmailClient,
     model::{PluginManifest, RunStep, Task, Template},
+    outbound::OutboundHttp,
     store::Store,
 };
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Store,
-    client: Client,
+    outbound: OutboundHttp,
     interval: Duration,
     run_events: RunEventSender,
     email: EmailClient,
@@ -36,7 +37,7 @@ pub fn spawn(
     default_tz: chrono_tz::Tz,
 ) {
     let worker_store = store.clone();
-    let worker_client = client.clone();
+    let worker_outbound = outbound.clone();
     tokio::spawn(async move {
         let worker = format!("worker-{}", std::process::id());
         loop {
@@ -62,7 +63,7 @@ pub fn spawn(
                         let policy = run_policy(task.timeout_seconds, &settings);
                         execute_with_run(
                             worker_store.clone(),
-                            worker_client.clone(),
+                            worker_outbound.clone(),
                             task,
                             run,
                             &worker,
@@ -242,10 +243,46 @@ fn run_policy(
     }
 }
 
+/// The second of the two ways a run executes: a request the user composed out
+/// of a method, a URL, headers and a body, with no template involved.
+///
+/// Split out from [`execute_with_run`] so it can be tested as what it is — the
+/// most ordinary way to ask this server to fetch something, and the one that
+/// used to have no guard at all. Every part of the request is user-supplied, so
+/// it goes through the same guarded client a template run does and takes the
+/// same per-run timeout.
+///
+/// Returns the status code, which is all this path has ever reported.
+async fn execute_plain_task(
+    outbound: &OutboundHttp,
+    task: &Task,
+    variables: &BTreeMap<String, Value>,
+    policy: RunPolicy,
+) -> anyhow::Result<u16> {
+    let method = Method::from_bytes(task.method.as_bytes())?;
+    let target = render_plain(&task.url, variables)?;
+    let mut request = outbound
+        .request(method, &target)
+        .await?
+        .timeout(policy.request_timeout);
+    if let Some(headers) = task.headers.as_object() {
+        for (name, value) in headers {
+            if let Some(value) = value.as_str() {
+                let rendered = render_plain(value, variables).unwrap_or_else(|_| value.to_string());
+                request = request.header(name, rendered);
+            }
+        }
+    }
+    if let Some(body) = &task.body {
+        request = request.body(render_plain(body, variables).unwrap_or_else(|_| body.clone()));
+    }
+    Ok(request.send().await?.status().as_u16())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_run(
     store: Store,
-    client: Client,
+    outbound: OutboundHttp,
     task: Task,
     run: crate::model::Run,
     worker: &str,
@@ -320,23 +357,10 @@ async fn execute_with_run(
                 log_message,
             ));
         }
-        let method = Method::from_bytes(task.method.as_bytes())?;
-        let mut request = client
-            .request(method, &render_plain(&task.url, &variables)?)
-            .timeout(policy.request_timeout);
-        if let Some(headers) = task.headers.as_object() {
-            for (name, value) in headers {
-                if let Some(value) = value.as_str() {
-                    let rendered =
-                        render_plain(value, &variables).unwrap_or_else(|_| value.to_string());
-                    request = request.header(name, rendered);
-                }
-            }
-        }
-        if let Some(body) = &task.body {
-            request = request.body(render_plain(body, &variables).unwrap_or_else(|_| body.clone()));
-        }
-        Ok::<(u16, Option<String>), anyhow::Error>((request.send().await?.status().as_u16(), None))
+        Ok::<(u16, Option<String>), anyhow::Error>((
+            execute_plain_task(&outbound, &task, &variables, policy).await?,
+            None,
+        ))
     }
     .await;
     match result {
@@ -356,7 +380,7 @@ async fn execute_with_run(
             }));
             send_notifications(
                 &store,
-                &client,
+                &outbound,
                 &task,
                 run.id,
                 "success",
@@ -412,7 +436,7 @@ async fn execute_with_run(
             }));
             send_notifications(
                 &store,
-                &client,
+                &outbound,
                 &task,
                 run.id,
                 "failure",
@@ -452,7 +476,7 @@ async fn execute_with_run(
 #[allow(clippy::too_many_arguments)]
 async fn send_notifications(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     task: &Task,
     run_id: i64,
     event: &str,
@@ -537,7 +561,7 @@ async fn send_notifications(
             payload: &payload,
         };
         match crate::delivery::deliver(
-            client,
+            outbound,
             &channel.kind,
             &channel.config,
             &message,
@@ -795,7 +819,9 @@ async fn execute_template(
 mod tests {
     use super::*;
     use crate::email::normalize_recipient;
+    use crate::test_support::{LOOPBACK_MARKER, LOOPBACK_STATUS, serve_loopback};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A run policy for tests: 30s timeout, private network off unless asked,
@@ -806,6 +832,32 @@ mod tests {
             request_timeout: Duration::from_secs(30),
             allow_private_network,
             allow_invalid_certificates: false,
+        }
+    }
+
+    /// An `OutboundHttp` whose settings say what the test needs them to say.
+    ///
+    /// A fresh settings handle per call rather than a shared one that gets
+    /// flipped, so a test states its posture in one line and cannot leave it
+    /// behind for another test to inherit.
+    fn guarded(allow_private_network: bool, allow_invalid_certificates: bool) -> OutboundHttp {
+        let settings = crate::api::runtime_settings();
+        {
+            let mut runtime = settings.write().unwrap();
+            runtime.allow_private_network = allow_private_network;
+            runtime.allow_invalid_certificates = allow_invalid_certificates;
+        }
+        OutboundHttp::new(settings, Duration::from_secs(30))
+    }
+
+    /// A task with no template: the plain-URL execution path, complete with a
+    /// method, a body and no template to fall back on.
+    fn plain_task(url: String) -> Task {
+        Task {
+            method: "POST".into(),
+            url,
+            body: Some("{\"probe\":true}".into()),
+            ..due_probe_task("0 0 8 * * *", None, None)
         }
     }
 
@@ -880,6 +932,33 @@ mod tests {
         assert!(include_str!("scheduler.rs").contains(&needle));
     }
 
+    /// The worker must not build a client of its own for either branch it owns.
+    ///
+    /// What this covers is a hop, not a function: the worker handing its
+    /// `OutboundHttp` to the plain-URL branch and to the notification branches.
+    /// `execute_plain_task` and `deliver` are each tested with a client passed
+    /// in, so a worker that reached for `OutboundHttp::standalone()` instead
+    /// would leave every other test green — and that is the shape of the bug
+    /// this whole change is about: one client, four paths, one guard.
+    ///
+    /// Structural, and phrased as "not built here" rather than "passes this
+    /// argument", so it depends on neither an argument order nor a line break.
+    /// The production half is cut at the first `#[cfg(test)]`, which is where
+    /// this module begins; the assertion's own literal therefore cannot match
+    /// itself.
+    #[test]
+    fn the_worker_builds_no_client_of_its_own() {
+        let source = include_str!("scheduler.rs").replace("\r\n", "\n");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file is never empty");
+        assert!(
+            !production.contains("OutboundHttp::standalone()"),
+            "the worker built its own client; every branch takes the one it was handed"
+        );
+    }
+
     #[test]
     fn the_executor_is_built_with_both_relaxations_from_the_policy() {
         // Structural for the same reason as the test above: `qdrust-core` cannot
@@ -942,38 +1021,6 @@ mod tests {
         assert_eq!(results[0].status, 200);
     }
 
-    /// Marker the loopback server puts in every response body.
-    const LOOPBACK_MARKER: &str = "from-the-loopback-test-server";
-
-    /// A loopback HTTP server answering every request with a body only it
-    /// sends. The marker matters: a run that succeeds here must have reached
-    /// *this* socket, so an intermediary answering 200 on its own (a proxy, a
-    /// captive portal) cannot make the test pass by accident.
-    async fn serve_loopback_marker() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                tokio::spawn(async move {
-                    // One request per connection is all a template step needs.
-                    let mut scratch = [0_u8; 2048];
-                    let _ = socket.read(&mut scratch).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        LOOPBACK_MARKER.len(),
-                        LOOPBACK_MARKER
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        address
-    }
-
     /// A one-step template that GETs `url` and extracts the marker from the
     /// body. The URL is passed in rather than built from an address so the same
     /// shape serves both the plain-HTTP and the HTTPS tests.
@@ -1014,7 +1061,7 @@ mod tests {
     /// cover it, because there the flag is set straight on the options.
     #[tokio::test]
     async fn a_private_target_is_refused_until_the_admin_allows_it() {
-        let address = serve_loopback_marker().await;
+        let address = serve_loopback().await;
 
         let blocked = execute_template(
             loopback_template(format!("http://{address}/")),
@@ -1041,9 +1088,59 @@ mod tests {
         .await
         .expect("with the flag on the same template must go through");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, 200);
+        assert_eq!(results[0].status, LOOPBACK_STATUS);
         // The body has to be the one this test's server wrote.
         assert_eq!(variables.get("marker"), Some(&json!(LOOPBACK_MARKER)));
+    }
+
+    /// The path this whole guard started from, and the one it was missing for
+    /// longest: a task with no template is a single request the user composed,
+    /// and it reached the network with no policy at all — no address check, no
+    /// pinning, no switch. Reaching a private address from it is the same
+    /// primitive as reaching one from a template.
+    ///
+    /// The status is the only thing this path reports, so the test server also
+    /// counts requests: the refusal has to leave the count at zero, which is
+    /// stronger than any status comparison — nothing was sent at all.
+    #[tokio::test]
+    async fn a_plain_task_url_is_guarded_like_a_template_run() {
+        let (address, served) = crate::test_support::serve_counting_loopback().await;
+        let task = plain_task(format!("http://{address}/"));
+
+        let blocked = execute_plain_task(
+            &guarded(false, false),
+            &task,
+            &BTreeMap::new(),
+            policy(false),
+        )
+        .await
+        .unwrap_err();
+        // The whole chain: the guard's reason is the cause of the message this
+        // module wraps it in, so `{}` alone would show only the wrapper.
+        let blocked = format!("{blocked:#}");
+        assert!(
+            blocked.contains("private or special-use network target is blocked"),
+            "a task URL pointing at loopback must be refused while the switch is off: {blocked}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            0,
+            "a refused task must not reach the network at all"
+        );
+
+        let status =
+            execute_plain_task(&guarded(true, false), &task, &BTreeMap::new(), policy(true))
+                .await
+                .expect("with the switch on the same task must go through");
+        assert_eq!(
+            status, LOOPBACK_STATUS,
+            "the status has to be the one this test's server sent"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the allowed attempt must have reached this socket"
+        );
     }
 
     /// Self-signed certificate and its matching key, DER, base64.

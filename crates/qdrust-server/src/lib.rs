@@ -8,7 +8,10 @@ pub mod header_auth;
 pub mod library;
 pub mod model;
 pub mod oidc;
+pub mod outbound;
 pub mod push_channels;
 pub mod redis_cache;
 pub mod scheduler;
 pub mod store;
+#[cfg(test)]
+pub mod test_support;

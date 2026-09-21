@@ -6,8 +6,9 @@
 //! (application message) and WeCom group robot webhook.
 
 use anyhow::{Context, anyhow, bail};
-use reqwest::Client;
 use serde_json::{Value, json};
+
+use crate::outbound::OutboundHttp;
 
 /// Push channel kinds handled by this module (everything except
 /// "webhook" and "email", which the scheduler delivers itself).
@@ -51,21 +52,21 @@ pub fn is_known_channel_kind(kind: &str) -> bool {
 
 /// Dispatch a rendered notification to the given channel kind.
 pub async fn push_to_channel(
-    client: &Client,
+    outbound: &OutboundHttp,
     kind: &str,
     config: &Value,
     title: &str,
     body: &str,
 ) -> anyhow::Result<()> {
     match kind {
-        "bark" => send_bark(client, config, title, body).await,
-        "serverchan" => send_serverchan(client, config, title, body).await,
-        "telegram" => send_telegram(client, config, title, body).await,
-        "dingtalk" => send_dingtalk(client, config, title, body).await,
-        "wxpusher" => send_wxpusher(client, config, title, body).await,
-        "wxpusher_spt" => send_wxpusher_spt(client, config, title, body).await,
-        "wecom_app" => send_wecom_app(client, config, title, body).await,
-        "wecom_webhook" => send_wecom_webhook(client, config, title, body).await,
+        "bark" => send_bark(outbound, config, title, body).await,
+        "serverchan" => send_serverchan(outbound, config, title, body).await,
+        "telegram" => send_telegram(outbound, config, title, body).await,
+        "dingtalk" => send_dingtalk(outbound, config, title, body).await,
+        "wxpusher" => send_wxpusher(outbound, config, title, body).await,
+        "wxpusher_spt" => send_wxpusher_spt(outbound, config, title, body).await,
+        "wecom_app" => send_wecom_app(outbound, config, title, body).await,
+        "wecom_webhook" => send_wecom_webhook(outbound, config, title, body).await,
         other => Err(anyhow!("unsupported push channel kind: {other}")),
     }
 }
@@ -124,7 +125,12 @@ async fn check_business_code(
 
 // ---------- bark ----------
 
-async fn send_bark(client: &Client, config: &Value, title: &str, body: &str) -> anyhow::Result<()> {
+async fn send_bark(
+    outbound: &OutboundHttp,
+    config: &Value,
+    title: &str,
+    body: &str,
+) -> anyhow::Result<()> {
     let url = cfg_str(config, "url").ok_or_else(|| {
         anyhow!("bark channel requires a device URL (e.g. https://api.day.app/yourkey)")
     })?;
@@ -135,8 +141,9 @@ async fn send_bark(client: &Client, config: &Value, title: &str, body: &str) -> 
             payload[key] = json!(value);
         }
     }
-    client
+    outbound
         .post(&url)
+        .await?
         .json(&payload)
         .send()
         .await
@@ -149,7 +156,7 @@ async fn send_bark(client: &Client, config: &Value, title: &str, body: &str) -> 
 // ---------- ServerChan ----------
 
 async fn send_serverchan(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -160,8 +167,9 @@ async fn send_serverchan(
         "https://sctapi.ftqq.com/{}.send",
         key.trim_end_matches(".send")
     );
-    client
+    outbound
         .post(&url)
+        .await?
         .json(&json!({ "text": title, "desp": body.replace("\\r\\n", "\n\n") }))
         .send()
         .await
@@ -174,7 +182,7 @@ async fn send_serverchan(
 // ---------- Telegram ----------
 
 async fn send_telegram(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -198,8 +206,9 @@ async fn send_telegram(
         ),
         None => format!("https://api.telegram.org/bot{token}/sendMessage"),
     };
-    client
+    outbound
         .post(&url)
+        .await?
         .json(&payload)
         .send()
         .await
@@ -212,7 +221,7 @@ async fn send_telegram(
 // ---------- DingTalk robot ----------
 
 async fn send_dingtalk(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -220,8 +229,9 @@ async fn send_dingtalk(
     let token = cfg_str(config, "access_token")
         .ok_or_else(|| anyhow!("dingtalk channel requires a robot access token"))?;
     let url = format!("https://oapi.dingtalk.com/robot/send?access_token={token}");
-    let response = client
+    let response = outbound
         .post(&url)
+        .await?
         .json(&json!({
             "msgtype": "markdown",
             "markdown": {
@@ -240,7 +250,7 @@ async fn send_dingtalk(
 // ---------- WxPusher ----------
 
 async fn send_wxpusher(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -249,8 +259,9 @@ async fn send_wxpusher(
         .ok_or_else(|| anyhow!("wxpusher channel requires an appToken"))?;
     let uid = cfg_str(config, "uid").ok_or_else(|| anyhow!("wxpusher channel requires a uid"))?;
     let content = plain_body(title, &body.replace("\\r\\n", "\n"));
-    let response = client
+    let response = outbound
         .post("https://wxpusher.zjiecode.com/api/send/message")
+        .await?
         .json(&json!({
             "appToken": app_token,
             "content": content,
@@ -274,7 +285,7 @@ async fn send_wxpusher(
 }
 
 async fn send_wxpusher_spt(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -291,8 +302,9 @@ async fn send_wxpusher_spt(
         bail!("wxpusher_spt channel requires at least one SPT code");
     }
     let content = plain_body(title, &body.replace("\\r\\n", "\n"));
-    let response = client
+    let response = outbound
         .post("https://wxpusher.zjiecode.com/api/send/message/simple-push")
+        .await?
         .json(&json!({
             "content": content,
             "summary": content.chars().take(99).collect::<String>(),
@@ -310,7 +322,7 @@ async fn send_wxpusher_spt(
 // ---------- WeCom application pusher ----------
 
 async fn send_wecom_app(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
@@ -327,8 +339,9 @@ async fn send_wecom_app(
         None => "https://qyapi.weixin.qq.com/".into(),
     };
 
-    let token_response: Value = client
-        .get(format!("{base}cgi-bin/gettoken"))
+    let token_response: Value = outbound
+        .get(&format!("{base}cgi-bin/gettoken"))
+        .await?
         .query(&[("corpid", corpid), ("corpsecret", secret)])
         .send()
         .await
@@ -350,10 +363,11 @@ async fn send_wecom_app(
         .map(|value| json!(value))
         .unwrap_or_else(|_| json!(agentid));
 
-    let response = client
-        .post(format!(
+    let response = outbound
+        .post(&format!(
             "{base}cgi-bin/message/send?access_token={access_token}"
         ))
+        .await?
         .json(&json!({
             "touser": to_user,
             "msgtype": "text",
@@ -371,17 +385,18 @@ async fn send_wecom_app(
 // ---------- WeCom group robot webhook ----------
 
 async fn send_wecom_webhook(
-    client: &Client,
+    outbound: &OutboundHttp,
     config: &Value,
     title: &str,
     body: &str,
 ) -> anyhow::Result<()> {
     let key = cfg_str(config, "key")
         .ok_or_else(|| anyhow!("wecom_webhook channel requires a webhook key"))?;
-    let response = client
-        .post(format!(
+    let response = outbound
+        .post(&format!(
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={key}"
         ))
+        .await?
         .json(&json!({
             "msgtype": "text",
             "text": { "content": plain_body(title, &body.replace("\\r\\n", "\n")) },
@@ -397,6 +412,8 @@ async fn send_wecom_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[test]
     fn recognizes_push_kinds() {
@@ -425,7 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_config() {
-        let client = Client::new();
+        let client = OutboundHttp::standalone();
         for kind in CHANNEL_KINDS {
             let result = push_to_channel(&client, kind, &json!({}), "t", "b").await;
             assert!(result.is_err(), "{kind} should fail without config");
@@ -434,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unsupported_kind() {
-        let client = Client::new();
+        let client = OutboundHttp::standalone();
         let err = push_to_channel(&client, "nope", &json!({}), "t", "b")
             .await
             .unwrap_err();
@@ -447,6 +464,53 @@ mod tests {
         assert_eq!(
             ensure_scheme("qyapi.weixin.qq.com/"),
             "https://qyapi.weixin.qq.com/"
+        );
+    }
+
+    /// An `OutboundHttp` with the private-network switch set the way the test
+    /// needs it. A fresh settings handle per call, so one test cannot leave a
+    /// posture behind for another.
+    fn guarded(allow_private_network: bool) -> OutboundHttp {
+        let settings = crate::api::runtime_settings();
+        settings.write().unwrap().allow_private_network = allow_private_network;
+        OutboundHttp::new(settings, Duration::from_secs(30))
+    }
+
+    /// The push senders take the client as an argument instead of going through
+    /// `deliver`'s two inline kinds, so a test on `webhook` alone would leave
+    /// these eight free to build a client of their own and keep reaching a
+    /// private address while the switch said no.
+    ///
+    /// The request count is the signal, and it has to be: 218 is neither a
+    /// client nor a server error, so every sender here reports success whatever
+    /// answered — a 200 from a proxy or a captive portal would look identical.
+    /// A refused send must leave the count at zero and an allowed one must move
+    /// it, which is a claim no other host on the network can satisfy.
+    #[tokio::test]
+    async fn a_push_channel_send_goes_through_the_same_guard() {
+        let (address, served) = crate::test_support::serve_counting_loopback().await;
+        let config = json!({ "url": format!("http://{address}/push") });
+
+        let refused = push_to_channel(&guarded(false), "bark", &config, "t", "b")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("private or special-use network target is blocked"),
+            "a push channel on loopback must be refused while the switch is off: {refused:#}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            0,
+            "a refused send must not reach the network at all"
+        );
+
+        push_to_channel(&guarded(true), "bark", &config, "t", "b")
+            .await
+            .expect("with the switch on the same channel must send");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the allowed send must have reached this socket"
         );
     }
 }

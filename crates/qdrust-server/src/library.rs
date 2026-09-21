@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use base64::Engine;
 use qdrust_core::qd_har::QdHar;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -32,6 +31,7 @@ use crate::model::{
     LibrarySourceStatus, TemplateImport, TemplateLibrary, TemplateSubscription,
     UpdateQdHarTemplate,
 };
+use crate::outbound::OutboundHttp;
 use crate::store::Store;
 
 /// Upper bound on how many entries one source may contribute, so a repository
@@ -67,7 +67,7 @@ const FETCH_ATTEMPTS: u32 = 3;
 /// the failure this covers is a dropped connection rather than a busy server.
 const FETCH_BACKOFF: Duration = Duration::from_millis(300);
 
-/// Room given to one library request, over the client's default.
+/// Room given to one library request, over the default request timeout.
 ///
 /// The default request timeout is sized for API calls, but a catalogue is a
 /// multi-megabyte download — the official manifest alone is 3 MB, and 93% of it
@@ -101,11 +101,11 @@ impl CatalogueCache {
     /// where the listing came from.
     async fn catalogue(
         &self,
-        client: &Client,
+        outbound: &OutboundHttp,
         url: &str,
         max_age: Duration,
     ) -> Result<(Catalogue, bool)> {
-        self.catalogue_via(url, max_age, || catalogue(client, url))
+        self.catalogue_via(url, max_age, || catalogue(outbound, url))
             .await
     }
 
@@ -299,10 +299,10 @@ struct ManifestEntry {
 /// whose upstream version has moved on.
 pub async fn browse(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     subscription: &TemplateSubscription,
 ) -> Result<TemplateLibrary> {
-    let catalogue = catalogue(client, &subscription.url).await?;
+    let catalogue = catalogue(outbound, &subscription.url).await?;
     let installed = installed_index(store.list_template_imports(subscription.id).await?);
     let entries = catalogue
         .entries
@@ -322,12 +322,12 @@ pub async fn browse(
 /// discard the rest of the selection.
 pub async fn import_selected(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     subscription: &TemplateSubscription,
     names: &[String],
 ) -> Result<LibraryImportResult> {
     ensure!(!names.is_empty(), "no templates selected");
-    let catalogue = catalogue(client, &subscription.url).await?;
+    let catalogue = catalogue(outbound, &subscription.url).await?;
     let index = catalogue.by_name();
     let linked = installed_index(store.list_template_imports(subscription.id).await?);
     let source = parse_github_url(&subscription.url);
@@ -351,7 +351,7 @@ pub async fn import_selected(
         };
         match import_entry(
             store,
-            client,
+            outbound,
             subscription,
             source.as_ref(),
             entry,
@@ -386,13 +386,13 @@ pub async fn import_selected(
 /// Returns the template's id and whether an existing row was updated in place.
 pub(crate) async fn import_entry(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     subscription: &TemplateSubscription,
     source: Option<&GitHubSource>,
     entry: &RawEntry,
     linked_template_id: Option<i64>,
 ) -> Result<(i64, bool)> {
-    let har = resolve_har(client, source, entry).await?;
+    let har = resolve_har(outbound, source, entry).await?;
     QdHar::parse_qd(har.clone())
         .with_context(|| format!("{} is not a valid QD HAR template", entry.name))?;
     persist_entry(
@@ -415,19 +415,24 @@ pub(crate) async fn import_entry(
 /// decision made before the content is visible.
 pub async fn preview(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     cache: &CatalogueCache,
     subscription: &TemplateSubscription,
     name: &str,
 ) -> Result<LibraryPreview> {
     let (catalogue, _) = cache
-        .catalogue(client, &subscription.url, CATALOGUE_TTL)
+        .catalogue(outbound, &subscription.url, CATALOGUE_TTL)
         .await?;
     let index = catalogue.by_name();
     let entry = index
         .get(name)
         .with_context(|| format!("this source does not offer {name}"))?;
-    let har = resolve_har(client, parse_github_url(&subscription.url).as_ref(), entry).await?;
+    let har = resolve_har(
+        outbound,
+        parse_github_url(&subscription.url).as_ref(),
+        entry,
+    )
+    .await?;
     // Checked before it reaches the editor: a template that does not parse is
     // worthless to look at, and the reason belongs beside the row that was
     // clicked rather than at save time.
@@ -448,14 +453,14 @@ pub async fn preview(
 /// points nowhere.
 pub async fn apply(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     cache: &CatalogueCache,
     subscription: &TemplateSubscription,
     input: ApplyLibraryTemplate,
 ) -> Result<LibraryImportOutcome> {
     ensure!(!input.name.trim().is_empty(), "the template needs a name");
     let (catalogue, _) = cache
-        .catalogue(client, &subscription.url, CATALOGUE_TTL)
+        .catalogue(outbound, &subscription.url, CATALOGUE_TTL)
         .await?;
     let index = catalogue.by_name();
     let entry = index
@@ -487,7 +492,7 @@ pub async fn apply(
 /// reports its own error instead of taking the listing down with it.
 pub async fn overview(
     store: &Store,
-    client: &Client,
+    outbound: &OutboundHttp,
     cache: &CatalogueCache,
     subscriptions: &[TemplateSubscription],
     refresh: bool,
@@ -500,7 +505,7 @@ pub async fn overview(
     let catalogues = futures::future::join_all(
         subscriptions
             .iter()
-            .map(|subscription| cache.catalogue(client, &subscription.url, max_age)),
+            .map(|subscription| cache.catalogue(outbound, &subscription.url, max_age)),
     )
     .await;
     let mut entries = Vec::new();
@@ -616,7 +621,7 @@ async fn persist_entry(
 /// Resolve an entry's HAR document, preferring the inlined base64 `content`
 /// and otherwise downloading it.
 async fn resolve_har(
-    client: &Client,
+    outbound: &OutboundHttp,
     source: Option<&GitHubSource>,
     entry: &RawEntry,
 ) -> Result<Value> {
@@ -633,7 +638,7 @@ async fn resolve_har(
         .clone()
         .or_else(|| source.map(|source| source.raw_url(&entry.filename)))
         .with_context(|| format!("{} has neither content nor a download URL", entry.name))?;
-    let text = fetch_text(client, &url)
+    let text = fetch_text(outbound, &url)
         .await?
         .with_context(|| format!("{} is not available at {url}", entry.name))?;
     serde_json::from_str(&text).with_context(|| format!("{url} is not valid JSON"))
@@ -641,9 +646,9 @@ async fn resolve_har(
 
 /// Build a source's catalogue: the manifest when it publishes one, otherwise
 /// the repository tree, otherwise a single direct file URL.
-pub(crate) async fn catalogue(client: &Client, url: &str) -> Result<Catalogue> {
+pub(crate) async fn catalogue(outbound: &OutboundHttp, url: &str) -> Result<Catalogue> {
     if let Some(source) = parse_github_url(url) {
-        if let Some(manifest) = fetch_manifest(client, &source).await? {
+        if let Some(manifest) = fetch_manifest(outbound, &source).await? {
             if manifest.har.len() > MAX_LIBRARY_ENTRIES {
                 // Surfaced rather than silently dropped: a truncated catalogue
                 // would make the missing entries look like a search miss.
@@ -671,7 +676,7 @@ pub(crate) async fn catalogue(client: &Client, url: &str) -> Result<Catalogue> {
                 entries,
             });
         }
-        let entries = scan_tree(client, &source).await?;
+        let entries = scan_tree(outbound, &source).await?;
         ensure!(
             !entries.is_empty(),
             "no template files found in that repository"
@@ -707,9 +712,12 @@ pub(crate) async fn catalogue(client: &Client, url: &str) -> Result<Catalogue> {
     })
 }
 
-async fn fetch_manifest(client: &Client, source: &GitHubSource) -> Result<Option<Manifest>> {
+async fn fetch_manifest(
+    outbound: &OutboundHttp,
+    source: &GitHubSource,
+) -> Result<Option<Manifest>> {
     let url = source.raw_url(MANIFEST_FILE);
-    let Some(text) = fetch_text(client, &url).await? else {
+    let Some(text) = fetch_text(outbound, &url).await? else {
         return Ok(None);
     };
     let manifest: Manifest =
@@ -774,15 +782,16 @@ fn manifest_raw_entry(key: &str, entry: &ManifestEntry) -> Option<RawEntry> {
 
 /// Scan a repository tree for QD template files, for sources that publish no
 /// manifest. Entries carry no version, so they never report an update.
-async fn scan_tree(client: &Client, source: &GitHubSource) -> Result<Vec<RawEntry>> {
+async fn scan_tree(outbound: &OutboundHttp, source: &GitHubSource) -> Result<Vec<RawEntry>> {
     let api_url = format!(
         "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
         source.owner, source.repo, source.branch
     );
     let body: Value = retrying(
         |_| async {
-            let response = client
+            let response = outbound
                 .get(&api_url)
+                .await?
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "application/vnd.github+json")
                 .timeout(LIBRARY_TIMEOUT)
@@ -944,7 +953,7 @@ fn plain_text(html: &str) -> String {
         .join("\n")
 }
 
-async fn fetch_text(client: &Client, url: &str) -> Result<Option<String>> {
+async fn fetch_text(outbound: &OutboundHttp, url: &str) -> Result<Option<String>> {
     // The body is read inside the retry, not after it: a dropped connection
     // surfaces as often while the body streams as it does on connect, and a
     // retry that only covered `send` would miss exactly the failure this exists
@@ -952,8 +961,9 @@ async fn fetch_text(client: &Client, url: &str) -> Result<Option<String>> {
     // stays an answer rather than becoming a retried error.
     retrying(
         |_| async {
-            let response = client
+            let response = outbound
                 .get(url)
+                .await?
                 .header("User-Agent", USER_AGENT)
                 .timeout(LIBRARY_TIMEOUT)
                 .send()
@@ -1008,6 +1018,11 @@ where
 /// that stops mid-transfer. An HTTP status is the server's answer, and asking
 /// again just gets the same one — a 404 for a manifest is how a source says it
 /// publishes no manifest, which is a normal branch here, not an error to retry.
+///
+/// A refusal from the outbound guard is likewise an answer, and a deterministic
+/// one: the address is private now, it will be private on the third attempt, and
+/// the guard's error carries no `reqwest::Error` to match on, so it falls
+/// through to the non-retryable arm by construction rather than by accident.
 fn is_transient(err: &anyhow::Error) -> bool {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
@@ -1216,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn catalogue_falls_back_to_a_single_entry_for_a_direct_file_url() {
         // A non-GitHub URL is a one-entry source; this branch reads nothing.
-        let catalogue = catalogue(&Client::new(), "https://example.com/naive.har")
+        let catalogue = catalogue(&OutboundHttp::standalone(), "https://example.com/naive.har")
             .await
             .unwrap();
         assert_eq!(catalogue.source_kind, "files");
@@ -1226,6 +1241,38 @@ mod tests {
             catalogue.entries[0].url.as_deref(),
             Some("https://example.com/naive.har")
         );
+    }
+
+    /// The subscription path: a source URL is the user's to choose, and every
+    /// library read goes through [`fetch_text`], which used to hand that URL
+    /// straight to an unguarded client.
+    ///
+    /// The body is asserted, so a run that succeeds here has read the response
+    /// this test's own server wrote rather than anything else's answer.
+    #[tokio::test]
+    async fn a_library_source_is_fetched_through_the_same_guard() {
+        let address = crate::test_support::serve_loopback().await;
+        let url = format!("http://{address}/tpls_history.json");
+
+        let blocked = fetch_text(&guarded(false), &url).await.unwrap_err();
+        assert!(
+            format!("{blocked:#}").contains("private or special-use network target is blocked"),
+            "a source on loopback must be refused while the switch is off: {blocked:#}"
+        );
+
+        let body = fetch_text(&guarded(true), &url)
+            .await
+            .expect("with the switch on the same source must be read")
+            .expect("a 218 is not a 404");
+        assert_eq!(body, crate::test_support::LOOPBACK_MARKER);
+    }
+
+    /// An `OutboundHttp` with the private-network switch set the way the test
+    /// needs it.
+    fn guarded(allow_private_network: bool) -> OutboundHttp {
+        let settings = crate::api::runtime_settings();
+        settings.write().unwrap().allow_private_network = allow_private_network;
+        OutboundHttp::new(settings, Duration::from_secs(30))
     }
 
     #[test]
@@ -1305,15 +1352,24 @@ mod tests {
         // so this exercises the cache itself rather than the network: the
         // aggregate listing leans on reuse here to stay cheap, and on the
         // zero-max-age path to be able to bypass it on demand.
-        let client = Client::new();
+        let outbound = OutboundHttp::standalone();
         let cache = CatalogueCache::new();
         let url = "https://example.com/naive.har";
 
-        let (_, cached) = cache.catalogue(&client, url, CATALOGUE_TTL).await.unwrap();
+        let (_, cached) = cache
+            .catalogue(&outbound, url, CATALOGUE_TTL)
+            .await
+            .unwrap();
         assert!(!cached, "the first read has nothing to reuse");
-        let (_, cached) = cache.catalogue(&client, url, CATALOGUE_TTL).await.unwrap();
+        let (_, cached) = cache
+            .catalogue(&outbound, url, CATALOGUE_TTL)
+            .await
+            .unwrap();
         assert!(cached, "the second read must reuse the first");
-        let (_, cached) = cache.catalogue(&client, url, Duration::ZERO).await.unwrap();
+        let (_, cached) = cache
+            .catalogue(&outbound, url, Duration::ZERO)
+            .await
+            .unwrap();
         assert!(!cached, "max_age zero must bypass the cache");
     }
 
