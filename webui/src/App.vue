@@ -1580,7 +1580,16 @@ function pushStatusLabel(status: string): string {
 // ---------- admin ----------
 const adminUsers = ref<User[]>([]);
 const adminSettings = ref<SiteSetting[]>([]);
-const settingsForm = reactive({ requireEmail: false, gaKey: "", retentionDays: 0 });
+/** ADR-0008's two relaxations. Each key is the whole contract with the server:
+ *  an unknown key is stored happily and then ignored, so a typo here would
+ *  present as "the switch does nothing". Both are pinned against the matching
+ *  Rust constants by admin-settings.test.ts. */
+const ALLOW_PRIVATE_NETWORK_KEY = "security.allow_private_network";
+const ALLOW_INVALID_CERTIFICATES_KEY = "security.allow_invalid_certificates";
+const settingsForm = reactive({
+  requireEmail: false, gaKey: "", retentionDays: 0,
+  allowPrivateNetwork: false, allowInvalidCertificates: false,
+});
 async function openAdmin() {
   view.value = "admin";
   try {
@@ -1588,9 +1597,13 @@ async function openAdmin() {
     const requireEmail = adminSettings.value.find((s) => s.key === "require_email_verification");
     const ga = adminSettings.value.find((s) => s.key === "ga_key");
     const retention = adminSettings.value.find((s) => s.key === "logs.retention_days");
+    const privateNetwork = adminSettings.value.find((s) => s.key === ALLOW_PRIVATE_NETWORK_KEY);
+    const invalidCertificates = adminSettings.value.find((s) => s.key === ALLOW_INVALID_CERTIFICATES_KEY);
     settingsForm.requireEmail = requireEmail?.value === true;
     settingsForm.gaKey = typeof ga?.value === "string" ? ga.value : "";
     settingsForm.retentionDays = typeof retention?.value === "number" ? retention.value : 0;
+    settingsForm.allowPrivateNetwork = privateNetwork?.value === true;
+    settingsForm.allowInvalidCertificates = invalidCertificates?.value === true;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function toggleUser(user: User) {
@@ -1615,6 +1628,8 @@ async function saveAdminSettings() {
     await api.adminSetSetting("require_email_verification", settingsForm.requireEmail);
     await api.adminSetSetting("ga_key", settingsForm.gaKey);
     await api.adminSetSetting("logs.retention_days", settingsForm.retentionDays);
+    await api.adminSetSetting(ALLOW_PRIVATE_NETWORK_KEY, settingsForm.allowPrivateNetwork);
+    await api.adminSetSetting(ALLOW_INVALID_CERTIFICATES_KEY, settingsForm.allowInvalidCertificates);
     notify(t("settingsSaved"));
     await openAdmin();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
@@ -2598,6 +2613,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <label class="checkbox"><input v-model="settingsForm.requireEmail" type="checkbox" />{{ t('requireEmailVerify') }}</label>
             <label>{{ t('gaKey') }}<input v-model="settingsForm.gaKey" placeholder="G-XXXXXXX" /></label>
             <label>{{ t('retentionDays') }}<input v-model.number="settingsForm.retentionDays" type="number" min="0" /></label>
+            <label class="checkbox"><input v-model="settingsForm.allowPrivateNetwork" type="checkbox" />{{ t('allowPrivateNetwork') }}</label>
+            <p class="risk-notice">{{ t('allowPrivateNetworkRisk') }}</p>
+            <label class="checkbox"><input v-model="settingsForm.allowInvalidCertificates" type="checkbox" />{{ t('allowInvalidCertificates') }}</label>
+            <p class="risk-notice">{{ t('allowInvalidCertificatesRisk') }}</p>
             <div class="inline-actions">
               <button class="primary-button">{{ t('saveSettings') }}</button>
               <button class="secondary-button" type="button" @click="cleanupLogs">{{ t('cleanupLogs') }}</button>

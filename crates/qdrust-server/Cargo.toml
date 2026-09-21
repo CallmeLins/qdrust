@@ -40,3 +40,8 @@ openidconnect = { version = "4", default-features = false, features = ["reqwest"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Local HTTPS server for ADR-0008's invalid-certificate test. `ring` rather than
+# the default `aws-lc-rs` backend: the workspace already builds rustls with ring
+# (via reqwest), so the test reuses that provider instead of adding a second
+# crypto stack to the build.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

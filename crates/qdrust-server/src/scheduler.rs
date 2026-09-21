@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
-    executor::{CancellationToken, ExecutionContext, QdExecutor, StepResult},
+    executor::{CancellationToken, ExecutionContext, ExecutorOptions, QdExecutor, StepResult},
     plugin::{PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, SubprocessPlugin},
     qd_har::{QdHar, QdProgram},
     template::Step,
@@ -31,6 +31,7 @@ pub fn spawn(
     run_events: RunEventSender,
     email: EmailClient,
     log_retention_days: u64,
+    settings: Arc<std::sync::RwLock<crate::api::RuntimeSettings>>,
     browser: Option<Arc<BrowserSessionManager>>,
     default_tz: chrono_tz::Tz,
 ) {
@@ -55,6 +56,10 @@ pub fn spawn(
                             step: None,
                             error: None,
                         }));
+                        // Read the admin's network policy per run rather than
+                        // snapshotting it at boot, so flipping the switch in the
+                        // UI takes effect on the next run, not the next restart.
+                        let policy = run_policy(task.timeout_seconds, &settings);
                         execute_with_run(
                             worker_store.clone(),
                             worker_client.clone(),
@@ -63,6 +68,7 @@ pub fn spawn(
                             &worker,
                             &run_events,
                             &email,
+                            policy,
                             browser.clone(),
                         )
                         .await;
@@ -195,6 +201,47 @@ fn task_variables(task: &Task) -> BTreeMap<String, Value> {
     variables
 }
 
+/// What a single run is allowed to do, as opposed to what its template asks
+/// for.
+///
+/// Grouped into one value so a new policy knob cannot be threaded into one call
+/// site and forgotten at another: the executor is built from exactly one of
+/// these per run, in one place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RunPolicy {
+    /// Per-task request timeout (`task.timeout_seconds`, default 30s).
+    request_timeout: Duration,
+    /// ADR-0008 private-network opt-in.
+    allow_private_network: bool,
+    /// ADR-0008 invalid-certificate opt-in. A sibling of the flag above, not a
+    /// consequence of it: they are granted separately.
+    allow_invalid_certificates: bool,
+}
+
+/// The policy a run executes under, assembled from the task and the shared
+/// runtime settings.
+///
+/// Read per run rather than once at boot: that is what makes flipping the admin
+/// switch apply to the next run instead of the next restart. A snapshot taken
+/// at startup would compile, look correct, and quietly require a restart — the
+/// reason this is a named function with a test rather than an inline read.
+fn run_policy(
+    timeout_seconds: Option<i64>,
+    settings: &std::sync::RwLock<crate::api::RuntimeSettings>,
+) -> RunPolicy {
+    // One read for both switches rather than one per field: this is a blocking
+    // lock taken from async code, so it is held for the shortest span that
+    // still yields a consistent pair.
+    let snapshot = settings.read().unwrap();
+    RunPolicy {
+        request_timeout: Duration::from_secs(
+            timeout_seconds.filter(|v| *v > 0).unwrap_or(30) as u64
+        ),
+        allow_private_network: snapshot.allow_private_network,
+        allow_invalid_certificates: snapshot.allow_invalid_certificates,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_run(
     store: Store,
@@ -204,12 +251,11 @@ async fn execute_with_run(
     worker: &str,
     run_events: &broadcast::Sender<Value>,
     email: &EmailClient,
+    policy: RunPolicy,
     browser: Option<Arc<BrowserSessionManager>>,
 ) {
     let result = async {
         let variables = task_variables(&task);
-        let request_timeout =
-            Duration::from_secs(task.timeout_seconds.filter(|v| *v > 0).unwrap_or(30) as u64);
         if let Some(template_id) = task.template_id {
             let template = store
                 .get_template(template_id)
@@ -228,7 +274,7 @@ async fn execute_with_run(
                 template.clone(),
                 &cancellation,
                 &variables,
-                request_timeout,
+                policy,
                 &plugins,
             )
             .await;
@@ -277,7 +323,7 @@ async fn execute_with_run(
         let method = Method::from_bytes(task.method.as_bytes())?;
         let mut request = client
             .request(method, &render_plain(&task.url, &variables)?)
-            .timeout(request_timeout);
+            .timeout(policy.request_timeout);
         if let Some(headers) = task.headers.as_object() {
             for (name, value) in headers {
                 if let Some(value) = value.as_str() {
@@ -682,10 +728,19 @@ async fn execute_template(
     template: Template,
     cancellation: &CancellationToken,
     variables: &BTreeMap<String, Value>,
-    request_timeout: Duration,
+    policy: RunPolicy,
     plugins: &[Arc<dyn Plugin>],
 ) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
-    let mut executor = QdExecutor::new(request_timeout)?;
+    // The one place a run's executor is built, so a policy knob cannot be
+    // honoured on one path (a QD template) and quietly ignored on the other
+    // (a plain request). Everything except the timeout and ADR-0008's two
+    // relaxations keeps the hardened defaults.
+    let mut executor = QdExecutor::with_options(ExecutorOptions {
+        timeout: policy.request_timeout,
+        allow_private_network: policy.allow_private_network,
+        allow_invalid_certificates: policy.allow_invalid_certificates,
+        ..ExecutorOptions::default()
+    })?;
     for plugin in plugins {
         let plugin_id = plugin.manifest().id.clone();
         if let Err(err) = executor.register_plugin(plugin.clone()) {
@@ -741,6 +796,115 @@ mod tests {
     use super::*;
     use crate::email::normalize_recipient;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A run policy for tests: 30s timeout, private network off unless asked,
+    /// certificates always verified. The certificate relaxation gets its own
+    /// constructor so no existing call site silently gains it.
+    fn policy(allow_private_network: bool) -> RunPolicy {
+        RunPolicy {
+            request_timeout: Duration::from_secs(30),
+            allow_private_network,
+            allow_invalid_certificates: false,
+        }
+    }
+
+    /// The same policy with ADR-0008's other relaxation on. Takes the
+    /// private-network flag too, because reaching a loopback test server needs
+    /// both — which is itself the point of the HTTPS test below.
+    fn policy_accepting_invalid_certs(allow_private_network: bool) -> RunPolicy {
+        RunPolicy {
+            allow_invalid_certificates: true,
+            ..policy(allow_private_network)
+        }
+    }
+
+    #[test]
+    fn the_run_policy_reads_the_live_setting_instead_of_a_boot_snapshot() {
+        // Flipping the admin switch has to reach the next run. A value captured
+        // at startup would leave a restart in between, which reads as the switch
+        // not working. Both switches, since they are read in the same function.
+        let settings = crate::api::runtime_settings();
+        assert!(!run_policy(None, &settings).allow_private_network);
+        assert!(!run_policy(None, &settings).allow_invalid_certificates);
+        settings.write().unwrap().allow_private_network = true;
+        settings.write().unwrap().allow_invalid_certificates = true;
+        assert!(run_policy(None, &settings).allow_private_network);
+        assert!(run_policy(None, &settings).allow_invalid_certificates);
+    }
+
+    #[test]
+    fn the_run_policy_takes_the_task_timeout_and_defaults_the_rest() {
+        let settings = crate::api::runtime_settings();
+        assert_eq!(
+            run_policy(Some(45), &settings).request_timeout,
+            Duration::from_secs(45)
+        );
+        // Unset and non-positive both fall back to 30s.
+        for value in [None, Some(0), Some(-5)] {
+            assert_eq!(
+                run_policy(value, &settings).request_timeout,
+                Duration::from_secs(30)
+            );
+        }
+    }
+
+    #[test]
+    fn one_relaxation_never_drags_the_other_along() {
+        // The pair is read from one snapshot, so a copy-paste slip could wire
+        // both fields to whichever flag was written first. With both settings
+        // off and only the private-network flag set, the certificate field has
+        // to stay off.
+        let settings = crate::api::runtime_settings();
+        settings.write().unwrap().allow_private_network = true;
+        let policy = run_policy(None, &settings);
+        assert!(policy.allow_private_network);
+        assert!(!policy.allow_invalid_certificates);
+    }
+
+    #[test]
+    fn the_worker_assembles_that_policy_once_per_claim() {
+        // Structural, and deliberately so: the tests above cover `run_policy`
+        // and the loopback test covers the executor, but neither covers the
+        // worker *calling* it. A snapshot hoisted out of the loop would pass
+        // everything else and silently reintroduce the restart requirement.
+        //
+        // The needle is assembled from parts because this file is what
+        // `include_str!` reads: written as one literal it would also match the
+        // assertion's own source, and the test would pass whether or not the
+        // worker still calls it. Keep it split.
+        let needle = format!(
+            "{}{}",
+            "let policy = run_policy(", "task.timeout_seconds, &settings);"
+        );
+        assert!(include_str!("scheduler.rs").contains(&needle));
+    }
+
+    #[test]
+    fn the_executor_is_built_with_both_relaxations_from_the_policy() {
+        // Structural for the same reason as the test above: `qdrust-core` cannot
+        // cover this, because there the options are handed to it directly. What
+        // is unverified until this assertion exists is the step where the
+        // policy's two flags become `ExecutorOptions` fields — the exact place
+        // the original bug lived (`QdExecutor::new` never set either).
+        let source = include_str!("scheduler.rs");
+        for needle in [
+            format!(
+                "{}{}",
+                "allow_private_network: policy.", "allow_private_network,"
+            ),
+            format!(
+                "{}{}",
+                "allow_invalid_certificates: policy.", "allow_invalid_certificates,"
+            ),
+        ] {
+            assert!(
+                source.contains(&needle),
+                "the executor no longer takes {} from the policy",
+                needle.trim_end_matches(',')
+            );
+        }
+    }
 
     #[tokio::test]
     async fn executes_qd_template_through_core() {
@@ -769,13 +933,256 @@ mod tests {
             template,
             &CancellationToken::new(),
             &BTreeMap::new(),
-            Duration::from_secs(30),
+            policy(false),
             &[],
         )
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, 200);
+    }
+
+    /// Marker the loopback server puts in every response body.
+    const LOOPBACK_MARKER: &str = "from-the-loopback-test-server";
+
+    /// A loopback HTTP server answering every request with a body only it
+    /// sends. The marker matters: a run that succeeds here must have reached
+    /// *this* socket, so an intermediary answering 200 on its own (a proxy, a
+    /// captive portal) cannot make the test pass by accident.
+    async fn serve_loopback_marker() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    // One request per connection is all a template step needs.
+                    let mut scratch = [0_u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        LOOPBACK_MARKER.len(),
+                        LOOPBACK_MARKER
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A one-step template that GETs `url` and extracts the marker from the
+    /// body. The URL is passed in rather than built from an address so the same
+    /// shape serves both the plain-HTTP and the HTTPS tests.
+    fn loopback_template(url: String) -> Template {
+        Template {
+            id: 1,
+            name: "loopback".into(),
+            description: None,
+            schema_version: 1,
+            source_format: "qd_har".into(),
+            definition: None,
+            qd_har: Some(serde_json::json!({
+                "log": {
+                    "version": "1.2",
+                    "entries": [{
+                        "checked": true,
+                        "request": {"method": "GET", "url": url},
+                        "extract_variables": [
+                            {"name": "marker", "re": "(from-the-loopback-test-server)", "from": "content"}
+                        ]
+                    }]
+                }
+            })),
+            variables: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            grp: None,
+        }
+    }
+
+    /// The regression this switch exists for: a template that needs a service on
+    /// the host's own network (a local flaresolverr, an intranet sign-in page).
+    /// With the flag off the run is refused; with it on the same template
+    /// completes.
+    ///
+    /// What this covers is the *wiring* — that the admin setting reaches
+    /// `ExecutorOptions.allow_private_network`. `qdrust-core`'s own tests cannot
+    /// cover it, because there the flag is set straight on the options.
+    #[tokio::test]
+    async fn a_private_target_is_refused_until_the_admin_allows_it() {
+        let address = serve_loopback_marker().await;
+
+        let blocked = execute_template(
+            loopback_template(format!("http://{address}/")),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            policy(false),
+            &[],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            blocked.contains("private or special-use network target is blocked"),
+            "with the flag off a loopback target must be refused: {blocked}"
+        );
+
+        let (results, variables) = execute_template(
+            loopback_template(format!("http://{address}/")),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            policy(true),
+            &[],
+        )
+        .await
+        .expect("with the flag on the same template must go through");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, 200);
+        // The body has to be the one this test's server wrote.
+        assert_eq!(variables.get("marker"), Some(&json!(LOOPBACK_MARKER)));
+    }
+
+    /// Self-signed certificate and its matching key, DER, base64.
+    ///
+    /// Generated once (Git Bash; `MSYS_NO_PATHCONV=1` keeps openssl from
+    /// mangling the `/CN=` argument) and pasted here, so the test needs no
+    /// fixture file, no certificate authority and no generation step at run
+    /// time:
+    ///
+    /// ```text
+    /// openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    ///   -nodes -keyout key.pem -out cert.pem -days 36500 -subj "/CN=localhost" \
+    ///   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    /// openssl x509 -in cert.pem -outform DER | base64 -w0     # SELF_SIGNED_CERT_DER
+    /// openssl pkcs8 -topk8 -nocrypt -in key.pem -outform DER \
+    ///   | base64 -w0                                          # SELF_SIGNED_KEY_DER
+    /// ```
+    ///
+    /// EC rather than RSA only to keep the two constants short. The key is a
+    /// throwaway that exists solely to be rejected by every verifier in the
+    /// world — not a secret, and used nowhere else.
+    const SELF_SIGNED_CERT_DER: &str = "MIIBmjCCAUGgAwIBAgIUOk7XR2G9pRfJWNW6JvvdHND1A4EwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkyMTEwNTgzN1oYDzIxMjYwODI4MTA1ODM3WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASldseGX52lLRbHOCxxNbLCjoqd3Vnv92juDGjVX6q7KtFQq3DRYff09TNRaxYtLLNBjiXxE5fyiPSijepVPhdBo28wbTAdBgNVHQ4EFgQUKAS3Xy5p7OxAaJx3BLtPevh2CegwHwYDVR0jBBgwFoAUKAS3Xy5p7OxAaJx3BLtPevh2CegwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgHja5JnnGPw+caWkvhrKGzcn6+88SSw/yaf0BvNFRZU8CIFHKcAL4Ex3Y+5x6RzgidTydMJ5b/gBOZDIGWyFUWEqg";
+    const SELF_SIGNED_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgrSnuGF4NX83+l5YpganV3mqCNlogXcyHm4ZY0knSRrqhRANCAASldseGX52lLRbHOCxxNbLCjoqd3Vnv92juDGjVX6q7KtFQq3DRYff09TNRaxYtLLNBjiXxE5fyiPSijepVPhdB";
+
+    /// HTTPS server presenting that self-signed certificate, answering with the
+    /// loopback marker. Same marker reasoning as the plain server above: a run
+    /// that returns 200 must have talked to *this* socket.
+    ///
+    /// Handshake failures are expected (that is what the certificate switch is
+    /// about) and are swallowed, so the listener keeps serving.
+    async fn serve_self_signed_marker() -> std::net::SocketAddr {
+        use base64::Engine as _;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::{ServerConfig, crypto::ring, pki_types};
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let certificate = pki_types::CertificateDer::from(
+            engine
+                .decode(SELF_SIGNED_CERT_DER)
+                .expect("certificate is base64"),
+        );
+        let key = pki_types::PrivateKeyDer::Pkcs8(pki_types::PrivatePkcs8KeyDer::from(
+            engine.decode(SELF_SIGNED_KEY_DER).expect("key is base64"),
+        ));
+        // The provider is passed explicitly rather than installed process-wide:
+        // tests share a process, and a global install would be a side effect
+        // other tests could trip over.
+        let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .expect("the pasted certificate and key match");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(socket).await else {
+                        // A client that verifies certificates gives up here.
+                        return;
+                    };
+                    let mut scratch = [0_u8; 2048];
+                    let _ = stream.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        LOOPBACK_MARKER.len(),
+                        LOOPBACK_MARKER
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// ADR-0008's second switch, and the proof that it is a switch of its own
+    /// rather than a passenger on the first.
+    ///
+    /// The target is a self-signed HTTPS endpoint on loopback, so one request
+    /// exercises both relaxations at once: reaching the address needs the
+    /// network switch, accepting the certificate needs this one. With only the
+    /// network switch on the run still fails — visibly, and for a reason that
+    /// is emphatically *not* the SSRF guard, which is what makes this a test of
+    /// the second switch rather than a repeat of the first.
+    ///
+    /// What it covers is the wiring: that the admin setting reaches
+    /// `ExecutorOptions.allow_invalid_certificates`. `qdrust-core` cannot cover
+    /// it — there the flag is set straight on the options, and its own tests
+    /// never exercise `danger_accept_invalid_certs` at all.
+    #[tokio::test]
+    async fn a_self_signed_target_needs_the_certificate_switch_too() {
+        let address = serve_self_signed_marker().await;
+        let url = format!("https://{address}/");
+
+        // Network switch alone: the address is allowed through and TLS then
+        // refuses the certificate. The error must not be the SSRF guard's.
+        let rejected = execute_template(
+            loopback_template(url.clone()),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            policy(true),
+            &[],
+        )
+        .await
+        .expect_err("a self-signed certificate must not be accepted by default");
+        // `{:#}` prints anyhow's whole chain, which is where reqwest puts the
+        // rustls cause; `{}` would only show "error sending request for url".
+        let chain = format!("{rejected:#}");
+        assert!(
+            !chain.contains("private or special-use network target is blocked"),
+            "the network switch alone must let the address through to TLS: {chain}"
+        );
+        assert!(
+            chain.contains("certificate"),
+            "the failure must be the certificate, not something else: {chain}"
+        );
+
+        // Both switches on: same template, same server, completes — and the
+        // body is the one this test's server sent.
+        let (results, variables) = execute_template(
+            loopback_template(url),
+            &CancellationToken::new(),
+            &BTreeMap::new(),
+            policy_accepting_invalid_certs(true),
+            &[],
+        )
+        .await
+        .expect("with the certificate switch on the same template must go through");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, 200);
+        assert_eq!(variables.get("marker"), Some(&json!(LOOPBACK_MARKER)));
     }
 
     /// In-process plugin used to exercise the whole wiring path (store -> load
@@ -865,7 +1272,7 @@ mod tests {
             mock_template(),
             &CancellationToken::new(),
             &BTreeMap::new(),
-            Duration::from_secs(30),
+            policy(false),
             &plugins,
         )
         .await
@@ -886,7 +1293,7 @@ mod tests {
             mock_template(),
             &CancellationToken::new(),
             &BTreeMap::new(),
-            Duration::from_secs(30),
+            policy(false),
             &[],
         )
         .await

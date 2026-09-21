@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
         runtime.require_email_verification = config.require_email_verification;
         runtime.ga_key = config.ga_key.clone();
         runtime.log_retention_days = config.log_retention_days;
+        runtime.allow_private_network = config.allow_private_network;
+        runtime.allow_invalid_certificates = config.allow_invalid_certificates;
     }
     let config_file = config.config_file.clone();
     spawn_settings_watcher(store.clone(), settings.clone(), config_file);
@@ -63,6 +65,7 @@ async fn main() -> Result<()> {
         run_events.clone(),
         email,
         config.log_retention_days,
+        settings.clone(),
         browser,
         default_tz,
     );
@@ -167,6 +170,17 @@ fn spawn_settings_watcher(
                                 if let Some(v) = json.get("ga_key").and_then(|v| v.as_str()) {
                                     runtime.ga_key = Some(v.to_string());
                                 }
+                                if let Some(v) =
+                                    json.get("allow_private_network").and_then(|v| v.as_bool())
+                                {
+                                    runtime.allow_private_network = v;
+                                }
+                                if let Some(v) = json
+                                    .get("allow_invalid_certificates")
+                                    .and_then(|v| v.as_bool())
+                                {
+                                    runtime.allow_invalid_certificates = v;
+                                }
                                 info!("reloaded runtime settings from {}", path.display());
                             }
                         }
@@ -176,21 +190,22 @@ fn spawn_settings_watcher(
                     }
                 }
             }
-            // site_settings table overrides (admin-editable at runtime)
-            if let Ok(Some(setting)) = store.get_setting("require_email_verification").await
-                && let Some(v) = setting.value.as_bool()
-            {
-                settings.write().unwrap().require_email_verification = v;
-            }
-            if let Ok(Some(setting)) = store.get_setting("ga_key").await
-                && let Some(v) = setting.value.as_str()
-            {
-                settings.write().unwrap().ga_key = Some(v.to_string());
-            }
-            if let Ok(Some(setting)) = store.get_setting("logs.retention_days").await
-                && let Some(v) = setting.value.as_i64()
-            {
-                settings.write().unwrap().log_retention_days = v.max(0) as u64;
+            // site_settings table overrides (admin-editable at runtime).
+            //
+            // Driven by the same table `admin_set_setting` applies through, so
+            // a key cannot be editable through the admin API yet invisible to
+            // this poll. Adding a runtime-tunable key is a one-line change in
+            // `api::apply_runtime_setting` plus its name in this list.
+            for key in [
+                "require_email_verification",
+                "ga_key",
+                "logs.retention_days",
+                api::ALLOW_PRIVATE_NETWORK_SETTING,
+                api::ALLOW_INVALID_CERTIFICATES_SETTING,
+            ] {
+                if let Ok(Some(setting)) = store.get_setting(key).await {
+                    api::apply_runtime_setting(&mut settings.write().unwrap(), key, &setting.value);
+                }
             }
         }
     });

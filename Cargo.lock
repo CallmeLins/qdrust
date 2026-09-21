@@ -2260,6 +2260,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",

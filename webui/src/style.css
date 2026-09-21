@@ -474,6 +474,15 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .inline-actions { display: flex; gap: 9px; }
 .modal-wide { width: min(720px, 100%); }
 
+/* High-risk warning under a settings checkbox (ADR-0008's private-network
+   opt-in). Spans the form's two columns, otherwise the sentence is squeezed
+   into one cell of the grid. */
+.risk-notice {
+  grid-column: 1 / -1; margin: 0; padding: 9px 11px;
+  border: 1px solid rgb(180 83 9 / 0.3); border-radius: var(--r-s);
+  color: var(--warn); background: rgb(180 83 9 / 0.08); font-size: 12px; line-height: 1.6;
+}
+
 .error-banner {
   margin-bottom: 12px; padding: 11px 13px;
   border: 1px solid rgb(220 38 38 / 0.35); border-radius: var(--r-s);

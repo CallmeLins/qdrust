@@ -175,6 +175,20 @@ pub struct Config {
     pub log_retention_days: u64,
     pub ga_key: Option<String>,
     pub require_email_verification: bool,
+    /// Deploy-time default for ADR-0008's private-network opt-in
+    /// (`QDRUST_ALLOW_PRIVATE_NETWORK`, default `false`). Lets a single-tenant
+    /// or air-gapped install allow templates to reach LAN services (a local
+    /// flaresolverr, an intranet sign-in page) without going through the admin
+    /// UI first. The admin setting `security.allow_private_network` overrides
+    /// it at runtime, exactly like the other runtime-tunable keys.
+    pub allow_private_network: bool,
+    /// Deploy-time default for ADR-0008's invalid-certificate opt-in
+    /// (`QDRUST_ALLOW_INVALID_CERTIFICATES`, default `false`). For targets that
+    /// only ever live on a trusted LAN and were never given a real certificate.
+    /// Separate from `allow_private_network` on purpose: ADR-0008 asks for the
+    /// two to be grantable independently. The admin setting
+    /// `security.allow_invalid_certificates` overrides it at runtime.
+    pub allow_invalid_certificates: bool,
     /// IANA timezone applied to cron scheduling when a task does not set its
     /// own `timezone`. Defaults to `Asia/Shanghai` to match a China-first
     /// deployment. Empty means UTC (the previous hardcoded fallback).
@@ -252,6 +266,8 @@ impl Config {
             log_retention_days: parse_env("LOG_RETENTION_DAYS", 0)?,
             ga_key: env::var("GA_KEY").ok().filter(|s| !s.is_empty()),
             require_email_verification: parse_env("REQUIRE_EMAIL_VERIFICATION", false)?,
+            allow_private_network: parse_env("QDRUST_ALLOW_PRIVATE_NETWORK", false)?,
+            allow_invalid_certificates: parse_env("QDRUST_ALLOW_INVALID_CERTIFICATES", false)?,
             default_timezone: env::var("QDRUST_DEFAULT_TIMEZONE")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -415,6 +431,10 @@ impl Config {
                 .or(self.ga_key),
             require_email_verification: get_bool("require_email_verification")
                 .unwrap_or(self.require_email_verification),
+            allow_private_network: get_bool("allow_private_network")
+                .unwrap_or(self.allow_private_network),
+            allow_invalid_certificates: get_bool("allow_invalid_certificates")
+                .unwrap_or(self.allow_invalid_certificates),
             default_timezone: {
                 // Config file is only a fallback; env already won above.
                 let file = get("default_timezone").unwrap_or("");
@@ -768,6 +788,31 @@ mod tests {
     }
 
     #[test]
+    fn both_relaxation_switches_are_parsed_with_a_false_default() {
+        // A wrong default is the one mistake in this area that would ship a
+        // security switch already on, and it is a single character: `parse_env`
+        // is where the default lives, and both ADR-0008 keys go through the
+        // same shape.
+        //
+        // The needles are assembled from parts because this file is what
+        // `include_str!` reads: written as one literal each would also match the
+        // assertion's own source and never fail.
+        let source = include_str!("config.rs");
+        for key in [
+            "QDRUST_ALLOW_PRIVATE_NETWORK",
+            "QDRUST_ALLOW_INVALID_CERTIFICATES",
+        ] {
+            // `concat` rather than a nested `format!`, which clippy rejects as
+            // `format_in_format_args`.
+            let needle = ["parse_env(\"", key, "\", ", "false)?"].concat();
+            assert!(
+                source.contains(&needle),
+                "{key} must default to false, not to a permissive value"
+            );
+        }
+    }
+
+    #[test]
     fn oidc_groups_claim_defaults_to_groups_and_is_retained() {
         // Default claim name is `groups` so a bare OidcConfig keeps working.
         assert_eq!(OidcConfig::default().groups_claim, "groups");
@@ -789,6 +834,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
@@ -831,6 +878,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -867,6 +916,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: "Not/A_Zone".into(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -911,6 +962,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
@@ -951,6 +1004,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
@@ -995,6 +1050,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
@@ -1030,6 +1087,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
@@ -1076,6 +1135,8 @@ mod tests {
             log_retention_days: 0,
             ga_key: None,
             require_email_verification: false,
+            allow_private_network: false,
+            allow_invalid_certificates: false,
             default_timezone: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,

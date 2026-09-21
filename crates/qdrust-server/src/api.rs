@@ -60,10 +60,72 @@ pub struct RuntimeSettings {
     pub require_email_verification: bool,
     pub ga_key: Option<String>,
     pub log_retention_days: u64,
+    /// Admin opt-in from ADR-0008: let template runs reach private, loopback
+    /// and link-local targets. Off by default — the executor's SSRF guard
+    /// stays on, so a template cannot be used to probe the host's network
+    /// (or a cloud metadata endpoint) unless an administrator says so.
+    pub allow_private_network: bool,
+    /// The other half of ADR-0008: accept certificates that do not validate
+    /// (self-signed, expired, wrong host). Needed by targets that are only
+    /// ever reached on a trusted LAN and were never given a real certificate.
+    /// Off by default; the two relaxations are deliberately separate, because
+    /// needing one is no reason to grant the other.
+    pub allow_invalid_certificates: bool,
 }
 
 pub fn runtime_settings() -> std::sync::Arc<std::sync::RwLock<RuntimeSettings>> {
     std::sync::Arc::new(std::sync::RwLock::new(RuntimeSettings::default()))
+}
+
+/// Site-settings key for ADR-0008's private-network opt-in. Named once here so
+/// the admin API, the settings watcher, the tests and the docs cannot drift
+/// apart on the spelling of a key that changes what a template may reach.
+pub const ALLOW_PRIVATE_NETWORK_SETTING: &str = "security.allow_private_network";
+
+/// Site-settings key for ADR-0008's invalid-certificate opt-in, the sibling of
+/// the key above — same reasoning, same single place to change the spelling.
+pub const ALLOW_INVALID_CERTIFICATES_SETTING: &str = "security.allow_invalid_certificates";
+
+/// Apply one stored `site_settings` row to the runtime snapshot.
+///
+/// Kept as one table so a key cannot be persisted without also being applied:
+/// the settings watcher and `admin_set_setting` both go through here, which is
+/// the only place the key-to-field mapping is written down. A key that is
+/// stored but missing here would silently do nothing.
+pub fn apply_runtime_setting(runtime: &mut RuntimeSettings, key: &str, value: &Value) {
+    match key {
+        "require_email_verification" => {
+            if let Some(v) = value.as_bool() {
+                runtime.require_email_verification = v;
+            }
+        }
+        "ga_key" => {
+            if let Some(v) = value.as_str() {
+                runtime.ga_key = Some(v.to_string());
+            }
+        }
+        "logs.retention_days" => {
+            if let Some(v) = value.as_i64() {
+                runtime.log_retention_days = v.max(0) as u64;
+            }
+        }
+        // ADR-0008: private-network access for template runs. Off by default;
+        // audited like every other setting (`admin.setting_changed`).
+        ALLOW_PRIVATE_NETWORK_SETTING => {
+            if let Some(v) = value.as_bool() {
+                runtime.allow_private_network = v;
+            }
+        }
+        // ADR-0008: accept unvalidated certificates. A sibling of the key
+        // above, not a rider on it — reaching a LAN host and skipping hostname
+        // verification are different risks, so they stay separate switches.
+        ALLOW_INVALID_CERTIFICATES_SETTING => {
+            if let Some(v) = value.as_bool() {
+                runtime.allow_invalid_certificates = v;
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2502,6 +2564,12 @@ async fn admin_set_setting(
     require_admin(&state, &headers).await?;
     ensure_setting_key(&key)?;
     let setting = state.store.set_setting(&key, &input).await?;
+    // Apply it to the in-memory snapshot at once instead of waiting for the
+    // settings watcher's next poll (up to 30s). A security toggle that stays
+    // effective for another half minute after being switched off reads as a
+    // bug; the watcher remains the path for keys written out-of-band and for
+    // the other replicas, which this request cannot reach.
+    apply_runtime_setting(&mut state.settings.write().unwrap(), &key, &input.value);
     state
         .store
         .record_audit(
@@ -3145,6 +3213,97 @@ mod tests {
             base_path,
             None,
         )
+    }
+
+    #[test]
+    fn every_runtime_setting_key_maps_to_its_field() {
+        // The mapping table is the only place a stored key turns into behaviour:
+        // a key that is persisted but missing from it is accepted, audited and
+        // then ignored. Each one is asserted here next to its own field.
+        let mut runtime = RuntimeSettings::default();
+        apply_runtime_setting(&mut runtime, "require_email_verification", &json!(true));
+        apply_runtime_setting(&mut runtime, "ga_key", &json!("G-TEST"));
+        apply_runtime_setting(&mut runtime, "logs.retention_days", &json!(30));
+        apply_runtime_setting(&mut runtime, ALLOW_PRIVATE_NETWORK_SETTING, &json!(true));
+        apply_runtime_setting(
+            &mut runtime,
+            ALLOW_INVALID_CERTIFICATES_SETTING,
+            &json!(true),
+        );
+
+        assert!(runtime.require_email_verification);
+        assert_eq!(runtime.ga_key.as_deref(), Some("G-TEST"));
+        assert_eq!(runtime.log_retention_days, 30);
+        assert!(runtime.allow_private_network);
+        assert!(runtime.allow_invalid_certificates);
+    }
+
+    #[test]
+    fn the_two_relaxation_switches_stay_independent() {
+        // ADR-0008 asks for two switches, not one. Needing to reach a LAN host
+        // is no reason to also stop verifying certificates, so turning one on
+        // must not quietly turn the other on. This is the assertion that keeps
+        // "implemented both" from decaying into "implemented them together".
+        let mut runtime = RuntimeSettings::default();
+        apply_runtime_setting(&mut runtime, ALLOW_PRIVATE_NETWORK_SETTING, &json!(true));
+        assert!(runtime.allow_private_network);
+        assert!(!runtime.allow_invalid_certificates);
+
+        let mut runtime = RuntimeSettings::default();
+        apply_runtime_setting(
+            &mut runtime,
+            ALLOW_INVALID_CERTIFICATES_SETTING,
+            &json!(true),
+        );
+        assert!(runtime.allow_invalid_certificates);
+        assert!(!runtime.allow_private_network);
+    }
+
+    #[test]
+    fn the_relaxation_switches_fail_closed_on_a_malformed_value() {
+        // Type-strict, like the other keys. Anything that is not a real JSON
+        // boolean has to leave the guards on: a hand-written request sending
+        // {"value": "true"} should hand out neither network access nor
+        // certificate forgiveness.
+        for key in [
+            ALLOW_PRIVATE_NETWORK_SETTING,
+            ALLOW_INVALID_CERTIFICATES_SETTING,
+        ] {
+            for value in [json!("true"), json!(1), json!(null), json!({})] {
+                let mut runtime = RuntimeSettings::default();
+                apply_runtime_setting(&mut runtime, key, &value);
+                assert!(
+                    !runtime.allow_private_network && !runtime.allow_invalid_certificates,
+                    "{key} = {value} must not enable anything"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_relaxation_switch_is_wired_from_config_and_reloaded_by_the_poller() {
+        // The two pieces of main.rs that no behavioural test reaches: the
+        // start-up copy from the parsed config, and the poller's key list. The
+        // list matters most — it is what re-applies a stored setting after a
+        // restart, so a key missing from it makes the switch silently revert to
+        // the deploy-time default on every boot.
+        let main = include_str!("main.rs");
+        for name in ["allow_private_network", "allow_invalid_certificates"] {
+            let copy = format!("{}{}{}", "runtime.", name, " = config.");
+            assert!(
+                main.contains(&format!("{copy}{name};")),
+                "main.rs must seed the runtime snapshot with {name} from the config"
+            );
+        }
+        for constant in [
+            "api::ALLOW_PRIVATE_NETWORK_SETTING",
+            "api::ALLOW_INVALID_CERTIFICATES_SETTING",
+        ] {
+            assert!(
+                main.contains(constant),
+                "{constant} must be in the settings poller's key list"
+            );
+        }
     }
 
     fn public(auth_mode: &'static str, oidc: bool, local: bool) -> crate::config::PublicAuthConfig {

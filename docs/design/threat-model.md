@@ -24,3 +24,5 @@
 任何允许访问内网、关闭 TLS 校验或授予插件权限的配置都必须由管理员显式开启，并在 UI/API 中标为高风险。旧 QD 兼容行为不能自动扩大这些权限。
 
 当前 Core 已默认启用 TLS 校验，在请求前阻止私网/loopback/链路本地地址，并将已校验地址固定到实际 Reqwest 连接。重定向默认关闭；未来启用时必须逐跳复检。
+
+ADR-0008 承诺的两个开关都已落地：管理员在「站点设置」里**分别**开启 `security.allow_private_network` 与 `security.allow_invalid_certificates`（或部署时设 `QDRUST_ALLOW_PRIVATE_NETWORK=true` / `QDRUST_ALLOW_INVALID_CERTIFICATES=true`），WebUI 各配一条高风险说明，每次修改写一条 `admin.setting_changed` 审计记录，保存后下一次运行即生效。私网开关只放宽「地址是否公网」这一项判断——解析校验、已校验地址固定、超时与重定向策略都不变；证书开关只把 Reqwest 的 `danger_accept_invalid_certs` 打开，不触及地址校验。两者互相独立、可分别开启；非布尔取值一律忽略，失败方向都是保持关闭。
