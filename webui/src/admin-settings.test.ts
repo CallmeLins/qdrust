@@ -23,6 +23,10 @@ const scheduler = readFileSync(
 );
 const i18n = readFileSync(new URL("./i18n.ts", import.meta.url), "utf8");
 const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+/** Everything from the confirmation dialog's marker to the end of App.vue: the
+ *  dialog plus the modals that follow it. Scoped so "the notice is in the
+ *  dialog" is a real statement rather than "the notice exists somewhere". */
+const riskDialog = app.split("<!-- ===== HIGH-RISK CONFIRMATION ===== -->").pop() ?? "";
 
 /** The value of `const NAME: &str = "...";` in the Rust source. */
 function rustConst(source: string, name: string): string {
@@ -86,18 +90,26 @@ for (const sw of SWITCHES) {
       expect(app).toContain(`settingsForm.${sw.field} = ${sw.loadVar}?.value === true`);
     });
 
-    it("binds the checkbox and saves it back", () => {
-      // The exact save line, not just the presence of the key: two switches
-      // wired from one form field is precisely the copy-paste this catches.
-      expect(app).toContain(`v-model="settingsForm.${sw.field}" type="checkbox"`);
+    it("binds the checkbox through the confirmation gate and saves it back", () => {
+      // `:checked` plus the gate, not `v-model`. The promise is that the value
+      // only moves once the dialog is answered, and `v-model` writes the new
+      // value into the form *before* the change handler runs — the promise
+      // would then depend on the order Vue calls two listeners in. The exact
+      // binding line, per field: two switches wired from one field is still
+      // what this catches.
+      expect(app).toContain(`:checked="settingsForm.${sw.field}" type="checkbox"`);
+      expect(app).toContain(`@change="onRiskToggle('${sw.field}', $event)"`);
+      expect(app).not.toContain(`v-model="settingsForm.${sw.field}"`);
       expect(app).toContain(`api.adminSetSetting(${sw.vueConst}, settingsForm.${sw.field})`);
     });
 
-    it("warns that the switch is high risk", () => {
+    it("warns that the switch is high risk, in the dialog that gates it", () => {
       // ADR-0008: each opt-in has to be marked as high risk in the UI, not just
-      // granted. A bare checkbox would understate what it unlocks.
+      // granted. A bare checkbox would understate what it unlocks. The sentence
+      // is now the body of the dialog the tick has to be confirmed in, so it is
+      // read at the moment it matters instead of sitting under the checkbox.
       expect(app).toContain(`t('${sw.label}')`);
-      expect(app).toContain(`t('${sw.risk}')`);
+      expect(riskDialog).toContain(`t('${sw.risk}')`);
     });
 
     it("defines both labels in Chinese and English", () => {
@@ -120,12 +132,72 @@ describe("the two switches", () => {
     }
   });
 
-  it("each carry their own high-risk notice, spanning both columns", () => {
+  it("each carry their own high-risk notice, shown in the confirmation dialog", () => {
     // A checkbox added without its notice would leave the form looking complete
-    // while one relaxation goes unflagged.
+    // while one relaxation goes unflagged. One `<p class="risk-notice">` per
+    // switch: they are chosen by the prompt's field rather than shared.
     expect(app.split('class="risk-notice"').length - 1).toBe(SWITCHES.length);
     const rule = css.match(/\.risk-notice\s*\{[^}]*\}/)?.[0] ?? "";
     expect(rule, "style.css must style .risk-notice").not.toBe("");
     expect(rule).toContain("grid-column: 1 / -1");
+  });
+});
+
+describe("the site-settings form layout", () => {
+  it("stacks the two clusters and separates them by surface, not by heading", () => {
+    // The form is a two-column grid, and five mixed rows in it read as a pile.
+    // Two clusters, one above the other — side by side they are one wide row of
+    // controls again, only tidier. The tinted surface is what tells them apart,
+    // which is why a heading here would be a label for a label.
+    // Counted by prefix: the second cluster also carries its inner two-column
+    // rule, and an exact `class="settings-group"` match would miss it.
+    expect(app.split('class="settings-group').length - 1).toBe(2);
+    const rule = css.match(/\.settings-group\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(rule, "style.css must style .settings-group").not.toBe("");
+    expect(rule).toContain("background");
+    expect(rule, "each cluster spans the row, so the two stack").toContain("grid-column: 1 / -1");
+    expect(app, "a cluster heading would only repeat the surface").not.toContain("group-label");
+    expect(css).not.toContain(".group-label");
+  });
+});
+
+describe("the high-risk confirmation", () => {
+  it("is a dialog over the page, not a paragraph in the form", () => {
+    // The warning used to be an amber paragraph under each checkbox, which is a
+    // thing the eye skips on the way to 保存. What replaces it has to actually
+    // stop the click, so it is a centred dialog the tick cannot pass through.
+    expect(app).toContain('v-if="riskPrompt" class="modal-backdrop"');
+    expect(riskDialog).toContain('class="modal modal-risk"');
+    expect(riskDialog).toContain('@click.self="cancelRisk"');
+  });
+
+  it("names the switch it is asking about", () => {
+    // Both switches share one dialog. A title that did not follow the pending
+    // field would ask about the wrong one — and the notice under it would have
+    // to be a guess as well.
+    expect(app).toContain("riskPrompt === 'allowPrivateNetwork'");
+    expect(app).toContain("settingsForm[riskPrompt.value] = true");
+  });
+
+  it("puts the checkbox back when the user cancels", () => {
+    // The box was flipped by the browser, not by the form: with no `v-model`
+    // there is nothing else that would move it back. This is also what makes
+    // 取消 independent of the order Vue runs the two listeners in.
+    expect(app).toContain("riskCheckbox.checked = false");
+    expect(app).toContain("function cancelRisk()");
+  });
+
+  it("keeps the tick on 确认 and asks nothing on the way off", () => {
+    // Turning a switch *off* is not a risk, so it takes the plain path: the
+    // prompt may only be opened from the branch where the box came back
+    // checked.
+    expect(app).toContain("if (!box.checked) { settingsForm[field] = false; return; }");
+  });
+
+  it("defines the dialog's words in Chinese and English", () => {
+    for (const key of ["highRisk:", "highRiskConfirm:"]) {
+      const occurrences = i18n.split(`  ${key}`).length - 1;
+      expect(occurrences, `${key} must appear in zh and en`).toBe(2);
+    }
   });
 });

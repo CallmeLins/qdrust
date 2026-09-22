@@ -1590,6 +1590,37 @@ const settingsForm = reactive({
   requireEmail: false, gaKey: "", retentionDays: 0,
   allowPrivateNetwork: false, allowInvalidCertificates: false,
 });
+/** The two risk-gated fields, named as the form names them. */
+type RiskField = "allowPrivateNetwork" | "allowInvalidCertificates";
+/** Which risk-gated switch is waiting for a confirmation, if any. Drives the
+ *  dialog; the *notice* it shows is chosen in the template so every switch
+ *  keeps its own sentence rather than sharing one generic warning. */
+const riskPrompt = ref<RiskField | null>(null);
+/** The checkbox the user just ticked, kept only so a cancelled prompt can put
+ *  it back. Deliberately not reactive: nothing renders from it. */
+let riskCheckbox: HTMLInputElement | null = null;
+/** Turning a guarded switch on asks first; turning one off is taken as given.
+ *
+ *  The guarded checkboxes are `:checked`-bound rather than `v-model`-bound, and
+ *  that is the point: `v-model` writes the new value into the form before this
+ *  handler runs, so "cancel" would be undoing a change that may or may not have
+ *  landed yet — correct only if Vue happens to call the two listeners in one
+ *  order. Here the form keeps its old value until 确认, and 取消 restores the
+ *  box itself, so neither button depends on listener order. */
+function onRiskToggle(field: RiskField, event: Event) {
+  const box = event.target as HTMLInputElement;
+  if (!box.checked) { settingsForm[field] = false; return; }
+  riskCheckbox = box;
+  riskPrompt.value = field;
+}
+function acceptRisk() {
+  if (riskPrompt.value) settingsForm[riskPrompt.value] = true;
+  riskPrompt.value = null; riskCheckbox = null;
+}
+function cancelRisk() {
+  if (riskCheckbox) riskCheckbox.checked = false;
+  riskPrompt.value = null; riskCheckbox = null;
+}
 async function openAdmin() {
   view.value = "admin";
   try {
@@ -2610,13 +2641,23 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
           <h2>{{ t('siteSettings') }}</h2>
           <form class="modal inline-modal" @submit.prevent="saveAdminSettings">
-            <label class="checkbox"><input v-model="settingsForm.requireEmail" type="checkbox" />{{ t('requireEmailVerify') }}</label>
-            <label>{{ t('gaKey') }}<input v-model="settingsForm.gaKey" placeholder="G-XXXXXXX" /></label>
-            <label>{{ t('retentionDays') }}<input v-model.number="settingsForm.retentionDays" type="number" min="0" /></label>
-            <label class="checkbox"><input v-model="settingsForm.allowPrivateNetwork" type="checkbox" />{{ t('allowPrivateNetwork') }}</label>
-            <p class="risk-notice">{{ t('allowPrivateNetworkRisk') }}</p>
-            <label class="checkbox"><input v-model="settingsForm.allowInvalidCertificates" type="checkbox" />{{ t('allowInvalidCertificates') }}</label>
-            <p class="risk-notice">{{ t('allowInvalidCertificatesRisk') }}</p>
+            <div class="settings-group">
+              <label class="checkbox"><input v-model="settingsForm.requireEmail" type="checkbox" />{{ t('requireEmailVerify') }}</label>
+              <label class="checkbox">
+                <input :checked="settingsForm.allowPrivateNetwork" type="checkbox" @change="onRiskToggle('allowPrivateNetwork', $event)" />
+                {{ t('allowPrivateNetwork') }}
+                <span v-if="settingsForm.allowPrivateNetwork" class="chip chip-warn">{{ t('highRisk') }}</span>
+              </label>
+              <label class="checkbox">
+                <input :checked="settingsForm.allowInvalidCertificates" type="checkbox" @change="onRiskToggle('allowInvalidCertificates', $event)" />
+                {{ t('allowInvalidCertificates') }}
+                <span v-if="settingsForm.allowInvalidCertificates" class="chip chip-warn">{{ t('highRisk') }}</span>
+              </label>
+            </div>
+            <div class="settings-group settings-group-pair">
+              <label>{{ t('gaKey') }}<input v-model="settingsForm.gaKey" placeholder="G-XXXXXXX" /></label>
+              <label>{{ t('retentionDays') }}<input v-model.number="settingsForm.retentionDays" type="number" min="0" /></label>
+            </div>
             <div class="inline-actions">
               <button class="primary-button">{{ t('saveSettings') }}</button>
               <button class="secondary-button" type="button" @click="cleanupLogs">{{ t('cleanupLogs') }}</button>
@@ -2839,6 +2880,29 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           @next="nextRunLogPage"
           @update:page-size="setRunLogPageSize"
         />
+      </div>
+    </div>
+
+    <!-- ===== HIGH-RISK CONFIRMATION ===== -->
+    <!-- The switch's own sentence, shown at the moment it is turned on. In the
+         form it was a paragraph the eye skipped past on the way to the save
+         button; here it is the thing being answered. 取消 puts the box back, so
+         the dialog is the only way the value moves. -->
+    <div v-if="riskPrompt" class="modal-backdrop" @click.self="cancelRisk">
+      <div class="modal modal-risk">
+        <div class="modal-header">
+          <div class="risk-heading">
+            <h2>{{ riskPrompt === 'allowPrivateNetwork' ? t('allowPrivateNetwork') : t('allowInvalidCertificates') }}</h2>
+            <span class="chip chip-warn">{{ t('highRisk') }}</span>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="cancelRisk"><X :size="20" /></button>
+        </div>
+        <p v-if="riskPrompt === 'allowPrivateNetwork'" class="risk-notice">{{ t('allowPrivateNetworkRisk') }}</p>
+        <p v-else class="risk-notice">{{ t('allowInvalidCertificatesRisk') }}</p>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" @click="cancelRisk">{{ t('cancel') }}</button>
+          <button class="primary-button" type="button" @click="acceptRisk">{{ t('highRiskConfirm') }}</button>
+        </div>
       </div>
     </div>
 

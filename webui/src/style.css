@@ -474,9 +474,26 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .inline-actions { display: flex; gap: 9px; }
 .modal-wide { width: min(720px, 100%); }
 
-/* High-risk warning under a settings checkbox (ADR-0008's private-network
-   opt-in). Spans the form's two columns, otherwise the sentence is squeezed
-   into one cell of the grid. */
+/* The site-settings form is two clusters, one above the other: the switches,
+   then the values that are not switches. The tinted surface is what separates
+   them, so neither needs a heading. Full width each — side by side they read
+   as one wide row of controls, which is the pile this replaced. */
+.settings-group {
+  grid-column: 1 / -1; display: grid; gap: 11px;
+  padding: 15px 16px; border: 1px solid var(--line); border-radius: var(--r-m);
+  background: rgb(var(--interactive-surface) / 0.04);
+}
+/* The two value fields keep two columns of their own rather than stretching
+   across the full width of the page. */
+.settings-group-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* The confirmation dialog names the switch it is about and tags it, so the
+   sentence under it reads as this switch's warning. */
+.risk-heading { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+
+/* High-risk warning for ADR-0008's two opt-ins, shown in the dialog that asks
+   before either is turned on. Full width of that dialog's grid: the sentence
+   is long and reads as one block. */
 .risk-notice {
   grid-column: 1 / -1; margin: 0; padding: 9px 11px;
   border: 1px solid rgb(180 83 9 / 0.3); border-radius: var(--r-s);

@@ -437,6 +437,8 @@ const zh = {
   allowInvalidCertificates: "接受无效证书",
   allowInvalidCertificatesRisk:
     "高风险：开启后不再校验证书，自签名、过期、域名不匹配的证书都会被接受，中间人也因此可以冒充目标站点。与上一项彼此独立——需要访问内网并不代表需要放弃证书校验。仅在目标只在内网可达、且确实没配证书时开启；不用时请关掉。修改记入审计日志。",
+  highRisk: "高风险",
+  highRiskConfirm: "我已了解风险，确认开启",
   saveSettings: "保存设置",
   settingsSaved: "设置已保存",
   cleanupLogs: "立即清理旧日志",
@@ -935,6 +937,8 @@ const en: Record<MessageKey, string> = {
   allowInvalidCertificates: "Accept invalid certificates",
   allowInvalidCertificatesRisk:
     "High risk: with this on, certificates are no longer verified — self-signed, expired or mismatched ones are all accepted, which is what lets a machine in the middle impersonate the target. It is independent of the switch above: reaching an intranet host is no reason to stop checking certificates. Leave it on only while a target is reachable solely from the intranet and genuinely has no certificate, and turn it back off afterwards. Changes are recorded in the audit log.",
+  highRisk: "High risk",
+  highRiskConfirm: "I understand — turn it on",
   saveSettings: "Save settings",
   settingsSaved: "Settings saved",
   cleanupLogs: "Clean old logs now",
