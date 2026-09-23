@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, type AuthPolicy, type StorageLike } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -166,6 +166,36 @@ describe("logout-return marker", () => {
     const garbage = fakeStorage();
     garbage.setItem(OIDC_LOGOUT_RETURN_KEY, "not-a-number");
     expect(consumeLogoutReturn(garbage)).toBe(false);
+  });
+});
+
+describe("unboundTemplatesFirst", () => {
+  const templates = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+
+  it("moves the templates no task uses to the front", () => {
+    expect(unboundTemplatesFirst(templates, [2, 4]).map((t) => t.id)).toEqual([1, 3, 2, 4]);
+  });
+
+  it("keeps the arrival order inside each bucket instead of sorting", () => {
+    // The server hands templates over by creation id. The new task's dropdown
+    // must only split that list, not reshuffle either half of it.
+    const shuffled = [{ id: 30 }, { id: 10 }, { id: 20 }];
+    expect(unboundTemplatesFirst(shuffled, [10]).map((t) => t.id)).toEqual([30, 20, 10]);
+  });
+
+  it("changes nothing when every template is already used", () => {
+    expect(unboundTemplatesFirst(templates, [1, 2, 3, 4]).map((t) => t.id)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("keeps every template exactly once, so none drops out of the dropdown", () => {
+    const ordered = unboundTemplatesFirst(templates, [3]);
+    expect(ordered).toHaveLength(templates.length);
+    expect(new Set(ordered.map((t) => t.id)).size).toBe(templates.length);
+  });
+
+  it("copes with no tasks bound and with no templates at all", () => {
+    expect(unboundTemplatesFirst(templates, [])).toEqual(templates);
+    expect(unboundTemplatesFirst([], [1, 2])).toEqual([]);
   });
 });
 

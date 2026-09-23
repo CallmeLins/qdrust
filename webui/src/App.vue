@@ -9,7 +9,7 @@ import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
-import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly } from "./utils";
+import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, unboundTemplatesFirst } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
@@ -203,14 +203,21 @@ const templatesForSelect = computed(() => templates.value);
  * instead of a method/URL pair. For the same reason "（无模板）" is only offered
  * while editing a task that predates that rule and carries a standalone request;
  * hiding it would silently force such a task onto a template it never ran.
+ *
+ * Templates that no task uses yet come first (issue #25): with a library of
+ * hundreds, the unused ones are what someone adding a task is looking for, and
+ * they are otherwise scattered through a list too long to scan.
  */
 const templateDropdownOptions = computed(() => {
-  const bound = templatesForSelect.value.map((tpl) => ({
+  const used = tasks.value
+    .map((task) => task.template_id)
+    .filter((id): id is number => id != null);
+  const options = unboundTemplatesFirst(templatesForSelect.value, used).map((tpl) => ({
     value: tpl.id as string | number | null,
     label: `${tpl.name}（${tpl.source_format}）`,
   }));
-  if (taskForm.id == null || taskForm.templateId != null) return bound;
-  return [{ value: null as string | number | null, label: t("noTemplatesToBind") }, ...bound];
+  if (taskForm.id == null || taskForm.templateId != null) return options;
+  return [{ value: null as string | number | null, label: t("noTemplatesToBind") }, ...options];
 });
 
 // Full IANA timezone list for the task scheduling select. `Intl.supportedValuesOf`

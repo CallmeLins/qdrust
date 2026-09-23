@@ -10,6 +10,29 @@ export function formatRunTime(value: number | null, locale = "zh-CN", timeZone?:
   }).format(value * 1000);
 }
 
+// ---------- 任务表单：模板下拉 ----------
+
+/**
+ * Order the "bind to template" dropdown so the templates no task uses yet come
+ * first, each bucket keeping the order it arrived in.
+ *
+ * A template that already backs a task is rarely the one being looked for when
+ * adding one, and in a library of hundreds the unused ones cannot be found by
+ * scrolling — they are the reason someone opens this list at all. Reading the
+ * ids in use rather than the tasks themselves keeps the rule testable without a
+ * component harness, which this repo has none of.
+ */
+export function unboundTemplatesFirst<T extends { id: number }>(
+  templates: T[],
+  usedIds: Iterable<number>
+): T[] {
+  const used = new Set(usedIds);
+  return [
+    ...templates.filter((template) => !used.has(template.id)),
+    ...templates.filter((template) => used.has(template.id)),
+  ];
+}
+
 // ---------- QD 模板 → HAR 文档 ----------
 
 /** 编辑器在所有输入之前的起点：一个空的 HAR 文档。 */

@@ -822,7 +822,11 @@ macro_rules! define_store {
         } else {
             statement.push_str(" WHERE owner_id=?");
         }
-        statement.push_str(" ORDER BY grp, id");
+        // Newest first inside each group, so the task just added is the one at
+        // the top — the order every other list here uses (runs, push requests,
+        // templates). Ascending-by-id was the odd one out and read as "why is
+        // my new task at the bottom" (issue #25).
+        statement.push_str(" ORDER BY grp, id DESC");
         let mut query = sqlx::query(&statement).bind(owner_id);
         if let Some(grp) = grp {
             query = query.bind(grp);
@@ -3588,6 +3592,61 @@ mod tests {
         assert_eq!(updated.random_delay_max_seconds, Some(120));
         assert!(store.delete(created.id).await.unwrap());
         assert!(store.get(created.id).await.unwrap().is_none());
+    }
+
+    /// The order the tasks page renders: newest first inside each group, groups
+    /// in name order. This was the one list that came back oldest-first, which
+    /// is what made it look inconsistent next to the template list — both are
+    /// read the same way, "what I just added should be where I can see it".
+    #[tokio::test]
+    async fn lists_tasks_newest_first_inside_each_group() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("list_alice", &password_hash, "user")
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for (name, grp) in [
+            ("a-first", None),
+            ("a-second", None),
+            ("b-first", Some("zeta")),
+            ("b-second", Some("zeta")),
+            ("c-only", Some("alpha")),
+        ] {
+            let task = CreateTask {
+                grp: grp.map(str::to_string),
+                ..input(name)
+            };
+            ids.push(store.create_for_owner(alice.id, task).await.unwrap().id);
+        }
+
+        let listed = store
+            .list_for_owner_with_group(alice.id, None)
+            .await
+            .unwrap();
+        let names: Vec<&str> = listed.iter().map(|task| task.name.as_str()).collect();
+        // Ungrouped rows sort before any group name (NULL is the smallest
+        // value in SQLite), then `alpha`, then `zeta`; inside every cluster the
+        // later insert comes first.
+        assert_eq!(
+            names,
+            ["a-second", "a-first", "c-only", "b-second", "b-first"]
+        );
+        // The insertion order this used to return, for contrast: the oldest
+        // task is no longer the first row, and the newest ungrouped one is.
+        assert_eq!(ids[0], listed[1].id);
+        assert_eq!(ids[1], listed[0].id);
+
+        // Filtering to one group is the same order with the others removed.
+        let zeta = store
+            .list_for_owner_with_group(alice.id, Some("zeta"))
+            .await
+            .unwrap();
+        let zeta_names: Vec<&str> = zeta.iter().map(|task| task.name.as_str()).collect();
+        assert_eq!(zeta_names, ["b-second", "b-first"]);
     }
 
     #[tokio::test]
