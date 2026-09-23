@@ -29,6 +29,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v5"] }
 rand = "0.8"
 fake = { version = "2", features = ["derive"] }
+fancy-regex = { version = "0.19.2", default-features = false, features = ["perf", "std", "unicode"] }
 
 [dev-dependencies]
 axum = "0.8"

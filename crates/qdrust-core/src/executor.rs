@@ -1,7 +1,10 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
-use regex::{Regex, RegexBuilder};
+use fancy_regex::{Regex as FancyRegex, RegexBuilder as FancyRegexBuilder};
+use regex::{Captures, Regex, RegexBuilder};
 use reqwest::{
     Client, Method,
     cookie::{CookieStore, Jar},
@@ -783,7 +786,17 @@ impl QdExecutor {
         for rule in rules {
             let pattern = self.render(&rule.re, context)?;
             let source = rule_source(&rule.from, status, headers, content);
-            if compile_regex(&pattern)?.is_match(&source) {
+            // QD hands an assertion straight to `re.search`, delimiters and
+            // flags included, where a `/…/g` string would only ever match
+            // itself — no template in qd-today/templates writes one that way
+            // (all 3456 assertions are bare patterns), so reading the flags
+            // here is a superset of what QD does rather than a difference.
+            //
+            // The `?` also covers the fallback engine giving up, which is an
+            // error rather than a "no match": an assertion that could not be
+            // evaluated has not failed, and reporting it as one would be a
+            // verdict nothing reached.
+            if compile_regex(&pattern)?.is_match(&source)? {
                 matched = true;
                 if !success_rules {
                     bail!("failed assertion matched: {pattern}");
@@ -1069,20 +1082,505 @@ fn rule_source(source: &str, status: u16, headers: &[(String, String)], content:
     }
 }
 
-fn compile_regex(pattern: &str) -> Result<Regex> {
-    let Some((body, flags)) = split_qd_regex(pattern) else {
-        return Regex::new(pattern).context("invalid QD regular expression");
-    };
-    let mut builder = RegexBuilder::new(body);
-    builder
-        .case_insensitive(flags.contains('i'))
-        .multi_line(flags.contains('m'))
-        .dot_matches_new_line(flags.contains('s'))
-        .unicode(flags.contains('u'));
-    builder.build().context("invalid QD regular expression")
+/// How much backtracking the fallback engine may do before it gives up.
+///
+/// Rust's `regex` is linear-time and cannot be made to run long by any pattern,
+/// so it needs no such knob. `fancy-regex` backtracks, which is what buys
+/// lookaround, and that is also what makes `^((?!msg).)*$` over a long line
+/// exponential. The budget is what turns that into "the engine gave up"
+/// instead of a hung executor.
+///
+/// It is written out rather than left to the crate's default so that a
+/// template's behaviour cannot change under us in a dependency bump. The
+/// number matches the crate's own `MAX_STACK` and its default limit, and it is
+/// the same order as the largest response a step may see
+/// ([`DEFAULT_RESPONSE_LIMIT`]), so a plausible match is reached well inside it
+/// while a runaway one is cut off.
+const BACKTRACK_LIMIT: usize = 1_000_000;
+
+/// A QD pattern, compiled by whichever engine can take it.
+///
+/// Almost everything QD writes compiles on Rust's `regex`, which does not
+/// backtrack and therefore cannot be driven into exponential time by any
+/// pattern. Lookaround and back-references are the exception — Python's `re`
+/// has them, `regex` does not — so those fall through to `fancy-regex`, which
+/// backtracks and is built with [`BACKTRACK_LIMIT`].
+///
+/// The linear engine is tried first, and the second engine is only ever reached
+/// for a pattern the first one refuses, so the backtracking path stays as narrow
+/// as QD's dialect requires it to be.
+///
+/// The fallback variant keeps the pattern as the template wrote it, because
+/// that engine can also fail at match time and the error then has to name what
+/// it gave up on.
+enum CompiledRegex {
+    Linear(Regex),
+    Backtracking {
+        regex: Box<FancyRegex>,
+        pattern: String,
+    },
 }
 
-fn split_qd_regex(pattern: &str) -> Option<(&str, &str)> {
+impl CompiledRegex {
+    fn is_match(&self, source: &str) -> Result<bool> {
+        match self {
+            Self::Linear(regex) => Ok(regex.is_match(source)),
+            Self::Backtracking { regex, pattern } => backtracked(pattern, regex.is_match(source)),
+        }
+    }
+
+    /// Every match, each shaped the way Python's `re.findall` shapes it.
+    fn find_all(&self, source: &str) -> Result<Vec<Value>> {
+        match self {
+            Self::Linear(regex) => Ok(regex
+                .captures_iter(source)
+                .map(|capture| qd_findall_entry(&capture))
+                .collect()),
+            Self::Backtracking { regex, pattern } => {
+                let mut values = Vec::new();
+                for capture in regex.captures_iter(source) {
+                    values.push(qd_findall_entry(&backtracked(pattern, capture)?));
+                }
+                Ok(values)
+            }
+        }
+    }
+
+    fn first(&self, source: &str) -> Result<Option<Value>> {
+        match self {
+            Self::Linear(regex) => Ok(regex.captures(source).as_ref().and_then(qd_first_value)),
+            Self::Backtracking { regex, pattern } => {
+                Ok(backtracked(pattern, regex.captures(source))?
+                    .as_ref()
+                    .and_then(qd_first_value))
+            }
+        }
+    }
+}
+
+/// A fallback-engine result, with "I gave up" turned into an error that names
+/// the pattern.
+///
+/// Reporting `false` instead would be a verdict the engine never reached, and
+/// the two limits it can hit — backtracking steps and stack depth — are exactly
+/// the cases where QD's unguarded Python would have kept going. Saying so is
+/// more useful than a guess, and points at the pattern to rewrite.
+fn backtracked<T>(pattern: &str, result: fancy_regex::Result<T>) -> Result<T> {
+    result.with_context(|| {
+        format!("QD regular expression {pattern:?} gave up: it needed more backtracking than the fallback engine allows ({BACKTRACK_LIMIT} steps)")
+    })
+}
+
+/// The slice of a capture set that QD's two return shapes need — how many
+/// groups there are, and the text of one of them — so that the code reading
+/// them can be written once for both engines, whose capture types are otherwise
+/// unrelated.
+trait QdCaptures {
+    fn group_count(&self) -> usize;
+    fn group(&self, index: usize) -> Option<&str>;
+}
+
+impl QdCaptures for Captures<'_> {
+    fn group_count(&self) -> usize {
+        self.len()
+    }
+
+    fn group(&self, index: usize) -> Option<&str> {
+        self.get(index).map(|value| value.as_str())
+    }
+}
+
+impl QdCaptures for fancy_regex::Captures<'_, str> {
+    fn group_count(&self) -> usize {
+        self.len()
+    }
+
+    fn group(&self, index: usize) -> Option<&str> {
+        self.get(index).map(|value| value.as_str())
+    }
+}
+
+/// The flags a delimited QD pattern can carry.
+///
+/// qd-today reads them itself in `libs/fetcher.py`: `re.match(r"^/(.*?)/([gimsu]*)$", …)`
+/// and then one `flags |=` per letter. `g` is the odd one out — it is not a
+/// Python `re` flag but "match all", and only `extract_variables` looks at it.
+#[derive(Clone, Copy, Debug, Default)]
+struct QdFlags {
+    /// Python's `re.findall` rather than `re.search`.
+    global: bool,
+    /// `i`
+    case_insensitive: bool,
+    /// `m`
+    multi_line: bool,
+    /// `s`
+    dot_matches_new_line: bool,
+}
+
+impl QdFlags {
+    /// `u` is accepted and changes nothing: Python compiles a `str` pattern as
+    /// Unicode unless `re.A` overrides it, and `re.U` is a no-op on Python 3,
+    /// so `u` can only ever restate the default. It never asks for ASCII or
+    /// byte semantics — mapping it to `RegexBuilder::unicode(false)`, as this
+    /// code once did, is what gave every `/(.+?)/g` in every template the
+    /// error "pattern can match invalid UTF-8" (issue #26).
+    fn parse(flags: &str) -> Self {
+        Self {
+            global: flags.contains('g'),
+            case_insensitive: flags.contains('i'),
+            multi_line: flags.contains('m'),
+            dot_matches_new_line: flags.contains('s'),
+        }
+    }
+
+    /// Compile `body` into the matches Python's `re` would report for these
+    /// flags, keeping `pattern` — what the template wrote — for the failures
+    /// the fallback engine can still report at match time.
+    ///
+    /// The linear engine gets first refusal. Only when it will not take the
+    /// pattern does the backtracking one, which is the path lookaround and
+    /// back-references need; if that refuses too, the pattern is one Python
+    /// refuses as well (`[^]`, a variable-width look-behind) and the linear
+    /// engine's complaint — the narrower of the two — is the one reported.
+    ///
+    /// The error is a plain string because the two ways to fail have different
+    /// error types: the translation refuses a `{2,1}`, and the engines refuse
+    /// everything neither of them can read.
+    fn build(self, pattern: &str, body: &str) -> std::result::Result<CompiledRegex, String> {
+        let body = translate_from_python(body)?;
+        match self.linear(&body) {
+            Ok(regex) => Ok(CompiledRegex::Linear(regex)),
+            Err(error) => match self.backtracking(&body) {
+                Ok(regex) => Ok(CompiledRegex::Backtracking {
+                    regex: Box::new(regex),
+                    pattern: pattern.to_string(),
+                }),
+                Err(_) => Err(error.to_string()),
+            },
+        }
+    }
+
+    fn linear(self, body: &str) -> std::result::Result<Regex, regex::Error> {
+        let mut builder = RegexBuilder::new(body);
+        builder
+            .case_insensitive(self.case_insensitive)
+            .multi_line(self.multi_line)
+            .dot_matches_new_line(self.dot_matches_new_line)
+            // Always on, and deliberately not wired to the `u` flag: Unicode
+            // is Rust's default too, so the two engines agree on everything QD
+            // can write.
+            .unicode(true);
+        builder.build()
+    }
+
+    /// The same flags again on the backtracking engine.
+    ///
+    /// `unicode_mode` is this builder's spelling of the `unicode(true)` above.
+    /// The look-behind feature is deliberately left off: Python's `re` requires
+    /// a fixed-width look-behind, and the templates' look-behinds are all
+    /// fixed-width, so turning the feature on could only make this engine
+    /// accept patterns QD would reject.
+    ///
+    /// `seek` is on. Without it this engine retries the pattern at every
+    /// position of the haystack, so a `(?s)(?=.*"ok"…)` that fails costs the
+    /// whole haystack per position — quadratic, and measured: Linux_SB.har's
+    /// assertion over a 100 KB body that does not contain the payload takes
+    /// 63.8 s, and it is *failing* on exactly the responses a scheduled run is
+    /// most likely to see (an expired session's error page). `seek` derives a
+    /// conservative approximation of the pattern and uses it to skip positions
+    /// that cannot start a match; the same body answers in 1.3 ms.
+    ///
+    /// The flag is marked experimental upstream, and the note there is worth
+    /// repeating: the approximation is conservative, so it may offer positions
+    /// that do not match, but it must not skip one that would. That is the one
+    /// property that matters — a skipped match would silently change an
+    /// assertion's verdict — so it is not taken on the mechanism's word: the
+    /// differential runs all 6280 cases with the flag on and off and finds no
+    /// difference, and the one place it does change an answer is upward, giving
+    /// the true "no match" where the engine previously gave up
+    /// (see `a_runaway_pattern_gives_up_instead_of_running_away`).
+    fn backtracking(self, body: &str) -> fancy_regex::Result<FancyRegex> {
+        FancyRegexBuilder::new(body)
+            .case_insensitive(self.case_insensitive)
+            .multi_line(self.multi_line)
+            .dot_matches_new_line(self.dot_matches_new_line)
+            .unicode_mode(true)
+            .backtrack_limit(BACKTRACK_LIMIT)
+            .seek(true)
+            .build()
+    }
+}
+
+/// Read `body` the way Python's `re` reads it, in the places where Rust's
+/// engine reads the same characters differently.
+///
+/// The first is an omitted repetition minimum: Python's `{,n}` is `{0,n}` and
+/// `{,}` is `{0,}`, and writing the zero out is the whole difference.
+///
+/// The second is a literal brace. Python reads `{` as a repetition only when a
+/// well-formed one follows, so `{"total":(\d+)` — how one writes an extract for
+/// a JSON API — is the text `{"total":` and a group. Rust's engine insists on
+/// the well-formed form and refuses the pattern instead, which is why 27 of the
+/// 6182 regexes in qd-today/templates, most of them extracting from JSON, never
+/// got as far as running. Escaping the brace leaves both engines matching the
+/// same text, and the patterns that do use a repetition are copied through
+/// untouched.
+///
+/// The third is `\Z`, the end of the string in Python; Rust's engine spells
+/// that `\z` and rejects `\Z` outright. Python rejects `\Z` inside a class too,
+/// so inside one the text is left alone and both engines refuse it.
+///
+/// The fourth is a backslash before punctuation, which Python reads as the
+/// punctuation itself and Rust's engine refuses — see [`means_itself`].
+///
+/// The fifth is a `[` inside a class, which Python reads as one more member of
+/// the set and Rust reads as the start of a POSIX class.
+///
+/// Two things it does not translate but refuses, because translating them would
+/// mean guessing and a wrong guess matches the wrong text rather than failing:
+/// `{m,n}` with `m > n`, which is a syntax error in Python and a match in the
+/// fallback engine; and `\N{...}`, which Python reads as a named character and
+/// the fallback engine reads as "not a newline".
+fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'static str> {
+    let characters: Vec<char> = body.chars().collect();
+    let mut translated = String::with_capacity(body.len());
+    let mut changed = false;
+    let mut index = 0;
+    let mut in_class = false;
+    // A `]` that opens a class body is a literal, and so is one after `[^`.
+    let mut class_head = false;
+    while index < characters.len() {
+        let character = characters[index];
+        // An escape owns the character after it, `{` and `}` included.
+        if character == '\\' {
+            let escaped = characters.get(index + 1).copied();
+            if !in_class && escaped == Some('Z') {
+                translated.push_str("\\z");
+                changed = true;
+                index += 2;
+                class_head = false;
+                continue;
+            }
+            // `\N{BULLET}` is `•` in Python, inside a class and out, and Python
+            // has no other reading of `\N`. Rust's engine refuses the escape
+            // outright, which was the right answer; the fallback engine reads
+            // `\N` as "not a newline" and the name as literal text, so it
+            // compiles and matches the wrong thing. Reading it properly needs
+            // the Unicode name table, and a refusal is the honest alternative.
+            if escaped == Some('N') {
+                return Err(r"`\N`, Python's named-character escape");
+            }
+            if let Some(literal) = escaped.filter(|escaped| means_itself(*escaped)) {
+                translated.push(literal);
+                changed = true;
+                index += 2;
+                class_head = false;
+                continue;
+            }
+            // Any other letter is a `bad escape` in Python. Rust's engine would
+            // refuse it too, but the fallback engine takes some of them as
+            // oniguruma operators — `\h`, `\R`, `\G`, `\X` — so a pattern QD
+            // rejects would start working here.
+            if escaped.is_some_and(|escaped| !knows_escape(escaped)) {
+                return Err("an escape Python does not know");
+            }
+            translated.push(character);
+            if let Some(escaped) = escaped {
+                translated.push(escaped);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            class_head = false;
+            continue;
+        }
+        if in_class {
+            // A class is a set of characters in both engines, braces included,
+            // so there is almost nothing here to translate — except a `[`,
+            // which Python reads as one more member of the set and Rust reads
+            // as the start of a POSIX class. Python has no `[[:alpha:]]`, so
+            // escaping the bracket is its reading in every case: `[[:alpha:]]`
+            // is the six characters `[ : a l p h` and then a literal `]`.
+            if character == '[' {
+                translated.push_str("\\[");
+                changed = true;
+                index += 1;
+                class_head = false;
+                continue;
+            }
+            if character == ']' && !class_head {
+                in_class = false;
+            }
+            if character != '^' {
+                class_head = false;
+            }
+            translated.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '[' {
+            in_class = true;
+            class_head = true;
+            translated.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '{' {
+            let Some(repetition) = python_repetition(&characters[index..]) else {
+                translated.push_str("\\{");
+                changed = true;
+                index += 1;
+                continue;
+            };
+            // `{2,1}` is not a repetition Python reads, it is a syntax error —
+            // and the fallback engine would read it as a match, so it is
+            // refused here rather than left to an engine whose verdict would
+            // differ from QD's.
+            if repetition.minimum_exceeds_maximum {
+                return Err("a repetition whose minimum is greater than its maximum");
+            }
+            if repetition.omitted_minimum {
+                translated.push_str("{0");
+                translated.extend(&characters[index + 1..index + repetition.length]);
+                changed = true;
+            } else {
+                translated.extend(&characters[index..index + repetition.length]);
+            }
+            index += repetition.length;
+            continue;
+        }
+        translated.push(character);
+        index += 1;
+    }
+    Ok(if changed {
+        Cow::Owned(translated)
+    } else {
+        Cow::Borrowed(body)
+    })
+}
+
+/// A repetition as Python's `re` reads one.
+struct PythonRepetition {
+    /// How many characters of the pattern it spans, braces included.
+    length: usize,
+    /// `{,n}` and `{,}` omit the minimum, which Rust's engine has no shorthand
+    /// for: `{,2}` is `{0,2}` and `{,}` is `{0,}`.
+    omitted_minimum: bool,
+    /// `{m,n}` with `m > n`. Python raises `min repeat greater than max
+    /// repeat`, and Rust's linear engine refuses it too — but the backtracking
+    /// engine reads it as a match, so it has to be caught before either is
+    /// asked.
+    minimum_exceeds_maximum: bool,
+}
+
+/// The repetition at the start of `characters` (which begins with `{`).
+///
+/// `{m}`, `{m,}`, `{m,n}` and their Python shorthand `{,n}` and `{,}` come back
+/// as repetitions; anything else — `{}`, `{ 2 }`, `{a,b}`, `{2,3,4}`, a lone
+/// `{` — is not one at all, which is what makes the brace literal.
+fn python_repetition(characters: &[char]) -> Option<PythonRepetition> {
+    let mut index = 1;
+    let minimum_start = index;
+    while characters.get(index).is_some_and(char::is_ascii_digit) {
+        index += 1;
+    }
+    let minimum = &characters[minimum_start..index];
+    let omitted_minimum = minimum.is_empty();
+    let mut comma = false;
+    let mut maximum: &[char] = &[];
+    if characters.get(index) == Some(&',') {
+        comma = true;
+        index += 1;
+        let maximum_start = index;
+        while characters.get(index).is_some_and(char::is_ascii_digit) {
+            index += 1;
+        }
+        maximum = &characters[maximum_start..index];
+    }
+    // `{}` has neither a minimum nor a comma, so it is a literal brace.
+    if characters.get(index) != Some(&'}') || (omitted_minimum && !comma) {
+        return None;
+    }
+    Some(PythonRepetition {
+        length: index + 1,
+        omitted_minimum,
+        minimum_exceeds_maximum: !omitted_minimum
+            && !maximum.is_empty()
+            && exceeds(minimum, maximum),
+    })
+}
+
+/// Whether the minimum of a repetition is greater than its maximum.
+///
+/// The digits are compared as digits rather than parsed into a number, so that
+/// a repetition too large for a `u64` is judged by the same rule Python applies
+/// instead of overflowing.
+fn exceeds(minimum: &[char], maximum: &[char]) -> bool {
+    let significant = |digits: &[char]| {
+        let start = digits
+            .iter()
+            .position(|digit| *digit != '0')
+            .unwrap_or(digits.len());
+        digits[start..].to_vec()
+    };
+    let (minimum, maximum) = (significant(minimum), significant(maximum));
+    minimum.len() > maximum.len() || (minimum.len() == maximum.len() && minimum > maximum)
+}
+
+fn compile_regex(pattern: &str) -> Result<CompiledRegex> {
+    let (body, flags) = qd_pattern(pattern);
+    flags
+        .build(pattern, body)
+        .map_err(|reason| anyhow::anyhow!("invalid QD regular expression {pattern:?}: {reason}"))
+}
+
+/// Whether Python reads `\` before this character as the character itself.
+///
+/// Python lets a backslash escape any character that is not a letter or a
+/// digit: `\<` is `<` and `\:` is `:`. Rust's engine takes a backslash before a
+/// letter (`\d`, `\n`) and before its own metacharacters (`\.`, `\*`), so what
+/// is left is punctuation that means itself anyway — and a backslash in front
+/// of it is refused there.
+///
+/// Dropping the backslash is exactly Python's reading, and it also takes those
+/// characters away from the fallback engine, whose oniguruma vocabulary gives
+/// `\<` and `\>` a meaning of their own. yunyaokz.har is written that way:
+/// `(?<=累计已签到:  \<b\>)` has to look behind `<b>`, which it would silently
+/// stop doing if `\<` were left as a word boundary.
+fn means_itself(escaped: char) -> bool {
+    escaped.is_ascii_punctuation() && !RUST_METACHARACTERS.contains(escaped)
+}
+
+/// The characters Rust's engine lets a backslash escape, which is the set it
+/// gives a meaning of its own.
+const RUST_METACHARACTERS: &str = r"\.+*?()|[]{}^$#&-~";
+
+/// The ASCII letters Python gives a meaning to after a backslash.
+///
+/// `\Z` and `\N` are on it and are handled above; everything else is an
+/// ordinary escape both engines read the same way. Any *other* letter is a
+/// `bad escape` in Python, so refusing it keeps the fallback engine's
+/// extra vocabulary — `\h` horizontal space, `\R` a line break, `\X` a
+/// grapheme, `\p{...}` a Unicode property — from making patterns legal here
+/// that QD would refuse.
+fn knows_escape(escaped: char) -> bool {
+    !escaped.is_ascii_alphabetic() || "abfnrtvdDsSwWABZNxuU".contains(escaped)
+}
+
+/// The text to compile and the flags to compile it with. A pattern that is not
+/// delimited carries none.
+fn qd_pattern(pattern: &str) -> (&str, QdFlags) {
+    split_qd_regex(pattern).unwrap_or((pattern, QdFlags::default()))
+}
+
+/// The delimited form, parsed the way qd-today parses it — `^/(.*?)/([gimsu]*)$`,
+/// which is the last `/` whose tail is all flag letters.
+///
+/// The quirks are QD's, and are kept on purpose: the flag set is exactly
+/// `gimsu`, so `/(\d+)/x` is not a delimited regex at all but the literal
+/// pattern `/(\d+)/x`, and a string that does not parse is never an error, it
+/// is simply a pattern with no flags.
+fn split_qd_regex(pattern: &str) -> Option<(&str, QdFlags)> {
     let rest = pattern.strip_prefix('/')?;
     let slash = rest.rfind('/')?;
     let (body, suffix) = rest.split_at(slash);
@@ -1090,31 +1588,56 @@ fn split_qd_regex(pattern: &str) -> Option<(&str, &str)> {
     flags
         .chars()
         .all(|flag| "gimsu".contains(flag))
-        .then_some((body, flags))
+        .then(|| (body, QdFlags::parse(flags)))
 }
 
 fn extract(pattern: &str, source: &str) -> Result<Option<Value>> {
     let regex = compile_regex(pattern)?;
-    let global = split_qd_regex(pattern).is_some_and(|(_, flags)| flags.contains('g'));
-    if global {
-        let values = regex
-            .captures_iter(source)
-            .map(|capture| {
-                capture
-                    .get(1)
-                    .or_else(|| capture.get(0))
-                    .map(|value| Value::String(value.as_str().into()))
-                    .unwrap_or(Value::Null)
-            })
-            .collect();
-        return Ok(Some(Value::Array(values)));
+    let (_, flags) = qd_pattern(pattern);
+    if flags.global {
+        // Python's `re.findall`: every match at once, each shaped by the
+        // pattern's group count.
+        return Ok(Some(Value::Array(regex.find_all(source)?)));
     }
-    Ok(regex.captures(source).and_then(|capture| {
-        capture
-            .get(1)
-            .or_else(|| capture.get(0))
-            .map(|value| Value::String(value.as_str().into()))
-    }))
+    regex.first(source)
+}
+
+/// One entry of a `findall` result. Python decides its shape by how many
+/// groups the pattern has, and templates index into it accordingly.
+fn qd_findall_entry<C: QdCaptures + ?Sized>(capture: &C) -> Value {
+    let group = |index: usize| {
+        Value::String(
+            capture
+                .group(index)
+                // A group that took no part in the match is "" in Python too.
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    match capture.group_count() {
+        // No groups: the whole match.
+        1 => group(0),
+        // One group: that group, not the whole match.
+        2 => group(1),
+        // Several: one tuple per match, which templates index as `item[0]`.
+        groups => Value::Array((1..groups).map(group).collect()),
+    }
+}
+
+/// What QD stores for a non-global `extract_variables`: `re.search`, then
+/// `m.groups()[0]` when the pattern has groups and `m.group(0)` when it has
+/// none — that is, the first group or the whole match.
+fn qd_first_value<C: QdCaptures + ?Sized>(capture: &C) -> Option<Value> {
+    let matched = if capture.group_count() > 1 {
+        capture.group(1)
+    } else {
+        capture.group(0)
+    };
+    // QD stores Python's `None` when the first group took no part, and that
+    // reaches the template as the text "None". The whole match is the only
+    // other thing it could be, and the more useful of the two.
+    let matched = matched.or_else(|| capture.group(0))?;
+    Some(Value::String(matched.into()))
 }
 
 fn iterable_values(value: Value) -> Result<Vec<Value>> {
@@ -1869,12 +2392,466 @@ mod tests {
         );
     }
 
+    /// Issue #26: a delimited pattern used to be compiled with
+    /// `.unicode(false)`, and a `.` under that flag can match a byte, which a
+    /// `str` pattern may not — so every `/(…)/` regex containing `.` failed to
+    /// compile ("pattern can match invalid UTF-8") before it ever ran.
     #[test]
-    fn supports_qd_regex_flags_and_global_extraction() {
-        assert!(compile_regex("/^hello/im").unwrap().is_match("x\nHello"));
+    fn a_delimited_pattern_keeps_python_unicode_semantics() {
+        // pcbeta.har, verbatim.
         assert_eq!(
-            extract("/id=(\\d+)/g", "id=1 id=2").unwrap(),
-            Some(json!(["1", "2"]))
+            extract(r#"/"name": "(.+?)"/g"#, r#"{"name": "张三"}"#).unwrap(),
+            Some(json!(["张三"]))
         );
+        // `.` reaches a Chinese character…
+        assert_eq!(extract("/(.+)/g", "中文").unwrap(), Some(json!(["中文"])));
+        // …and `\w` is Unicode word characters, the default in both engines,
+        // whether or not the pattern asks for `u`.
+        assert!(compile_regex("/\\w+/").unwrap().is_match("中文").unwrap());
+        assert!(compile_regex("/\\w+/u").unwrap().is_match("中文").unwrap());
+    }
+
+    /// The five letters QD accepts, mapped to the matches Python makes.
+    #[test]
+    fn qd_flags_map_to_the_same_matches_python_makes() {
+        assert!(
+            compile_regex("/^hello/im")
+                .unwrap()
+                .is_match("x\nHello")
+                .unwrap()
+        );
+        // `s` is what lets `.` cross a newline; without it, it does not.
+        assert!(compile_regex("/a.b/s").unwrap().is_match("a\nb").unwrap());
+        assert!(!compile_regex("/a.b/").unwrap().is_match("a\nb").unwrap());
+        // `g` is QD's own flag rather than the engine's — it picks findall over
+        // search, and it is a set, not a sequence.
+        assert_eq!(extract("/a/", "a a").unwrap(), Some(json!("a")));
+        assert_eq!(extract("/a/g", "a a").unwrap(), Some(json!(["a", "a"])));
+    }
+
+    /// `split_qd_regex` mirrors QD's `^/(.*?)/([gimsu]*)$`, so the strings QD
+    /// does *not* read as delimited have to stay undelimited here too.
+    #[test]
+    fn qd_delimiters_are_read_the_way_qd_reads_them() {
+        // `x` is not one of QD's flags: this is the literal pattern `/a/x`.
+        assert!(compile_regex("/a/x").unwrap().is_match("/a/x").unwrap());
+        assert!(!compile_regex("/a/x").unwrap().is_match("a").unwrap());
+        // Neither is a trailing path segment, however flag-like it looks.
+        assert!(
+            compile_regex("/api/v1/x")
+                .unwrap()
+                .is_match("/api/v1/x")
+                .unwrap()
+        );
+        // A body may hold slashes; the split is at the last one that fits.
+        assert_eq!(
+            extract(r#"/<a href="/album/(\d+)//g"#, r#"<a href="/album/42/"#).unwrap(),
+            Some(json!(["42"]))
+        );
+    }
+
+    /// Python's `findall` shapes each entry by the pattern's group count: the
+    /// whole match with none, the group with one, a tuple with several — and
+    /// an empty string for a group that took no part.
+    #[test]
+    fn findall_shapes_follow_the_group_count() {
+        assert_eq!(
+            extract("/\\d+/g", "a1b22c").unwrap(),
+            Some(json!(["1", "22"]))
+        );
+        assert_eq!(
+            extract("/\\d(\\d)/g", "a12b34").unwrap(),
+            Some(json!(["2", "4"]))
+        );
+        assert_eq!(
+            extract("/(\\d)(\\d)/g", "a12b34").unwrap(),
+            Some(json!([["1", "2"], ["3", "4"]]))
+        );
+        assert_eq!(
+            extract("/(a)|(b)/g", "ab").unwrap(),
+            Some(json!([["a", ""], ["", "b"]]))
+        );
+        // No match at all is an empty list in Python, not `None`.
+        assert_eq!(extract("/\\d+/g", "abc").unwrap(), Some(json!([])));
+    }
+
+    #[test]
+    fn a_non_global_extraction_is_the_first_group_or_the_whole_match() {
+        assert_eq!(extract("/\\d+/", "a12b").unwrap(), Some(json!("12")));
+        assert_eq!(extract("/\\d(\\d)/", "a12b").unwrap(), Some(json!("2")));
+        assert_eq!(extract("/\\d+/", "abc").unwrap(), None);
+        // QD stores Python's `None` when the first group took no part, which a
+        // template renders as the text "None"; the whole match is the other
+        // candidate and the more useful one.
+        assert_eq!(extract("/(?:x(\\d))|y/", "y").unwrap(), Some(json!("y")));
+    }
+
+    /// Lookaround and back-references are Python constructs Rust's linear
+    /// engine does not have, and 34 regexes across 10 of the 387 templates in
+    /// qd-today/templates use them. They are what the backtracking fallback is
+    /// for, so what matters is not that they compile but that they *match* what
+    /// Python matches.
+    #[test]
+    fn lookaround_matches_what_python_matches() {
+        // Positive look-behind and look-ahead, 2Libra每日签到.har and
+        // NS云社区.har verbatim.
+        assert_eq!(
+            extract(r#"(?<="coins":)\d+"#, r#"{"coins":7,"name":"a"}"#).unwrap(),
+            Some(json!("7"))
+        );
+        assert_eq!(
+            extract(r#""name":"([^"]*)"(?=,)"#, r#""name":"x","a":1"#).unwrap(),
+            Some(json!("x"))
+        );
+        // A look-behind is zero-width: it is not part of what is extracted.
+        assert_eq!(
+            extract(r#"(?<="m":").*?(?=")"#, r#"{"m":"hello"}"#).unwrap(),
+            Some(json!("hello"))
+        );
+        // A negative look-ahead, Linux_SB.har: everything that is not a bare
+        // `200`.
+        assert!(
+            compile_regex(r#"^(?!200$)"#)
+                .unwrap()
+                .is_match("404")
+                .unwrap()
+        );
+        assert!(
+            !compile_regex(r#"^(?!200$)"#)
+                .unwrap()
+                .is_match("200")
+                .unwrap()
+        );
+        // Flags reach the fallback too, and `g` still selects findall — the
+        // pattern has to be delimited for QD to read `g` at all.
+        assert_eq!(
+            extract(r#"/(?<=":)\d+(?=,)/g"#, r#"{"a":1,"b":22,"c":3}"#).unwrap(),
+            Some(json!(["1", "22"]))
+        );
+        // A look-behind and a look-ahead together, 搜书吧.har verbatim, in its
+        // delimited and global form.
+        assert_eq!(
+            extract(
+                r#"/最新主题[\s\S]+?tid=(\d+)[\s\S]+?tid=(\d+)[\s\S]+?tid=(\d+)[\s\S]+?(?<=valign="top")/g"#,
+                r#"最新主题 x tid=1 y tid=2 z tid=3 valign="top""#
+            )
+            .unwrap(),
+            Some(json!([["1", "2", "3"]]))
+        );
+        // A look-behind needs fixed width in Python, and `\s` is one character;
+        // 精睿论坛.har and OpenFRP.har use this shape.
+        assert_eq!(
+            extract(
+                r#"(?<=Set-Cookie: 17a=)[^;]+"#,
+                "Set-Cookie: 17a=abc123; Path=/"
+            )
+            .unwrap(),
+            Some(json!("abc123"))
+        );
+        // A back-reference. The extraction is the first group, so `bb` — the
+        // whole match — only reaches the template through `is_match`.
+        assert_eq!(extract(r#"(\w)\1"#, "abbc").unwrap(), Some(json!("b")));
+        assert!(compile_regex(r#"(\w)\1"#).unwrap().is_match("aa").unwrap());
+        assert!(!compile_regex(r#"(\w)\1"#).unwrap().is_match("ab").unwrap());
+        // The flags reach the fallback engine the same way they reach the
+        // linear one.
+        assert!(
+            compile_regex(r"/(?<=x)y/i")
+                .unwrap()
+                .is_match("XY")
+                .unwrap()
+        );
+        assert!(!compile_regex(r"/(?<=x)y/").unwrap().is_match("XY").unwrap());
+    }
+
+    /// The linear engine is tried first and the second one only when it must
+    /// be, so the engine that can be made slow is reached by 34 patterns out of
+    /// 6182 and not by the other 6148.
+    #[test]
+    fn only_a_pattern_the_linear_engine_refuses_reaches_the_fallback() {
+        assert!(matches!(
+            compile_regex(r#"/"name": "(.+?)"/g"#).unwrap(),
+            CompiledRegex::Linear(_)
+        ));
+        // No lookaround, but `regex` will not read Python's literal brace —
+        // that is a translation, so the linear engine still takes it.
+        assert!(matches!(
+            compile_regex(r#"{"total":(\d+)"#).unwrap(),
+            CompiledRegex::Linear(_)
+        ));
+        // `{,n}` and `{,}` are the same story: `regex` refuses them, the
+        // translation writes the zero out, and the linear engine takes the
+        // result. The reading is identical either way, because the fallback
+        // engine reads `{,n}` the way Python does — what the translation buys
+        // is the engine, and that is what these assert.
+        assert!(matches!(
+            compile_regex(r"a{,2}").unwrap(),
+            CompiledRegex::Linear(_)
+        ));
+        assert!(matches!(
+            compile_regex(r"a{,}").unwrap(),
+            CompiledRegex::Linear(_)
+        ));
+        // Python's literal `[` in a class is another: `[[:alpha:]]` is not a
+        // POSIX class in Python, and escaping the bracket keeps it away from
+        // the fallback engine's reading of one.
+        assert!(matches!(
+            compile_regex(r"[[:alpha:]]").unwrap(),
+            CompiledRegex::Linear(_)
+        ));
+        assert!(matches!(
+            compile_regex(r#"(?<="coins":)\d+"#).unwrap(),
+            CompiledRegex::Backtracking { .. }
+        ));
+        assert!(matches!(
+            compile_regex(r#"(\w)\1"#).unwrap(),
+            CompiledRegex::Backtracking { .. }
+        ));
+    }
+
+    /// A budget is only worth having if the patterns it guards fit inside it,
+    /// and a `search` that is quadratic in the haystack is what makes them not
+    /// fit. This is Linux_SB.har's success assertion — two `(?s)(?=.*…)` over
+    /// the whole body, the most expensive lookaround in the corpus — against a
+    /// body far larger than the JSON API it is written for.
+    ///
+    /// The bound is on the clock because the clock is the property: without the
+    /// fallback engine's `seek` pre-filter this body takes 66 s to come back
+    /// with "no match" (measured: switching the flag off makes this test fail
+    /// on the bound after 66.49 s), and on a scheduled run that is
+    /// indistinguishable from a hang. The measured time with the pre-filter on
+    /// is milliseconds, so the bound is only there to catch the pre-filter
+    /// being switched off, not to pin a number.
+    #[test]
+    fn a_long_body_with_no_payload_answers_instead_of_crawling() {
+        let pattern = r#"(?s)(?=.*"ok"\s*:\s*(?:true|1))(?=.*"redirect"\s*:\s*"[^"]*/daily_checkin(?:\?[^"]*)?")"#;
+        let pad = "x".repeat(100_000);
+
+        let started = std::time::Instant::now();
+        let missing = extract(pattern, &format!(r#"{{"pad": "{pad}"}}"#)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(missing, None);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a body with no payload took {elapsed:?}"
+        );
+
+        // The same assertion over the same body, with the payloads present.
+        let answered = compile_regex(pattern)
+            .unwrap()
+            .is_match(&format!(
+                r#"{{"ok": true, "redirect": "https://x/daily_checkin", "pad": "{pad}"}}"#
+            ))
+            .unwrap();
+        assert!(answered);
+    }
+
+    /// The fallback backtracks, so it can be made to run for a very long time.
+    /// It is given a fixed budget and gives up rather than hang — and giving up
+    /// is an error, not a `false`, because a match the engine never reached is
+    /// not a match it failed to find.
+    ///
+    /// The tail is `(?!)` rather than a literal, and that is the point. With a
+    /// trailing literal the `seek` pre-filter answers first: on the same
+    /// alternation ending in `x` over a haystack of `a`s there is no `x`, so
+    /// there is nothing to find and the engine never runs — the pre-filter
+    /// returns "no match" in a millisecond, which is a *better* answer than the
+    /// give-up but leaves the budget untested. `(?!)` is the same alternation
+    /// with a tail that can never succeed and no literal to prune on, so the
+    /// engine has to try every partition of the run and exhaust the budget to
+    /// prove it.
+    #[test]
+    fn a_runaway_pattern_gives_up_instead_of_running_away() {
+        // Two branches that consume different amounts of the same run, and a
+        // back-reference to keep them off the linear engine's side: every
+        // partition of the haystack has to be tried, and the `(?!)` that would
+        // end the search can never succeed.
+        let pattern = r"(?:(a)\1|(a)\1\1)+(?!)";
+        let message = format!("{:#}", extract(pattern, &"a".repeat(60)).unwrap_err());
+        assert!(
+            message.contains("gave up"),
+            "expected the give-up to be reported, got: {message}"
+        );
+        assert!(
+            message.contains("backtracking"),
+            "expected the reason to be named, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("{pattern:?}")),
+            "expected the pattern to be named, got: {message}"
+        );
+        // The same alternation with a tail that *can* succeed answers at once:
+        // 60 `a`s are 30 pairs, and then the `x`. The extraction is the first
+        // group, one `a`.
+        assert_eq!(
+            extract(r"(?:(a)\1|(a)\1\1)+x", &format!("{}x", "a".repeat(60))).unwrap(),
+            Some(json!("a"))
+        );
+    }
+
+    /// Python has no POSIX classes: `[[:alpha:]]` is the six characters
+    /// `[ : a l p h`, and then a literal `]`. Rust's engine reads the inner
+    /// `[` as the start of a POSIX class instead, which compiles and matches
+    /// different text — the quietest kind of difference there is.
+    #[test]
+    fn a_bracket_inside_a_class_is_one_more_member_of_the_set() {
+        for name in ["alpha", "digit", "space", "alnum"] {
+            let matched = extract(&format!("[[:{name}:]]"), "a").unwrap();
+            assert_eq!(matched, None, "`[[:{name}:]]` matched `a`");
+        }
+        // What it does match: one of those six characters, then a `]`.
+        assert_eq!(extract(r"[[:alpha:]]", "a]").unwrap(), Some(json!("a]")));
+        assert_eq!(extract(r"[[:alpha:]]", "[]").unwrap(), Some(json!("[]")));
+        // A `[` anywhere in a class, and a class that is only a bracket.
+        assert_eq!(extract(r"[a[b]", "[").unwrap(), Some(json!("[")));
+        assert_eq!(extract(r"[[]", "[").unwrap(), Some(json!("[")));
+        // An already-escaped bracket is left as it is.
+        assert_eq!(extract(r"[\[a]", "[").unwrap(), Some(json!("[")));
+    }
+
+    /// Python lets a backslash escape any character that is not a letter or a
+    /// digit, and reads `\<` as a plain `<`. Rust's engine refuses those
+    /// escapes, and the fallback engine reads some of them as oniguruma
+    /// operators — `\<` and `\>` become word boundaries — so leaving them alone
+    /// would match the wrong text on a template that is written correctly.
+    #[test]
+    fn a_backslash_before_punctuation_is_the_punctuation() {
+        // yunyaokz.har verbatim: the look-behind has to be `<b>`, not a word
+        // boundary and a `b`.
+        assert_eq!(
+            extract(r"(?<=累计已签到:  \<b\>)[0-9]+", "累计已签到:  <b>12").unwrap(),
+            Some(json!("12"))
+        );
+        assert_eq!(extract(r"\<b\>", "<b>").unwrap(), Some(json!("<b>")));
+        assert_eq!(extract(r"\:", ":").unwrap(), Some(json!(":")));
+        assert_eq!(extract(r"a\@b", "a@b").unwrap(), Some(json!("a@b")));
+        // Inside a class, and after an escaped backslash, which is a literal
+        // backslash and then a literal `<`.
+        assert_eq!(extract(r"[\<]", "<").unwrap(), Some(json!("<")));
+        assert_eq!(extract(r"\\<", r"\<").unwrap(), Some(json!(r"\<")));
+        // The characters Rust's engine does give a meaning to keep their
+        // backslash, so `\*` is still a literal star and `\n` is still a
+        // newline.
+        assert_eq!(extract(r"a\*b", "a*b").unwrap(), Some(json!("a*b")));
+        assert!(!compile_regex(r"a\*b").unwrap().is_match("aab").unwrap());
+        assert_eq!(extract(r"a\nb", "a\nb").unwrap(), Some(json!("a\nb")));
+    }
+
+    /// What is left of Python's dialect that neither engine here reads.
+    ///
+    /// The list is short, and it is measured rather than guessed: over all 6182
+    /// regexes in the 387 qd-today/templates, none lands here (the single
+    /// corpus pattern that is refused — `[^]` in `糖果VR资源网` — is refused for
+    /// an unclosed class, which Python refuses as well). These two shapes are
+    /// what a probe of the dialect turned up, and they are refused with the
+    /// engine's own complaint rather than mistranslated into something that
+    /// would match the wrong text.
+    #[test]
+    fn the_rest_of_pythons_dialect_is_refused() {
+        // `\101` is `A` in Python: three octal digits make an octal escape.
+        assert!(extract(r"\101", "A").is_err());
+        // `(?a)` asks for ASCII semantics, which no Rust engine has.
+        assert!(extract(r"(?a)\w+", "abc").is_err());
+        // So do the oniguruma escapes the fallback engine knows and Python
+        // does not: `\h`, `\R`, `\X`, `\p{...}`.
+        for pattern in [r"\h", r"\R", r"\X", r"\p{L}", r"\K"] {
+            assert!(extract(pattern, "a").is_err(), "{pattern}");
+        }
+        // Named groups are not on that list: both engines take them.
+        assert_eq!(
+            extract(r#"(?P<num>\d+)"#, "a12").unwrap(),
+            Some(json!("12"))
+        );
+        // Nor is a back-reference by name.
+        assert_eq!(
+            extract(r"(?P<w>\w)(?P=w)", "aab").unwrap(),
+            Some(json!("a"))
+        );
+    }
+
+    /// `{m,n}` with `m > n` is a syntax error in Python and in Rust's linear
+    /// engine — but the fallback engine reads it as a match, so it has to be
+    /// refused before either is asked, or such a pattern would quietly start
+    /// working here and not in QD.
+    #[test]
+    fn an_inverted_repetition_range_is_refused() {
+        for pattern in [r"a{2,1}", r"a{9,3}", r"\d{10,2}", r"[a-z]{3,2}"] {
+            assert!(extract(pattern, "aaa").is_err(), "{pattern}");
+        }
+        // The neighbouring forms still compile.
+        assert_eq!(extract(r"a{1,1}", "aaa").unwrap(), Some(json!("a")));
+        assert_eq!(extract(r"a{0,0}", "aaa").unwrap(), Some(json!("")));
+        assert_eq!(extract(r"a{10,20}", &"a".repeat(5)).unwrap(), None);
+        // A repetition too large for a `u64` is still compared by its digits.
+        assert!(extract(r"a{99999999999999999999,1}", "a").is_err());
+    }
+
+    /// `\Z` is Python's end of string; Rust's engine calls it `\z` and refuses
+    /// `\Z`, so the translation is what keeps both engines reading the same
+    /// text.
+    #[test]
+    fn the_end_of_string_escape_is_read_the_way_python_reads_it() {
+        assert_eq!(extract(r#"ab\Z"#, "ab").unwrap(), Some(json!("ab")));
+        // Python's `\Z` is the end of the string and not the end of a line.
+        assert_eq!(extract(r#"ab\Z"#, "ab\n").unwrap(), None);
+        assert_eq!(extract(r#"/a\Z/g"#, "ba").unwrap(), Some(json!(["a"])));
+        // Inside a class Python refuses it too, so it is left for both engines
+        // to refuse rather than being rewritten into something Python would
+        // have read differently.
+        assert!(extract(r#"[\Z]"#, "Z").is_err());
+    }
+
+    /// `\N{BULLET}` is `•` in Python — inside a class and out — and Python has
+    /// no other reading of `\N`.
+    ///
+    /// Rust's linear engine refuses the escape outright, which was the right
+    /// answer, but the fallback engine reads `\N` as "not a newline" and the
+    /// name as literal text. That compiles and matches the wrong thing, which
+    /// is worse than refusing: reading it properly needs the Unicode name
+    /// table, so the translation refuses it instead.
+    #[test]
+    fn a_named_character_escape_is_refused_rather_than_misread() {
+        assert!(extract(r"\N{BULLET}", "•").is_err());
+        assert!(extract(r"[\N{BULLET}]", "•").is_err());
+        // An escaped backslash is a literal backslash, then a literal `N`.
+        assert_eq!(
+            extract(r"\\N\{BULLET\}", r"\N{BULLET}").unwrap(),
+            Some(json!(r"\N{BULLET}"))
+        );
+    }
+
+    /// Python reads `{` as a repetition only when a well-formed one follows,
+    /// so a JSON snippet is literal text; Rust's engine refuses those outright
+    /// unless the brace is escaped.
+    #[test]
+    fn literal_braces_are_read_the_way_python_reads_them() {
+        assert_eq!(
+            extract(r#"{"total":(\d+)"#, r#"{"total":12}"#).unwrap(),
+            Some(json!("12"))
+        );
+        assert_eq!(
+            extract(r#"{"a":1}"#, r#"{"a":1}"#).unwrap(),
+            Some(json!("{\"a\":1}"))
+        );
+        // A lone brace, and an escape that owns its brace.
+        assert_eq!(extract(r#"a{"#, "a{").unwrap(), Some(json!("a{")));
+        assert_eq!(extract(r#"\{\}"#, "{}").unwrap(), Some(json!("{}")));
+        // A class is a set of characters in both engines.
+        assert_eq!(extract(r#"[{}]"#, "{").unwrap(), Some(json!("{")));
+        // Escaping the literal braces must not disturb the real repetitions.
+        assert_eq!(extract(r#"a{2}"#, "aaa").unwrap(), Some(json!("aa")));
+        assert_eq!(extract(r#"a{2,}"#, "aaa").unwrap(), Some(json!("aaa")));
+        assert_eq!(extract(r#"a{2,3}"#, "aaaa").unwrap(), Some(json!("aaa")));
+        assert_eq!(extract(r#"\d{1,3}"#, "1234").unwrap(), Some(json!("123")));
+    }
+
+    /// `{,n}` and `{,}` omit their minimum in Python; Rust has no shorthand for
+    /// that, so it has to be written out.
+    #[test]
+    fn an_omitted_repetition_minimum_is_written_out() {
+        assert_eq!(extract(r#"a{,2}"#, "aaa").unwrap(), Some(json!("aa")));
+        assert_eq!(extract(r#"a{,}"#, "aaa").unwrap(), Some(json!("aaa")));
+        // Still a repetition, so still refused by both engines.
+        assert!(extract(r#"a{2,1}"#, "aaa").is_err());
     }
 }

@@ -14,6 +14,9 @@ A：迁移是**前向 only** 的。仅回退镜像而不恢复数据库不被支
 **Q：CLI 报网络被拒绝（私网 / localhost / 证书）？**
 A：这是刻意的安全策略——CLI 默认拒绝私网、localhost 和无效 TLS 证书，不像旧 QD 那样宽松。服务端执行不受此限制。
 
+**Q：模板报 `invalid QD regular expression`？**
+A：先看报错里点名了什么。`\N{...}`（Python 的命名字符）、`\ooo` 八进制转义、`(?a)` ASCII 内联 flag，以及 `{m,n}` 里 `m > n`，都是旧 QD 的 Python `re` 认、这里的引擎不认（或会读成别的意思）的写法，需要改写该 `re`。lookaround（`(?=` `(?!` `(?<=` `(?<!`）和反向引用（`\1`）**已经支持**，不必再绕开。若弹的是「needed more backtracking」，说明该 `re` 在回溯引擎里代价过高，改写它就能过。`re` 字段的写法、flags、返回形状与剩余边界见 [参考 · 与旧 QD 的兼容范围](reference.md)。
+
 **Q：调度好像没按我设的时间跑？**
 A：`SCHEDULER_INTERVAL_SECONDS`（默认 15 秒）是调度器轮询间隔，任务触发精度受其影响；如需更精确请相应调小（会增加数据库轮询压力）。
 
