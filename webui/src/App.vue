@@ -2830,13 +2830,24 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     </div>
 
     <!-- ===== RUN LOG MODAL ===== -->
+    <!-- A list, not a form: the table is what the dialog is for and everything
+         around it is chrome, so the table is the one thing allowed to scroll.
+         It used to take the shared `.modal-har`, whose height cap no child could
+         reach — so the *dialog* scrolled, and a 50-row page carried the filters,
+         the column headers and the pager off the screen. Title, hint and filter
+         row are one header block rather than three stacked ones: the hint
+         explains the title above it rather than the list below it, and the
+         shared `.section-hint` margins drew a gutter between lines that read as
+         a single heading. -->
     <div v-if="showRunLog" class="modal-backdrop modal-backdrop-wide" @click.self="showRunLog = false">
-      <div class="modal modal-har">
+      <div class="modal modal-runlog">
         <div class="modal-header">
-          <div><h2>{{ t('runLogTitle') }}</h2></div>
+          <div>
+            <h2>{{ t('runLogTitle') }}</h2>
+            <p class="muted run-log-hint">{{ t('runLogHint') }}</p>
+          </div>
           <button class="icon-button" type="button" :title="t('close')" @click="showRunLog = false"><X :size="20" /></button>
         </div>
-        <p class="muted section-hint">{{ t('runLogHint') }}</p>
         <div class="toolbar">
           <div class="seg" role="group" :aria-label="t('status')">
             <button
@@ -2851,7 +2862,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <span>{{ t('runLogTask') }}</span>
             <Dropdown v-model="runLogTaskId" :options="runLogTaskDropdownOptions" compact />
           </label>
-          <button class="icon-button" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
+          <button class="icon-button run-log-refresh" :title="t('refresh')" @click="loadRunLog()"><RefreshCw :class="{ spin: runLogLoading }" :size="18" /></button>
         </div>
         <div v-if="runLogLoading && allRuns.length === 0" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
         <div v-else-if="allRuns.length === 0" class="empty-state">
@@ -2865,9 +2876,9 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </tr></thead>
             <tbody>
               <tr v-for="run in allRuns" :key="run.id">
-                <td class="run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
+                <td class="col-time run-time">{{ formatRunTime(run.started_at ?? run.created_at, undefined, taskTimezone(run.task_id)) }}</td>
                 <td><button class="text-button" @click="openRunLogHistory(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
-                <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                <td class="col-status"><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
                 <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
                 <td class="row-actions">
                   <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>

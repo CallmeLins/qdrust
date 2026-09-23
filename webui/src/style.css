@@ -516,17 +516,32 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .status-text { color: var(--accent); font-weight: 700; }
 
 .run-log-col { min-width: 320px; }
-/* The aggregated log rows are scanned, not read: a 30-row page of full logs can
+/* The aggregated log rows are scanned, not read: a 50-row page of full logs can
    only be skimmed if each row keeps a predictable height, so the cell caps and
-   scrolls. The per-task history page still shows logs in full. */
-.runs-table .run-log { display: block; max-height: 8.5em; overflow-y: auto; }
+   scrolls. The per-task history page still shows logs in full. The cap is a
+   multiple of the line box rather than a round `em` value, so the cut lands
+   between two lines instead of through one. */
+.runs-table .run-log { display: block; max-height: calc(1.5em * 5); overflow-y: auto; }
 .run-toolbar { display: inline-flex; gap: 4px; }
-.run-log { min-width: 0; white-space: pre-line; word-break: break-word; font-size: 12px; color: var(--ink-2); line-height: 1.6; font-family: var(--font-mono); }
+.run-log { min-width: 0; white-space: pre-line; word-break: break-word; font-size: 12px; color: var(--ink-2); line-height: 1.5; font-family: var(--font-mono); }
 .run-time { margin-left: auto; color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
 .run-ok { color: var(--ok); }
 .run-bad { color: var(--bad); }
 .run-cancelled { color: var(--ink-3); }
 .run-active { color: var(--warn); }
+
+/* A run row holds three short cells and an excerpt, so it is only as tall as
+   what is in it. The shared `td` rule pads every row out to 68px because rows
+   elsewhere carry buttons; on a list whose rows are one line of log it halved
+   the number that fit on screen. `vertical-align: top` keeps the time and the
+   status level with the first line of a multi-line excerpt rather than floating
+   against its middle. */
+.runs-table th { height: 34px; padding: 0 14px; }
+.runs-table td { height: auto; padding: 7px 14px; vertical-align: top; }
+/* Sticky, and opaque: the excerpt is why this table scrolls at all, and a header
+   that scrolls away from it leaves 50 rows of log under no column names. The
+   shared `th` background is a tint, which those rows would show through. */
+.runs-table thead th { position: sticky; top: 0; z-index: 1; background: var(--surface-strong); }
 
 /* ---------- toolbar & search ---------- */
 .toolbar { padding: 20px 0 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -541,7 +556,19 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .search input { width: 100%; border: 0; outline: 0; background: transparent; font-size: 13px; color: var(--ink); }
 .search input::placeholder { color: var(--ink-3); }
 
-.group-filter { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 12px; }
+/* A caption with its control beside it, on one line. The modal-scoped selector is
+   not redundant: `.modal label` describes a *field* caption — display:grid so the
+   caption stacks over its input, and semibold — and at (0,1,1) it outranks a bare
+   class, so anywhere inside a dialog this one lost every property it declares and
+   the pair rendered as two rows with the control underneath. `font-weight` is
+   spelled out because it is the one property no non-modal ancestor of these sets:
+   outside a dialog it is inherited from the page (400) and only the field-caption
+   rule ever names it. `white-space: nowrap` is the second half of the same
+   defence: a two-character caption is only two characters wide, and Chinese
+   breaks between any two of them, so a flexible box short enough to squeeze this
+   one wraps 任务 onto two lines rather than overflowing it. The caption keeps its
+   shape and the picker next to it — which ellipsises — absorbs the squeeze. */
+.group-filter, .modal .group-filter { display: flex; align-items: center; gap: 8px; color: var(--ink-2); font-size: 12px; font-weight: 400; white-space: nowrap; }
 .group-filter select {
   height: 38px; padding: 0 10px; border: 1px solid var(--line-strong);
   border-radius: var(--r-s); background: rgb(var(--card-surface)); color: var(--ink); outline: 0;
@@ -564,7 +591,11 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 .pager .pager-position { min-width: 88px; text-align: center; }
 .pager-total { margin-right: auto; }
-.pager-size { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--ink-3); font-size: 12px; }
+/* Modal-scoped for the same reason as `.group-filter` above — the run-log dialog
+   pages its own table, so this pair lives inside a `.modal` too. `--ink-3` rather
+   than the caption's `--ink-2`: the size picker is the quietest thing in the
+   footer and the field-caption rule was brightening it as well as bolding it. */
+.pager-size, .modal .pager-size { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--ink-3); font-size: 12px; font-weight: 400; white-space: nowrap; }
 
 /* ============================================================
    tables
@@ -859,11 +890,66 @@ code {
 /* HAR import modal */
 .modal-backdrop-wide { z-index: 60; }
 .modal-har { width: min(1080px, 96vw); display: flex; flex-direction: column; padding: 22px; height: calc(100vh - 40px); height: calc(100dvh - 40px); }
+
 .har-meta { display: grid; grid-template-columns: 1fr 2fr auto; gap: 12px; margin: 4px 0 12px; }
 .har-meta label { display: grid; gap: 6px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
 .har-meta input { height: 38px; min-height: 0; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r-s); outline: 0; background: rgb(var(--card-surface)); color: var(--ink); }
 .har-file-pick { display: inline-flex !important; align-items: center; justify-content: center; gap: 7px; align-self: end; height: 38px; padding: 0 14px; cursor: pointer; white-space: nowrap; }
 .har-file-pick input { display: none; }
+/* A `<label>` can BE a button — it wraps a hidden file input and wears the
+   button's own class, which is the only way to open a file dialog from a
+   button-shaped control. `.modal label` has no way to know that: it is (0,1,1)
+   against `.secondary-button`'s (0,1,0), so it wins and lays the caption-and-
+   input out as a grid while the real button beside it stays an inline-flex
+   button — the same leak as `.group-filter` and `.pager-size` above, on a
+   control that is a button rather than a caption. Measured at 1440px: the
+   label came back `display: grid` next to a `display: flex` button of the same
+   height, so the giveaway was its text sitting off-centre rather than any
+   difference in size. */
+.modal .file-button { display: inline-flex; align-items: center; justify-content: center; }
+
+/* Run-log dialog. A list, not a form: the table is what the dialog is for and
+   everything around it is chrome, so the table is the only thing that scrolls.
+   Written against the backdrop child because the rule there is what caps a
+   centred dialog and hands it a scrollbar — and that second half is exactly
+   what has to go somewhere else here. Under the shared `.modal-har` cap no child
+   was allowed to shrink, so the *dialog* scrolled: on a 50-row page it carried
+   the filters, the column headers and the pager off the screen and left one
+   unbroken strip of log. */
+.modal-runlog { width: min(1080px, 96vw); gap: 0; padding: 0; display: flex; flex-direction: column; }
+.modal-backdrop > .modal-runlog { overflow: hidden; }
+/* Header, filter row and pager are bands of one frame: hairline dividers rather
+   than three blocks floating in a gutter, and no `height` anywhere, so a short
+   result is a short dialog instead of a card with a blank half under the pager —
+   the backdrop rule's cap still keeps a long one on screen. */
+.modal-runlog .modal-header { padding: 14px 18px 12px; border-bottom: 1px solid var(--line); }
+/* The hint explains the title, so it sits against it — a line of copy about the
+   dialog is one heading, not a paragraph with a gutter above and below. It
+   carries its own margin because a bare `p` still gets the browser's, and the
+   `.section-hint` margins (6px / 18px) are drawn for a paragraph between
+   sections. */
+.modal-runlog .run-log-hint { margin: 3px 0 0; }
+/* The filters cluster left as one group and the refresh keeps the right edge.
+   Left to the shared `space-between`, three children put the task filter in the
+   dead centre of a 1080px band and the three of them read as three unrelated
+   controls. */
+.modal-runlog .toolbar { justify-content: flex-start; gap: 14px; padding: 11px 18px; border-bottom: 1px solid var(--line); }
+.modal-runlog .toolbar .run-log-refresh { margin-left: auto; }
+.modal-runlog .pager { margin: 0; padding: 10px 18px; border-top: 1px solid var(--line); }
+/* The flexible child, and the only scroll container in the dialog. `min-height:
+   0` is what lets it shrink below its content; without it the cap is ignored and
+   nothing here scrolls at all. The dialog already draws the card, so the inner
+   frame goes — one border, one radius and one shadow that separated nothing. */
+.modal-runlog .table-wrap {
+  flex: 1 1 auto; min-height: 0; overflow: auto;
+  border: 0; border-radius: 0; box-shadow: none; background: transparent;
+}
+/* Empty and loading *are* the table area here, so they take its height rather
+   than the 300px floor the standalone pages want, and drop the dashed frame they
+   would otherwise draw inside the dialog's own. */
+.modal-runlog .empty-state, .modal-runlog .loading-state {
+  flex: 1 1 auto; min-height: 150px; margin: 16px 18px; border: 0; background: transparent;
+}
 
 /* ============================================================
    steps / live
@@ -1048,6 +1134,9 @@ code {
   .heading-actions > button { width: 100%; }
   .toolbar { align-items: center; }
   .modal { padding: 20px; }
+  /* The run-log dialog draws its own band padding, and its bands have to reach
+     the frame's edges; the shared rule above would inset them. */
+  .modal-runlog { padding: 0; }
   .modal-backdrop { padding: 10px; }
   .modal-backdrop > .modal { max-height: calc(100dvh - 20px); }
   .modal-actions { flex-wrap: wrap; }
