@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-cli"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-core"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "aes",
  "anyhow",
@@ -2244,7 +2244,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-plugin-browser"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "qdrust-server"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "argon2",

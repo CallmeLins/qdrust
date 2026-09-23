@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "qdrust API",
-    "version": "0.1.16"
+    "version": "0.1.17"
   },
   "servers": [
     {
