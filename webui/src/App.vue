@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -901,10 +901,38 @@ async function copyTemplate(id: number) {
   try { await api.copyPublicTemplate(id); notify(t("importDone")); await openTemplates(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
-async function removeTemplate(id: number, name: string) {
+/** Delete one of the caller's templates.
+ *
+ *  `tasks.template_id` is declared `ON DELETE RESTRICT`, so a template that
+ *  still has tasks cannot go — the server refuses it. The table already renders
+ *  `task_count`, so the ordinary case is settled here, before any request, with
+ *  a sentence naming how many tasks are in the way and what to do about them.
+ *
+ *  That count is only as fresh as the last list read, which is why this is a
+ *  courtesy rather than the guard: bind a task in another tab and the count is
+ *  stale. The server re-counts and answers 409 `template_in_use`, handled
+ *  below, so the race still ends in a sentence instead of a 500.
+ *
+ *  Kept clickable on purpose rather than disabled while `task_count > 0`. A
+ *  greyed-out button cannot say what is holding the template or what to do
+ *  next, and a stale zero would leave the user pressing a dead control with no
+ *  way to learn why. */
+async function removeTemplate(id: number, name: string, taskCount: number) {
+  if (taskCount > 0) { notify(fmt("templateInUse", { name, n: taskCount }), "error", { meta: t("templateInUseHint") }); return; }
   if (!window.confirm(fmt("deleteTemplateConfirm", { name }))) return;
   try { await api.deleteTemplate(id); await openTemplates(); }
-  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+  catch (cause) {
+    // The server refused because a task appeared after this list was read. Its
+    // 409 does carry the fresh count, but a number the user can check against
+    // the table is worth more than one in a toast: re-read the list and let the
+    // row report it, so the next attempt is specific.
+    if (errorCode(cause) === "template_in_use") {
+      notify(fmt("templateInUseStale", { name }), "error", { meta: t("templateInUseHint") });
+      await openTemplates();
+      return;
+    }
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  }
 }
 function openImportModal(template?: Template) {
   editingTemplateId.value = template?.id ?? null;
@@ -2348,7 +2376,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                     <button v-if="item.source_format === 'qd_har'" class="secondary-button" @click="openImportModal(item)"><Pencil :size="14" />{{ t('editTemplate') }}</button>
                     <button v-if="publishedTemplateIds.has(item.id)" class="secondary-button" @click="unpublishTemplate(item.id)"><Undo2 :size="14" />{{ t('unpublish') }}</button>
                     <button v-else class="secondary-button" @click="publishTemplate(item.id)"><Upload :size="14" />{{ t('publish') }}</button>
-                    <button class="icon-button danger" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name)"><Trash2 :size="16" /></button>
+                    <button class="icon-button danger" :title="t('deleteTemplate')" @click="removeTemplate(item.id, item.name, item.task_count ?? 0)"><Trash2 :size="16" /></button>
                   </td>
                 </tr>
               </tbody>

@@ -1863,6 +1863,23 @@ macro_rules! define_store {
         )
     }
 
+    /// How many tasks are bound to a template.
+    ///
+    /// `tasks.template_id` is declared `ON DELETE RESTRICT`, so this counts
+    /// exactly what the database would refuse a delete over -- which is why the
+    /// count is taken across *every* owner rather than scoped to one. A
+    /// per-owner count could report 0 for a template the delete still has to
+    /// refuse (a binding created before `fix(server)!` scoped bindings to the
+    /// task owner), and then the caller would have no idea why it failed.
+    pub async fn count_tasks_for_template(&self, template_id: i64) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE template_id=?")
+                .bind(template_id)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn set_template_published(
         &self,
         id: i64,
@@ -3279,6 +3296,7 @@ impl Store {
         pub async fn update_template_for_owner(id: i64, owner_id: i64, input: UpdateTemplate) -> Result<Option<Template>> { id, owner_id, input };
         pub async fn delete_template(id: i64) -> Result<bool> { id };
         pub async fn delete_template_for_owner(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn count_tasks_for_template(template_id: i64) -> Result<i64> { template_id };
         pub async fn set_template_published(id: i64, owner_id: i64, published: bool) -> Result<bool> { id, owner_id, published };
         pub async fn list_public_templates() -> Result<Vec<Template>> {  };
         pub async fn copy_public_template(id: i64, owner_id: i64) -> Result<Option<Template>> { id, owner_id };

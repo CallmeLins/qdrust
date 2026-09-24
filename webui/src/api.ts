@@ -145,6 +145,37 @@ export function oidcStartUrl(prefix: string = detectUrlPrefix()): string {
  *  fetch loop. */
 const TEMPLATE_PAGE_LIMIT = 50;
 
+/** A response the server turned down, carrying both halves of the error
+ *  envelope: `code` is the stable, machine-readable half (`template_in_use`,
+ *  `template_not_found`, …) and `message` is the server's own sentence.
+ *
+ *  Both are kept because the two callers want different ones. A caller that can
+ *  say something better than the server — the templates page naming the tasks
+ *  that block a delete — branches on `code` and renders its own localized
+ *  wording; everything else prints `message`. Before this, only the message
+ *  survived, so every failure arrived indistinguishable and no caller could
+ *  react to a specific one. */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  /** The server's error code, or null when the body was not an API error at
+   *  all (a proxy answering with HTML, an empty 502 body, …). */
+  readonly code: string | null;
+
+  constructor(message: string, status: number, code: string | null) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+/** The error code of a caught failure, or null for anything that was not a
+ *  rejected response — a dropped connection, a thrown primitive, a bug. Lets a
+ *  caller write `if (errorCode(cause) === "template_in_use")` without a cast. */
+export function errorCode(cause: unknown): string | null {
+  return cause instanceof ApiRequestError ? cause.code : null;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiPath(path), {
     ...init,
@@ -153,7 +184,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null) as ApiError | null;
-    throw new Error(payload?.message ?? response.statusText ?? "请求失败");
+    throw new ApiRequestError(
+      payload?.message ?? response.statusText ?? "请求失败",
+      response.status,
+      payload?.code ?? null
+    );
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

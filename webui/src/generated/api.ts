@@ -2893,6 +2893,7 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
         };
     };
     registerUser: {

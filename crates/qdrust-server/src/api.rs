@@ -893,7 +893,7 @@ async fn bootstrap(
         .await?
         .ok_or(ApiError::Conflict(
             "bootstrap_already_completed",
-            "Initial administrator already exists",
+            "Initial administrator already exists".into(),
         ))?;
     state
         .store
@@ -1573,7 +1573,7 @@ async fn run_task(
     }
     let run = store.enqueue_run(id).await?.ok_or(ApiError::Conflict(
         "task_already_running",
-        "Task already has an active run",
+        "Task already has an active run".into(),
     ))?;
     Ok((StatusCode::ACCEPTED, Json(json!(run))))
 }
@@ -1597,7 +1597,10 @@ async fn cancel_run(
     if store.cancel_run(id).await? {
         Ok(StatusCode::ACCEPTED)
     } else {
-        Err(ApiError::Conflict("run_not_active", "Run is not active"))
+        Err(ApiError::Conflict(
+            "run_not_active",
+            "Run is not active".into(),
+        ))
     }
 }
 
@@ -2284,20 +2287,69 @@ async fn update_template(
         ))
 }
 
+/// Delete one of the caller's templates.
+///
+/// `tasks.template_id` is declared `ON DELETE RESTRICT`, so a template that
+/// still has tasks cannot be removed. Left to the database that shows up as a
+/// foreign-key violation, which the blanket `From<E> for ApiError` folds into
+/// `internal_error` -- a 500 telling the user nothing. Count first instead, and
+/// refuse with a 409 that says what is holding the template and how much of it.
+///
+/// The ownership question is only asked when the count is non-zero: a template
+/// with no tasks is settled by the delete itself (`0 rows affected` -> 404), and
+/// a template that is not the caller's must stay a 404 rather than reporting
+/// another owner's task count.
 async fn delete_template(
     State(store): State<Store>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
-    if store.delete_template_for_owner(id, session.user.id).await? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::NotFound(
+
+    let bound = store.count_tasks_for_template(id).await?;
+    if bound > 0 {
+        if store
+            .get_template_for_owner(id, session.user.id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::NotFound(
+                "template_not_found",
+                "Template not found",
+            ));
+        }
+        return Err(template_in_use(bound));
+    }
+
+    match store.delete_template_for_owner(id, session.user.id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(ApiError::NotFound(
             "template_not_found",
             "Template not found",
-        ))
+        )),
+        // A task was bound between the count above and this delete, so the
+        // foreign key refused it after all. Ask the same question again and
+        // answer with the real reason -- no driver-specific error strings, and
+        // the race ends in the same 409 the caller would have got a moment
+        // earlier instead of an opaque 500.
+        Err(cause) => {
+            let bound = store.count_tasks_for_template(id).await.unwrap_or(0);
+            if bound > 0 {
+                Err(template_in_use(bound))
+            } else {
+                Err(cause.into())
+            }
+        }
     }
+}
+
+/// The 409 for a template that cannot go yet. Shared by the check above and its
+/// race backstop so both answer identically.
+fn template_in_use(bound: i64) -> ApiError {
+    ApiError::Conflict(
+        "template_in_use",
+        format!("Template is still used by {bound} task(s); delete or re-bind them first"),
+    )
 }
 
 async fn update_qd_har(
@@ -2334,7 +2386,7 @@ async fn register(
         .map_err(|_| {
             ApiError::Conflict(
                 "username_taken",
-                "Username is already registered or invalid",
+                "Username is already registered or invalid".into(),
             )
         })?;
     if let Some(email) = input.email.as_deref() {
@@ -3179,7 +3231,12 @@ enum ApiError {
     NotFound(&'static str, &'static str),
     Unauthorized(&'static str, &'static str),
     Forbidden(&'static str, &'static str),
-    Conflict(&'static str, &'static str),
+    /// A 409: the request is well-formed but the current state forbids it. The
+    /// message is owned rather than `&'static str` because some conflicts can
+    /// only be explained with a number in them — how many tasks still hold a
+    /// template, for instance — and a client cannot be expected to guess that
+    /// from a fixed sentence.
+    Conflict(&'static str, String),
     TooManyRequests(&'static str, &'static str),
     Unprocessable(anyhow::Error),
     Internal(anyhow::Error),
@@ -3234,7 +3291,7 @@ impl IntoResponse for ApiError {
             Self::NotFound(code, message) => (StatusCode::NOT_FOUND, code, message.into()),
             Self::Unauthorized(code, message) => (StatusCode::UNAUTHORIZED, code, message.into()),
             Self::Forbidden(code, message) => (StatusCode::FORBIDDEN, code, message.into()),
-            Self::Conflict(code, message) => (StatusCode::CONFLICT, code, message.into()),
+            Self::Conflict(code, message) => (StatusCode::CONFLICT, code, message),
             Self::TooManyRequests(code, message) => {
                 (StatusCode::TOO_MANY_REQUESTS, code, message.into())
             }
@@ -4920,6 +4977,148 @@ mod tests {
             random_delay_max_seconds: None,
             variables: None,
         }
+    }
+
+    /// A template with no variables and one GET step: enough to be stored and
+    /// bound to a task.
+    fn seeded_template(name: &str) -> crate::model::CreateTemplate {
+        use qdrust_core::template::{
+            RequestStep, Step, TEMPLATE_SCHEMA_VERSION, TemplateDefinition,
+        };
+        crate::model::CreateTemplate {
+            name: name.into(),
+            description: None,
+            definition: TemplateDefinition {
+                version: TEMPLATE_SCHEMA_VERSION,
+                name: name.into(),
+                variables: Default::default(),
+                steps: vec![Step::Request(RequestStep {
+                    name: "request".into(),
+                    method: "GET".into(),
+                    url: "https://example.invalid/health".into(),
+                    headers: Default::default(),
+                    query: Default::default(),
+                    body: None,
+                })],
+            },
+            grp: None,
+        }
+    }
+
+    async fn delete_template_request(app: &Router, cookie: &str, id: i64) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/templates/{id}"))
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Deleting a template that still has tasks must explain itself.
+    ///
+    /// `tasks.template_id` is `ON DELETE RESTRICT`, so the database refuses the
+    /// delete. That refusal is a `sqlx::Error`, and the blanket
+    /// `From<E> for ApiError` turns *every* such error into `internal_error` —
+    /// so this used to answer `500 {"message":"An internal error occurred"}`
+    /// with the real reason only in the server log. It now answers 409 and says
+    /// how many tasks are holding the template, which is what the WebUI shows
+    /// before it lets the user try.
+    #[tokio::test]
+    async fn deleting_a_template_that_still_has_tasks_is_a_conflict() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let cookie = test_auth_cookie(&app).await;
+        let owner = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "route_admin")
+            .expect("bootstrap created the owner");
+        let template = store
+            .create_template_for_owner(owner.id, seeded_template("still-used"))
+            .await
+            .unwrap();
+        let mut task = seeded_task("holds-the-template");
+        task.template_id = Some(template.id);
+        task.url = String::new();
+        let task = store.create_for_owner(owner.id, task).await.unwrap();
+
+        // The list the WebUI reads already carries the count, which is what the
+        // delete button warns from -- no extra request needed.
+        let listed = store.list_templates_for_owner(owner.id).await.unwrap();
+        let row = listed.iter().find(|t| t.id == template.id).unwrap();
+        assert_eq!(row.task_count, 1);
+
+        let response = delete_template_request(&app, &cookie, template.id).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let (_, _, body) = response_json(response).await;
+        assert_eq!(body["code"], "template_in_use");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains('1'),
+            "the message must say how many tasks are in the way: {message}"
+        );
+
+        // Nothing was deleted, on either side.
+        assert!(
+            store
+                .get_template_for_owner(template.id, owner.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.count_tasks_for_template(template.id).await.unwrap(),
+            1
+        );
+
+        // Release it and the very same request succeeds.
+        assert!(store.delete_for_owner(task.id, owner.id).await.unwrap());
+        assert_eq!(
+            delete_template_request(&app, &cookie, template.id)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// The 409 must not become an oracle for another owner's templates: someone
+    /// else's in-use template has to stay a plain 404.
+    #[tokio::test]
+    async fn an_in_use_template_is_a_404_for_anyone_but_its_owner() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let cookie = test_auth_cookie(&app).await;
+        let hash = crate::auth::hash_password("bob-pass-123456").unwrap();
+        let bob = store.create_user("bob", &hash, "user").await.unwrap();
+        let template = store
+            .create_template_for_owner(bob.id, seeded_template("bobs-template"))
+            .await
+            .unwrap();
+        let mut task = seeded_task("bobs-task");
+        task.template_id = Some(template.id);
+        task.url = String::new();
+        store.create_for_owner(bob.id, task).await.unwrap();
+
+        // route_admin holds the session, the template belongs to bob.
+        let response = delete_template_request(&app, &cookie, template.id).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let (_, _, body) = response_json(response).await;
+        assert_eq!(body["code"], "template_not_found");
+        // And bob's template survived an attempt from outside.
+        assert!(
+            store
+                .get_template_for_owner(template.id, bob.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Read the run log through its raw query string, so the parsing is exercised
