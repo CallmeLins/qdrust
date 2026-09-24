@@ -1716,7 +1716,7 @@ fn python_format(value: &JinjaValue, spec: &str) -> Result<String, Error> {
                     format!("{}{body}{}", " ".repeat(left), " ".repeat(right))
                 }
                 _ => {
-                    let pad_char = if zero_pad && !align.is_some() {
+                    let pad_char = if zero_pad && align.is_none() {
                         "0"
                     } else {
                         " "

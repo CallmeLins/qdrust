@@ -794,26 +794,36 @@ code {
    (50 / 60) but below the toast stack (90). */
 .dd-pop {
   position: fixed; z-index: 80;
-  max-height: 260px; overflow: auto;
-  margin: 0; padding: 5px; list-style: none;
+  display: flex; flex-direction: column;
+  max-height: 260px; padding: 5px;
   border: 1px solid var(--line-strong); border-radius: var(--r-m);
   background: var(--surface-strong); color: var(--ink);
   box-shadow: 0 10px 30px rgb(0 0 0 / 0.16);
 }
-.dd-pop li {
+/* The scroll area is the <ul>, not the popup: the filter box stays visible
+   while hundreds of rows move under it. */
+.dd-list { margin: 0; padding: 0; list-style: none; overflow: auto; min-height: 0; }
+.dd-filter {
+  flex: none; width: 100%; margin-bottom: 4px; min-height: 30px;
+  padding: 0 8px; font-size: 13px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: var(--surface); color: var(--ink);
+}
+.dd-list li {
   padding: 7px 9px; border-radius: var(--r-s); cursor: pointer;
   font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.dd-pop li:hover:not(.disabled) { background: var(--accent-glow); }
-.dd-pop li.active { color: var(--primary); font-weight: 600; background: var(--accent-glow); }
-.dd-pop li.disabled { opacity: 0.5; cursor: not-allowed; }
+.dd-list li:hover:not(.disabled) { background: var(--accent-glow); }
+.dd-list li.active { color: var(--primary); font-weight: 600; background: var(--accent-glow); }
+.dd-list li.disabled { opacity: 0.5; cursor: not-allowed; }
+.dd-list li.dd-empty { cursor: default; color: var(--ink-3); font-style: italic; }
 /* Compact variant: for toolbars / table rows so it behaves like a small inline
    select rather than a full-height form field. */
 .dd.compact { display: inline-block; }
 .dd.compact .dd-trigger { min-height: 34px; padding: 0 10px; font-size: 12px; }
 /* `compact` is carried by the list itself because the teleported list is no
    longer a DOM descendant of `.dd`. */
-.dd-pop.compact li { font-size: 12px; padding: 5px 8px; }
+.dd-pop.compact .dd-list li { font-size: 12px; padding: 5px 8px; }
 .modal input::placeholder, .modal textarea::placeholder { color: var(--ink-3); }
 .modal .checkbox { display: flex; align-items: center; gap: 8px; grid-template-columns: none; }
 .modal .checkbox input { width: 16px; height: 16px; min-height: 0; accent-color: var(--primary); }

@@ -9,7 +9,7 @@ import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
-import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, unboundTemplatesFirst } from "./utils";
+import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
@@ -209,12 +209,23 @@ const templatesForSelect = computed(() => templates.value);
  * they are otherwise scattered through a list too long to scan.
  */
 const templateDropdownOptions = computed(() => {
-  const used = tasks.value
-    .map((task) => task.template_id)
-    .filter((id): id is number => id != null);
-  const options = unboundTemplatesFirst(templatesForSelect.value, used).map((tpl) => ({
+  // "Has a task" comes from two sources on purpose. The server counts tasks per
+  // template (`task_count`), which is right as of the read; the client's task
+  // list is refreshed after every task change, which closes the gap until the
+  // template list is re-read. Taking the union means a template is only offered
+  // as unused when neither side knows a task for it.
+  const used = new Set<number>(
+    tasks.value.map((task) => task.template_id).filter((id): id is number => id != null)
+  );
+  for (const tpl of templatesForSelect.value) if ((tpl.task_count ?? 0) > 0) used.add(tpl.id);
+  const options = orderTemplatesForNewTask(templatesForSelect.value, used).map((tpl) => ({
     value: tpl.id as string | number | null,
-    label: `${tpl.name}（${tpl.source_format}）`,
+    // The suffix is what makes the ordering legible: without it "unused first"
+    // is only visible by comparing rows, and a library that is entirely unused
+    // looks exactly like one where the rule did nothing.
+    label: `${tpl.name}（${tpl.source_format}） · ${
+      (tpl.task_count ?? 0) > 0 ? fmt("templateUsedCount", { n: tpl.task_count ?? 0 }) : t("templateUnused")
+    }`,
   }));
   if (taskForm.id == null || taskForm.templateId != null) return options;
   return [{ value: null as string | number | null, label: t("noTemplatesToBind") }, ...options];
@@ -325,6 +336,11 @@ async function loadTasks() {
   } finally {
     loading.value = false;
   }
+  // A task change moves templates in and out of the "unused" bucket, and both
+  // the templates table and the create-task dropdown read that count. Refresh
+  // it whenever the template list is on screen; before that there is nothing to
+  // correct, and a task-page visit must not fetch templates at all.
+  if (templates.value.length) void refreshTemplates();
 }
 async function refreshTaskStatuses() {
   if (!tasks.value.length) return;
@@ -389,11 +405,10 @@ async function submitTask() {
 function openCreateTask() {
   Object.assign(taskForm, blankTaskForm());
   showCreate.value = true;
-  if (!templates.value.length) {
-    void api.templates(undefined, undefined, 200)
-      .then((items) => { templates.value = items; })
-      .catch((cause) => notify(cause instanceof Error ? cause.message : t("genericError"), "error"));
-  }
+  // Always re-read, not only when the list is empty: the dropdown's order and
+  // its "unused" suffix are computed from these rows, so a template bound since
+  // the last read would otherwise still be offered as unused.
+  void refreshTemplates();
 }function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
   Object.assign(taskForm, {
@@ -685,6 +700,10 @@ watch([runLogStatus, runLogTaskId, runLogPageSize], () => {
 const templates = ref<Template[]>([]);
 const publicTemplates = ref<Template[]>([]);
 const templateSearch = ref("");
+/** "Unused only" narrows the table to the templates no task is bound to — the
+ *  list the create-task dropdown floats anyway, asked as a filter so a large
+ *  library can be audited instead of guessed at. */
+const unusedOnly = ref(false);
 const editingTemplateId = ref<number | null>(null);
 const importForm = reactive({ name: "", description: "" });
 const harEditorDoc = ref<object | null>(null);
@@ -697,7 +716,7 @@ type SortDir = "asc" | "desc";
  *  templates by creation id, the library in manifest order — so the newest
  *  thing was never anywhere in particular. Defaults follow what these lists are
  *  scanned for: what changed last, first. */
-const templateSort = reactive<{ key: "name" | "grp" | "variables" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
+const templateSort = reactive<{ key: "name" | "grp" | "variables" | "tasks" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
 const publicSort = reactive<{ key: "name" | "updated_at"; dir: SortDir }>({ key: "updated_at", dir: "desc" });
 const librarySort = reactive<{ key: "name" | "author" | "source" | "version" | "date"; dir: SortDir }>({ key: "date", dir: "desc" });
 
@@ -743,14 +762,17 @@ function sortRows<T>(
 
 const filteredTemplates = computed(() => {
   const term = templateSearch.value.trim().toLowerCase();
-  const matched = term
-    ? templates.value.filter((x) => `${x.name} ${x.description ?? ""} ${x.grp ?? ""}`.toLowerCase().includes(term))
-    : templates.value;
+  const matched = templates.value.filter((x) => {
+    if (unusedOnly.value && (x.task_count ?? 0) > 0) return false;
+    if (!term) return true;
+    return `${x.name} ${x.description ?? ""} ${x.grp ?? ""}`.toLowerCase().includes(term);
+  });
   return sortRows(matched, templateSort, (item, key) => {
     switch (key) {
       case "name": return item.name;
       case "grp": return item.grp ?? "";
       case "variables": return item.variables?.length ?? 0;
+      case "tasks": return item.task_count ?? 0;
       default: return item.updated_at;
     }
   });
@@ -769,7 +791,7 @@ const {
   page: publicTemplatesPage, pages: publicTemplatesTotalPages, items: pagedPublicTemplates,
   prev: publicTemplatesPrevPage, next: publicTemplatesNextPage,
 } = usePager(() => sortedPublicTemplates.value, () => publicTemplatesPageSize.value);
-watch(templateSearch, resetTemplatesPage);
+watch([templateSearch, unusedOnly], resetTemplatesPage);
 
 /** Headers of the "my templates" table. `text` marks the columns whose natural
  *  first order is A→Z rather than newest-first. */
@@ -777,15 +799,30 @@ const templateColumns = computed(() => [
   { key: "name" as const, label: t("name"), text: true },
   { key: "grp" as const, label: t("group"), text: true },
   { key: "variables" as const, label: t("variables"), text: false },
+  { key: "tasks" as const, label: t("templateTaskCount"), text: false },
   { key: "updated_at" as const, label: t("updatedAt"), text: false },
 ]);
 /** The public list is every published template, so it doubles as the publish-state index. */
 const publishedTemplateIds = computed(() => new Set(publicTemplates.value.map((x) => x.id)));
+/** Re-read the owner's templates, keeping the current list if the read fails.
+ *
+ *  Both the templates table and the create-task dropdown derive their "unused"
+ *  state from these rows, so this is called after a task change and whenever
+ *  the new-task dialog opens — not only when the list is empty. */
+async function refreshTemplates() {
+  try {
+    templates.value = await api.allTemplates();
+  } catch (cause) {
+    // A failed refresh must not blank a list that is already on screen; report
+    // it only when there is nothing to show instead.
+    if (!templates.value.length) notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  }
+}
 async function openTemplates() {
   view.value = "templates";
   try {
     const [mine, pub, subs] = await Promise.all([
-      api.templates(undefined, undefined, 200),
+      api.allTemplates(),
       api.publicTemplates(),
       api.subscriptions(),
     ]);
@@ -1211,7 +1248,7 @@ const subEditing = ref<TemplateSubscription | null>(null);
 /** Refresh subscriptions and templates without touching the active view, so an
  *  import from the library can pick up the new templates in place. */
 async function loadSubscriptions() {
-  [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.templates(undefined, undefined, 200)]);
+  [subscriptions.value, templates.value] = await Promise.all([api.subscriptions(), api.allTemplates()]);
 }
 function openSubModal(sub?: TemplateSubscription) {
   subEditing.value = sub ?? null;
@@ -1558,7 +1595,7 @@ const isAdmin = computed(() => currentUser.value?.role === "admin");
 async function openPush() {
   view.value = "push";
   try {
-    const [mine, tpls] = await Promise.all([api.myPushRequests(), api.templates(undefined, undefined, 200)]);
+    const [mine, tpls] = await Promise.all([api.myPushRequests(), api.allTemplates()]);
     myPushRequests.value = mine;
     templates.value = tpls;
     pendingPushRequests.value = isAdmin.value ? await api.adminPushRequests("pending").catch(() => []) : [];
@@ -2241,12 +2278,13 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <section class="task-section">
           <div class="toolbar">
             <label class="search"><Search :size="17" /><input v-model="templateSearch" type="search" :placeholder="t('templateSearch')" /></label>
+            <label class="group-filter"><input v-model="unusedOnly" type="checkbox" />{{ t('unusedOnly') }}</label>
             <span v-if="filteredTemplates.length" class="muted">{{ fmt('libraryEntryCount', { n: filteredTemplates.length }) }}</span>
           </div>
           <h2>{{ t('myTemplates') }}</h2>
           <div v-if="filteredTemplates.length === 0" class="empty-state">
             <span><FileJson2 :size="25" /></span>
-            <h2>{{ templateSearch ? t('noTemplates') : t('templateEmptyHint') }}</h2>
+            <h2>{{ unusedOnly ? t('noUnusedTemplates') : templateSearch ? t('noTemplates') : t('templateEmptyHint') }}</h2>
           </div>
           <div v-else class="table-wrap">
             <table class="templates-table">
@@ -2265,6 +2303,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   </td>
                   <td><span v-if="item.grp" class="chip">{{ item.grp }}</span><span v-else class="muted">—</span></td>
                   <td class="num">{{ item.variables?.length ?? 0 }}</td>
+                  <td class="num">{{ item.task_count ?? 0 }}</td>
                   <td class="run-time">{{ formatRunTime(item.updated_at) }}</td>
                   <td class="row-actions">
                     <button class="primary-button" :title="t('useTemplateTitle')" @click="createTaskFromTemplate(item)"><Play :size="14" />{{ t('useTemplate') }}</button>
@@ -2724,7 +2763,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
         <label>{{ t('taskName') }}<input v-model="taskForm.name" required maxlength="100" /></label>
         <label>{{ t('template') }}
-          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" :placeholder="t('selectTemplate')" />
+          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" :placeholder="t('selectTemplate')" filterable :filter-placeholder="t('templateFilterPlaceholder')" :filter-empty-label="t('filterNoMatch')" />
         </label>
         <small v-if="taskForm.templateId == null && taskForm.id == null" class="kv-hint">{{ t('templateRequiredHint') }}</small>
         <div class="schedule-head">

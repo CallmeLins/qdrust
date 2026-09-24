@@ -821,6 +821,7 @@
           {
             "name": "cursor",
             "in": "query",
+            "description": "Id of the last row of the previous page. Pages walk newest first, so the next page holds rows with a smaller id.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -3043,7 +3044,8 @@
           "source_format",
           "variables",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "task_count"
         ],
         "properties": {
           "id": {
@@ -3098,6 +3100,11 @@
           "updated_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "task_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of the owner's tasks currently bound to this template (0 = unused)"
           }
         }
       },

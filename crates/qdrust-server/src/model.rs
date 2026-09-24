@@ -489,6 +489,13 @@ pub struct Template {
     pub variables: Vec<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// How many of the owner's tasks are bound to this template right now.
+    /// Counted on read (see `TEMPLATE_FIELDS`) rather than stored, so it can
+    /// never drift from the `tasks` table: "which templates are still unused"
+    /// is the same question the create-task dropdown asks, and both sides now
+    /// read one number instead of each keeping its own list.
+    #[serde(default)]
+    pub task_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grp: Option<String>,
 }

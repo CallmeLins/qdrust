@@ -33,6 +33,36 @@ export function unboundTemplatesFirst<T extends { id: number }>(
   ];
 }
 
+/** Newest first, the order the templates table shows by default.
+ *
+ *  The table sorts by `updated_at` in the component; the dropdown reads the
+ *  same array in the order the server sent it, which is creation-id order. That
+ *  made the two disagree — the list said one thing, the list you pick from said
+ *  another — so both now ask for the same order. A copy is sorted, not the
+ *  caller's array: this feeds a `computed` that must not mutate its source. */
+export function newestTemplatesFirst<T extends { updated_at: number }>(templates: T[]): T[] {
+  return [...templates].sort((a, b) => b.updated_at - a.updated_at);
+}
+
+/**
+ * The create-task dropdown's order: templates no task uses yet first (issue
+ * #25), newest first inside each half.
+ *
+ *  Both halves matter. "Unused first" is what someone adding a task is looking
+ *  for; "newest first" is what every other list in the app means by its order,
+ *  and without it the unused ones arrive oldest-first (the server pages them by
+ *  creation id) while the table right above shows the newest. A user with one
+ *  bound template and a hundred unused ones sees the same first row either way
+ *  only if the split is invisible — with it, the first row is the one just
+ *  imported, which is the one they came for.
+ */
+export function orderTemplatesForNewTask<T extends { id: number; updated_at: number }>(
+  templates: T[],
+  usedIds: Iterable<number>
+): T[] {
+  return unboundTemplatesFirst(newestTemplatesFirst(templates), usedIds);
+}
+
 // ---------- QD 模板 → HAR 文档 ----------
 
 /** 编辑器在所有输入之前的起点：一个空的 HAR 文档。 */

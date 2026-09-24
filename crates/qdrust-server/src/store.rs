@@ -714,27 +714,41 @@ macro_rules! define_store {
     /// listings and for API clients that still create plain tasks. An unbound
     /// task keeps the caller's request; `current` is the row's existing pair,
     /// used when an update omits both.
+    ///
+    /// The template is looked up through the caller's owner, and that lookup
+    /// runs **before** the caller-supplied URL is considered. A bound task
+    /// executes the template, so the URL is only the listing mirror: letting it
+    /// short-circuit the lookup would let a task reference — and then run —
+    /// another user's template by simply sending any URL alongside the id.
     async fn resolve_task_request(
         &self,
+        owner_id: Option<i64>,
         template_id: Option<i64>,
         requested_method: Option<&str>,
         requested_url: Option<&str>,
         current: Option<(&str, &str)>,
     ) -> Result<(String, String)> {
+        // Owner-scoped whenever the caller has an owner; the owner-less path is
+        // the internal/test one and keeps the unscoped lookup. A foreign id is
+        // reported as "not found" so the error cannot confirm it exists.
+        let template = match template_id {
+            Some(template_id) => Some(
+                match owner_id {
+                    Some(owner_id) => self.get_template_for_owner(template_id, owner_id).await?,
+                    None => self.get_template(template_id).await?,
+                }
+                .with_context(|| format!("template {template_id} not found"))?,
+            ),
+            None => None,
+        };
         if let Some(url) = requested_url.map(str::trim).filter(|url| !url.is_empty()) {
             return Ok((
                 requested_method.unwrap_or("GET").to_uppercase(),
                 url.to_owned(),
             ));
         }
-        let mut bound_to_template = false;
-        if let Some(template_id) = template_id {
-            let template = self
-                .get_template(template_id)
-                .await?
-                .with_context(|| format!("template {template_id} not found"))?;
-            bound_to_template = true;
-            if let Some(mirrored) = template_mirror_request(&template) {
+        if let Some(template) = &template {
+            if let Some(mirrored) = template_mirror_request(template) {
                 return Ok(mirrored);
             }
         }
@@ -743,7 +757,7 @@ macro_rules! define_store {
                 requested_method.unwrap_or(method).to_uppercase(),
                 url.to_owned(),
             )),
-            None if bound_to_template => Err(anyhow!(
+            None if template.is_some() => Err(anyhow!(
                 "the bound template has no request to mirror, set the task URL explicitly"
             )),
             None => Err(anyhow!("task URL is required when no template is bound")),
@@ -753,7 +767,7 @@ macro_rules! define_store {
     async fn create_with_owner(&self, owner_id: Option<i64>, input: CreateTask) -> Result<Task> {
         let template_id = input.template_id;
         let (method, url) = self
-            .resolve_task_request(template_id, input.method.as_deref(), Some(&input.url), None)
+            .resolve_task_request(owner_id, template_id, input.method.as_deref(), Some(&input.url), None)
             .await?;
         // A bound task's URL is only a mirror of the template, so a URL that
         // would not parse on its own (e.g. an `api://util/...` step with
@@ -882,6 +896,7 @@ macro_rules! define_store {
         let template_id = input.template_id.or(current.template_id);
         let (method, url) = self
             .resolve_task_request(
+                owner_id,
                 template_id,
                 input.method.as_deref(),
                 input.url.as_deref(),
@@ -1984,9 +1999,17 @@ macro_rules! define_store {
             }
         );
         if cursor.is_some() {
-            statement.push_str(" AND id>?");
+            statement.push_str(" AND id<?");
         }
-        statement.push_str(" ORDER BY id LIMIT ?");
+        // Newest first, and the cursor walks *down* the ids. Two things depend
+        // on that direction. The list is the one the WebUI shows (it sorts by
+        // updated_at) and the one the create-task dropdown reads, so `id DESC`
+        // is the "what I just added is at the top" order used everywhere else.
+        // It also decides which rows survive the `limit`: ascending ids handed
+        // back the *oldest* 200 templates, so on a library past that size every
+        // later import was invisible in the UI and unfindable by its search,
+        // which filters the array it was given.
+        statement.push_str(" ORDER BY id DESC LIMIT ?");
         let mut query_builder = sqlx::query(&statement).bind(owner_id);
         if let Some(like) = like {
             query_builder = query_builder.bind(like);
@@ -2756,7 +2779,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
 }
 
 const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
-const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp FROM templates";
+const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp,(SELECT COUNT(*) FROM tasks WHERE tasks.template_id = templates.id) AS task_count FROM templates";
 const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_at,updated_at FROM template_subscriptions";
 // `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
 // them as well). Every other reference to this column in the file must be
@@ -2916,6 +2939,7 @@ fn template_from_row(row: $row) -> Result<Template> {
         variables,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        task_count: row.try_get("task_count")?,
         grp: row.try_get("grp")?,
     })
 }
@@ -3783,6 +3807,71 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+
+        // Binding a task to a template is an owner-scoped read: a bound task
+        // executes the template, so knowing an id is not enough to run someone
+        // else's HAR. The URL sent alongside the id must not skip the lookup —
+        // a bound task's URL is only the mirror shown in listings.
+        let stolen = store
+            .create_for_owner(
+                bob.id,
+                CreateTask {
+                    template_id: Some(template.id),
+                    ..input("bob bound task")
+                },
+            )
+            .await;
+        assert!(
+            stolen.is_err(),
+            "bob must not be able to bind alice's template"
+        );
+
+        // Rebinding an existing task onto a foreign template is refused too.
+        let bob_task = store
+            .create_for_owner(bob.id, input("bob own task"))
+            .await
+            .unwrap();
+        let swapped = store
+            .update_for_owner(
+                bob_task.id,
+                bob.id,
+                UpdateTask {
+                    name: None,
+                    cron: None,
+                    method: None,
+                    url: None,
+                    headers: None,
+                    body: None,
+                    disabled: None,
+                    template_id: Some(template.id),
+                    grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    random_delay_max_seconds: None,
+                    variables: None,
+                },
+            )
+            .await;
+        assert!(
+            swapped.is_err(),
+            "bob must not be able to rebind his task onto alice's template"
+        );
+
+        // The owner can still bind it.
+        let owned = store
+            .create_for_owner(
+                alice.id,
+                CreateTask {
+                    template_id: Some(template.id),
+                    ..input("alice bound task")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(owned.template_id, Some(template.id));
     }
 
     #[tokio::test]
@@ -4119,6 +4208,145 @@ mod tests {
 
         assert!(store.delete_template(created.id).await.unwrap());
         assert!(store.get_template(created.id).await.unwrap().is_none());
+    }
+
+    /// `task_count` is derived on read, so binding and removing tasks moves it
+    /// without any write to the template row. The create-task dropdown's
+    /// "unused first" rule and the templates table's count read this one
+    /// number; a count that only existed in the client could disagree with the
+    /// server and hide a template that is actually in use.
+    #[tokio::test]
+    async fn template_listing_counts_bound_tasks() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("counts_alice", &password_hash, "user")
+            .await
+            .unwrap();
+
+        let bound = store
+            .create_template_for_owner(
+                alice.id,
+                CreateTemplate {
+                    name: "bound".into(),
+                    description: None,
+                    definition: template_definition("bound"),
+                    grp: None,
+                },
+            )
+            .await
+            .unwrap();
+        let unused = store
+            .create_template_for_owner(
+                alice.id,
+                CreateTemplate {
+                    name: "unused".into(),
+                    description: None,
+                    definition: template_definition("unused"),
+                    grp: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.task_count, 0);
+        assert_eq!(unused.task_count, 0);
+
+        // Two tasks on the same template: the count is a count, not a flag.
+        for name in ["first", "second"] {
+            store
+                .create_for_owner(
+                    alice.id,
+                    CreateTask {
+                        template_id: Some(bound.id),
+                        ..input(name)
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let listed = store
+            .search_templates_for_owner(alice.id, None, None, None, 50)
+            .await
+            .unwrap();
+        let count_of = |id: i64| listed.iter().find(|t| t.id == id).unwrap().task_count;
+        assert_eq!(count_of(bound.id), 2);
+        assert_eq!(count_of(unused.id), 0);
+
+        // Removing a task drops the count again, with no template write.
+        let tasks = store
+            .list_for_owner_with_group(alice.id, None)
+            .await
+            .unwrap();
+        store.delete(tasks[0].id).await.unwrap();
+        let relisted = store
+            .search_templates_for_owner(alice.id, None, None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            relisted
+                .iter()
+                .find(|t| t.id == bound.id)
+                .unwrap()
+                .task_count,
+            1
+        );
+    }
+
+    /// Templates page newest first, and the cursor walks down the ids.
+    ///
+    /// The direction is not cosmetic: with ascending ids the first page was the
+    /// *oldest* templates, so on a library larger than a page every later
+    /// import fell off the end of the only page the UI read — present in the
+    /// database, absent from the table and from its search.
+    #[tokio::test]
+    async fn pages_templates_newest_first() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("pages_alice", &password_hash, "user")
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a", "b", "c"] {
+            ids.push(
+                store
+                    .create_template_for_owner(
+                        alice.id,
+                        CreateTemplate {
+                            name: name.into(),
+                            description: None,
+                            definition: template_definition(name),
+                            grp: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+
+        // `limit` rows plus one, so the caller can tell "has_more".
+        let first = store
+            .search_templates_for_owner(alice.id, None, None, None, 2)
+            .await
+            .unwrap();
+        let page: Vec<i64> = first.iter().take(2).map(|t| t.id).collect();
+        assert_eq!(page, vec![ids[2], ids[1]]);
+
+        // The cursor is the last id of the previous page; the next page holds
+        // what is older than it.
+        let second = store
+            .search_templates_for_owner(alice.id, None, None, Some(ids[1]), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
     }
 
     #[tokio::test]

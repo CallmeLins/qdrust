@@ -128,6 +128,12 @@ export function oidcStartUrl(prefix: string = detectUrlPrefix()): string {
   return apiPath("/api/v1/auth/oidc/start", prefix);
 }
 
+/** Hard stop for `allTemplates`' page walk: 50 pages of 200 rows. A library
+ *  anywhere near this size already cannot be browsed by scrolling, and a server
+ *  that kept saying `has_more` must not turn one page load into an endless
+ *  fetch loop. */
+const TEMPLATE_PAGE_LIMIT = 50;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiPath(path), {
     ...init,
@@ -158,7 +164,8 @@ export const api = {
   rotateCsrf: () => request<{ csrf_token: string }>("/api/v1/auth/csrf/rotate", { method: "POST" }),
 
   // ---- templates ----
-  /** Returns the item array from the paginated list response. */
+  /** One page of the paginated template list. Most callers want
+   *  `allTemplates`; reach for this only to walk pages by hand. */
   templates: async (q?: string, grp?: string, limit = 100) => {
     const params = new URLSearchParams();
     if (q) params.set("q", q);
@@ -166,6 +173,33 @@ export const api = {
     params.set("limit", String(limit));
     const page = await request<TemplatePage>(`/api/v1/templates?${params.toString()}`);
     return page.items;
+  },
+  /** Every template the caller owns, walked page by page.
+   *
+   *  The endpoint is cursor-paginated and caps a page at 200 rows, while the
+   *  WebUI filters, sorts and pages the whole list in the browser. Reading only
+   *  page one therefore used to drop every template imported after the 200th —
+   *  invisible in the table, and invisible to its own search box, which filters
+   *  the array it was handed. The walk is bounded so a server that keeps
+   *  claiming `has_more` cannot spin here.
+   *
+   *  `q` / `grp` are server-side filters; the templates page searches locally,
+   *  so it passes neither and gets the complete list. */
+  allTemplates: async (q?: string, grp?: string) => {
+    const items: Template[] = [];
+    let cursor: number | null = null;
+    for (let page = 0; page < TEMPLATE_PAGE_LIMIT; page += 1) {
+      const params = new URLSearchParams();
+      if (q) params.set("q", q);
+      if (grp) params.set("grp", grp);
+      if (cursor != null) params.set("cursor", String(cursor));
+      params.set("limit", "200");
+      const result = await request<TemplatePage>(`/api/v1/templates?${params.toString()}`);
+      items.push(...result.items);
+      if (!result.has_more || result.next_cursor == null) break;
+      cursor = result.next_cursor;
+    }
+    return items;
   },
   templateGroups: () => request<string[]>("/api/v1/task-groups"),
   publicTemplates: () => request<Template[]>("/api/v1/public-templates"),

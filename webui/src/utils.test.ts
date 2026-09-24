@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, ssoAvailable, ssoOnly, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, newestTemplatesFirst, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -196,6 +196,31 @@ describe("unboundTemplatesFirst", () => {
   it("copes with no tasks bound and with no templates at all", () => {
     expect(unboundTemplatesFirst(templates, [])).toEqual(templates);
     expect(unboundTemplatesFirst([], [1, 2])).toEqual([]);
+  });
+});
+
+describe("newestTemplatesFirst / orderTemplatesForNewTask", () => {
+  const newest = { id: 1, updated_at: 300 };
+  const oldest = { id: 2, updated_at: 100 };
+  const middle = { id: 3, updated_at: 200 };
+
+  it("orders by updated_at descending and leaves the input array alone", () => {
+    const input = [oldest, newest, middle];
+    expect(newestTemplatesFirst(input).map((t) => t.id)).toEqual([1, 3, 2]);
+    // A computed sorts a copy: the array the table and the dropdown share must
+    // not be reordered underneath either of them.
+    expect(input.map((t) => t.id)).toEqual([2, 1, 3]);
+  });
+
+  it("puts unused templates first, newest first inside each half", () => {
+    // id 2 is bound, so 1 and 3 lead, and 1 (newest of the two) leads them.
+    expect(orderTemplatesForNewTask([oldest, newest, middle], [2]).map((t) => t.id)).toEqual([1, 3, 2]);
+  });
+
+  it("keeps every template exactly once when all are bound", () => {
+    const ordered = orderTemplatesForNewTask([oldest, newest, middle], [1, 2, 3]);
+    expect(ordered.map((t) => t.id)).toEqual([1, 3, 2]);
+    expect(new Set(ordered.map((t) => t.id)).size).toBe(3);
   });
 });
 

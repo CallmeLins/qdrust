@@ -1314,6 +1314,11 @@ export interface components {
             created_at: number;
             /** Format: int64 */
             updated_at: number;
+            /**
+             * Format: int64
+             * @description Number of the owner's tasks currently bound to this template (0 = unused)
+             */
+            task_count: number;
         };
         TemplatePage: {
             items: components["schemas"]["Template"][];
@@ -2652,6 +2657,7 @@ export interface operations {
             query?: {
                 q?: string;
                 grp?: string;
+                /** @description Id of the last row of the previous page. Pages walk newest first, so the next page holds rows with a smaller id. */
                 cursor?: number;
                 limit?: number;
             };

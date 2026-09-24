@@ -25,12 +25,25 @@ describe("task form template dropdown", () => {
     expect(options).toContain("templatesForSelect");
   });
 
-  it("offers the templates no task uses first", () => {
-    expect(options).toContain("unboundTemplatesFirst(");
+  it("offers the templates no task uses first, newest first inside each half", () => {
+    expect(options).toContain("orderTemplatesForNewTask(");
   });
 
   it("reads the ids in use off the loaded tasks, not a constant", () => {
     expect(options).toMatch(/\.map\(\(task\)\s*=>\s*task\.template_id\)/);
+  });
+
+  it("also counts the server's per-template task_count, so a stale task list cannot hide a bound template", () => {
+    expect(options).toContain("task_count");
+  });
+
+  it("labels each option with its use, so the ordering is legible", () => {
+    expect(options).toContain("templateUnused");
+    expect(options).toContain("templateUsedCount");
+  });
+
+  it("offers the dropdown a filter box, so hundreds of templates can be searched", () => {
+    expect(app).toMatch(/<Dropdown[^>]*v-model="taskForm\.templateId"[^>]*filterable/);
   });
 
   it("still offers the no-template fallback, and only on the edit path", () => {

@@ -1006,6 +1006,7 @@ mod tests {
             variables: Vec::new(),
             created_at: 0,
             updated_at: 0,
+            task_count: 0,
             grp: None,
         };
         let (results, _) = execute_template(
@@ -1047,6 +1048,7 @@ mod tests {
             variables: Vec::new(),
             created_at: 0,
             updated_at: 0,
+            task_count: 0,
             grp: None,
         }
     }
@@ -1358,6 +1360,7 @@ mod tests {
             variables: Vec::new(),
             created_at: 0,
             updated_at: 0,
+            task_count: 0,
             grp: None,
         }
     }

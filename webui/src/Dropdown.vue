@@ -17,8 +17,15 @@ const props = withDefaults(
     /** Compact control for toolbars / table cells; defaults to full-width like an input. */
     compact?: boolean;
     disabled?: boolean;
+    /** Render a text box above the list that narrows it as you type. Required
+     *  once a list runs to hundreds of rows — scrolling is not a search. */
+    filterable?: boolean;
+    /** Placeholder for that box. */
+    filterPlaceholder?: string;
+    /** Row shown when the filter excludes every option. */
+    filterEmptyLabel?: string;
   }>(),
-  { placeholder: "", compact: false, disabled: false }
+  { placeholder: "", compact: false, disabled: false, filterable: false, filterPlaceholder: "", filterEmptyLabel: "" }
 );
 
 const emit = defineEmits<{
@@ -36,12 +43,26 @@ const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const trigger = ref<HTMLElement | null>(null);
 const list = ref<HTMLElement | null>(null);
+const filterInput = ref<HTMLInputElement | null>(null);
 /** Viewport coordinates for the teleported listbox. */
 const listStyle = ref<Record<string, string>>({});
+/** Current filter text; cleared every time the list opens. */
+const filter = ref("");
 
 const selected = computed(() => props.options.find((o) => o.value === props.modelValue));
 const selectedLabel = computed(() => selected.value?.label ?? "");
 const empty = computed(() => !selected.value);
+
+/**
+ * The options the list actually renders. Without a filter this is the caller's
+ * array untouched — order included, because the caller's order is meaningful
+ * (the task form floats unused templates first).
+ */
+const filteredOptions = computed(() => {
+  const term = filter.value.trim().toLowerCase();
+  if (!term) return props.options;
+  return props.options.filter((option) => option.label.toLowerCase().includes(term));
+});
 
 /**
  * Anchor the list to its trigger using viewport coordinates.
@@ -90,12 +111,21 @@ function pick(option: DropdownOption) {
 }
 function move(dir: 1 | -1) {
   if (props.disabled) return;
-  const active = props.options.findIndex((o) => o.value === props.modelValue);
-  let i = active < 0 ? 0 : (active + dir + props.options.length) % props.options.length;
-  while (i !== active && props.options[i].disabled) {
-    i = (i + dir + props.options.length) % props.options.length;
+  const options = filteredOptions.value;
+  if (!options.length) return;
+  const active = options.findIndex((o) => o.value === props.modelValue);
+  let i = active < 0 ? 0 : (active + dir + options.length) % options.length;
+  while (i !== active && options[i].disabled) {
+    i = (i + dir + options.length) % options.length;
   }
-  emit("update:modelValue", props.options[i].value);
+  emit("update:modelValue", options[i].value);
+}
+/** Enter inside the filter box: take the active row, else the first usable one. */
+function pickActive() {
+  const options = filteredOptions.value;
+  const active = options.find((o) => o.value === props.modelValue && !o.disabled);
+  const choice = active ?? options.find((o) => !o.disabled);
+  if (choice) pick(choice);
 }
 function onDocumentMouseDown(event: MouseEvent) {
   const target = event.target as Node;
@@ -113,9 +143,13 @@ function onViewportChange() {
 // `place()` runs in the same microtask batch as the patch that inserts the list,
 // so it is already positioned by the time the browser paints — no jump/flash.
 watch(open, async (isOpen) => {
+  // A filter is a question about *this* open; carrying it to the next one would
+  // hide options for a reason the reader cannot see any more.
+  filter.value = "";
   if (!isOpen) return;
   await nextTick();
   place();
+  if (props.filterable) filterInput.value?.focus();
 });
 watch(() => props.modelValue, () => { /* keep open only while choosing */ });
 
@@ -154,27 +188,44 @@ onBeforeUnmount(() => {
       <ChevronDown :size="16" class="dd-caret" :class="{ flip: open }" />
     </button>
     <!-- Teleported so the list can never be clipped by, nor grow the scrollable
-         area of, the container the trigger lives in (issue #12). -->
+         area of, the container the trigger lives in (issue #12). The filter box
+         sits outside the scrolling <ul> so it stays put while the rows move. -->
     <Teleport to="body">
-      <ul
+      <div
         v-if="open"
         ref="list"
         class="dd-pop"
         :class="{ compact }"
         :style="listStyle"
-        role="listbox"
       >
-        <li
-          v-for="(o, i) in props.options"
-          :key="i"
-          :class="{ active: o.value === props.modelValue, disabled: o.disabled }"
-          role="option"
-          :aria-selected="o.value === props.modelValue"
-          @mousedown.prevent="pick(o)"
-        >
-          {{ o.label }}
-        </li>
-      </ul>
+        <input
+          v-if="filterable"
+          ref="filterInput"
+          v-model="filter"
+          class="dd-filter"
+          type="text"
+          :placeholder="filterPlaceholder"
+          @keydown.down.prevent="move(1)"
+          @keydown.up.prevent="move(-1)"
+          @keydown.enter.prevent="pickActive"
+          @keydown.esc.prevent="open = false"
+        />
+        <ul class="dd-list" role="listbox">
+          <li
+            v-for="(o, i) in filteredOptions"
+            :key="i"
+            :class="{ active: o.value === props.modelValue, disabled: o.disabled }"
+            role="option"
+            :aria-selected="o.value === props.modelValue"
+            @mousedown.prevent="pick(o)"
+          >
+            {{ o.label }}
+          </li>
+          <li v-if="filterable && filteredOptions.length === 0" class="dd-empty">
+            {{ filterEmptyLabel }}
+          </li>
+        </ul>
+      </div>
     </Teleport>
   </span>
 </template>
