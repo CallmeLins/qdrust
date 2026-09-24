@@ -64,6 +64,16 @@ export interface AuthConfig {
   oidc_post_logout_redirect_uri: string;
 }
 
+/** Public deployment metadata exposed by GET /api/v1/meta. Read before the app
+ *  mounts so an `en-US` deployment never flashes a Chinese frame; mirrors the
+ *  server `PublicMeta`. */
+export interface AppMeta {
+  /** Release the server was built from. */
+  version: string;
+  /** Language a visitor with no stored choice gets (QDRUST_DEFAULT_LOCALE). */
+  default_locale: string;
+}
+
 /** Live run-step WebSocket event */
 export interface LiveRunEvent {
   run_id: number;
@@ -150,6 +160,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // ---- meta ----
+  /** Deployment metadata. The WebUI asks for this before it mounts, which
+   *  is why it is the first entry here and needs no session. */
+  meta: () => request<AppMeta>("/api/v1/meta"),
+
   // ---- auth ----
   authConfig: () => request<AuthConfig>("/api/v1/auth/config"),
   session: () => request<{ user: User; expires_at: number }>("/api/v1/auth/session"),

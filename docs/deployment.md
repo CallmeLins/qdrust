@@ -134,6 +134,7 @@ QDRUST_BASE_PATH=/qd
 | `LOGIN_RATE_LIMIT_ATTEMPTS` / `_WINDOW_SECONDS` | `5` / `60` | 登录限流 |
 | `LOG_RETENTION_DAYS` | `0` | 已完成运行记录保留天数（`0` = 永久） |
 | `QDRUST_DEFAULT_TIMEZONE` | `Asia/Shanghai` | 未显式设时区的任务按其 cron 调度的 IANA 时区（DST 感知）。欧美部署可设如 `America/New_York` |
+| `QDRUST_DEFAULT_LOCALE` | `zh-CN` | 首次访问者的 WebUI 语言，`zh-CN`（默认）或 `en-US`（也接受裸 `zh` / `en`）。**只是默认值**：页头语言切换器选过的语言会存在该浏览器里，已存的偏好永远优先于本变量，所以它不会覆盖老用户的语言 |
 | `QDRUST_BASE_PATH` | 空 | 反代到二级目录时设为该前缀（如 `/qd`，伺服 `https://host/qd`）。WebUI 以相对 base 构建、运行时自适应，**无需**为每个前缀重建。置空=根路径。可选编译期固定见 `VITE_BASE_PATH` |
 | `QDRUST_SMTP_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD` / `_FROM` | 空 | 邮件发送（重置密码 / 邮箱验证 / Email 渠道） |
 | `QDRUST_BASE_URL` | `http://localhost:8923` | 密码重置 / 邮箱验证邮件中的链接基址 |

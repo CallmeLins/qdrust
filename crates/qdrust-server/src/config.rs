@@ -53,6 +53,31 @@ pub struct PublicAuthConfig {
     pub oidc_post_logout_redirect_uri: String,
 }
 
+/// Language the WebUI starts in when the visitor has not chosen one
+/// (`QDRUST_DEFAULT_LOCALE`, config-file key `default_locale`). A deployment
+/// that speaks English to its users sets this once instead of leaving every
+/// first-time visitor on a Chinese page.
+pub const DEFAULT_LOCALE: &str = "zh-CN";
+
+/// Public (safe to expose to the browser) deployment metadata: what the WebUI
+/// needs to render itself before anyone has logged in. Deliberately tiny — the
+/// version identifies the running release in a bug report, and the locale tells
+/// a first-time visitor which language this deployment speaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicMeta {
+    pub version: &'static str,
+    pub default_locale: String,
+}
+
+impl Default for PublicMeta {
+    fn default() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            default_locale: DEFAULT_LOCALE.to_string(),
+        }
+    }
+}
+
 /// Deep OIDC provider settings consumed by the authorization-code + PKCE flow
 /// (Phase 1). The public `/auth/config` endpoint only ever sees the coarse
 /// `oidc_enabled` / `oidc_provider_name` booleans — never anything here.
@@ -193,6 +218,13 @@ pub struct Config {
     /// own `timezone`. Defaults to `Asia/Shanghai` to match a China-first
     /// deployment. Empty means UTC (the previous hardcoded fallback).
     pub default_timezone: String,
+    /// WebUI language a first-time visitor gets. Like `default_timezone` this is
+    /// a *default*, not an override: a visitor who picked a language in the UI
+    /// keeps it across reloads (the WebUI stores that choice in localStorage).
+    /// Empty falls back to `zh-CN` in [`Config::validate`]; anything other than
+    /// the two shipped languages is refused at startup rather than silently
+    /// ignored, because the wrong language is hard to notice and easy to typo.
+    pub default_locale: String,
     /// URL sub-path the whole site (API + SPA assets) is served under, e.g.
     /// `/qd` when reverse-proxied at `https://host/qd`. Empty means root `/`
     /// (current behaviour, compatible with subdomain or bare deploys).
@@ -233,6 +265,20 @@ impl Config {
             oidc_post_logout_redirect_uri: self.oidc.post_logout_redirect_uri.clone(),
         }
     }
+
+    /// Public deployment metadata, served by `GET /api/v1/meta`. The WebUI asks
+    /// for this *before* it mounts so an `en-US` deployment never flashes a
+    /// Chinese frame; it carries no secrets and needs no session.
+    pub fn public_meta(&self) -> PublicMeta {
+        PublicMeta {
+            version: env!("CARGO_PKG_VERSION"),
+            default_locale: if self.default_locale.trim().is_empty() {
+                DEFAULT_LOCALE.to_string()
+            } else {
+                self.default_locale.clone()
+            },
+        }
+    }
 }
 
 impl Config {
@@ -269,6 +315,10 @@ impl Config {
             allow_private_network: parse_env("QDRUST_ALLOW_PRIVATE_NETWORK", false)?,
             allow_invalid_certificates: parse_env("QDRUST_ALLOW_INVALID_CERTIFICATES", false)?,
             default_timezone: env::var("QDRUST_DEFAULT_TIMEZONE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
+            default_locale: env::var("QDRUST_DEFAULT_LOCALE")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_default(),
@@ -440,6 +490,15 @@ impl Config {
                 let file = get("default_timezone").unwrap_or("");
                 if !self.default_timezone.is_empty() {
                     self.default_timezone.clone()
+                } else {
+                    file.to_string()
+                }
+            },
+            default_locale: {
+                // Config file is only a fallback; env already won above.
+                let file = get("default_locale").unwrap_or("");
+                if !self.default_locale.is_empty() {
+                    self.default_locale.clone()
                 } else {
                     file.to_string()
                 }
@@ -674,6 +733,12 @@ impl Config {
         default_timezone
             .parse::<chrono_tz::Tz>()
             .context("default_timezone must be a valid IANA timezone name")?;
+
+        // WebUI language: unset everywhere means zh-CN. An unknown value is
+        // refused here rather than ignored, so a typo (`en_US` is accepted and
+        // canonicalised, but `english` is not) surfaces at startup instead of
+        // shipping a language nobody asked for.
+        let default_locale = normalize_locale(&self.default_locale)?;
         let base_path = normalize_base_path(&self.base_path);
         // A mode that leans on external providers must actually have one
         // enabled; otherwise refuse loudly rather than silently degrade.
@@ -724,10 +789,22 @@ impl Config {
         );
         Ok(Self {
             default_timezone,
+            default_locale,
             base_path,
             oidc_enabled,
             ..self
         })
+    }
+}
+
+/// Canonicalise `QDRUST_DEFAULT_LOCALE`. Accepts the two languages the WebUI
+/// ships plus the spellings a deployer is likely to type (bare `zh`/`en`, and
+/// underscores); empty means "unset" -> [`DEFAULT_LOCALE`].
+fn normalize_locale(value: &str) -> Result<String> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "" | "zh-cn" | "zh" => Ok(DEFAULT_LOCALE.to_string()),
+        "en-us" | "en" => Ok("en-US".to_string()),
+        other => anyhow::bail!("QDRUST_DEFAULT_LOCALE must be zh-CN or en-US, got {other:?}"),
     }
 }
 
@@ -837,6 +914,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
             local_login_enabled: false,
@@ -881,6 +959,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
             local_login_enabled: false,
@@ -895,6 +974,45 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.default_timezone, "Asia/Shanghai");
         assert_eq!(cfg.base_path, "");
+        // Same shape as the timezone above: unset everywhere means the built-in
+        // default, not an empty string the WebUI would have to guess about.
+        assert_eq!(cfg.default_locale, "zh-CN");
+    }
+
+    #[test]
+    fn default_locale_accepts_the_spellings_a_deployer_types() {
+        // The two shipped languages plus the bare/underscore forms someone is
+        // likely to write from memory. Anything else is refused below rather
+        // than quietly ignored.
+        for (input, expected) in [
+            ("", "zh-CN"),
+            ("zh", "zh-CN"),
+            ("zh-CN", "zh-CN"),
+            ("ZH_cn", "zh-CN"),
+            ("  zh_cn  ", "zh-CN"),
+            ("en", "en-US"),
+            ("en-US", "en-US"),
+            ("EN_us", "en-US"),
+        ] {
+            assert_eq!(
+                normalize_locale(input).unwrap(),
+                expected,
+                "input {input:?} must canonicalise to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_default_locale_is_rejected() {
+        // A locale the WebUI does not ship must fail the boot: silently serving
+        // the wrong language is the kind of thing nobody notices for months.
+        for input in ["english", "fr", "de-DE", "en-GB"] {
+            let message = normalize_locale(input).unwrap_err().to_string();
+            assert!(
+                message.contains("QDRUST_DEFAULT_LOCALE"),
+                "the error has to name the variable, got {message:?}"
+            );
+        }
     }
 
     #[test]
@@ -919,6 +1037,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: "Not/A_Zone".into(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
             local_login_enabled: false,
@@ -965,6 +1084,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
             local_login_enabled: false,
@@ -1007,6 +1127,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Oidc,
             local_login_enabled: false,
@@ -1053,6 +1174,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
             local_login_enabled: false,
@@ -1090,6 +1212,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Hybrid,
             local_login_enabled: true,
@@ -1138,6 +1261,7 @@ mod tests {
             allow_private_network: false,
             allow_invalid_certificates: false,
             default_timezone: String::new(),
+            default_locale: String::new(),
             base_path: String::new(),
             auth_mode: AuthMode::Local,
             local_login_enabled: false,

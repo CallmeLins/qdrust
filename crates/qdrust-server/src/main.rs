@@ -80,6 +80,9 @@ async fn main() -> Result<()> {
             login_rate_limit_attempts: config.login_rate_limit_attempts,
             login_rate_limit_window: config.login_rate_limit_window,
             public: config.public_auth_config(),
+            // Release version + the WebUI's default language, read by the
+            // browser before it mounts (`GET /api/v1/meta`).
+            meta: config.public_meta(),
             oidc: config.oidc.clone(),
         },
         run_events,

@@ -908,7 +908,8 @@
           }
         }
       }
-    },    "/api/v1/templates/{id}/test": {
+    },
+    "/api/v1/templates/{id}/test": {
       "post": {
         "operationId": "testTemplate",
         "parameters": [
@@ -1737,6 +1738,24 @@
         "responses": {
           "200": {
             "description": "Restore complete"
+          }
+        }
+      }
+    },
+    "/api/v1/meta": {
+      "get": {
+        "operationId": "getMeta",
+        "summary": "Deployment metadata the WebUI reads before it mounts",
+        "responses": {
+          "200": {
+            "description": "Release version and the default WebUI language",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Meta"
+                }
+              }
+            }
           }
         }
       }
@@ -3906,6 +3925,27 @@
         "properties": {
           "token": {
             "type": "string"
+          }
+        }
+      },
+      "Meta": {
+        "type": "object",
+        "required": [
+          "version",
+          "default_locale"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "Release the server was built from"
+          },
+          "default_locale": {
+            "type": "string",
+            "enum": [
+              "zh-CN",
+              "en-US"
+            ],
+            "description": "Language a visitor with no stored choice gets (QDRUST_DEFAULT_LOCALE)"
           }
         }
       }

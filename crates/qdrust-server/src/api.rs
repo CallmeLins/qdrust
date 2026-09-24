@@ -141,6 +141,11 @@ pub struct AuthConfig {
     /// Public login-policy snapshot (no secrets), surfaced by
     /// `GET /api/v1/auth/config` and used to gate local entry points.
     pub public: crate::config::PublicAuthConfig,
+    /// Public deployment metadata (release version + the WebUI language a
+    /// first-time visitor gets), surfaced by `GET /api/v1/meta`. Read by the
+    /// WebUI *before* it mounts, so it cannot sit behind a session: the login
+    /// page itself has to know what language to speak.
+    pub meta: crate::config::PublicMeta,
     /// Deep OIDC provider settings for the authorization-code + PKCE flow.
     pub oidc: crate::config::OidcConfig,
 }
@@ -161,6 +166,7 @@ impl Default for AuthConfig {
                 oidc_logout_url: String::new(),
                 oidc_post_logout_redirect_uri: String::new(),
             },
+            meta: crate::config::PublicMeta::default(),
             oidc: crate::config::OidcConfig::default(),
         }
     }
@@ -258,6 +264,7 @@ pub fn router_with_auth(
             .expect("login rate limit configuration must be valid");
     let inner = Router::new()
         .route("/api/v1/openapi.json", get(openapi))
+        .route("/api/v1/meta", get(app_meta))
         .route("/api/v1/auth/config", get(auth_config))
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
         .route("/api/v1/auth/register", axum::routing::post(register))
@@ -518,6 +525,20 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         "header_auth_enabled": public.header_auth_enabled,
         "oidc_logout_url": public.oidc_logout_url,
         "oidc_post_logout_redirect_uri": public.oidc_post_logout_redirect_uri,
+    }))
+}
+
+/// `GET /api/v1/meta`
+///
+/// Public deployment metadata: the release this server was built from, and the
+/// language a first-time visitor should get. The WebUI reads it before it
+/// mounts, which is why it carries no secrets and needs no session — an
+/// `en-US` deployment would otherwise flash a Chinese frame on every load.
+async fn app_meta(State(state): State<AppState>) -> Json<Value> {
+    let meta = &state.auth.meta;
+    Json(json!({
+        "version": meta.version,
+        "default_locale": meta.default_locale,
     }))
 }
 
@@ -3434,6 +3455,63 @@ mod tests {
         assert!(!text.to_lowercase().contains("client_id"));
     }
 
+    /// A locale-parameterised app for the pre-login metadata endpoint.
+    async fn test_app_with_meta(meta: crate::config::PublicMeta) -> Router {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        router_with_auth(
+            store,
+            AuthConfig {
+                meta,
+                ..AuthConfig::default()
+            },
+            run_event_channel().0,
+            runtime_settings(),
+            crate::outbound::OutboundHttp::standalone(),
+            crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+            "",
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn meta_serves_the_deployments_default_language() {
+        let app = test_app_with_meta(crate::config::PublicMeta {
+            version: env!("CARGO_PKG_VERSION"),
+            default_locale: "en-US".into(),
+        })
+        .await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/meta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No session, no cookie: the WebUI asks for this before anyone logs in.
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["default_locale"], "en-US");
+
+        // The built-in default has to be a language the WebUI actually ships.
+        let shipped = test_app_with_meta(crate::config::PublicMeta::default()).await;
+        let response = shipped
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/meta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["default_locale"], "zh-CN");
+    }
+
     #[tokio::test]
     async fn auth_config_defaults_to_local_with_login_enabled() {
         let app = test_app().await; // AuthConfig::default()
@@ -3922,6 +4000,9 @@ mod tests {
         );
         assert!(document["paths"]["/api/v1/tasks"].is_object());
         assert!(document["paths"]["/api/v1/templates/{id}/test"].is_object());
+        // The WebUI reads the deployment's default language from here before it
+        // mounts, so the path must stay in the published contract.
+        assert!(document["paths"]["/api/v1/meta"]["get"].is_object());
         // The endpoints that back the WebUI's aggregated log, the channel-test
         // button and the notification editors must stay in the published
         // contract.

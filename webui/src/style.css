@@ -583,19 +583,41 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 
 /* pager: the footer under a paged list (tasks, subscriptions, both template
    lists, the library tables, the run-log modal). Row count on the left, the
-   page controls centred, the page-size picker on the right — and it wraps
-   instead of overflowing once a narrow screen runs out of width. */
+   page controls centred, the page-size picker on the right — and it stacks
+   instead of overflowing once a narrow screen runs out of width.
+
+   Three columns: the navigation gets its own `auto` column instead of relying
+   on `justify-content: center`, because a flex line only centres its middle
+   group when the two sides happen to be equally wide — with a 43px count
+   against a 102px picker the buttons sat 29px left of centre (measured in
+   headless Chrome at four widths), which is what made them read as uncentred
+   and as moving while the list above them changed length. `1fr` on both sides
+   makes the centre exact whatever the two sides weigh. */
 .pager {
-  display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   gap: 8px 12px; margin-top: 12px; font-size: 13px;
 }
+.pager-total { grid-column: 1; justify-self: start; }
 .pager .pager-position { min-width: 88px; text-align: center; }
-.pager-total { margin-right: auto; }
+/* The navigation is one group: prev, the position between them, and next travel
+   together, so what gets centred is the centre of that whole group. */
+.pager-nav { grid-column: 2; display: flex; align-items: center; justify-content: center; gap: 8px 12px; flex-wrap: wrap; }
 /* Modal-scoped for the same reason as `.group-filter` above — the run-log dialog
    pages its own table, so this pair lives inside a `.modal` too. `--ink-3` rather
    than the caption's `--ink-2`: the size picker is the quietest thing in the
    footer and the field-caption rule was brightening it as well as bolding it. */
-.pager-size, .modal .pager-size { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: var(--ink-3); font-size: 12px; font-weight: 400; white-space: nowrap; }
+.pager-size, .modal .pager-size { grid-column: 3; justify-self: end; display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12px; font-weight: 400; white-space: nowrap; }
+/* Narrow windows: one centred column again. Stacking beats a three-column grid
+   whose side cells would otherwise squeeze the navigation off the page. The
+   child selectors carry an extra class so they beat the `grid-column`
+   placements above whatever order the minifier leaves them in — without that,
+   a cell keeps being placed at column 3 and the "one column" grid silently
+   grows implicit tracks for it (measured: the buttons landed 63px off centre
+   at a 700px window). */
+@media (max-width: 720px) {
+  .pager { grid-template-columns: 1fr; justify-items: center; }
+  .pager > .pager-total, .pager > .pager-nav, .pager > .pager-size, .modal .pager > .pager-size { grid-column: 1; justify-self: center; }
+}
 
 /* ============================================================
    tables

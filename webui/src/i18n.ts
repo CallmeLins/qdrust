@@ -1,7 +1,25 @@
 import { ref } from "vue";
 
 export type Locale = "zh-CN" | "en-US";
-export const locale = ref<Locale>((localStorage.getItem("qdrust.locale") as Locale) || "zh-CN");
+const LOCALE_KEY = "qdrust.locale";
+
+/** The two languages the WebUI actually ships. Anything else — including a
+ *  value left in localStorage by an older build — is not a locale we can
+ *  render, so it is ignored rather than cast into `locale` where every `t()`
+ *  would look up a key that does not exist. */
+export function isLocale(value: unknown): value is Locale {
+  return value === "zh-CN" || value === "en-US";
+}
+
+/** The visitor's own choice, or null when they have never made one. Guarded
+ *  because this module is imported by tests running outside a browser. */
+function storedLocale(): Locale | null {
+  if (typeof localStorage === "undefined") return null;
+  const value = localStorage.getItem(LOCALE_KEY);
+  return isLocale(value) ? value : null;
+}
+
+export const locale = ref<Locale>(storedLocale() ?? "zh-CN");
 
 const zh = {
   // nav
@@ -1036,8 +1054,24 @@ function applyDocumentLang(): void {
   if (typeof document !== "undefined") document.documentElement.lang = locale.value;
 }
 applyDocumentLang();
+
+/** Adopt the deployment's default language (`QDRUST_DEFAULT_LOCALE`, served by
+ *  `GET /api/v1/meta`) unless this browser already holds a choice of its own.
+ *
+ *  Called before the app mounts, so an `en-US` deployment never renders a
+ *  Chinese frame first. Deliberately does NOT write to localStorage: never
+ *  having chosen is not the same as having chosen `zh-CN`, and an admin who
+ *  changes the default later should reach everyone who has never picked one. */
+export function applyDefaultLocale(value: unknown): void {
+  if (storedLocale() !== null) return; // an explicit choice always wins
+  if (!isLocale(value)) return; // unset/unrecognised -> keep the built-in
+  if (locale.value === value) return;
+  locale.value = value;
+  applyDocumentLang();
+}
+
 export function toggleLocale(): void {
   locale.value = locale.value === "zh-CN" ? "en-US" : "zh-CN";
-  localStorage.setItem("qdrust.locale", locale.value);
+  if (typeof localStorage !== "undefined") localStorage.setItem(LOCALE_KEY, locale.value);
   applyDocumentLang();
 }

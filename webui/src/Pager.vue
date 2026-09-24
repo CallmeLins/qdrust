@@ -23,6 +23,10 @@ import { PAGE_SIZE_OPTIONS, showsNav } from "./pagination";
  * Only the navigation inside may hide — on a one-page list it has nothing to
  * do — and the count and the picker stay even then, so a short list reads as a
  * compact status line rather than losing its way back to a smaller page.
+ *
+ * Laid out as three columns — count, navigation, size picker — so the buttons
+ * are centred in the row itself rather than in whatever space the two sides
+ * leave over. See `.pager` in style.css: the difference is 29px.
  */
 const props = defineProps<{
   page: number;
@@ -56,11 +60,11 @@ const navVisible = computed(() => showsNav(props.pages));
 <template>
   <div class="pager">
     <span v-if="total != null" class="muted pager-total">{{ fmt('pageTotal', { n: total }) }}</span>
-    <template v-if="navVisible">
+    <span v-if="navVisible" class="pager-nav">
       <button class="secondary-button" type="button" :disabled="busy || !canPrev" @click="emit('prev')"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
       <span class="muted pager-position">{{ pages != null ? fmt('pageOf', { n: page, total: pages }) : fmt('runLogPageNo', { n: page }) }}</span>
       <button class="secondary-button" type="button" :disabled="busy || !canNext" @click="emit('next')">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
-    </template>
+    </span>
     <label class="pager-size">
       <span>{{ t('pageSizeLabel') }}</span>
       <Dropdown :model-value="pageSize" :options="sizeOptions" compact @change="(value) => emit('update:pageSize', Number(value))" />
