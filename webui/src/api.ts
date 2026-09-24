@@ -34,6 +34,7 @@ export type PushRequest = components["schemas"]["PushRequest"];
 export type SiteSetting = components["schemas"]["SiteSetting"];
 export type BatchTaskResult = components["schemas"]["BatchTaskResult"];
 export type QdHarValidation = components["schemas"]["QdHarValidation"];
+export type TemplateTestResult = components["schemas"]["TemplateTestResult"];
 
 /** Paginated response returned by GET /api/v1/templates */
 export interface TemplatePage {
@@ -210,6 +211,11 @@ export const api = {
   importQdHar: (name: string, description: string, har: unknown) => request<Template>("/api/v1/templates/import-qd-har", { method: "POST", body: JSON.stringify({ name, description: description || null, har }) }),
   updateQdHar: (id: number, name: string, description: string, har: unknown) => request<Template>(`/api/v1/templates/${id}/qd-har`, { method: "PUT", body: JSON.stringify({ name, description: description || null, har }) }),
   validateQdHar: (har: unknown) => request<QdHarValidation>("/api/v1/templates/validate-qd-har", { method: "POST", body: JSON.stringify({ har }) }),
+  /** Run a saved template with these variables and return the steps, without
+   *  creating a task or a run. Same execution path (and outbound guard) as a
+   *  real run, so a failure here is the failure the task would hit. */
+  testTemplate: (id: number, variables: Record<string, unknown>) =>
+    request<TemplateTestResult>(`/api/v1/templates/${id}/test`, { method: "POST", body: JSON.stringify({ variables }) }),
 
   // ---- plugins ----
   plugins: () => request<Plugin[]>("/api/v1/plugins"),

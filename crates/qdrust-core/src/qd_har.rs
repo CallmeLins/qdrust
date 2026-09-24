@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -84,23 +84,9 @@ impl QdHar {
         let mut seen: HashSet<String> = HashSet::new();
         let mut variables = Vec::new();
         for entry in &self.document.log.entries {
-            let request = &entry.request;
             let mut found = Vec::new();
-            let fields = [Some(request.method.as_str()), Some(request.url.as_str())]
-                .into_iter()
-                .flatten()
-                .chain(
-                    request
-                        .post_data
-                        .as_ref()
-                        .and_then(|data| data.text.as_deref()),
-                );
-            for field in fields {
+            for field in request_fields(&entry.request) {
                 found.extend(engine.undeclared_variables(field));
-            }
-            for item in request.headers.iter().chain(request.cookies.iter()) {
-                found.extend(engine.undeclared_variables(&item.name));
-                found.extend(engine.undeclared_variables(&item.value));
             }
             for name in found {
                 if known.contains(&name) || extracted.contains(&name) {
@@ -116,6 +102,52 @@ impl QdHar {
         }
         variables
     }
+
+    /// Default values declared in the template, keyed by variable name.
+    ///
+    /// The counterpart to [`Self::variables`] for the `init_env` half of QD's
+    /// `HARSave.post`: a `{{ name|default("...") }}` seeds the new-task form
+    /// with `...` instead of an empty box. Only names that are actually inputs
+    /// are kept (a default on an extracted or helper name is not an input), and
+    /// the first declaration wins, which is exactly QD's `not in init_env`
+    /// guard.
+    pub fn defaults(&self) -> BTreeMap<String, String> {
+        let variables: HashSet<String> = self.variables().into_iter().collect();
+        if variables.is_empty() {
+            return BTreeMap::new();
+        }
+        let engine = QdExpressionEngine::default();
+        let mut defaults = BTreeMap::new();
+        for entry in &self.document.log.entries {
+            for field in request_fields(&entry.request) {
+                for (name, value) in engine.declared_defaults(field) {
+                    if variables.contains(&name) && !defaults.contains_key(&name) {
+                        defaults.insert(name, value);
+                    }
+                }
+            }
+        }
+        defaults
+    }
+}
+
+/// Every string a QD entry can read a variable from, in the order QD's
+/// `get_variables` visits them: method, URL, body, then each header and cookie
+/// name and value.
+fn request_fields(request: &QdHarRequest) -> Vec<&str> {
+    let mut fields = vec![request.method.as_str(), request.url.as_str()];
+    if let Some(text) = request
+        .post_data
+        .as_ref()
+        .and_then(|data| data.text.as_deref())
+    {
+        fields.push(text);
+    }
+    for item in request.headers.iter().chain(request.cookies.iter()) {
+        fields.push(item.name.as_str());
+        fields.push(item.value.as_str());
+    }
+    fields
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -773,6 +805,71 @@ mod tests {
         ]);
         let har = QdHar::parse_qd(raw).expect("Jpopsuki HAR must parse");
         assert_eq!(har.variables(), ["jpop_username", "jpop_password"]);
+    }
+
+    #[test]
+    fn reads_default_values_from_the_default_filter() {
+        // QD's `HARSave.post` seeds the new-task form from `{{x|default("...")}}`
+        // (`init_env`). The proxy case is the one that matters in practice:
+        // `{{_proxy|default("")}}` is an input whose default is empty.
+        let raw = json!([{
+            "request": {
+                "method": "GET",
+                "url": "https://example.com/?a={{flaresolverr|default(\"http://flaresolverr.d.test/v1\")}}&b={{token|default('')}}&c={{other}}",
+                "headers": [{"name": "X-P", "value": "{{_proxy|default(\"\")}}"}],
+                "cookies": []
+            },
+            "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+        }]);
+        let har = QdHar::parse_qd(raw).expect("HAR must parse");
+        assert_eq!(
+            har.variables(),
+            ["flaresolverr", "token", "other", "_proxy"]
+        );
+        let defaults = har.defaults();
+        assert_eq!(
+            defaults.get("flaresolverr").map(String::as_str),
+            Some("http://flaresolverr.d.test/v1")
+        );
+        assert_eq!(defaults.get("token").map(String::as_str), Some(""));
+        assert_eq!(defaults.get("_proxy").map(String::as_str), Some(""));
+        // No `default(...)` for `other`, so the form is blank for it.
+        assert!(!defaults.contains_key("other"));
+    }
+
+    #[test]
+    fn default_filter_scan_matches_qd_ast_restrictions() {
+        let engine = QdExpressionEngine::default();
+        let found = engine.declared_defaults(
+            "{{ a|default(\"first\") }} {{ a|default('second') }} \
+             {{ b|default(other) }} {{ c.d|default(\"x\") }} {{ e|urlencode|default(\"y\") }}",
+        );
+        // Every `default` on a bare name with a literal first argument, in
+        // source order; de-duplication and the input-name filter are the
+        // caller's job (`QdHar::defaults`). A non-literal, a dotted path and a
+        // filter chain all contribute nothing, as QD's AST walk drops them.
+        assert_eq!(
+            found,
+            vec![
+                ("a".to_string(), "first".to_string()),
+                ("a".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_default_declaration_wins() {
+        let raw = json!([{
+            "request": {
+                "method": "GET",
+                "url": "{{a|default(\"first\")}} {{a|default(\"second\")}}",
+                "headers": [],
+                "cookies": []
+            },
+            "rule": {"success_asserts": [], "failed_asserts": [], "extract_variables": []}
+        }]);
+        let har = QdHar::parse_qd(raw).expect("HAR must parse");
+        assert_eq!(har.defaults().get("a").map(String::as_str), Some("first"));
     }
 
     #[test]

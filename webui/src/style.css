@@ -828,6 +828,16 @@ code {
 .modal .checkbox { display: flex; align-items: center; gap: 8px; grid-template-columns: none; }
 .modal .checkbox input { width: 16px; height: 16px; min-height: 0; accent-color: var(--primary); }
 .modal-actions { padding-top: 5px; display: flex; justify-content: flex-end; gap: 9px; }
+/* Test-run feedback in the task dialog: the steps a template produced, kept
+   compact so the dialog does not grow a second scrollbar. */
+.template-test {
+  border: 1px solid var(--line); border-radius: var(--r-m);
+  padding: 9px 11px; background: var(--surface); display: grid; gap: 6px;
+}
+.template-test-head { display: flex; gap: 9px; align-items: baseline; font-size: 12px; }
+.template-test-steps { margin: 0; padding-left: 18px; display: grid; gap: 4px; max-height: 150px; overflow: auto; }
+.template-test-steps li { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.template-test-steps code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* align-items:end keeps the inputs on one baseline even when a label wraps */
 .form-row { display: grid; grid-template-columns: 140px 1fr; gap: 14px; align-items: end; }

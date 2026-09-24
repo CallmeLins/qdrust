@@ -545,6 +545,43 @@ impl Plugin for UtilityPlugin {
                         body: result.into_bytes(),
                     })
                 }
+                "totp" => {
+                    // Computed locally so a 2FA secret never has to be sent to an
+                    // external API. `secret` is the base32 value from the setup
+                    // page; `t` exists for replay and tests.
+                    let secret = request
+                        .query
+                        .get("secret")
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    let digits = request
+                        .query
+                        .get("digits")
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .unwrap_or(6);
+                    let period = request
+                        .query
+                        .get("period")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(30);
+                    let algorithm = request
+                        .query
+                        .get("algo")
+                        .map(String::as_str)
+                        .unwrap_or("sha1");
+                    let at = request
+                        .query
+                        .get("t")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp().max(0) as u64);
+                    let result = crate::totp::code(secret, digits, period, algorithm, at)?;
+
+                    Ok(PluginResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: result.into_bytes(),
+                    })
+                }
                 "uuid" => {
                     let namespace = request
                         .query
@@ -1399,6 +1436,41 @@ mod tests {
         assert_eq!(
             String::from_utf8(response.body).unwrap(),
             "ac&lt;b&gt;&amp;amp;"
+        );
+    }
+
+    #[tokio::test]
+    async fn computes_totp_locally() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        // RFC 6238 vector: 8 digits, sha1, t=59.
+        let response = registry
+            .call(
+                "api://util/totp?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=8&t=59",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(response.body).unwrap(), "94287082");
+
+        // A bad secret or digit count is refused rather than answered with a
+        // wrong code.
+        assert!(
+            registry
+                .call("api://util/totp?secret=nope!", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .call(
+                    "api://util/totp?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=4",
+                    Duration::from_secs(1),
+                )
+                .await
+                .is_err()
         );
     }
 

@@ -535,6 +535,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/templates/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["testTemplate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/templates/{id}": {
         parameters: {
             query?: never;
@@ -1292,6 +1308,24 @@ export interface components {
             controls: number;
             extract_variables: number;
         };
+        TestTemplate: {
+            variables?: {
+                [key: string]: unknown;
+            };
+        };
+        TemplateTestStep: {
+            index: number;
+            url: string;
+            status: number;
+            body_size: number;
+        };
+        TemplateTestResult: {
+            steps: components["schemas"]["TemplateTestStep"][];
+            variables: {
+                [key: string]: unknown;
+            };
+            log?: string | null;
+        };
         Template: {
             /** Format: int64 */
             id: number;
@@ -1308,6 +1342,10 @@ export interface components {
             };
             /** @description Input variables a task created from this template must supply (QD's 变量 list) */
             variables: string[];
+            /** @description Default values for those variables, keyed by name (QD init_env for HAR templates, the declared variables map for native ones) */
+            variable_defaults?: {
+                [key: string]: string;
+            };
             /** @description Group label (QD _groups equivalent) */
             grp?: string | null;
             /** Format: int64 */
@@ -2735,6 +2773,35 @@ export interface operations {
                     "application/json": components["schemas"]["QdHarValidation"];
                 };
             };
+            422: components["responses"]["ValidationError"];
+        };
+    };
+    testTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TestTemplate"];
+            };
+        };
+        responses: {
+            /** @description Test run outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TemplateTestResult"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
             422: components["responses"]["ValidationError"];
         };
     };

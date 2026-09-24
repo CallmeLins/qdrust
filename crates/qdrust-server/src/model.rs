@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -259,6 +261,33 @@ pub struct QdHarValidation {
     pub extract_variables: usize,
 }
 
+/// Body of `POST /api/v1/templates/{id}/test`: the variable values to run the
+/// template with. Anything omitted renders as undefined, exactly as a task that
+/// never filled that variable would.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TestTemplate {
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateTestStep {
+    pub index: usize,
+    pub url: String,
+    pub status: u16,
+    pub body_size: usize,
+}
+
+/// A test run's outcome. Nothing is persisted: the point is to answer "does
+/// this template work with these variables" before a task is saved.
+#[derive(Clone, Debug, Serialize)]
+pub struct TemplateTestResult {
+    pub steps: Vec<TemplateTestStep>,
+    pub variables: BTreeMap<String, Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
+}
+
 // ---- P1 features: template subscriptions, push requests, email verification ----
 
 /// A source the user browses and imports templates from on demand. There is no
@@ -487,6 +516,12 @@ pub struct Template {
     /// "变量" form, for native templates the declared `variables` map keys.
     #[serde(default)]
     pub variables: Vec<String>,
+    /// Default values for those variables, keyed by name: QD's `init_env`
+    /// (`{{name|default("...")}}`) for HAR templates, the declared `variables`
+    /// map for native ones. The new-task form seeds each row with this instead
+    /// of an empty box.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variable_defaults: BTreeMap<String, String>,
     pub created_at: i64,
     pub updated_at: i64,
     /// How many of the owner's tasks are bound to this template right now.

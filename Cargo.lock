@@ -2225,6 +2225,7 @@ dependencies = [
  "fake",
  "fancy-regex",
  "hex",
+ "hmac",
  "html-escape",
  "md5",
  "minijinja",

@@ -22,7 +22,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 - **可视化 HAR 编辑器**：在 WebUI 里直接编辑请求、变量与断言，无需手写 JSON。
 - **双后端数据库**：SQLite（开箱即用）与 MySQL（按 `DATABASE_URL` 自动选择）。
 - **完整通知体系**：Webhook + Email + 自定义 HTTP + 8 种推送渠道，共 **11 种**；支持批量绑定、失败次数阈值、仅自动执行触发，以及自定义标题 / 正文模板（见 [推送 / 通知](docs/notifications.md)）。
-- **模板表达式**：26 个 Jinja2 过滤器 + 38 个表达式函数，以及 `api://util/*` 内置工具（时间 / 编码 / 哈希 / 正则 / JSON / RSA / OCR，见 [模板表达式与内置工具](docs/expressions.md)）。
+- **模板表达式**：27 个 Jinja2 过滤器 + 39 个表达式函数，以及 `api://util/*` 内置工具（时间 / 编码 / 哈希 / TOTP / 正则 / JSON / RSA / OCR，见 [模板表达式与内置工具](docs/expressions.md)）。
 - **无头浏览器插件**（可选）：`api://browser/*` 通过 CDP 驱动远程无头浏览器，补齐"生成签名 / 过验证码 / 渲染 JS / 多步表单交互"这类纯 HTTP 做不了的一步。支持跨步骤存活的会话复用与 `type`/`click` DOM 操作，结果可提取成变量回填到后续请求（见 [浏览器插件](docs/browser-plugin.md)）。
 - **任务调度**：分组、批量操作、可视化调度器（含随机延迟）、模板变量预填。任务以**模板**为请求源（多页模板常混合 GET/POST），任务级不携带请求方法 / URL / 请求头 / 请求体。
 - **运行可观测**：QD 风格运行日志、按任务查看运行历史、WebSocket 实时步骤流。

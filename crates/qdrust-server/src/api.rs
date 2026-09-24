@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{any, delete, get, get_service},
 };
+use qdrust_core::executor::CancellationToken;
 use qdrust_core::plugin::{
     PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, PluginRequest,
     SubprocessPlugin,
@@ -43,9 +44,10 @@ use crate::{
         CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
         DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportLibraryTemplates,
         ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetSiteSetting, TemplateSubscription, UpdateNotificationAction,
-        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        ResetPassword, SetSiteSetting, TemplateSubscription, TemplateTestResult, TemplateTestStep,
+        TestTemplate, UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest,
+        UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
+        VerifyEmail,
     },
     store::Store,
 };
@@ -404,6 +406,10 @@ pub fn router_with_auth(
         .route(
             "/api/v1/templates/{id}/qd-har",
             axum::routing::put(update_qd_har),
+        )
+        .route(
+            "/api/v1/templates/{id}/test",
+            axum::routing::post(test_template),
         )
         .route(
             "/api/v1/public-templates/{id}/copy",
@@ -2165,6 +2171,64 @@ async fn validate_qd_har(
     }))
 }
 
+/// Run a saved template with the caller's variables, without creating a task or
+/// a run record.
+///
+/// The execution path is the scheduler's, not a second implementation: the same
+/// per-run policy (timeouts and both ADR-0008 relaxations), the same
+/// request/loop limits and the same SSRF guard apply. What differs is only that
+/// the outcome comes back to the caller instead of being written to
+/// `runs`/`run_steps`.
+async fn test_template(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    ApiJson(input): ApiJson<TestTemplate>,
+) -> Result<Json<TemplateTestResult>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let template = store
+        .get_template_for_owner(id, session.user.id)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "template_not_found",
+            "Template not found",
+        ))?;
+    let policy = crate::scheduler::run_policy(None, &runtime_settings());
+    let plugins = crate::scheduler::load_plugins_for_owner(&store, session.user.id, None).await;
+    let (steps, variables) = crate::scheduler::execute_template(
+        template,
+        &CancellationToken::new(),
+        &input.variables,
+        policy,
+        &plugins,
+    )
+    .await
+    .map_err(ApiError::unprocessable)?;
+    let steps = steps
+        .into_iter()
+        .enumerate()
+        .map(|(index, step)| TemplateTestStep {
+            index,
+            url: step.url,
+            status: step.status,
+            body_size: step.body_size,
+        })
+        .collect();
+    // `__log__` is the template's own summary line, the same one a real run
+    // stores as its log.
+    let log = variables
+        .get("__log__")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    Ok(Json(TemplateTestResult {
+        steps,
+        variables,
+        log,
+    }))
+}
+
 async fn get_template(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -3857,6 +3921,7 @@ mod tests {
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
         assert!(document["paths"]["/api/v1/tasks"].is_object());
+        assert!(document["paths"]["/api/v1/templates/{id}/test"].is_object());
         // The endpoints that back the WebUI's aggregated log, the channel-test
         // button and the notification editors must stay in the published
         // contract.
@@ -4270,6 +4335,76 @@ mod tests {
         assert_eq!(result["requests"], 2);
         assert_eq!(result["controls"], 2);
         assert_eq!(result["extract_variables"], 1);
+    }
+
+    #[tokio::test]
+    async fn tests_a_saved_template_without_creating_a_task() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+
+        // The only step is an in-process util call, so the test touches no
+        // network — the point here is the endpoint, not the HTTP stack.
+        let har = json!({
+            "log": {"version": "1.2", "entries": [
+                {"checked": true, "request": {"method": "GET", "url": "api://util/delay?seconds=0"}}
+            ]}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/templates/import-qd-har")
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(
+                        json!({"name": "probe", "description": null, "har": har}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // Success responses do not carry `x-request-id` (only `ApiError` does),
+        // so read the body directly rather than through `response_json`.
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/templates/{id}/test"))
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(json!({"variables": {}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(body["steps"][0]["status"], 200);
+
+        // A test run is not a task run: it must leave both tables untouched.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let tasks: Value = serde_json::from_slice(&body).unwrap();
+        assert!(tasks.as_array().unwrap().is_empty());
     }
 
     // --- External identity login audit trail (docs/design/EXTERNAL_IDP_PLAN.md Phase 2) ---

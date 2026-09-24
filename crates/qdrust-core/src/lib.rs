@@ -3,3 +3,4 @@ pub mod expression;
 pub mod plugin;
 pub mod qd_har;
 pub mod template;
+pub mod totp;

@@ -509,7 +509,7 @@ impl QdExecutor {
                 response.body,
             );
         }
-        let client = self.client_for_url(&url).await?;
+        let client = self.client_for_url(&url, context).await?;
         let method = Method::from_bytes(method.as_bytes()).context("invalid rendered method")?;
         let request_method = method.clone();
         let mut request = client.request(method, &url);
@@ -879,8 +879,31 @@ impl QdExecutor {
     /// The part of this executor that decides whether a request may happen at
     /// all, in the form [`guarded_client_for_url`] takes.
     ///
-    async fn client_for_url(&self, url: &str) -> Result<Client> {
-        guarded_client_for_url(url, &self.policy, Some(self.cookies.clone())).await
+    async fn client_for_url(&self, url: &str, context: &ExecutionContext) -> Result<Client> {
+        let policy = self.policy_with_proxy(context);
+        guarded_client_for_url(url, &policy, Some(self.cookies.clone())).await
+    }
+
+    /// The run policy with this step's `_proxy` applied.
+    ///
+    /// QD reads `env["variables"]["_proxy"]` before every request
+    /// (`libs/fetcher.py::do_fetch`), so a template can send one run through a
+    /// proxy without a server-wide setting — the reason it exists is a
+    /// trawl/flaresolverr in front of a Cloudflare challenge. An empty or
+    /// absent value means "no proxy", which also clears whatever the run policy
+    /// started with; the guard still classifies the proxy host (see
+    /// [`classify_proxy`]), so this cannot be used to reach loopback or
+    /// metadata addresses while the private-network switch is off.
+    fn policy_with_proxy(&self, context: &ExecutionContext) -> OutboundPolicy {
+        let mut policy = self.policy.clone();
+        let proxy = context
+            .variables
+            .get("_proxy")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        policy.proxy = (!proxy.is_empty()).then(|| proxy.to_string());
+        policy
     }
 
     #[cfg(test)]
@@ -1702,9 +1725,13 @@ pub async fn guarded_client_for_url(
         builder = builder.cookie_provider(cookies);
     }
     if let Some(proxy) = policy.proxy.as_deref() {
-        // With a proxy, DNS is delegated to the proxy; do not pin the host.
+        // With a proxy, DNS is delegated to the proxy; do not pin the host. The
+        // proxy address itself still has to pass the same classification: a
+        // user-supplied `_proxy` pointing at loopback/private/metadata would
+        // otherwise make *it* the connection and bypass the SSRF switch.
+        let proxy_url = classify_proxy(proxy, policy.allow_private_network).await?;
         return builder
-            .proxy(reqwest::Proxy::all(proxy).context("invalid proxy URL")?)
+            .proxy(reqwest::Proxy::all(proxy_url.as_str()).context("invalid proxy URL")?)
             .build()
             .context("cannot build proxied HTTP client");
     }
@@ -1742,6 +1769,36 @@ async fn resolve_target(
         );
     }
     Ok((parsed, addresses))
+}
+
+/// Parse a proxy URL and classify its host with the same rules as a target.
+///
+/// HTTP(S) and SOCKS5 are accepted (QD's `_proxy` supports all three). The host
+/// is resolved and, unless the admin allowed private networks, every address it
+/// resolves to must be public — otherwise a template's `_proxy` would be a way
+/// around the SSRF switch. Returns the parsed URL to hand to reqwest.
+async fn classify_proxy(proxy: &str, allow_private_network: bool) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(proxy).context("invalid proxy URL")?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h"),
+        "unsupported proxy scheme"
+    );
+    let host = parsed.host_str().context("proxy host is missing")?;
+    let port = parsed
+        .port_or_known_default()
+        .context("proxy port is missing")?;
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .context("cannot resolve proxy host")?
+        .collect::<Vec<_>>();
+    ensure!(!addresses.is_empty(), "proxy host resolved to no addresses");
+    if !allow_private_network {
+        ensure!(
+            addresses.iter().all(|address| is_public_ip(address.ip())),
+            "private or special-use network target is blocked"
+        );
+    }
+    Ok(parsed)
 }
 
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
@@ -2116,6 +2173,54 @@ mod tests {
         )
         .await
         .expect("the relaxation must let the same URL through");
+    }
+
+    /// A template's `_proxy` is user input, so the proxy host must pass the same
+    /// classification as the target. Without this, `_proxy=http://169.254.169.254`
+    /// would make the proxy itself the connection and walk around the switch.
+    #[tokio::test]
+    async fn a_proxy_host_is_classified_like_a_target() {
+        let loopback = format!("http://{}", loopback_address());
+        let error = classify_proxy(&loopback, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("private or special-use network target is blocked"),
+            "a loopback proxy must be refused: {error}"
+        );
+        classify_proxy(&loopback, true)
+            .await
+            .expect("the relaxation must allow an internal proxy");
+        // Schemes and shapes that cannot be proxied through are refused rather
+        // than silently downgraded.
+        assert!(classify_proxy("ftp://example.com:21", true).await.is_err());
+        assert!(classify_proxy("socks5://127.0.0.1", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_run_policy_takes_its_proxy_from_the_proxy_variable() {
+        let executor = QdExecutor::new(Duration::from_secs(5)).unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+        assert!(executor.policy_with_proxy(&context).proxy.is_none());
+
+        context
+            .variables
+            .insert("_proxy".into(), json!("http://proxy.test:8080"));
+        assert_eq!(
+            executor.policy_with_proxy(&context).proxy.as_deref(),
+            Some("http://proxy.test:8080")
+        );
+
+        // Empty and whitespace both mean "no proxy" — the `default("")` case —
+        // and must also clear a proxy the run policy started with.
+        context.variables.insert("_proxy".into(), json!("   "));
+        let executor = QdExecutor::with_options(ExecutorOptions {
+            proxy: Some("http://default.test:8080".into()),
+            ..ExecutorOptions::default()
+        })
+        .unwrap();
+        assert!(executor.policy_with_proxy(&context).proxy.is_none());
     }
 
     /// The executor must reach a client only through the shared constructor: a

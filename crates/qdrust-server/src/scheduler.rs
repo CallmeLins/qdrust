@@ -226,7 +226,7 @@ pub(crate) struct RunPolicy {
 /// switch apply to the next run instead of the next restart. A snapshot taken
 /// at startup would compile, look correct, and quietly require a restart — the
 /// reason this is a named function with a test rather than an inline read.
-fn run_policy(
+pub(crate) fn run_policy(
     timeout_seconds: Option<i64>,
     settings: &std::sync::RwLock<crate::api::RuntimeSettings>,
 ) -> RunPolicy {
@@ -704,10 +704,26 @@ async fn load_plugins(
     let Some(owner) = owner else {
         return Vec::new();
     };
+    load_plugins_for_owner(store, owner, browser).await
+}
+
+/// The same plugin set a run of this owner would get, without needing a task:
+/// used by the template test endpoint, which must execute a template exactly as
+/// a real run would.
+///
+/// `browser` is `None` there because the process-level browser manager is held
+/// by the scheduler, not the API; a template whose step needs `api://browser/*`
+/// reports the plugin as unavailable in a test run, which is honest rather than
+/// silently skipping the step.
+pub(crate) async fn load_plugins_for_owner(
+    store: &Store,
+    owner: i64,
+    browser: Option<Arc<BrowserSessionManager>>,
+) -> Vec<Arc<dyn Plugin>> {
     let manifests = match store.list_enabled_plugins(owner).await {
         Ok(manifests) => manifests,
         Err(err) => {
-            warn!(task_id, %err, "cannot load plugins for task");
+            warn!(owner, %err, "cannot load plugins for owner");
             return Vec::new();
         }
     };
@@ -718,7 +734,7 @@ async fn load_plugins(
         let plugin_id = format!("plugin-{}", manifest.id);
         match build_plugin(&manifest, &plugin_id) {
             Ok(plugin) => plugins.push(plugin),
-            Err(err) => warn!(task_id, plugin_id = %plugin_id, %err, "skipping plugin"),
+            Err(err) => warn!(owner, plugin_id = %plugin_id, %err, "skipping plugin"),
         }
     }
     // The optional browser plugin is wired in when the process owns a headless
@@ -748,7 +764,7 @@ fn build_plugin(manifest: &PluginManifest, plugin_id: &str) -> anyhow::Result<Ar
     )?))
 }
 
-async fn execute_template(
+pub(crate) async fn execute_template(
     template: Template,
     cancellation: &CancellationToken,
     variables: &BTreeMap<String, Value>,
@@ -1004,6 +1020,7 @@ mod tests {
                 }
             })),
             variables: Vec::new(),
+            variable_defaults: Default::default(),
             created_at: 0,
             updated_at: 0,
             task_count: 0,
@@ -1046,6 +1063,7 @@ mod tests {
                 }
             })),
             variables: Vec::new(),
+            variable_defaults: Default::default(),
             created_at: 0,
             updated_at: 0,
             task_count: 0,
@@ -1358,6 +1376,7 @@ mod tests {
                 }
             })),
             variables: Vec::new(),
+            variable_defaults: Default::default(),
             created_at: 0,
             updated_at: 0,
             task_count: 0,

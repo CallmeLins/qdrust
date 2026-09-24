@@ -72,6 +72,7 @@ Every error response also includes an opaque `request_id` and `field_errors`. In
 - `util/regex`
 - `util/string/replace`
 - `util/timestamp`
+- `util/totp`
 - `util/rsa`
 - `util/delay`
 - `util/dddd/ocr`

@@ -4,7 +4,7 @@
 
 模板变量与步骤请求支持两种动态求值方式，兼容旧 QD HAR：
 
-- **Jinja2 表达式**：由 `minijinja` 驱动，内置 26 个过滤器（`upper`/`lower`/`replace`/`split`/`join`/`sort`/`unique`/`tojson`/`fromjson` 等）和 38 个表达式函数（`int`/`float`/`len`/`b64encode`/`md5`/`sha1`/`hash`/`timestamp`/`strftime`/`random_int`/`fake`/`regex_*` 等）。
+- **Jinja2 表达式**：由 `minijinja` 驱动，内置 27 个过滤器（`upper`/`lower`/`replace`/`split`/`join`/`sort`/`unique`/`tojson`/`fromjson` 等）和 39 个表达式函数（`int`/`float`/`len`/`b64encode`/`md5`/`sha1`/`hash`/`timestamp`/`strftime`/`random_int`/`fake`/`regex_*`/`totp` 等）。
 - **`api://util/*` 内置工具**：当模板步骤 URL 以 `api://` 开头时，executor 在进程内计算并返回结果，不发起真实 HTTP 请求。时间、编码、哈希、正则、JSON 类工具已与 QD 对齐：
 
   | 工具 | 说明 |
@@ -15,6 +15,7 @@
   | `gb2312` | GB2312 百分号编码（urllib.quote 语义） |
   | `base64` (encode / decode) | Base64 编解码 |
   | `hash` (md5 / sha1 / sha256 / sha512) | 哈希 |
+  | `totp` | TOTP（RFC 6238）：`?secret=<base32>&digits=6&period=30&algo=sha1`。在本地算码，2FA 密钥不出网；表达式侧同样可用 `{{ totp(secret) }}`（`secret` 会被识别为输入变量） |
   | `uuid` / `random` (float) | 随机值 |
   | `regex` (findall / replace) | 正则提取与替换 |
   | `string/replace` | 正则替换，支持组引用与文本模式 |

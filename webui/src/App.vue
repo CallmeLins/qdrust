@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus } from "./api";
+import { api, apiPath, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -195,6 +195,10 @@ interface TaskForm {
 const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
+/** Result of the last "test" run in the task dialog; cleared when the dialog or
+ *  the selected template changes. */
+const testing = ref(false);
+const testResult = ref<TemplateTestResult | null>(null);
 /**
  * Dropdown options for the "bind to template" field in the task form.
  *
@@ -404,6 +408,7 @@ async function submitTask() {
 
 function openCreateTask() {
   Object.assign(taskForm, blankTaskForm());
+  testResult.value = null;
   showCreate.value = true;
   // Always re-read, not only when the list is empty: the dropdown's order and
   // its "unused" suffix are computed from these rows, so a template bound since
@@ -411,6 +416,7 @@ function openCreateTask() {
   void refreshTemplates();
 }function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
+  testResult.value = null;
   Object.assign(taskForm, {
     id: task.id,
     name: task.name,
@@ -842,16 +848,47 @@ function onTemplatePicked() {
   // QD 式变量联动：变量清单由服务端按 QD 的 HARSave.get_variables 语义算出
   // （过滤器和函数名不算变量，且只有被 extract_variables 提取之后的引用才不算输入），
   // 这里只负责生成填值行，并保留用户已输入的同名值。
+  // A different template invalidates any earlier test result.
+  testResult.value = null;
   const names = tmpl.variables ?? [];
   if (names.length) {
     const existing = new Map(taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value]));
-    taskForm.variables = names.map((name) => ({ name, value: existing.get(name) ?? "" }));
+    // A declared default (`{{x|default("...")}}` in the HAR, or the native
+    // variables map) seeds the row, so `{{_proxy|default("")}}` and the like do
+    // not have to be typed in by hand. A value the user already entered wins.
+    const defaults = tmpl.variable_defaults ?? {};
+    taskForm.variables = names.map((name) => ({ name, value: existing.get(name) ?? defaults[name] ?? "" }));
     notify(fmt("templateVarsFound", { n: names.length }));
   }
 }
-watch(() => taskForm.templateId, (id, previous) => {
-  if (id != null && id !== previous) onTemplatePicked();
-});
+
+/** Run the selected template with the variables currently in the form.
+ *
+ *  Goes through the server's normal execution path, so the SSRF guard, the
+ *  request/loop limits and the per-run timeout all apply — a test cannot be
+ *  more permissive than the task it stands in for. Nothing is persisted. */
+async function runTemplateTest() {
+  if (taskForm.templateId == null || testing.value) return;
+  testing.value = true;
+  testResult.value = null;
+  try {
+    const variables = Object.fromEntries(
+      taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value])
+    );
+    testResult.value = await api.testTemplate(taskForm.templateId, variables);
+    notify(t("templateTestDone"));
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    testing.value = false;
+  }
+}
+// This used to be a `watch` on `taskForm.templateId` that fired on a *change*.
+// It missed the ordinary retry: cancelling leaves the form as it was, so the
+// next "new task from this template" resets the id to null and sets it back to
+// the same value within one tick — the watcher sees X -> X, never fires, and the
+// variable rows silently stay empty. The two places a template is actually
+// chosen call this directly instead.
 async function publishTemplate(id: number) {
   try { await api.publishTemplate(id); notify(t("publishDone")); await openTemplates(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
@@ -901,6 +938,7 @@ function closeHarEditor() {
 function createTaskFromTemplate(item: Template) {
   openCreateTask();
   taskForm.templateId = item.id;
+  onTemplatePicked();
 }
 
 /** 导入本地模板文件：兼容标准 HAR 与 QD 导出的请求数组两种格式 */
@@ -2763,7 +2801,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         </div>
         <label>{{ t('taskName') }}<input v-model="taskForm.name" required maxlength="100" /></label>
         <label>{{ t('template') }}
-          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" :placeholder="t('selectTemplate')" filterable :filter-placeholder="t('templateFilterPlaceholder')" :filter-empty-label="t('filterNoMatch')" />
+          <Dropdown v-model="taskForm.templateId" :options="templateDropdownOptions" :placeholder="t('selectTemplate')" filterable :filter-placeholder="t('templateFilterPlaceholder')" :filter-empty-label="t('filterNoMatch')" @change="onTemplatePicked" />
         </label>
         <small v-if="taskForm.templateId == null && taskForm.id == null" class="kv-hint">{{ t('templateRequiredHint') }}</small>
         <div class="schedule-head">
@@ -2819,7 +2857,23 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <small class="kv-hint">{{ taskForm.templateId ? t('templateVarsHint') : t('variablesHint') }}</small>
         </label>
         <label class="checkbox"><input v-model="taskForm.disabled" type="checkbox" />{{ t('createPaused') }}</label>
+        <div v-if="testing || testResult" class="template-test">
+          <div class="template-test-head">
+            <strong>{{ t('templateTestResult') }}</strong>
+            <span v-if="testing" class="muted">{{ t('templateTestRunning') }}</span>
+            <span v-else-if="testResult?.log" class="muted">{{ testResult.log }}</span>
+          </div>
+          <ol v-if="testResult?.steps?.length" class="template-test-steps">
+            <li v-for="step in testResult.steps" :key="step.index">
+              <span class="chip" :class="{ 'chip-ok': step.status < 400 }">{{ step.status }}</span>
+              <code>{{ step.url }}</code>
+              <span class="muted">{{ step.body_size }} B</span>
+            </li>
+          </ol>
+          <p v-else-if="testResult" class="muted">{{ t('templateTestNoSteps') }}</p>
+        </div>
         <div class="modal-actions">
+          <button v-if="taskForm.templateId != null" class="secondary-button" type="button" :disabled="testing" @click="runTemplateTest"><Play :size="14" />{{ testing ? t('templateTestRunning') : t('templateTest') }}</button>
           <button class="secondary-button" type="button" @click="showCreate = false">{{ t('cancel') }}</button>
           <button class="primary-button" type="submit">{{ taskForm.id ? t('saveTask') : t('createTask') }}</button>
         </div>

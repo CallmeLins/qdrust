@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, path::Path, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
@@ -2898,6 +2898,16 @@ fn run_step_from_row(row: $row) -> Result<RunStep> {
     })
 }
 
+/// Render a native template's declared variable value as the text the new-task
+/// form shows. A string keeps its text; other JSON scalars use their JSON form,
+/// which is what a `{{var}}` read would render anyway.
+fn default_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 fn template_from_row(row: $row) -> Result<Template> {
     let definition: String = row.try_get("definition")?;
     let source_format: String = row.try_get("source_format")?;
@@ -2928,6 +2938,21 @@ fn template_from_row(row: $row) -> Result<Template> {
         (Some(definition), None) => definition.variables.keys().cloned().collect(),
         (None, None) => Vec::new(),
     };
+    // QD computes this from the parsed AST when the template is saved
+    // (`HARSave.post`'s `init_env`); native templates already carry it in their
+    // declared `variables` map. Derived on read like `variables` so a fix to the
+    // extractor applies to rows already in the database.
+    let variable_defaults = match (&definition, &qd_har) {
+        (_, Some(har)) => QdHar::parse_qd(har.clone())
+            .map(|har| har.defaults())
+            .unwrap_or_default(),
+        (Some(definition), None) => definition
+            .variables
+            .iter()
+            .map(|(name, value)| (name.clone(), default_text(value)))
+            .collect(),
+        (None, None) => BTreeMap::new(),
+    };
     Ok(Template {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
@@ -2937,6 +2962,7 @@ fn template_from_row(row: $row) -> Result<Template> {
         definition,
         qd_har,
         variables,
+        variable_defaults,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         task_count: row.try_get("task_count")?,
@@ -4395,7 +4421,7 @@ mod tests {
                             "headers": [],
                             "cookies": [],
                             "mimeType": "application/x-www-form-urlencoded",
-                            "data": "username={{username|urlencode}}&password={{password|urlencode}}"
+                            "data": "username={{username|default(\"bob\")|urlencode}}&password={{password|urlencode}}"
                         },
                         "rule": {
                             "success_asserts": [],
@@ -4420,9 +4446,26 @@ mod tests {
         // Reads behind a filter are still inputs; the `token` produced by the
         // first entry's extract_variables is not offered to the user.
         assert_eq!(imported.variables, ["username", "password"]);
+        // `{{username|default("bob")}}` seeds the form with `bob`; `password`
+        // declares no default, so it stays blank.
+        assert_eq!(
+            imported
+                .variable_defaults
+                .get("username")
+                .map(String::as_str),
+            Some("bob")
+        );
+        assert!(!imported.variable_defaults.contains_key("password"));
 
         let listed = store.list_templates().await.unwrap();
         assert_eq!(listed[0].variables, ["username", "password"]);
+        assert_eq!(
+            listed[0]
+                .variable_defaults
+                .get("username")
+                .map(String::as_str),
+            Some("bob")
+        );
     }
 
     #[tokio::test]

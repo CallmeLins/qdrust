@@ -908,6 +908,39 @@
           }
         }
       }
+    },    "/api/v1/templates/{id}/test": {
+      "post": {
+        "operationId": "testTemplate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TestTemplate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Test run outcome",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TemplateTestResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "422": { "$ref": "#/components/responses/ValidationError" }
+        }
+      }
     },
     "/api/v1/templates/{id}": {
       "parameters": [
@@ -3034,6 +3067,40 @@
           }
         }
       },
+      "TestTemplate": {
+        "type": "object",
+        "properties": {
+          "variables": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      },
+      "TemplateTestStep": {
+        "type": "object",
+        "required": ["index", "url", "status", "body_size"],
+        "properties": {
+          "index": { "type": "integer" },
+          "url": { "type": "string" },
+          "status": { "type": "integer" },
+          "body_size": { "type": "integer" }
+        }
+      },
+      "TemplateTestResult": {
+        "type": "object",
+        "required": ["steps", "variables"],
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TemplateTestStep" }
+          },
+          "variables": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "log": { "type": ["string", "null"] }
+        }
+      },
       "Template": {
         "type": "object",
         "required": [
@@ -3085,6 +3152,13 @@
               "type": "string"
             },
             "description": "Input variables a task created from this template must supply (QD's 变量 list)"
+          },
+          "variable_defaults": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Default values for those variables, keyed by name (QD init_env for HAR templates, the declared variables map for native ones)"
           },
           "grp": {
             "type": [

@@ -277,6 +277,34 @@ impl Default for QdExpressionEngine {
                 }
             }
         );
+        // TOTP (RFC 6238), computed locally so a 2FA secret never has to be
+        // sent to an external API. `{{ totp(secret) }}` is the ergonomic form
+        // for a header or body; `api://util/totp` is the step form. The last
+        // argument is the unix time, which makes the result reproducible.
+        qd_fn!(
+            environment,
+            "totp",
+            |secret: String,
+             digits: Option<i64>,
+             period: Option<i64>,
+             algo: Option<String>,
+             at: Option<i64>| {
+                let at = at.map(|value| value.max(0) as u64).unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs())
+                        .unwrap_or(0)
+                });
+                crate::totp::code(
+                    &secret,
+                    digits.unwrap_or(6).clamp(6, 10) as u32,
+                    period.unwrap_or(30).max(1) as u64,
+                    algo.as_deref().unwrap_or("sha1"),
+                    at,
+                )
+                .map_err(|err| Error::new(ErrorKind::InvalidOperation, err.to_string()))
+            }
+        );
         // QD get_encrypted_password relies on passlib modular-crypt formats which
         // qdrust does not implement; fail with a clear message instead of an
         // "unknown function" render error.
@@ -1107,6 +1135,38 @@ impl QdExpressionEngine {
         ordered
     }
 
+    /// Literal defaults attached to a variable with `{{ name|default(...) }}`,
+    /// in source order.
+    ///
+    /// This is the `init_env` half of QD's `HARSave.post`
+    /// (`web/handlers/har.py`), which walks the parsed AST for `default`
+    /// filters, requires the filter's target to be a bare name, and takes the
+    /// first argument only when it is a constant. MiniJinja's AST sits behind
+    /// the `unstable_machinery` feature, so this reads the source with the same
+    /// restrictions: a bare name (never `a.b`), `default` applied directly to it
+    /// (never after another filter, whose AST node would not be a name), and a
+    /// literal first argument. A non-literal (`default(other)`) contributes
+    /// nothing, exactly as `as_const()` fails there.
+    pub fn declared_defaults(&self, source: &str) -> Vec<(String, String)> {
+        let mut defaults = Vec::new();
+        for capture in DEFAULT_FILTER.captures_iter(source) {
+            let (Some(name), Some(whole)) = (capture.get(1), capture.get(0)) else {
+                continue;
+            };
+            // `default` after another filter (`x|urlencode|default(...)`) is a
+            // filter node in QD's AST, not a name, so it declares nothing. The
+            // regex reads `urlencode` as the name; the `|` before it says that
+            // it is itself a filter rather than the variable.
+            if source[..name.start()].trim_end().ends_with('|') {
+                continue;
+            }
+            if let Some(value) = first_literal_argument(&source[whole.end()..]) {
+                defaults.push((name.as_str().to_string(), value));
+            }
+        }
+        defaults
+    }
+
     pub fn evaluate_bool(
         &self,
         expression: &str,
@@ -1127,6 +1187,60 @@ impl QdExpressionEngine {
 static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").expect("identifier pattern must compile")
 });
+
+/// `name|default(` — the shape of a default a user can see in the variable form.
+///
+/// `regex` has no lookbehind, so the leading class consumes whatever precedes
+/// the name and rejects it when that could make the name part of something else
+/// (a dotted path such as `a.b|default(...)`, or a longer identifier).
+static DEFAULT_FILTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*)\s*\|\s*default\s*\(")
+        .expect("default-filter pattern must compile")
+});
+
+/// The first argument of a `default(...)` call, when it is a literal.
+///
+/// Strings are unescaped for the escapes QD templates actually use; numbers keep
+/// their source text, and booleans become `true` / `false`. Anything that is not
+/// a constant (a variable, `none`, an expression) yields nothing — QD's
+/// `as_const()` raises there and the default is dropped.
+fn first_literal_argument(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    let quote = rest.chars().next()?;
+    if quote == '\'' || quote == '"' {
+        let mut value = String::new();
+        let mut escaped = false;
+        for ch in rest[quote.len_utf8()..].chars() {
+            if escaped {
+                value.push(match ch {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                return Some(value);
+            } else {
+                value.push(ch);
+            }
+        }
+        return None;
+    }
+    let token: String = rest
+        .chars()
+        .take_while(|ch| !ch.is_whitespace() && *ch != ',' && *ch != ')')
+        .collect();
+    if token == "true" || token == "false" || token.parse::<f64>().is_ok() {
+        return Some(token);
+    }
+    None
+}
 
 /// Undeclared names in a QD template fragment.
 ///
@@ -2001,6 +2115,36 @@ mod tests {
         assert_eq!(
             engine.undeclared_variables("{% if token %}ok{% endif %}"),
             ["token"]
+        );
+    }
+
+    #[test]
+    fn totp_matches_the_rfc_6238_vectors() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::new();
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        // Function form, timestamp pinned so the vector is exact.
+        let rendered = engine
+            .render(
+                &format!("{{{{ totp(\"{secret}\", 8, 30, \"sha1\", 59) }}}}"),
+                &variables,
+            )
+            .expect("totp function must exist");
+        assert_eq!(rendered, "94287082");
+        // Defaults are 6 digits / 30s / sha1, and the filter form works too.
+        let rendered = engine
+            .render(
+                &format!("{{{{ \"{secret}\"|totp(6, 30, \"sha1\", 59) }}}}"),
+                &variables,
+            )
+            .expect("totp filter must exist");
+        assert_eq!(rendered, "287082");
+        // A secret that is not base32 fails the render instead of silently
+        // producing a wrong code.
+        assert!(
+            engine
+                .render("{{ totp('not base32!') }}", &variables)
+                .is_err()
         );
     }
 
