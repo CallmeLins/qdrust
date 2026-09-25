@@ -2204,21 +2204,27 @@ async fn validate_qd_har(
 /// the outcome comes back to the caller instead of being written to
 /// `runs`/`run_steps`.
 async fn test_template(
-    State(store): State<Store>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     ApiJson(input): ApiJson<TestTemplate>,
 ) -> Result<Json<TemplateTestResult>, ApiError> {
-    let (_, session) = require_session_from_store(&store, &headers).await?;
-    let template = store
+    let (_, session) = require_session_from_store(&state.store, &headers).await?;
+    let template = state
+        .store
         .get_template_for_owner(id, session.user.id)
         .await?
         .ok_or(ApiError::NotFound(
             "template_not_found",
             "Template not found",
         ))?;
-    let policy = crate::scheduler::run_policy(None, &runtime_settings());
-    let plugins = crate::scheduler::load_plugins_for_owner(&store, session.user.id, None).await;
+    // The shared runtime settings, not a fresh snapshot: this is the same
+    // switch a scheduled run reads, and a test that ignored it would refuse a
+    // target the run it stands in for accepts — the one combination that makes
+    // an administrator's opt-in read as broken.
+    let policy = crate::scheduler::run_policy(None, &state.settings);
+    let plugins =
+        crate::scheduler::load_plugins_for_owner(&state.store, session.user.id, None).await;
     let (steps, variables) = crate::scheduler::execute_template(
         template,
         &CancellationToken::new(),
@@ -3334,6 +3340,7 @@ mod tests {
         extract::ConnectInfo,
         http::{Request, header::SET_COOKIE},
     };
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     use super::*;
@@ -3355,6 +3362,26 @@ mod tests {
             base_path,
             None,
         )
+    }
+
+    /// Like [`test_app`], but hands back the settings the router was built with,
+    /// so a test can flip an admin switch the way the site-settings page does
+    /// and watch the next request honour it.
+    async fn test_app_with_settings() -> (Router, std::sync::Arc<std::sync::RwLock<RuntimeSettings>>)
+    {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let settings = runtime_settings();
+        let app = router_with_auth(
+            store,
+            AuthConfig::default(),
+            run_event_channel().0,
+            settings.clone(),
+            crate::outbound::OutboundHttp::standalone(),
+            crate::redis_cache::SessionCache::from_env().expect("invalid REDIS_URL"),
+            "",
+            None,
+        );
+        (app, settings)
     }
 
     #[test]
@@ -4543,6 +4570,97 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let tasks: Value = serde_json::from_slice(&body).unwrap();
         assert!(tasks.as_array().unwrap().is_empty());
+    }
+
+    /// The test endpoint must read the same admin switch a scheduled run does.
+    /// This used to read a fresh default `RuntimeSettings` instead of the
+    /// router's shared one, so an administrator's private-network opt-in was
+    /// invisible to it: a template testing against an intranet service (a local
+    /// flaresolverr, say) was refused with the guard's message no matter where
+    /// the switch stood, while the run it stood in for went through.
+    #[tokio::test]
+    async fn the_template_test_honours_the_admin_private_network_switch() {
+        use crate::test_support::{LOOPBACK_STATUS, serve_counting_loopback};
+        let (address, served) = serve_counting_loopback().await;
+
+        let (app, settings) = test_app_with_settings().await;
+        let cookie = test_auth_cookie(&app).await;
+        let har = json!({
+            "log": {"version": "1.2", "entries": [
+                {"checked": true, "request": {"method": "GET", "url": format!("http://{address}/")}}
+            ]}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/templates/import-qd-har")
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(
+                        json!({"name": "probe", "description": null, "har": har}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Switch off (the default): the test is refused and nothing is sent.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/templates/{id}/test"))
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(json!({"variables": {}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("private or special-use"),
+            "with the switch off the loopback target must be refused: {body}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 0);
+
+        // Flip the switch the way the site-settings page does — on the shared
+        // settings the router holds — and the very next test goes through.
+        settings.write().unwrap().allow_private_network = true;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/templates/{id}/test"))
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(json!({"variables": {}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["steps"][0]["status"], LOOPBACK_STATUS);
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the allowed test must have reached the loopback server"
+        );
     }
 
     // --- External identity login audit trail (docs/design/EXTERNAL_IDP_PLAN.md Phase 2) ---

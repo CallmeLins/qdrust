@@ -813,12 +813,17 @@ macro_rules! define_store {
     }
 
     pub async fn list(&self) -> Result<Vec<Task>> {
-        let rows = sqlx::query(TASK_FIELDS).fetch_all(&self.pool).await?;
+        // The scheduler tick scans this list to find due tasks; a defined order
+        // makes the same set of due tasks fire in the same order every tick
+        // instead of whatever the storage engine happens to hand back.
+        let rows = sqlx::query(&format!("{TASK_FIELDS} ORDER BY id"))
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(task_from_row).collect()
     }
 
     pub async fn list_for_owner(&self, owner_id: i64) -> Result<Vec<Task>> {
-        let rows = sqlx::query(&format!("{TASK_FIELDS} WHERE owner_id = ?"))
+        let rows = sqlx::query(&format!("{TASK_FIELDS} WHERE owner_id = ? ORDER BY id"))
             .bind(owner_id)
             .fetch_all(&self.pool)
             .await?;
