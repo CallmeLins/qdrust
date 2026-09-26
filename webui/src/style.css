@@ -651,6 +651,13 @@ table { width: 100%; border-collapse: collapse; min-width: 850px; }
 th {
   height: 44px; padding: 0 18px; color: var(--ink-3); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
   text-align: left; font-size: 10.5px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase;
+  /* The header is a column's floor: under the auto table layout a cell's
+     specified width only wins when it clears every cell's min-content width,
+     and CJK labels fold between any two characters, which let a narrow count
+     column (the 72px .num ones) collapse below its own header and wrap it.
+     Keeping headers on one line makes the full label the min-content, so the
+     column is never narrower than its title. */
+  white-space: nowrap;
   border-bottom: 1px solid var(--line);
 }
 td { height: 68px; padding: 0 18px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 13px; }
@@ -1324,6 +1331,9 @@ th.sortable button {
   width: 100%; height: 44px; padding: 0 18px; border: 0; background: transparent;
   display: flex; align-items: center; gap: 6px; cursor: pointer;
   color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit;
+  /* white-space inherits, but button is the one box in the header that could
+     still fold the label; pinning it here keeps the th's floor honest. */
+  white-space: nowrap;
   transition: color var(--t-fast);
 }
 th.sortable button:hover { color: var(--ink); }
