@@ -177,35 +177,82 @@ const MANIFEST_FILE: &str = "tpls_history.json";
 
 const USER_AGENT: &str = "qdrust-subscription";
 
+/// The marker that splits a mirror-prefixed GitHub URL
+/// (`https://gh-proxy.org/https://github.com/owner/repo`): everything before
+/// it is the mirror, everything after is the real repository path.
+const GITHUB_URL: &str = "https://github.com/";
+
 /// A GitHub repository, as referenced by a subscription URL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitHubSource {
     pub owner: String,
     pub repo: String,
     pub branch: String,
+    /// An acceleration mirror the subscription URL carried, kept so every raw
+    /// and blob URL the source builds is routed back through it. The tree API
+    /// has no mirror equivalent and stays direct.
+    mirror: Option<String>,
 }
 
 impl GitHubSource {
     fn raw_url(&self, path: &str) -> String {
-        format!(
+        self.through_mirror(&format!(
             "https://raw.githubusercontent.com/{}/{}/{}/{}",
             self.owner, self.repo, self.branch, path
-        )
+        ))
     }
 
     fn blob_url(&self, path: &str) -> String {
-        format!(
+        self.through_mirror(&format!(
             "https://github.com/{}/{}/blob/{}/{}",
             self.owner, self.repo, self.branch, path
-        )
+        ))
+    }
+
+    /// Route a GitHub URL through the source's mirror, when it has one. Only
+    /// the hosts the mirrors actually proxy are rewritten; anything else is
+    /// returned unchanged so a stray manifest link cannot grow a bogus prefix.
+    fn through_mirror(&self, url: &str) -> String {
+        mirror_rewrite(&self.mirror, url)
+    }
+}
+
+/// Prepend `mirror` to `url` when both apply: a mirror is set and the URL
+/// points at a host the mirror proxies. Self-fulfilling elsewhere.
+fn mirror_rewrite(mirror: &Option<String>, url: &str) -> String {
+    match mirror {
+        Some(mirror)
+            if url.starts_with("https://github.com/")
+                || url.starts_with("https://raw.githubusercontent.com/") =>
+        {
+            format!("{mirror}{url}")
+        }
+        _ => url.to_string(),
     }
 }
 
 /// Parse a GitHub repository URL into its parts. Accepts a plain repo URL and
 /// the `/tree/<branch>` / `/blob/<branch>` forms GitHub's UI produces; a path
 /// prefix after the branch is ignored because the whole tree is scanned.
+///
+/// A mirror-prefixed URL — `<mirror>/https://github.com/...`, the form the
+/// public acceleration proxies document — is accepted too: the mirror is
+/// peeled off for parsing and kept for fetching, so a reader whose network
+/// cannot reach GitHub outright can subscribe through one. The mirror must
+/// look like a URL root (`http(s)://.../`), which keeps an ordinary path that
+/// merely contains the marker from being mistaken for a mirror.
 pub(crate) fn parse_github_url(url: &str) -> Option<GitHubSource> {
-    let rest = url.strip_prefix("https://github.com/")?;
+    let (mirror, rest) = if let Some(rest) = url.strip_prefix(GITHUB_URL) {
+        (None, rest)
+    } else {
+        let (prefix, rest) = url.split_once(GITHUB_URL)?;
+        if !(prefix.starts_with("http://") || prefix.starts_with("https://"))
+            || !prefix.ends_with('/')
+        {
+            return None;
+        }
+        (Some(prefix.to_string()), rest)
+    };
     let mut parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
     let owner = parts.first()?.to_string();
     let repo = parts.get(1)?.trim_end_matches(".git").to_string();
@@ -224,6 +271,7 @@ pub(crate) fn parse_github_url(url: &str) -> Option<GitHubSource> {
         owner,
         repo,
         branch,
+        mirror,
     })
 }
 
@@ -638,6 +686,13 @@ async fn resolve_har(
         .clone()
         .or_else(|| source.map(|source| source.raw_url(&entry.filename)))
         .with_context(|| format!("{} has neither content nor a download URL", entry.name))?;
+    // The manifest's own links point at the raw host directly; a subscription
+    // that arrived through a mirror must send them there too, or the download
+    // bypasses the very acceleration the reader subscribed with.
+    let url = match source {
+        Some(source) => source.through_mirror(&url),
+        None => url,
+    };
     let text = fetch_text(outbound, &url)
         .await?
         .with_context(|| format!("{} is not available at {url}", entry.name))?;
@@ -782,6 +837,12 @@ fn manifest_raw_entry(key: &str, entry: &ManifestEntry) -> Option<RawEntry> {
 
 /// Scan a repository tree for QD template files, for sources that publish no
 /// manifest. Entries carry no version, so they never report an update.
+///
+/// The tree API has no mirror equivalent — the public acceleration proxies
+/// cover raw, blob and release downloads, not `api.github.com` — so this read
+/// is direct even for a mirror-sourced subscription. A repository without a
+/// manifest therefore still needs GitHub to be reachable; a manifest source,
+/// which is the common case, never gets here.
 async fn scan_tree(outbound: &OutboundHttp, source: &GitHubSource) -> Result<Vec<RawEntry>> {
     let api_url = format!(
         "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
@@ -1215,6 +1276,64 @@ mod tests {
             "repo"
         );
         assert!(parse_github_url("https://example.com/tpl.har").is_none());
+    }
+
+    #[test]
+    fn a_mirror_prefixed_url_is_parsed_and_routed_back_through_the_mirror() {
+        // The form the public acceleration proxies document; a reader whose
+        // network cannot reach GitHub subscribes through one of these.
+        let source =
+            parse_github_url("https://gh-proxy.org/https://github.com/qd-today/templates").unwrap();
+        assert_eq!(source.owner, "qd-today");
+        assert_eq!(source.repo, "templates");
+        assert_eq!(
+            source.raw_url("tpls_history.json"),
+            "https://gh-proxy.org/https://raw.githubusercontent.com/qd-today/templates/HEAD/tpls_history.json"
+        );
+        assert_eq!(
+            source.blob_url("tpls_history.json"),
+            "https://gh-proxy.org/https://github.com/qd-today/templates/blob/HEAD/tpls_history.json"
+        );
+
+        // A manifest's own raw link is rewritten with it, but a foreign host
+        // is left alone rather than handed a bogus prefix.
+        let mirror = source.mirror;
+        assert_eq!(
+            mirror_rewrite(
+                &mirror,
+                "https://raw.githubusercontent.com/qd-today/templates/HEAD/a.har"
+            ),
+            "https://gh-proxy.org/https://raw.githubusercontent.com/qd-today/templates/HEAD/a.har"
+        );
+        assert_eq!(
+            mirror_rewrite(&mirror, "https://example.com/a.har"),
+            "https://example.com/a.har"
+        );
+        assert_eq!(
+            mirror_rewrite(&None, "https://raw.githubusercontent.com/a/b/HEAD/c.har"),
+            "https://raw.githubusercontent.com/a/b/HEAD/c.har"
+        );
+    }
+
+    #[test]
+    fn a_mirror_prefix_must_look_like_a_url_root() {
+        // The tree form of a plain URL, and mirrors that are not URL roots:
+        // anything else that merely contains the marker is not a mirror.
+        assert!(
+            parse_github_url("https://github.com/https://github.com/owner/repo")
+                .unwrap()
+                .mirror
+                .is_none()
+        );
+        assert!(parse_github_url("xhttps://github.com/owner/repo").is_none());
+        assert!(parse_github_url("ftp://mirror/https://github.com/owner/repo").is_none());
+        assert!(
+            parse_github_url("https://mirror/https://github.com/owner/repo")
+                .unwrap()
+                .mirror
+                .as_deref()
+                == Some("https://mirror/")
+        );
     }
 
     #[test]
