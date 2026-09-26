@@ -219,11 +219,7 @@ describe("footer reachability", () => {
 describe("footer wiring in App.vue", () => {
   const app = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
   const pagers = app.match(/<Pager\b[\s\S]*?\/>/g) ?? [];
-  // The footer under each table carries the row-count picker; the nav-only
-  // pager above it (issue #29) is just the prev/position/next pair and must
-  // not grow a second picker.
   const footers = pagers.filter((pager) => /:page-size=/.test(pager));
-  const topNavs = pagers.filter((pager) => /\bnav-only\b/.test(pager));
   const sizes = footers.map((footer) => footer.match(/:page-size="(\w+)"/)?.[1] ?? "");
 
   it("finds the footers, so the checks below are not vacuous", () => {
@@ -231,23 +227,27 @@ describe("footer wiring in App.vue", () => {
     expect(sizes.every(Boolean), "every footer names the count it shows").toBe(true);
   });
 
-  it("finds the nav-only pagers, so the checks below are not vacuous", () => {
-    expect(topNavs.length).toBeGreaterThan(0);
-    for (const nav of topNavs) {
-      expect(nav, "a nav-only pager is the pair of buttons, not a second picker").not.toMatch(
-        /:page-size=/,
-      );
-      expect(nav, "a nav-only pager turns the same list a footer turns").toMatch(
-        /:page="(\w+)"/,
-      );
-    }
+  it("leaves no second pager above the tables", () => {
+    // The top strip was tried (issue #29) and read as clutter: these lists are
+    // short enough that a pinned footer is always within reach, so the anchor
+    // is a plain marker and the footer is the one pager.
+    expect(app).not.toMatch(/\bnav-only\b/);
   });
 
-  it("pairs every nav-only pager with a footer over the same list", () => {
-    const footerPages = new Set(footers.map((footer) => footer.match(/:page="(\w+)"/)?.[1] ?? ""));
-    for (const nav of topNavs) {
-      const page = nav.match(/:page="(\w+)"/)?.[1] ?? "";
-      expect(footerPages.has(page), page + " has a nav-only pager but no footer").toBe(true);
+  it("keeps one scroll anchor per paged list", () => {
+    const anchors = app.match(/class="paged-anchor" ref="\w+"/g) ?? [];
+    expect(anchors.length).toBe(6);
+  });
+
+  it("pins the standalone footers, and only those", () => {
+    // A footer whose list has a last page stands alone on its page and rides
+    // over the rows while pinned, so it takes the sticky card; the run log's
+    // footer lives at the bottom of its dialog, already visible by layout.
+    for (const footer of footers) {
+      const sticky = /class="pager-sticky"/.test(footer);
+      expect(sticky, "a bounded list pins its footer; the dialog footer stays plain").toBe(
+        /:pages=/.test(footer),
+      );
     }
   });
 

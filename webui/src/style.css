@@ -593,14 +593,27 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    headless Chrome at four widths), which is what made them read as uncentred
    and as moving while the list above them changed length. `1fr` on both sides
    makes the centre exact whatever the two sides weigh. */
-/* The strip above a paged table holding the nav-only pager (issue #29). Paging
-   anchors back here, so give it a scroll margin that clears the sticky app
-   header — otherwise the header covers the buttons the view just jumped to. */
+/* The marker a paged table carries above it (issue #29): paging anchors back
+   here, so give it a scroll margin that clears the sticky app header —
+   otherwise the header covers the rows the view just jumped to. */
 .paged-anchor { scroll-margin-top: 72px; }
 
 .pager {
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   gap: 8px 12px; margin-top: 12px; font-size: 13px;
+}
+/* The standalone pages pin their footer to the viewport bottom while its
+   section is on screen (issue #29): one pager, always within reach, no second
+   pair above the table. Card styling because it rides over table rows while
+   pinned; the run-log dialog's footer is already visible by layout and stays
+   plain. */
+.pager-sticky {
+  position: sticky; bottom: 0; z-index: 5;
+  padding: 10px 14px;
+  background-color: rgb(var(--card-surface));
+  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  border-radius: var(--r-l);
+  box-shadow: var(--card-shadow);
 }
 .pager-total { grid-column: 1; justify-self: start; }
 .pager .pager-position { min-width: 88px; text-align: center; }

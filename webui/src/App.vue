@@ -325,11 +325,12 @@ const runLogAnchor = ref<HTMLElement | null>(null);
  *  29). Replacing the rows under an unmoved viewport left the scroll position
  *  to the browser's scroll anchoring, which picked a different anchor node
  *  every time — sometimes nothing moved, sometimes the view jumped to the page
- *  top, sometimes it pinned itself to the pager buttons. Anchoring to the
- *  nav-only pager above the table instead is deterministic, keeps that pager
- *  on screen so a reader can keep turning pages, and reads as "the list starts
+ *  top, sometimes it pinned itself to the pager buttons. Anchoring to a marker
+ *  above the table instead is deterministic and reads as "the list starts
  *  here" rather than as a jump. `scroll-margin-top` (see `.paged-anchor`)
- *  keeps the sticky app header from covering the target. */
+ *  keeps the sticky app header from covering the target. The footer stays the
+ *  one pager: `pager-sticky` pins it to the viewport bottom while its section
+ *  is on screen, so it is always within reach without a second pair on top. */
 function scrollToPaged(anchor: Ref<HTMLElement | null>): void {
   void nextTick().then(() => anchor.value?.scrollIntoView({ block: "start" }));
 }
@@ -2236,9 +2237,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <button v-if="!search && !groupFilter" class="secondary-button" @click="openCreateTask"><Plus :size="16" />{{ t('createTaskShort') }}</button>
           </div>
           <template v-else>
-          <div class="paged-anchor" ref="tasksAnchor">
-            <Pager nav-only :page="tasksPage" :pages="tasksTotalPages" @prev="tasksPrevPage" @next="tasksNextPage" />
-          </div>
+          <div class="paged-anchor" ref="tasksAnchor"></div>
           <div class="table-wrap tasks-wrap">
             <table class="tasks-table">
               <thead><tr>
@@ -2276,6 +2275,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           </template>
           <Pager
+            class="pager-sticky"
             :page="tasksPage"
             :pages="tasksTotalPages"
             :total="filteredTasks.length"
@@ -2339,9 +2339,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <p class="muted section-hint">{{ t('subHint') }}</p>
           <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
           <template v-else>
-          <div class="paged-anchor" ref="subscriptionsAnchor">
-            <Pager nav-only :page="subsPage" :pages="subsTotalPages" @prev="subsPrevPage" @next="subsNextPage" />
-          </div>
+          <div class="paged-anchor" ref="subscriptionsAnchor"></div>
           <div class="table-wrap">
             <table class="templates-table">
               <thead><tr>
@@ -2364,6 +2362,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           </template>
           <Pager
+            class="pager-sticky"
             :page="subsPage"
             :pages="subsTotalPages"
             :total="subscriptions.length"
@@ -2389,9 +2388,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <h2>{{ unusedOnly ? t('noUnusedTemplates') : templateSearch ? t('noTemplates') : t('templateEmptyHint') }}</h2>
           </div>
           <template v-else>
-          <div class="paged-anchor" ref="templatesAnchor">
-            <Pager nav-only :page="templatesPage" :pages="templatesTotalPages" @prev="templatesPrevPage" @next="templatesNextPage" />
-          </div>
+          <div class="paged-anchor" ref="templatesAnchor"></div>
           <div class="table-wrap">
             <table class="templates-table">
               <thead><tr>
@@ -2424,6 +2421,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           </template>
           <Pager
+            class="pager-sticky"
             :page="templatesPage"
             :pages="templatesTotalPages"
             :total="filteredTemplates.length"
@@ -2486,9 +2484,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <h2>{{ t('libraryEmpty') }}</h2>
             </div>
             <template v-else>
-            <div class="paged-anchor" ref="libraryAnchor">
-              <Pager nav-only :page="libraryPage" :pages="libraryTotalPages" @prev="libraryPrevPage" @next="libraryNextPage" />
-            </div>
+            <div class="paged-anchor" ref="libraryAnchor"></div>
             <div class="table-wrap">
               <table class="library-table">
                 <thead><tr>
@@ -2525,6 +2521,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
             </template>
             <Pager
+              class="pager-sticky"
               :page="libraryPage"
               :pages="libraryTotalPages"
               :total="libraryEntries.length"
@@ -2553,9 +2550,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <template v-if="showPublicTemplates">
             <div v-if="sortedPublicTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
             <template v-else>
-            <div class="paged-anchor" ref="publicTemplatesAnchor">
-              <Pager nav-only :page="publicTemplatesPage" :pages="publicTemplatesTotalPages" @prev="publicTemplatesPrevPage" @next="publicTemplatesNextPage" />
-            </div>
+            <div class="paged-anchor" ref="publicTemplatesAnchor"></div>
             <div class="table-wrap">
               <table class="templates-table">
                 <thead><tr>
@@ -2580,6 +2575,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </div>
             </template>
             <Pager
+              class="pager-sticky"
               :page="publicTemplatesPage"
               :pages="publicTemplatesTotalPages"
               :total="sortedPublicTemplates.length"
@@ -3042,9 +3038,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <h2>{{ t('runLogEmpty') }}</h2>
         </div>
         <template v-else>
-        <div class="paged-anchor" ref="runLogAnchor">
-          <Pager nav-only :page="runLogPageNo" :busy="runLogLoading" :prev-disabled="!runLogCanGoBack" :next-disabled="!runLogHasMore" @prev="prevRunLogPage" @next="nextRunLogPage" />
-        </div>
+        <div class="paged-anchor" ref="runLogAnchor"></div>
         <div class="table-wrap">
           <table class="runs-table">
             <thead><tr>
