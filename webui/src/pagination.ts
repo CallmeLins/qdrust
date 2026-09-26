@@ -176,7 +176,28 @@ export interface Pager<T> {
  * `showsNav`, has no boundary to be caught on the wrong side of. App.vue holds
  * up its end — no `<Pager>` behind a `v-if` — and pagination.test.ts checks it.
  */
-export function usePager<T>(source: () => readonly T[], pageSize: () => number): Pager<T> {
+/** What a caller can ask the pager to do beyond moving the slice.
+ *
+ *  `onPageChange` runs after the page changed because the *reader* moved —
+ *  prev, next, or a new row count, all of which re-slice the list under an
+ *  unmoved viewport and leave them stranded wherever the browser's scroll
+ *  anchoring happened to land (issue #29: sometimes nothing moved, sometimes
+ *  the view jumped to the page top, sometimes it pinned itself to the pager
+ *  buttons, because the anchor node the browser picked differed each time).
+ *  The callback is where App.vue anchors the form's top back into view.
+ *
+ *  It deliberately does NOT run on a reset or a shrink clamp: a filter change
+ *  or a deleted row also re-slices the list, but the reader did not ask to
+ *  move, and yanking the viewport then would be its own surprise. */
+export interface UsePagerOptions {
+  onPageChange?: () => void;
+}
+
+export function usePager<T>(
+  source: () => readonly T[],
+  pageSize: () => number,
+  options?: UsePagerOptions,
+): Pager<T> {
   const page = ref(1);
   const total = computed(() => source().length);
   const pages = computed(() => pageCount(total.value, pageSize()));
@@ -190,15 +211,23 @@ export function usePager<T>(source: () => readonly T[], pageSize: () => number):
   });
   // Re-chunking by a different row count invalidates the page number, so go
   // back to the top rather than show an arbitrary slice of the new layout.
+  // The reader picked the count, so this counts as a move they asked for.
   watch(pageSize, () => {
     page.value = 1;
+    options?.onPageChange?.();
   });
 
   function prev(): void {
-    if (page.value > 1) page.value -= 1;
+    if (page.value > 1) {
+      page.value -= 1;
+      options?.onPageChange?.();
+    }
   }
   function next(): void {
-    if (page.value < pages.value) page.value += 1;
+    if (page.value < pages.value) {
+      page.value += 1;
+      options?.onPageChange?.();
+    }
   }
   function reset(): void {
     page.value = 1;

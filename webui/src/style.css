@@ -593,6 +593,11 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    headless Chrome at four widths), which is what made them read as uncentred
    and as moving while the list above them changed length. `1fr` on both sides
    makes the centre exact whatever the two sides weigh. */
+/* The strip above a paged table holding the nav-only pager (issue #29). Paging
+   anchors back here, so give it a scroll margin that clears the sticky app
+   header — otherwise the header covers the buttons the view just jumped to. */
+.paged-anchor { scroll-margin-top: 72px; }
+
 .pager {
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   gap: 8px 12px; margin-top: 12px; font-size: 13px;

@@ -218,12 +218,37 @@ describe("footer reachability", () => {
  */
 describe("footer wiring in App.vue", () => {
   const app = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
-  const footers = app.match(/<Pager\b[\s\S]*?\/>/g) ?? [];
+  const pagers = app.match(/<Pager\b[\s\S]*?\/>/g) ?? [];
+  // The footer under each table carries the row-count picker; the nav-only
+  // pager above it (issue #29) is just the prev/position/next pair and must
+  // not grow a second picker.
+  const footers = pagers.filter((pager) => /:page-size=/.test(pager));
+  const topNavs = pagers.filter((pager) => /\bnav-only\b/.test(pager));
   const sizes = footers.map((footer) => footer.match(/:page-size="(\w+)"/)?.[1] ?? "");
 
   it("finds the footers, so the checks below are not vacuous", () => {
     expect(footers.length).toBeGreaterThan(0);
     expect(sizes.every(Boolean), "every footer names the count it shows").toBe(true);
+  });
+
+  it("finds the nav-only pagers, so the checks below are not vacuous", () => {
+    expect(topNavs.length).toBeGreaterThan(0);
+    for (const nav of topNavs) {
+      expect(nav, "a nav-only pager is the pair of buttons, not a second picker").not.toMatch(
+        /:page-size=/,
+      );
+      expect(nav, "a nav-only pager turns the same list a footer turns").toMatch(
+        /:page="(\w+)"/,
+      );
+    }
+  });
+
+  it("pairs every nav-only pager with a footer over the same list", () => {
+    const footerPages = new Set(footers.map((footer) => footer.match(/:page="(\w+)"/)?.[1] ?? ""));
+    for (const nav of topNavs) {
+      const page = nav.match(/:page="(\w+)"/)?.[1] ?? "";
+      expect(footerPages.has(page), page + " has a nav-only pager but no footer").toBe(true);
+    }
   });
 
   it("renders every footer unconditionally", () => {
@@ -334,6 +359,45 @@ describe("usePager", () => {
     pager.next();
     pager.reset();
     expect(pager.page.value).toBe(1);
+  });
+
+  it("lets a caller anchor the form after a page the reader turned", () => {
+    const rows = ref(Array.from({ length: 25 }, (_, i) => i + 1));
+    const turns: number[] = [];
+    const pager = usePager(() => rows.value, () => 10, {
+      onPageChange: () => turns.push(pager.page.value),
+    });
+    pager.next();
+    pager.next();
+    pager.prev();
+    expect(turns).toEqual([2, 3, 2]);
+  });
+
+  it("anchors after a row-count change but not on no-ops, resets, or shrink clamps", async () => {
+    const rows = ref(Array.from({ length: 25 }, (_, i) => i + 1));
+    const size = ref(10);
+    let calls = 0;
+    const pager = usePager(() => rows.value, () => size.value, {
+      onPageChange: () => {
+        calls += 1;
+      },
+    });
+    pager.prev(); // already on the first page: nothing moved
+    pager.reset(); // programmatic: the reader did not ask to move
+    expect(calls).toBe(0);
+    size.value = 50; // re-chunking counts: the reader picked the count
+    await flush();
+    expect(calls).toBe(1);
+    size.value = 10; // ...and so does picking it back
+    await flush();
+    expect(calls).toBe(2);
+    pager.next();
+    expect(pager.page.value).toBe(2);
+    expect(calls).toBe(3); // the turn itself
+    rows.value = [1, 2, 3]; // shrink clamps the page: no move asked for
+    await flush();
+    expect(pager.page.value).toBe(1);
+    expect(calls).toBe(3);
   });
 });
 

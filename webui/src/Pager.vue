@@ -30,7 +30,7 @@ import { PAGE_SIZE_OPTIONS, showsNav } from "./pagination";
  */
 const props = defineProps<{
   page: number;
-  pageSize: number;
+  pageSize?: number;
   /** Last page number; omitted by cursor paging. */
   pages?: number;
   /** Row count to report; omitted by cursor paging. */
@@ -39,6 +39,13 @@ const props = defineProps<{
   busy?: boolean;
   prevDisabled?: boolean;
   nextDisabled?: boolean;
+  /** Nav-only form: just the prev/position/next pair, no count and no picker.
+   *  This is the strip a paged table carries *above* it (issue #29) — a second
+   *  pair of buttons so a reader never has to travel to the footer to turn the
+   *  page, and the thing paging anchors back to. The footer below the table
+   *  stays the one place the row count is set; duplicating the picker here
+   *  would be two controls writing one number on one screen. */
+  navOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -58,16 +65,16 @@ const navVisible = computed(() => showsNav(props.pages));
 </script>
 
 <template>
-  <div class="pager">
-    <span v-if="total != null" class="muted pager-total">{{ fmt('pageTotal', { n: total }) }}</span>
+  <div v-if="!navOnly || navVisible" class="pager">
+    <span v-if="total != null && !navOnly" class="muted pager-total">{{ fmt('pageTotal', { n: total }) }}</span>
     <span v-if="navVisible" class="pager-nav">
       <button class="secondary-button" type="button" :disabled="busy || !canPrev" @click="emit('prev')"><ChevronLeft :size="15" />{{ t('prevPage') }}</button>
       <span class="muted pager-position">{{ pages != null ? fmt('pageOf', { n: page, total: pages }) : fmt('runLogPageNo', { n: page }) }}</span>
       <button class="secondary-button" type="button" :disabled="busy || !canNext" @click="emit('next')">{{ t('nextPage') }}<ChevronRight :size="15" /></button>
     </span>
-    <label class="pager-size">
+    <label v-if="!navOnly" class="pager-size">
       <span>{{ t('pageSizeLabel') }}</span>
-      <Dropdown :model-value="pageSize" :options="sizeOptions" compact @change="(value) => emit('update:pageSize', Number(value))" />
+      <Dropdown :model-value="pageSize ?? null" :options="sizeOptions" compact @change="(value) => emit('update:pageSize', Number(value))" />
     </label>
   </div>
 </template>

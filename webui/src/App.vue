@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
@@ -314,10 +314,30 @@ const filteredTasks = computed(() => {
 });
 /** One page of the filtered list. The summary tiles below stay account-wide,
  *  so they never report a page's worth as if it were the whole picture. */
+const tasksAnchor = ref<HTMLElement | null>(null);
+const subscriptionsAnchor = ref<HTMLElement | null>(null);
+const templatesAnchor = ref<HTMLElement | null>(null);
+const publicTemplatesAnchor = ref<HTMLElement | null>(null);
+const libraryAnchor = ref<HTMLElement | null>(null);
+const runLogAnchor = ref<HTMLElement | null>(null);
+
+/** Bring the top of a paged form back on screen after a page change (issue
+ *  29). Replacing the rows under an unmoved viewport left the scroll position
+ *  to the browser's scroll anchoring, which picked a different anchor node
+ *  every time — sometimes nothing moved, sometimes the view jumped to the page
+ *  top, sometimes it pinned itself to the pager buttons. Anchoring to the
+ *  nav-only pager above the table instead is deterministic, keeps that pager
+ *  on screen so a reader can keep turning pages, and reads as "the list starts
+ *  here" rather than as a jump. `scroll-margin-top` (see `.paged-anchor`)
+ *  keeps the sticky app header from covering the target. */
+function scrollToPaged(anchor: Ref<HTMLElement | null>): void {
+  void nextTick().then(() => anchor.value?.scrollIntoView({ block: "start" }));
+}
+
 const {
   page: tasksPage, pages: tasksTotalPages, items: pagedTasks,
   prev: tasksPrevPage, next: tasksNextPage, reset: resetTasksPage,
-} = usePager(() => filteredTasks.value, () => tasksPageSize.value);
+} = usePager(() => filteredTasks.value, () => tasksPageSize.value, { onPageChange: () => scrollToPaged(tasksAnchor) });
 // A new search term or group is a different list rather than a later page of
 // the same one, so it starts over.
 watch([search, groupFilter], resetTasksPage);
@@ -673,11 +693,13 @@ async function nextRunLogPage() {
   if (!runLogHasMore.value || runLogLoading.value) return;
   runLogAdvance(runLogNextCursor.value);
   await loadRunLog();
+  scrollToPaged(runLogAnchor);
 }
 async function prevRunLogPage() {
   if (!runLogCanGoBack.value || runLogLoading.value) return;
   runLogBack();
   await loadRunLog();
+  scrollToPaged(runLogAnchor);
 }
 /** The status is set on its ref and nothing else: the watch below is what
  *  refetches, so this stays a setter and there is one reload path, not two. */
@@ -701,6 +723,10 @@ watch([runLogStatus, runLogTaskId, runLogPageSize], () => {
   resetRunLogPaging();
   if (showRunLog.value) void loadRunLog();
 });
+// A new row count re-chunks the list, so it anchors like a page turn does;
+// filters intentionally do not — they change which runs match, not where the
+// reader was in the list.
+watch(runLogPageSize, () => scrollToPaged(runLogAnchor));
 
 // ---------- templates ----------
 const templates = ref<Template[]>([]);
@@ -792,11 +818,11 @@ const sortedPublicTemplates = computed(() =>
 const {
   page: templatesPage, pages: templatesTotalPages, items: pagedTemplates,
   prev: templatesPrevPage, next: templatesNextPage, reset: resetTemplatesPage,
-} = usePager(() => filteredTemplates.value, () => templatesPageSize.value);
+} = usePager(() => filteredTemplates.value, () => templatesPageSize.value, { onPageChange: () => scrollToPaged(templatesAnchor) });
 const {
   page: publicTemplatesPage, pages: publicTemplatesTotalPages, items: pagedPublicTemplates,
   prev: publicTemplatesPrevPage, next: publicTemplatesNextPage,
-} = usePager(() => sortedPublicTemplates.value, () => publicTemplatesPageSize.value);
+} = usePager(() => sortedPublicTemplates.value, () => publicTemplatesPageSize.value, { onPageChange: () => scrollToPaged(publicTemplatesAnchor) });
 watch([templateSearch, unusedOnly], resetTemplatesPage);
 
 /** Headers of the "my templates" table. `text` marks the columns whose natural
@@ -1306,7 +1332,7 @@ const subscriptions = ref<TemplateSubscription[]>([]);
 const {
   page: subsPage, pages: subsTotalPages, items: pagedSubscriptions,
   prev: subsPrevPage, next: subsNextPage,
-} = usePager(() => subscriptions.value, () => subsPageSize.value);
+} = usePager(() => subscriptions.value, () => subsPageSize.value, { onPageChange: () => scrollToPaged(subscriptionsAnchor) });
 const subForm = reactive<{ name: string; url: string }>({ name: "", url: "" });
 /** Add/edit dialog state: a null edit target means "create". */
 const showSubModal = ref(false);
@@ -1460,7 +1486,7 @@ const librarySelectedCount = computed(() => librarySelected.value.size);
 const {
   page: libraryPage, pages: libraryTotalPages, items: pagedLibraryEntries,
   prev: libraryPrevPage, next: libraryNextPage, reset: resetLibraryPage,
-} = usePager(() => libraryEntries.value, () => libraryPageSize.value);
+} = usePager(() => libraryEntries.value, () => libraryPageSize.value, { onPageChange: () => scrollToPaged(libraryAnchor) });
 watch(libraryEntries, resetLibraryPage);
 /** Only entries currently visible — the page on screen — can be selected, so a
  *  filter or a page turn never hides part of the selection. */
@@ -2209,7 +2235,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <h2>{{ search || groupFilter ? t('noTasksMatch') : t('createFirst') }}</h2>
             <button v-if="!search && !groupFilter" class="secondary-button" @click="openCreateTask"><Plus :size="16" />{{ t('createTaskShort') }}</button>
           </div>
-          <div v-else class="table-wrap tasks-wrap">
+          <template v-else>
+          <div class="paged-anchor" ref="tasksAnchor">
+            <Pager nav-only :page="tasksPage" :pages="tasksTotalPages" @prev="tasksPrevPage" @next="tasksNextPage" />
+          </div>
+          <div class="table-wrap tasks-wrap">
             <table class="tasks-table">
               <thead><tr>
                 <th class="col-check"><input type="checkbox" :checked="pagedTasks.length > 0 && pagedTasks.every(x => selected.has(x.id))" :title="t('selectAll')" @change="selectAllVisible" /></th>
@@ -2244,6 +2274,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          </template>
           <Pager
             :page="tasksPage"
             :pages="tasksTotalPages"
@@ -2307,7 +2338,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <h2>{{ t('subscriptionsTitle') }}</h2>
           <p class="muted section-hint">{{ t('subHint') }}</p>
           <div v-if="subscriptions.length === 0" class="muted">{{ t('noSubs') }}</div>
-          <div v-else class="table-wrap">
+          <template v-else>
+          <div class="paged-anchor" ref="subscriptionsAnchor">
+            <Pager nav-only :page="subsPage" :pages="subsTotalPages" @prev="subsPrevPage" @next="subsNextPage" />
+          </div>
+          <div class="table-wrap">
             <table class="templates-table">
               <thead><tr>
                 <th>{{ t('name') }}</th><th>{{ t('subUrl') }}</th><th>{{ t('status') }}</th>
@@ -2327,6 +2362,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          </template>
           <Pager
             :page="subsPage"
             :pages="subsTotalPages"
@@ -2352,7 +2388,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <span><FileJson2 :size="25" /></span>
             <h2>{{ unusedOnly ? t('noUnusedTemplates') : templateSearch ? t('noTemplates') : t('templateEmptyHint') }}</h2>
           </div>
-          <div v-else class="table-wrap">
+          <template v-else>
+          <div class="paged-anchor" ref="templatesAnchor">
+            <Pager nav-only :page="templatesPage" :pages="templatesTotalPages" @prev="templatesPrevPage" @next="templatesNextPage" />
+          </div>
+          <div class="table-wrap">
             <table class="templates-table">
               <thead><tr>
                 <th v-for="column in templateColumns" :key="column.key" class="sortable" :aria-sort="sortAria(templateSort, column.key)">
@@ -2382,6 +2422,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </tbody>
             </table>
           </div>
+          </template>
           <Pager
             :page="templatesPage"
             :pages="templatesTotalPages"
@@ -2444,7 +2485,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <span><LibraryIcon :size="25" /></span>
               <h2>{{ t('libraryEmpty') }}</h2>
             </div>
-            <div v-else class="table-wrap">
+            <template v-else>
+            <div class="paged-anchor" ref="libraryAnchor">
+              <Pager nav-only :page="libraryPage" :pages="libraryTotalPages" @prev="libraryPrevPage" @next="libraryNextPage" />
+            </div>
+            <div class="table-wrap">
               <table class="library-table">
                 <thead><tr>
                   <th v-if="libraryBatch" class="col-check"><input type="checkbox" :checked="libraryAllVisibleSelected" :aria-label="t('librarySelectAll')" @change="toggleLibraryAllVisible" /></th>
@@ -2478,6 +2523,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               </table>
             </div>
 
+            </template>
             <Pager
               :page="libraryPage"
               :pages="libraryTotalPages"
@@ -2506,7 +2552,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           <template v-if="showPublicTemplates">
             <div v-if="sortedPublicTemplates.length === 0" class="muted">{{ t('noTemplates') }}</div>
-            <div v-else class="table-wrap">
+            <template v-else>
+            <div class="paged-anchor" ref="publicTemplatesAnchor">
+              <Pager nav-only :page="publicTemplatesPage" :pages="publicTemplatesTotalPages" @prev="publicTemplatesPrevPage" @next="publicTemplatesNextPage" />
+            </div>
+            <div class="table-wrap">
               <table class="templates-table">
                 <thead><tr>
                   <th class="sortable" :aria-sort="sortAria(publicSort, 'name')">
@@ -2528,6 +2578,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 </tbody>
               </table>
             </div>
+            </template>
             <Pager
               :page="publicTemplatesPage"
               :pages="publicTemplatesTotalPages"
@@ -2990,7 +3041,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <span><Activity :size="25" /></span>
           <h2>{{ t('runLogEmpty') }}</h2>
         </div>
-        <div v-else class="table-wrap">
+        <template v-else>
+        <div class="paged-anchor" ref="runLogAnchor">
+          <Pager nav-only :page="runLogPageNo" :busy="runLogLoading" :prev-disabled="!runLogCanGoBack" :next-disabled="!runLogHasMore" @prev="prevRunLogPage" @next="nextRunLogPage" />
+        </div>
+        <div class="table-wrap">
           <table class="runs-table">
             <thead><tr>
               <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
@@ -3009,6 +3064,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             </tbody>
           </table>
         </div>
+        </template>
         <Pager
           :page="runLogPageNo"
           :page-size="runLogPageSize"
