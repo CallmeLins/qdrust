@@ -409,7 +409,11 @@ async fn execute_with_run(
                 }));
                 return;
             }
-            error!(task_id=task.id, %err, "task failed");
+            // The anyhow chain, not just the top context: a bare "cannot render
+            // QD template value" told a reporter nothing; the root cause (e.g.
+            // "unknown method: sequence has no method named append (in <string>:6)")
+            // is what they paste back to the issue.
+            error!(task_id = task.id, err = format!("{err:#}"), "task failed");
             let now = Utc::now().timestamp();
             let _ = store
                 .record_run_step(&RunStep {
