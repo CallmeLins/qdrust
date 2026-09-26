@@ -1735,8 +1735,15 @@ pub async fn guarded_client_for_url(
             .build()
             .context("cannot build proxied HTTP client");
     }
+    // Pin every address the guard classified, not just the first. A dual-stack
+    // name (an intranet dual-stack DNS is how this surfaced) resolves to both
+    // families, and getaddrinfo happily puts the dead one first — pinning only
+    // that made every connect fail with "connection refused" even though a
+    // later address was reachable, where curl, which walks the list, connected.
+    // Handing hyper the whole list keeps the guard's guarantee — the client can
+    // only dial addresses that were classified — while regaining the fallback.
     builder
-        .resolve(host, addresses[0])
+        .resolve_to_addrs(host, &addresses)
         .build()
         .context("cannot build pinned HTTP client")
 }
@@ -2173,6 +2180,44 @@ mod tests {
         )
         .await
         .expect("the relaxation must let the same URL through");
+    }
+
+    /// A multi-address name can resolve its dead address first. This surfaced
+    /// on an intranet dual-stack DNS (#27): `flaresolverr.d.test` answered with
+    /// an unreachable v6 ULA ahead of a working v4 address, and pinning only
+    /// the first classified address turned every connect into "connection
+    /// refused" where curl, which walks the list, connected. The pinned client
+    /// must carry every address the guard classified so the connector can fall
+    /// back. `localhost` is the one portable dual-family name: with the server
+    /// on v4 only, this connects whatever order the resolver returns — and it
+    /// fails again if pinning ever shrinks back to one address on a platform
+    /// that lists the v6 one first.
+    #[tokio::test]
+    async fn a_multi_address_host_connects_when_its_first_address_is_dead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, Router::new()).await.unwrap() });
+
+        let client = guarded_client_for_url(
+            &format!("http://localhost:{port}/"),
+            &OutboundPolicy {
+                allow_private_network: true,
+                ..OutboundPolicy::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An empty router answers 404 for everything; reaching it at all is
+        // the assertion.
+        let status = client
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
     }
 
     /// A template's `_proxy` is user input, so the proxy host must pass the same
