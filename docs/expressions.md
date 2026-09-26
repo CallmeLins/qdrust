@@ -27,22 +27,34 @@
 
 - **`api://browser/*` 浏览器插件（可选）**：进程内持有 chromiumoxide 驱动远程无头浏览器，处理"生成签名 / 过验证码 / 渲染 JS / 多步表单交互"这类纯 HTTP 步骤做不了的一步。配置 `QDRUST_BROWSER_URL` 即可启用（无需在插件管理页新建条目），`content`/`eval`/`screenshot`/`start`/`end`/`type`/`click`/`keepalive` 等 action 见 [浏览器插件（无头浏览器签到）](browser-plugin.md)。
 
-## 与 Python QD 的已知差异：列表不可变
+## 与 Python QD 的已知差异：列表的就地修改
 
-`minijinja` 的值是**不可变的**，而 Python QD 的 Jinja2 直接操作 Python 对象。因此 QD 模板里常见的**就地修改列表**写法在 qdrust 中会报错：
-
-```jinja
-{# Python QD 里合法，qdrust 里报 "sequence has no method named append" #}
-{% set items = [] %}
-{% for x in rows %}{% do items.append(x) %}{% endfor %}
-```
-
-改用 `namespace` 模式即可，**改写后的模板在 Python QD 中同样合法**，两边通用：
+`minijinja` 的值默认**不可变**，而 Python QD 的 Jinja2 直接操作 Python 对象。不过 qdrust 对最常见的**模板自建累加器**写法做了兼容：只要列表是在模板里用 `{% set items = [] %}`（或种子字面量 `{% set items = ['a'] %}`）声明的，`.append` / `.extend` / `.insert` / `.pop` / `.remove` / `.clear` 都可以直接用，无需任何改写（[#27](https://github.com/CallmeLins/qdrust/issues/27)）：
 
 ```jinja
-{% set ns = namespace(items=[]) %}
-{% for x in rows %}{% set ns.items = ns.items + [x] %}{% endfor %}
-{{ ns.items | join(',') }}
+{# 模板自建的列表：qdrust 与 Python QD 行为一致 #}
+{% set parts = [] %}
+{% for x in rows %}{% set _ = parts.append(x) %}{% endfor %}
+{{ parts | join('; ') }}
 ```
 
-同理不可用的还有 `.insert` / `.pop` / `.remove` / `.update`（字典）等一切就地修改方法；拼接（`+`）、过滤（`| select` / `| map` / `| sort`）等纯函数写法不受影响。
+实现上，渲染前会把模板内的字面量列表声明替换为内部可变对象（`__qd_list`，引擎全局函数，不会出现在任务的必需变量列表里）；该改写只在模板中出现了就地修改调用时发生。
+
+仍然**不支持**的两类写法：
+
+- 对**外部传入的变量**（提取到的数组、函数返回值）就地修改——它们是共享的不可变值：
+
+  ```jinja
+  {# cn 是提取变量，两边都不要这样写 #}
+  {% set _ = cn.append('x') %}
+  ```
+
+  改用 `namespace` 模式即可，**改写后的模板在 Python QD 中同样合法**，两边通用：
+
+  ```jinja
+  {% set ns = namespace(items=[]) %}
+  {% for x in rows %}{% set ns.items = ns.items + [x] %}{% endfor %}
+  {{ ns.items | join(',') }}
+  ```
+
+- 字典的就地修改（`.update` 等）；拼接（`+`）、过滤（`| select` / `| map` / `| sort`）等纯函数写法不受影响。

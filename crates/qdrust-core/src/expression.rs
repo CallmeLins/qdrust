@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Local, TimeZone};
 use fake::Fake;
-use minijinja::value::{Kwargs, Rest};
-use minijinja::{Environment, Error, ErrorKind, Value as JinjaValue};
+use minijinja::value::{Enumerator, Kwargs, Object, ObjectRepr, Rest};
+use minijinja::{Environment, Error, ErrorKind, State, Value as JinjaValue};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::Rng;
 use regex::Regex;
@@ -1054,6 +1054,26 @@ impl Default for QdExpressionEngine {
             Ok::<_, Error>(value.ends_with(&suffix))
         });
 
+        // The Python list-mutation idiom (issue #27): `{% set parts = [] %}` in
+        // the template itself, then `parts.append(...)` while it is built up.
+        // MiniJinja's literal `[]` is immutable and has no methods, and the
+        // Jinja2 `{% set %}` scoping that makes `{% set parts = parts + [x] %}`
+        // non-persistent inside `{% for %}` is exactly why QD templates use
+        // `.append` in the first place — so the accumulator is handed out as a
+        // mutable object instead. See `MutableSeq` / `compat_mutable_lists`.
+        environment.add_function("__qd_list", |initial: Option<JinjaValue>| {
+            let items = match initial {
+                Some(initial) => initial
+                    .try_iter()
+                    .map_err(|err| {
+                        Error::new(ErrorKind::InvalidOperation, format!("__qd_list: {err}"))
+                    })?
+                    .collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+            Ok(JinjaValue::from_object(MutableSeq(Mutex::new(items))))
+        });
+
         Self { environment }
     }
 }
@@ -1075,7 +1095,7 @@ impl QdExpressionEngine {
     /// as `{{ md5(x) }}` work in plain task URLs, headers and bodies too.
     pub fn render(&self, template: &str, variables: &BTreeMap<String, Value>) -> Result<String> {
         self.environment
-            .render_str(template, variables)
+            .render_str(&compat_mutable_lists(template), variables)
             .context("cannot render QD template value")
     }
 
@@ -1255,6 +1275,181 @@ fn undeclared_names(source: &str) -> HashSet<String> {
         return HashSet::new();
     };
     template.undeclared_variables(false)
+}
+
+/// A list that Python mutation methods work on.
+///
+/// MiniJinja values are immutable: the `[]` a template declares is a builtin
+/// sequence with no methods, and QD templates build their accumulators with
+/// `parts.append(x)` — the Python idiom, and the only one available to them,
+/// because Jinja2's `{% set %}` does not persist across `{% for %}` iterations
+/// (verified against MiniJinja: a `{% set parts = parts + [x] %}` rewrite loses
+/// every iteration but the last). When a template declares its accumulator with
+/// `{% set name = [] %}` (see [`compat_mutable_lists`]) the declaration is
+/// routed here instead, and the familiar calls mutate the shared object.
+/// Everywhere else — iteration, `|length`, indexing, `|join`, comparisons,
+/// serialization into extracted variables — it behaves like a plain array.
+#[derive(Debug, Default)]
+struct MutableSeq(Mutex<Vec<JinjaValue>>);
+
+impl Object for MutableSeq {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Seq
+    }
+
+    fn get_value(self: &Arc<Self>, key: &JinjaValue) -> Option<JinjaValue> {
+        let index = key.as_usize()?;
+        self.0.lock().unwrap().get(index).cloned()
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        // Owned clone: the lock guard cannot outlive the call, and QD
+        // accumulators are small.
+        Enumerator::Iter(Box::new(self.0.lock().unwrap().clone().into_iter()))
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &State,
+        name: &str,
+        args: &[JinjaValue],
+    ) -> Result<JinjaValue, Error> {
+        let mut items = self.0.lock().unwrap();
+        match name {
+            "append" => {
+                ensure_one_arg(name, args)?;
+                items.push(args[0].clone());
+                Ok(JinjaValue::UNDEFINED)
+            }
+            "extend" => {
+                ensure_one_arg(name, args)?;
+                let incoming = args[0]
+                    .try_iter()
+                    .map_err(|_| not_a_list(name, &args[0]))?
+                    .collect::<Vec<_>>();
+                items.extend(incoming);
+                Ok(JinjaValue::UNDEFINED)
+            }
+            "insert" => {
+                if args.len() != 2 {
+                    return Err(argument_count(name, args.len(), 2));
+                }
+                let index =
+                    clamp_index(args[0].to_string().parse().unwrap_or(i64::MAX), items.len());
+                items.insert(index, args[1].clone());
+                Ok(JinjaValue::UNDEFINED)
+            }
+            "pop" => {
+                if args.len() > 1 {
+                    return Err(argument_count(name, args.len(), 1));
+                }
+                let index = match args.first() {
+                    Some(index) => {
+                        clamp_index(index.to_string().parse().unwrap_or(i64::MAX), items.len())
+                    }
+                    None => items.len().wrapping_sub(1),
+                };
+                match items.get(index).cloned() {
+                    Some(popped) => {
+                        items.remove(index);
+                        Ok(popped)
+                    }
+                    None => Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "pop from empty list",
+                    )),
+                }
+            }
+            "remove" => {
+                ensure_one_arg(name, args)?;
+                let position = items
+                    .iter()
+                    .position(|item| *item == args[0])
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidOperation, "remove(x): x not in list")
+                    })?;
+                items.remove(position);
+                Ok(JinjaValue::UNDEFINED)
+            }
+            "clear" => {
+                items.clear();
+                Ok(JinjaValue::UNDEFINED)
+            }
+            other => Err(Error::new(
+                ErrorKind::UnknownMethod,
+                format!(
+                    "sequence has no method named {other} (mutable lists support append, extend, \
+                     insert, pop, remove, clear)"
+                ),
+            )),
+        }
+    }
+}
+
+fn ensure_one_arg(name: &str, args: &[JinjaValue]) -> Result<(), Error> {
+    if args.len() != 1 {
+        return Err(argument_count(name, args.len(), 1));
+    }
+    Ok(())
+}
+
+fn argument_count(name: &str, got: usize, want: usize) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("{name}() takes {want} argument(s), got {got}"),
+    )
+}
+
+fn not_a_list(name: &str, value: &JinjaValue) -> Error {
+    Error::new(
+        ErrorKind::InvalidOperation,
+        format!("{name}() argument is not iterable: {value:?}"),
+    )
+}
+
+/// Python `list.insert`/`list.pop` index clamping: negative counts from the
+/// end, anything out of range saturates.
+fn clamp_index(index: i64, len: usize) -> usize {
+    if index < 0 {
+        len.saturating_sub(index.unsigned_abs() as usize)
+    } else {
+        (index as usize).min(len)
+    }
+}
+
+/// The Python list mutators a template may call, as they appear in source.
+const MUTATOR_CALLS: &[&str] = &["append(", "extend(", "insert(", "pop(", "remove(", "clear("];
+
+/// Rewrite self-declared literal lists into mutable ones so the Python
+/// list-accumulator idiom keeps working (issue #27).
+///
+/// Only `{% set name = [literal] %}` declarations are touched — empty or a
+/// flat literal — and only in templates that call a mutator somewhere, so a
+/// template that never mutates renders exactly as before. Aliasing a variable
+/// (`{% set copy = original %}`) is deliberately left alone: the copy would
+/// share mutable state with the original, and `original` may be an extracted
+/// value that must stay read-only. The rewrite is textual and before parsing,
+/// which keeps it out of the variable-detection pass (`__qd_list` is an engine
+/// global, invisible to QD's required-variables list) and out of the docs: the
+/// template still reads exactly as Python QD wrote it.
+///
+/// Method calls on lists that came from *elsewhere* (extracted variables,
+/// function returns, non-literal assignments) still fail — those are shared
+/// MiniJinja values and cannot be swapped under a name the template did not
+/// declare with a literal.
+fn compat_mutable_lists(source: &str) -> std::borrow::Cow<'_, str> {
+    let looks_mutating =
+        source.contains('.') && MUTATOR_CALLS.iter().any(|call| source.contains(call));
+    if !looks_mutating {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    static SET_LIST_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+        // Flat literals only: no nested brackets or braces inside, so strings
+        // containing `]` are not rewritten (they fail loudly at render, as
+        // they always have, rather than silently corrupting).
+        Regex::new(r"\{%(-?)\s*set\s+([A-Za-z_]\w*)\s*=\s*(\[[^\[\]{}]*\])\s*(-?)%\}").unwrap()
+    });
+    SET_LIST_LITERAL.replace_all(source, "{%${1} set ${2} = __qd_list(${3}) ${4}%}")
 }
 
 fn parse_i64(value: &JinjaValue) -> Result<i64, Error> {
@@ -2022,6 +2217,117 @@ fn aes_format_output(data: &[u8], output_format: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The accumulator idiom from the issue-#27 pcbeta template, verbatim in
+    /// shape: a list declared in the template, built with `.append` inside a
+    /// `{% for %}`, then joined. Under plain MiniJinja this dies with
+    /// "sequence has no method named append", and no `{% set %}` rewrite can
+    /// save it because set does not persist across iterations.
+    #[test]
+    fn an_append_accumulator_survives_the_for_loop() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("cn".to_string(), json!(["a b", "c"]));
+
+        let template = "{% set parts = [] %}\n\
+            {% for i in range(cn|length) %}\n\
+            {% set n = cn[i] | urlencode %}\n\
+            {% if n %}\n\
+            {% set _ = parts.append(n ~ \"=\" ~ i) %}\n\
+            {% endif %}\n\
+            {% endfor %}\n\
+            {{ parts | join(\"; \") }}";
+        let rendered = engine.render(template, &variables).unwrap();
+        // Text between the tags is preserved as newlines; only the joined
+        // accumulator matters.
+        assert_eq!(rendered.trim(), "a%20b=0; c=1");
+    }
+
+    #[test]
+    fn the_other_python_list_mutators_work_too() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::new();
+
+        let rendered = engine
+            .render(
+                "{% set parts = ['a'] %}{% set _ = parts.extend(['b', 'c']) %}\
+                 {% set _ = parts.insert(0, 'z') %}{% set _ = parts.remove('b') %}\
+                 {% set popped = parts.pop() %}{{ parts|join(',') }}|{{ popped }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "z,a|c");
+
+        // A negative index counts from the end, like Python's.
+        let rendered = engine
+            .render(
+                "{% set parts = ['x', 'y'] %}{{ parts.pop(-1) }}|{{ parts|length }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "y|1");
+    }
+
+    #[test]
+    fn a_mutable_list_behaves_like_a_plain_array_everywhere_else() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::new();
+
+        // Iteration, length, indexing, comparisons, re-declaration as a reset,
+        // and the JSON an extracted variable would see.
+        let rendered = engine
+            .render(
+                "{% set parts = [] %}{% set _ = parts.append(2) %}{% set _ = parts.append(1) %}\
+                 {{ parts }}|{{ parts|length }}|{{ parts[1] }}|{{ parts == [2, 1] }}|\
+                 {% set parts = [] %}{{ parts|length }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "[2, 1]|2|1|True|0");
+    }
+
+    #[test]
+    fn a_list_that_came_from_a_variable_still_cannot_be_mutated() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("cn".to_string(), json!(["a"]));
+
+        // Values passed in from outside the template are shared and immutable;
+        // the rewrite only touches lists the template declares itself.
+        let error = engine
+            .render("{% set _ = cn.append('b') %}", &variables)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("has no method named append"));
+    }
+
+    #[test]
+    fn the_rewrite_leaves_templates_without_mutators_alone() {
+        let source = "{% set parts = [] %}{{ parts|length }}";
+        assert!(matches!(
+            compat_mutable_lists(source),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        let source = "{% set parts = [] %}{% set _ = parts.append(1) %}";
+        let rewritten = compat_mutable_lists(source);
+        assert!(rewritten.contains("__qd_list([])"));
+        // Whitespace-control dashes survive, and a seeded literal is carried
+        // into the mutable object.
+        let rewritten =
+            compat_mutable_lists("{%- set parts = ['a'] -%}{% set _ = parts.append(1) %}");
+        assert!(rewritten.contains("{%- set parts = __qd_list(['a']) -%}"));
+    }
+
+    #[test]
+    fn the_mutable_list_global_is_not_a_required_variable() {
+        // QD subtracts engine-known names from a template's required variables;
+        // the internal accumulator helper must be on that list.
+        assert!(
+            QdExpressionEngine::default()
+                .known_names()
+                .contains("__qd_list")
+        );
+    }
 
     #[test]
     fn qd_globals_are_also_registered_as_filters() {
