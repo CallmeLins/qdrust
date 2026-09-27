@@ -88,6 +88,31 @@ describe("scroll containment in style.css", () => {
     }
   });
 
+  it("stops the wheel at the run-log dialog, not at the log cell", () => {
+    // The dialog's only nested scroller is the capped log cell, and a notch it
+    // cannot use used to chain past the backdrop and move the page behind the
+    // dialog. Containment on the backdrop child is what cuts that chain, and it
+    // works because `overflow: hidden` already makes the box a scroll container
+    // — containment needs that identity, not room to scroll. The two properties
+    // therefore have to stay on one rule: take the `overflow` away and the
+    // `overscroll-behavior` beside it quietly stops doing anything. It cannot
+    // move down to `.runs-table .run-log` instead — a log that already fits has
+    // nothing inside to scroll and would swallow the wheel, turning the widest
+    // column of the table into a dead zone.
+    const edge = selectorIs(".modal-backdrop > .modal-runlog");
+    expect(edge).toHaveLength(1);
+    expect(edge[0].body).toContain("overflow: hidden");
+    expect(edge[0].body).toContain("overscroll-behavior: contain");
+
+    const capped = selectorIs(".runs-table .run-log");
+    expect(capped).toHaveLength(1);
+    expect(capped[0].body).toContain("overflow-y: auto");
+    expect(capped[0].body).not.toContain("overscroll-behavior");
+
+    // The per-cell class the wheel handler used to drive is gone with it.
+    expect(all.some((rule) => rule.selector.includes("run-log-can-scroll"))).toBe(false);
+  });
+
   it("keeps the one scrollbar the action form is allowed to have", () => {
     // The 220px task picker: it is what stops a long task list from stretching
     // the page, and it is the only scrolling the form should show.

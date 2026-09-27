@@ -522,6 +522,13 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    multiple of the line box rather than a round `em` value, so the cut lands
    between two lines instead of through one. */
 .runs-table .run-log { display: block; max-height: calc(1.5em * 5); overflow-y: auto; }
+/* The cap makes every log cell a scroll container nested in a table that
+   scrolls too, so one pointer can sit over two scrollers at once — and the
+   notch the cell cannot use chains out of the dialog and moves the page behind
+   it, which is the reported bug. The chain is cut at the dialog instead (see
+   `.modal-runlog` below). Containment on the cell itself is not an option: a
+   log that already fits has nothing inside to scroll and would swallow the
+   wheel whole, turning the widest column of the table into a dead zone. */
 .run-toolbar { display: inline-flex; gap: 4px; }
 .run-log { min-width: 0; white-space: pre-line; word-break: break-word; font-size: 12px; color: var(--ink-2); line-height: 1.5; font-family: var(--font-mono); }
 .run-time { margin-left: auto; color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -984,7 +991,19 @@ code {
    the filters, the column headers and the pager off the screen and left one
    unbroken strip of log. */
 .modal-runlog { width: min(1080px, 96vw); gap: 0; padding: 0; display: flex; flex-direction: column; }
-.modal-backdrop > .modal-runlog { overflow: hidden; }
+.modal-backdrop > .modal-runlog {
+  overflow: hidden;
+  /* This box is where the wheel stops: a notch the log cell cannot use dies at
+     the dialog's edge instead of chaining past the backdrop and moving the page
+     behind it. It takes the dialog and not `.table-wrap` — the header, the
+     filter row and the pager are inside it too and have no scroller of their
+     own, and a notch aimed at them leaked the same way. What makes it work is
+     the `overflow: hidden` above: hidden already makes a box a scroll
+     container, and containment needs that identity, not room to scroll. The
+     backdrop is no scroll container, so a wheel aimed outside the dialog still
+     reaches the page. Remove the `overflow` and this line stops doing anything. */
+  overscroll-behavior: contain;
+}
 /* Header, filter row and pager are bands of one frame: hairline dividers rather
    than three blocks floating in a gutter, and no `height` anywhere, so a short
    result is a short dialog instead of a card with a blank half under the pager —
