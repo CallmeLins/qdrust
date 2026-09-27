@@ -1,5 +1,10 @@
 use std::{
-    borrow::Cow, collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration,
+    borrow::Cow,
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -697,11 +702,18 @@ impl QdExecutor {
             body.len() <= self.response_limit,
             "response body limit exceeded"
         );
-        let content = String::from_utf8_lossy(&body);
+        // QD decodes the body once and hands every rule the same text; for an
+        // image it hands the base64 of the raw bytes instead, so a captcha
+        // survives an assertion or an extraction (see `is_image_response`).
+        let content = if is_image_response(&headers) {
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body)
+        } else {
+            decode_body(&body, &headers)
+        };
 
         context.last_status = Some(status);
         context.last_headers = headers.clone();
-        context.last_body = content.to_string();
+        context.last_body = content.clone();
 
         // QD shows the step request and response in the run log; surface both
         // so site-side rejections (e.g. result:-1 "用户名或密码为空") are
@@ -739,7 +751,16 @@ impl QdExecutor {
             }
             let pattern = self.render(&rule.rule.re, context)?;
             let source = rule_source(&rule.rule.from, status, &headers, &content);
-            let extracted = extract(&pattern, &source)?;
+            // QD compiles and searches inside a try/except and stores the
+            // exception's text as the variable's value, so a pattern its engine
+            // refuses leaves the run running: the mistake arrives as a variable
+            // holding the message rather than as a dead task, and a template
+            // that guards with `|default` still finishes. The message is this
+            // engine's own, which is what makes the variable useful to read.
+            let extracted = match extract(&pattern, &source) {
+                Ok(extracted) => extracted,
+                Err(err) => Some(Value::String(err.to_string())),
+            };
             if debug_requests_enabled() {
                 let preview = extracted
                     .as_ref()
@@ -1105,6 +1126,139 @@ fn rule_source(source: &str, status: u16, headers: &[(String, String)], content:
     }
 }
 
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Whether a response says it is an image.
+///
+/// QD's `run_rule.getdata` hands `content` to a rule as the base64 of the raw
+/// bytes when the response is one, and that is how a template keeps a captcha
+/// image intact through an assertion or an extraction.
+fn is_image_response(headers: &[(String, String)]) -> bool {
+    header_value(headers, "content-type")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("image"))
+}
+
+/// The `charset` parameter of a `Content-Type` value, quotes stripped.
+fn charset_parameter(content_type: &str) -> Option<&str> {
+    let lowered = content_type.to_ascii_lowercase();
+    let start = lowered.find("charset")? + "charset".len();
+    let rest = content_type[start..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.trim_start_matches(['"', '\'']);
+    let end = rest
+        .find(|character: char| {
+            character == ';' || character == ',' || character == '"' || character == '\''
+        })
+        .unwrap_or(rest.len());
+    let charset = rest[..end].trim();
+    (!charset.is_empty()).then_some(charset)
+}
+
+/// `charset` declarations a body carries: `<meta charset=…>`,
+/// `<meta content="…;charset=…">` and an XML declaration, in that order.
+///
+/// The three patterns are QD's `get_encodings_from_content` (`libs/utils.py`),
+/// which runs them over the raw bytes and takes the first match. What they look
+/// for is ASCII, so reading the bytes lossily turns exactly those declarations
+/// into text without altering them.
+fn declared_in_body(body: &[u8]) -> Option<String> {
+    static META_CHARSET: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)<meta.*?charset=["']*(.+?)["'>]"#).unwrap());
+    static META_PRAGMA: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)<meta.*?content=["']*;?charset=(.+?)["'>]"#).unwrap());
+    // No case-insensitive flag, as in QD, and `^` is the start of the document
+    // rather than a line, which is Python's reading without `re.M`.
+    static XML_DECLARATION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"^<\?xml.*?encoding=["']*(.+?)["'>]"#).unwrap());
+
+    for pattern in [&META_CHARSET, &META_PRAGMA, &XML_DECLARATION] {
+        if let Some(captured) = pattern.captures(&String::from_utf8_lossy(body)) {
+            return captured.get(1).map(|value| value.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// The encoding an encoding label names, as `encoding_rs` knows it.
+fn encoding_for(label: &str) -> Option<&'static encoding_rs::Encoding> {
+    let label = label.trim_matches(|character: char| {
+        character == '"' || character == '\'' || character.is_whitespace()
+    });
+    if label.eq_ignore_ascii_case("unicode") {
+        // QD has a literal label with a meaning of its own: `unicode` means the
+        // bytes are already text, which for a `str` is UTF-8.
+        return Some(encoding_rs::UTF_8);
+    }
+    if label.eq_ignore_ascii_case("gb2312") {
+        // QD upgrades this one: gb2312 is what sites *say*, gb18030 is what
+        // their bytes actually use once a character outside the 1980 set
+        // appears.
+        return Some(encoding_rs::GB18030);
+    }
+    if label.eq_ignore_ascii_case("latin_1") {
+        return Some(encoding_rs::WINDOWS_1252);
+    }
+    encoding_rs::Encoding::for_label(label.as_bytes())
+}
+
+/// The encoding to read a response body with, from the sources QD's
+/// `utils.find_encoding` reads.
+///
+/// Every source and every normalization is kept: the `charset` a response
+/// header declares, a declaration inside the body, an automatic detection when
+/// neither says anything, the `ISO-8859-1` a header carries by default
+/// *discarded* (it is what an HTTP stack writes when nobody decided, so QD
+/// treats it as silence), `gb2312` upgraded to `gb18030`, and Latin-1 as the
+/// last resort.
+///
+/// One step is ordered differently on purpose. QD asks its detector
+/// (`charset_normalizer`) *before* it reads the body's declaration, but that
+/// ordering only matters when the detector says nothing, and there it reports
+/// `utf_8` for anything ASCII or UTF-8 — so in QD the declaration is consulted
+/// mostly for the legacy encodings a detector has to guess at. This build's
+/// detector is `chardetng` (the one Firefox uses, from the same lineage as the
+/// `encoding_rs` decoders here), and swapping one guess for another is not
+/// fidelity to anything: a declaration in the page is a fact, so it is read
+/// before any guess. With no declaration the two do the same job.
+fn find_encoding(body: &[u8], headers: &[(String, String)]) -> &'static encoding_rs::Encoding {
+    if let Some(charset) = header_value(headers, "content-type")
+        .and_then(charset_parameter)
+        .filter(|charset| !charset.eq_ignore_ascii_case("iso-8859-1"))
+        && let Some(encoding) = encoding_for(charset)
+    {
+        return encoding;
+    }
+    if let Some(charset) = declared_in_body(body)
+        && let Some(encoding) = encoding_for(&charset)
+    {
+        return encoding;
+    }
+    // ISO-2022-JP is denied (the setting for content that can run scripts, and
+    // a character set no template here reads), and UTF-8 is allowed to be the
+    // guess: `charset_normalizer` answers `utf_8` for unlabelled UTF-8, and a
+    // page that is UTF-8 without saying so has to decode as UTF-8 to be read at
+    // all.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(body, true);
+    detector.guess(None, chardetng::Utf8Detection::Allow)
+}
+
+/// A response body as text, decoded the way QD decodes it.
+///
+/// `errors="replace"` is QD's, and `decode_without_bom_handling` is what gives
+/// it here: a byte the encoding cannot carry becomes U+FFFD rather than failing
+/// the step, and a byte-order mark stays in the text exactly as Python's
+/// `bytes.decode` leaves it.
+fn decode_body(body: &[u8], headers: &[(String, String)]) -> String {
+    let (text, _) = find_encoding(body, headers).decode_without_bom_handling(body);
+    text.into_owned()
+}
+
 /// How much backtracking the fallback engine may do before it gives up.
 ///
 /// Rust's `regex` is linear-time and cannot be made to run long by any pattern,
@@ -1448,6 +1602,18 @@ fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'stat
             index += 1;
             continue;
         }
+        // `(?(id)yes|no)` is Python's conditional group, and it is the one
+        // construct here that neither engine can express: it branches on
+        // whether another group took part in the match, which is not something
+        // an alternation, a look-around or a back-reference can stand in for.
+        // Both engines already refuse it, but they refuse the parenthesis, so
+        // the construct is named instead.
+        if character == '('
+            && characters.get(index + 1) == Some(&'?')
+            && characters.get(index + 2) == Some(&'(')
+        {
+            return Err("a conditional group, `(?(id)yes|no)`");
+        }
         if character == '{' {
             let Some(repetition) = python_repetition(&characters[index..]) else {
                 translated.push_str("\\{");
@@ -1623,6 +1789,24 @@ fn extract(pattern: &str, source: &str) -> Result<Option<Value>> {
         return Ok(Some(Value::Array(regex.find_all(source)?)));
     }
     regex.first(source)
+}
+
+/// Python's `re.findall(pattern, source, re.IGNORECASE)`, shaped the way
+/// `re.findall` shapes its entries.
+///
+/// This is what `api://util/regex` computes (qd's `UtilRegexHandler` calls
+/// `re.findall(p, data, re.IGNORECASE)` on the pattern as written — no
+/// `/…/flags` delimiters, which that handler never parses), and it borrows the
+/// same dialect translation every other QD pattern gets.
+pub(crate) fn python_findall(pattern: &str, source: &str) -> Result<Vec<Value>> {
+    let flags = QdFlags {
+        case_insensitive: true,
+        ..QdFlags::default()
+    };
+    flags
+        .build(pattern, pattern)
+        .map_err(|reason| anyhow::anyhow!("invalid QD regular expression {pattern:?}: {reason}"))?
+        .find_all(source)
 }
 
 /// One entry of a `findall` result. Python decides its shape by how many
@@ -1877,6 +2061,66 @@ mod tests {
             ..ExecutorOptions::default()
         })
         .unwrap()
+    }
+
+    /// The pieces of the encoding choice nothing else pins down: how a
+    /// `charset` parameter is read off a header, the three declarations a body
+    /// can carry, QD's own labels, and which source wins when two speak.
+    #[test]
+    fn the_encoding_sources_follow_qd() {
+        // The `charset` parameter of a `Content-Type`, quoted or bare.
+        assert_eq!(
+            charset_parameter("text/html; charset=gb2312"),
+            Some("gb2312")
+        );
+        assert_eq!(charset_parameter("text/html; charset=\"GBK\""), Some("GBK"));
+        assert_eq!(charset_parameter("text/html"), None);
+
+        // The three declarations a body can carry, and the ASCII-ness they
+        // rely on being readable in raw bytes.
+        assert_eq!(
+            declared_in_body(b"<meta charset=\"gb2312\">"),
+            Some("gb2312".to_string())
+        );
+        assert_eq!(
+            declared_in_body(b"<meta content=\";charset=big5\">"),
+            Some("big5".to_string())
+        );
+        assert_eq!(
+            declared_in_body(b"<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
+            Some("utf-8".to_string())
+        );
+
+        // QD's own labels: `unicode` is UTF-8, `gb2312` is read as `gb18030`
+        // (a site says the narrow set, its bytes use the wide one), and
+        // `latin_1` is Windows-1252.
+        assert_eq!(encoding_for("unicode").unwrap().name(), "UTF-8");
+        assert_eq!(encoding_for("gb2312").unwrap().name(), "gb18030");
+        assert_eq!(encoding_for("latin_1").unwrap().name(), "windows-1252");
+
+        // A header and a body can both speak; the header is the response's own
+        // word, so it wins.
+        assert_eq!(
+            find_encoding(
+                b"<meta charset=\"big5\">",
+                &[("content-type".into(), "text/html; charset=utf-8".into())],
+            )
+            .name(),
+            "UTF-8"
+        );
+        // `ISO-8859-1` is what a stack writes when nobody decided, so it is
+        // discarded and the body is read by its own declaration.
+        assert_eq!(
+            find_encoding(
+                b"<meta charset=\"gb2312\">",
+                &[(
+                    "content-type".into(),
+                    "text/html; charset=ISO-8859-1".into()
+                )],
+            )
+            .name(),
+            "gb18030"
+        );
     }
 
     #[tokio::test]
@@ -2384,7 +2628,7 @@ mod tests {
             "checked": true,
             "request": {"method": "GET", "url": "api://util/delay?seconds=0"},
             "success_asserts": [{"re": "200", "from": "status"}],
-            "extract_variables": [{"name": "delay_result", "re": "(delayed .+)", "from": "content"}]
+            "extract_variables": [{"name": "delay_result", "re": "(delay .+)", "from": "content"}]
         }]}}))
         .unwrap();
         let program = QdProgram::compile(&har).unwrap();
@@ -2396,7 +2640,7 @@ mod tests {
         assert_eq!(results[0].status, 200);
         assert_eq!(
             context.variables.get("delay_result"),
-            Some(&json!("delayed 0 seconds"))
+            Some(&json!("delay 0.0 second."))
         );
     }
 
@@ -3003,5 +3247,145 @@ mod tests {
         assert_eq!(extract(r#"a{,}"#, "aaa").unwrap(), Some(json!("aaa")));
         // Still a repetition, so still refused by both engines.
         assert!(extract(r#"a{2,1}"#, "aaa").is_err());
+    }
+
+    /// `(?(id)yes|no)` branches on whether another group took part in the
+    /// match, which neither engine here can express — and both refuse the
+    /// parenthesis rather than the construct, so the refusal names it.
+    #[test]
+    fn a_conditional_group_is_named_when_it_is_refused() {
+        for pattern in [r"(a)?(?(1)b|c)", r"(?P<x>a)?(?(x)b|c)"] {
+            let error = extract(pattern, "ab").unwrap_err().to_string();
+            assert!(error.contains("conditional group"), "{pattern}: {error}");
+        }
+    }
+
+    /// The encoding QD's `utils.decode` picks, source by source. Each case
+    /// isolates one: a wrong order would show up as mojibake rather than as a
+    /// missing feature.
+    #[test]
+    fn a_response_is_read_in_the_encoding_it_declares() {
+        let chinese = encoding_rs::GBK
+            .encode("中文签到成功获得积分")
+            .0
+            .into_owned();
+        let content_type = |value: &str| vec![("content-type".to_string(), value.to_string())];
+
+        assert_eq!(
+            decode_body(&chinese, &content_type("text/html; charset=gb2312")),
+            "中文签到成功获得积分"
+        );
+        // The same bytes when the header says nothing and the body declares the
+        // character set itself.
+        let mut page = br#"<html><head><meta charset="gb2312"></head><body>"#.to_vec();
+        page.extend_from_slice(&chinese);
+        assert!(decode_body(&page, &[]).ends_with("中文签到成功获得积分"));
+
+        // `ISO-8859-1` is what an HTTP stack writes when nobody decided, so QD
+        // discards it and reads the declaration behind it.
+        assert!(
+            decode_body(&page, &content_type("text/html; charset=ISO-8859-1"))
+                .ends_with("中文签到成功获得积分")
+        );
+
+        // With nothing declared, the detector reads what is there.
+        assert_eq!(decode_body(&chinese, &[]), "中文签到成功获得积分");
+        assert_eq!(decode_body("中文".as_bytes(), &[]), "中文");
+        // A byte the encoding cannot carry becomes U+FFFD rather than an error,
+        // which is Python's `errors="replace"`.
+        assert!(
+            decode_body(&[0xff], &content_type("text/html; charset=utf-8")).contains('\u{fffd}')
+        );
+    }
+
+    /// XML's declaration is the third source, and QD reads it only at the start
+    /// of the document.
+    #[test]
+    fn an_xml_declaration_is_read_as_an_encoding_source() {
+        let chinese = encoding_rs::GBK.encode("中文").0.into_owned();
+        let mut document = br#"<?xml version="1.0" encoding="gb2312"?><a>"#.to_vec();
+        document.extend_from_slice(&chinese);
+        assert!(decode_body(&document, &[]).ends_with("中文"));
+    }
+
+    #[test]
+    fn only_a_response_that_says_it_is_an_image_is_one() {
+        let header = |value: &str| vec![("Content-Type".to_string(), value.to_string())];
+        assert!(is_image_response(&header("image/png")));
+        assert!(is_image_response(&header("IMAGE/JPEG; charset=binary")));
+        assert!(!is_image_response(&header("text/html; charset=utf-8")));
+        assert!(!is_image_response(&[]));
+    }
+
+    /// QD hands a rule the base64 of an image response, which is what keeps a
+    /// captcha readable to the extraction that follows it.
+    #[tokio::test]
+    async fn an_image_response_reaches_a_rule_as_base64() {
+        let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let published = bytes.clone();
+        let app = Router::new().route(
+            "/captcha.png",
+            get(move || {
+                let bytes = published.clone();
+                async move { ([("content-type", "image/png")], bytes) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/captcha.png")},
+            "extract_variables": [{"name": "captcha", "re": "(.+)", "from": "content"}]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(
+            context.variables.get("captcha"),
+            Some(&json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &bytes
+            )))
+        );
+    }
+
+    /// QD stores the exception's text as the variable when a pattern will not
+    /// compile, and the run keeps going; the same shape here, with this
+    /// engine's message.
+    #[tokio::test]
+    async fn a_broken_extraction_pattern_becomes_a_variable_not_a_failed_run() {
+        let app = Router::new().route("/page", get(|| async { "hello" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/page")},
+            "extract_variables": [
+                {"name": "broken", "re": "(unclosed", "from": "content"},
+                {"name": "fine", "re": "(hel+)", "from": "content"}
+            ]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let stored = context
+            .variables
+            .get("broken")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(stored.contains("invalid QD regular expression"), "{stored}");
+        // The rule after the broken one still ran.
+        assert_eq!(context.variables.get("fine"), Some(&json!("hell")));
     }
 }

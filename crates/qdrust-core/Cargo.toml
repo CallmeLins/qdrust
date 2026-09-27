@@ -11,6 +11,7 @@ base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 ecb = { version = "0.1", features = ["alloc", "block-padding"] }
 chrono = "0.4"
+chardetng = "1"
 hex = "0.4"
 hmac = "0.12"
 html-escape = "0.2"

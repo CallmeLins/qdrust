@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::io::AsyncWriteExt;
 use tracing::info;
 
@@ -372,37 +372,75 @@ impl Plugin for UtilityPlugin {
                 // so both spellings must work. The action is the whole path here,
                 // so a path-form call arrives as `delay/<n>`.
                 action if action == "delay" || action.starts_with("delay/") => {
-                    let seconds = match action.strip_prefix("delay/") {
-                        Some(raw) => raw.parse::<f64>().context("invalid delay seconds")?,
+                    let raw = match action.strip_prefix("delay/") {
+                        Some(raw) => raw,
                         None => request
                             .query
                             .get("seconds")
                             .map(String::as_str)
-                            .unwrap_or("0")
-                            .parse::<f64>()
-                            .context("invalid delay seconds")?,
+                            .unwrap_or("0"),
                     };
+                    // QD wraps `float(...)` in try/except and answers
+                    // "Error, delay 0.0 second.": an unreadable value is a
+                    // reply, not a failed step, so the run continues.
+                    let Ok(parsed) = raw.parse::<f64>() else {
+                        return Ok(PluginResponse {
+                            status: 200,
+                            headers: BTreeMap::new(),
+                            body: b"Error, delay 0.0 second.".to_vec(),
+                        });
+                    };
+                    if !parsed.is_finite() {
+                        return Ok(PluginResponse {
+                            status: 200,
+                            headers: BTreeMap::new(),
+                            body: b"Error, delay 0.0 second.".to_vec(),
+                        });
+                    }
+                    // QD clamps a negative delay to zero and then sleeps.
+                    let seconds = parsed.max(0.0);
+                    // QD clamps at `delay_max_timeout` and sleeps the boundary
+                    // (300 s), answering with its "Error, limited by ..." text.
+                    // Sleeping the boundary here would only ever end as the
+                    // caller's own plugin timeout, which reads as a network
+                    // fault rather than an over-long delay, so the refusal is
+                    // kept and named with the same boundary.
                     ensure!(
-                        seconds.is_finite() && (0.0..=300.0).contains(&seconds),
-                        "delay must be between 0 and 300 seconds"
+                        seconds <= DELAY_MAX_SECONDS,
+                        "delay must be at most {DELAY_MAX_SECONDS} seconds"
                     );
                     tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
                     Ok(PluginResponse {
                         status: 200,
                         headers: BTreeMap::new(),
-                        body: format!("delayed {seconds} seconds").into_bytes(),
+                        // QD writes `f"delay {seconds} second."` here, and that
+                        // line is the `content` a template extracts.
+                        body: format!("delay {} second.", qd_float(seconds)).into_bytes(),
                     })
                 }
                 "timestamp" => {
-                    let format = request.query.get("format").map(String::as_str);
-                    let timestamp = chrono::Utc::now().timestamp();
-                    let body = match format {
-                        Some("ms") => (timestamp * 1000).to_string(),
-                        _ => timestamp.to_string(),
-                    };
+                    // QD 兼容（qd web/handlers/util.py TimeStampHandler）：`ts`（秒，
+                    // 可带小数）或 `dt`（配 `form`，Python strptime 语法）给出时间，
+                    // 两者都缺省时用当前时间；返回 QD 的中文键 JSON，供
+                    // success_asserts 的 "\"状态\": \"200\"" 与 extract_variables 的
+                    // "\"时间戳\": \"(.*)\"" 之类规则按原样匹配。
+                    let ts_arg = request.query.get("ts").map(String::as_str).unwrap_or("");
+                    let dt_arg = request.query.get("dt").map(String::as_str).unwrap_or("");
+                    let format = request
+                        .query
+                        .get("form")
+                        .map(String::as_str)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("%Y-%m-%d %H:%M:%S");
+                    let body = timestamp_body(ts_arg, dt_arg, format)?;
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "content-type".to_string(),
+                        "application/json; charset=UTF-8".to_string(),
+                    );
                     Ok(PluginResponse {
                         status: 200,
-                        headers: BTreeMap::new(),
+                        headers,
                         body: body.into_bytes(),
                     })
                 }
@@ -442,41 +480,40 @@ impl Plugin for UtilityPlugin {
                     })
                 }
                 "regex" => {
-                    let pattern = request
-                        .query
-                        .get("pattern")
-                        .context("regex pattern is required")?;
-                    let text = request.query.get("text").map(String::as_str).unwrap_or("");
-                    let operation = request
-                        .query
-                        .get("op")
-                        .map(String::as_str)
-                        .unwrap_or("search");
-
-                    let re = regex::Regex::new(pattern).context("invalid regex pattern")?;
-
-                    let result = match operation {
-                        "search" => re.find(text).map(|m| m.as_str()).unwrap_or("").to_string(),
-                        "findall" => {
-                            let matches: Vec<&str> =
-                                re.find_iter(text).map(|m| m.as_str()).collect();
-                            serde_json::to_string(&matches)?
-                        }
-                        "replace" => {
-                            let replacement = request
-                                .query
-                                .get("replacement")
-                                .map(String::as_str)
-                                .unwrap_or("");
-                            re.replace_all(text, replacement).to_string()
-                        }
-                        _ => bail!("unsupported regex operation: {operation}"),
-                    };
-
+                    // QD 兼容（qd web/handlers/util.py UtilRegexHandler）：`data`
+                    // 原文、`p` 正则，等价于 `re.findall(p, data, re.IGNORECASE)`，
+                    // 按 findall 的组语义（无组取整个匹配、一组取该组、多组取元组）
+                    // 编号成表，返回 QD 同款缩进 JSON；正则非法时只有「状态」键，
+                    // 与 QD 的 except 分支一致。
+                    let data = request.query.get("data").map(String::as_str).unwrap_or("");
+                    let pattern = request.query.get("p").map(String::as_str).unwrap_or("");
+                    let body = match crate::executor::python_findall(pattern, data) {
+                        Ok(matches) => qd_json(&QdJson::object(vec![
+                            (
+                                "数据".to_string(),
+                                QdJson::object(
+                                    matches
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, value)| {
+                                            ((index + 1).to_string(), QdJson::value(value.clone()))
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                            ("状态".to_string(), QdJson::value(serde_json::json!("OK"))),
+                        ])),
+                        Err(err) => qd_json(&qd_status(&err.to_string())),
+                    }?;
+                    let mut headers = BTreeMap::new();
+                    headers.insert(
+                        "content-type".to_string(),
+                        "application/json; charset=UTF-8".to_string(),
+                    );
                     Ok(PluginResponse {
                         status: 200,
-                        headers: BTreeMap::new(),
-                        body: result.into_bytes(),
+                        headers,
+                        body: body.into_bytes(),
                     })
                 }
                 "base64" => {
@@ -968,6 +1005,246 @@ fn strtobool(value: &str) -> bool {
     )
 }
 
+/// QD's `delay_max_timeout`. qd-today reads it from its config; the same 300
+/// seconds is the ceiling this build enforces.
+const DELAY_MAX_SECONDS: f64 = 300.0;
+
+/// Python's `str(float)` for the magnitudes a delay carries: `0.0`, `3.0`,
+/// `1.5`. Rust's `{}` drops the `.0` an integral float needs to read as one.
+fn qd_float(value: f64) -> String {
+    let text = format!("{value}");
+    if text
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && byte != b'-')
+    {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
+/// A JSON document that keeps object keys in insertion order, the way a Python
+/// `dict` does.
+///
+/// `serde_json::Map` is a `BTreeMap` in this build, so the `{"1": …, "2": …,
+/// "10": …}` QD's util handlers write would come out reordered. QD produces
+/// those bodies with `json.dumps(..., ensure_ascii=False, indent=4)` and
+/// templates read them back with `"…": "(.*)"` rules, so both the order and
+/// the four-space layout are part of what a template matches on.
+enum QdJson {
+    Value(serde_json::Value),
+    Object(Vec<(String, QdJson)>),
+}
+
+impl QdJson {
+    fn object(entries: Vec<(String, QdJson)>) -> Self {
+        Self::Object(entries)
+    }
+
+    fn value(value: serde_json::Value) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl Serialize for QdJson {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+/// A QD util handler's response body: `json.dumps(..., ensure_ascii=False,
+/// indent=4)`.
+fn qd_json(value: &QdJson) -> Result<String> {
+    let mut buffer = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut buffer, formatter);
+    value.serialize(&mut serializer)?;
+    String::from_utf8(buffer).context("QD JSON body is not valid UTF-8")
+}
+
+/// The `{"状态": ...}` object every QD util handler answers with when the work
+/// itself raised, in place of its result keys.
+fn qd_status(message: &str) -> QdJson {
+    QdJson::object(vec![(
+        "状态".to_string(),
+        QdJson::value(serde_json::json!(message)),
+    )])
+}
+
+/// The `strftime` directives Python's `time` module and chrono agree on.
+///
+/// chrono's formatter *panics* on a directive it does not recognise, where
+/// Python raises `ValueError: Invalid format string` — so a format string is
+/// checked against this set before it reaches the formatter, and an unknown
+/// directive becomes the same `状态` text Python would produce. Directives only
+/// one of the two knows (`%q`, `%s`, the `%.3f` family) are left out rather
+/// than guessed at, because reading one as the other would print a different
+/// date.
+const PYTHON_STRFTIME_DIRECTIVES: &str = "aAbBcdeEfGHIjMmpSuUVwWxXyYzZ%";
+
+/// `TimeStampHandler`'s time source: `dt` (read with `form`) wins over `ts`,
+/// and both absent means "now".
+fn timestamp_input(
+    ts_arg: &str,
+    dt_arg: &str,
+    format: &str,
+) -> std::result::Result<Option<f64>, String> {
+    if !dt_arg.is_empty() {
+        return match chrono::NaiveDateTime::parse_from_str(dt_arg, format) {
+            Ok(naive) => match naive.and_local_timezone(chrono::Local).single() {
+                Some(local) => Ok(Some(local.timestamp_micros() as f64 / 1_000_000.0)),
+                None => Err(format!("ambiguous local time: {dt_arg:?}")),
+            },
+            Err(err) => Err(format!(
+                "time data {dt_arg:?} does not match format {format:?}: {err}"
+            )),
+        };
+    }
+    if ts_arg.is_empty() {
+        return Ok(None);
+    }
+    ts_arg
+        .parse::<f64>()
+        .map(Some)
+        .map_err(|_| format!("could not convert string to float: {ts_arg:?}"))
+}
+
+/// `strftime` over the directives both Python and chrono read (see
+/// [`PYTHON_STRFTIME_DIRECTIVES`]).
+fn python_strftime<Tz: chrono::TimeZone>(
+    time: &chrono::DateTime<Tz>,
+    format: &str,
+) -> std::result::Result<String, String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            continue;
+        }
+        match characters.next() {
+            Some(directive) if PYTHON_STRFTIME_DIRECTIVES.contains(directive) => {}
+            _ => return Err(format!("Invalid format string: {format:?}")),
+        }
+    }
+    Ok(time.format(format).to_string())
+}
+
+/// Python's `datetime.isoformat()`: the fractional part is omitted when the
+/// microsecond is zero, and QD replaces the `+00:00` offset with `Z`.
+fn iso_format(utc: &chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Timelike as _;
+
+    let mut rendered = utc.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let micros = utc.nanosecond() / 1_000;
+    if micros != 0 {
+        rendered.push_str(&format!(".{micros:06}"));
+    }
+    rendered.push('Z');
+    rendered
+}
+
+/// QD's `yearday()`: how many days the year has, as a string.
+fn yearday(year: i32) -> String {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if leap { "366" } else { "365" }.to_string()
+}
+
+/// The `api://util/timestamp` body, shaped like `TimeStampHandler`.
+///
+/// The quirks are QD's and are kept: `dt` overrides `ts`, a `ts` of exactly
+/// zero counts as absent (Python's `if ts:`), the `本机时间` key appears only in
+/// that fallback branch, and any failure is answered as `{"状态": …}` rather
+/// than failing the step.
+fn timestamp_body(ts_arg: &str, dt_arg: &str, format: &str) -> Result<String> {
+    use chrono::{DateTime, FixedOffset, Local, Utc};
+
+    let given = match timestamp_input(ts_arg, dt_arg, format) {
+        Ok(given) => given,
+        Err(message) => return qd_json(&qd_status(&message)),
+    };
+    let current = given.is_none_or(|seconds| seconds == 0.0);
+    let micros = match given.filter(|seconds| *seconds != 0.0) {
+        Some(seconds) => (seconds * 1_000_000.0).round() as i64,
+        None => Utc::now().timestamp_micros(),
+    };
+    let Some(utc) = DateTime::from_timestamp_micros(micros) else {
+        return qd_json(&qd_status(&format!(
+            "timestamp out of range: {micros} microseconds"
+        )));
+    };
+
+    // China standard time is a fixed +08:00, so no time zone database is
+    // needed for the 北京时间 key even on a host with none installed.
+    let cst = FixedOffset::east_opt(8 * 3600).expect("UTC+8 is a valid offset");
+    let local = utc.with_timezone(&Local);
+    let beijing = utc.with_timezone(&cst);
+    let complete = micros as f64 / 1_000_000.0;
+
+    let mut entries: Vec<(&str, QdJson)> = vec![
+        ("完整时间戳", QdJson::value(serde_json::json!(complete))),
+        (
+            "时间戳",
+            QdJson::value(serde_json::json!(complete.trunc() as i64)),
+        ),
+        (
+            "16位时间戳",
+            QdJson::value(serde_json::json!((complete * 1_000_000.0) as i64)),
+        ),
+    ];
+    let rendered = (|| -> std::result::Result<Vec<(&str, String)>, String> {
+        use chrono::Datelike as _;
+
+        let mut rendered = Vec::new();
+        if current {
+            rendered.push(("本机时间", python_strftime(&local, format)?));
+        }
+        rendered.push(("周", python_strftime(&local, "%w/%W")?));
+        rendered.push((
+            "日",
+            format!(
+                "{}/{}",
+                python_strftime(&local, "%j")?,
+                yearday(local.year())
+            ),
+        ));
+        rendered.push(("北京时间", python_strftime(&beijing, format)?));
+        rendered.push((
+            "GMT格式",
+            python_strftime(&utc, "%a, %d %b %Y %H:%M:%S GMT")?,
+        ));
+        rendered.push(("ISO格式", iso_format(&utc)));
+        Ok(rendered)
+    })();
+    match rendered {
+        Ok(rendered) => entries.extend(
+            rendered
+                .into_iter()
+                .map(|(key, value)| (key, QdJson::value(serde_json::json!(value)))),
+        ),
+        Err(message) => return qd_json(&qd_status(&message)),
+    }
+    entries.push(("状态", QdJson::value(serde_json::json!("200"))));
+    qd_json(&QdJson::object(
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    ))
+}
+
 /// Normalize an RSA PEM key the way QD does: locate the `-----BEGIN/END...-----`
 /// markers even when all newlines were stripped by URL transport, restore '+'
 /// characters that turned into spaces, and re-wrap the base64 body at 64
@@ -1284,7 +1561,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"delayed 0 seconds");
+        assert_eq!(response.body, b"delay 0.0 second.");
     }
 
     #[tokio::test]
@@ -1298,7 +1575,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"delayed 0 seconds");
+        assert_eq!(response.body, b"delay 0.0 second.");
     }
 
     #[tokio::test]
@@ -1320,6 +1597,130 @@ mod tests {
                 .call("api://util/delay?seconds=301", Duration::from_secs(1))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delay_answers_with_qd_text_and_clamps_negative_seconds() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let response = registry
+            .call("api://util/delay?seconds=1.5", Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"delay 1.5 second.");
+        // QD clamps a negative delay to zero and still sleeps zero seconds.
+        let negative = registry
+            .call("api://util/delay/-5", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(negative.body, b"delay 0.0 second.");
+        // An unreadable value is a reply, not a failed step.
+        let broken = registry
+            .call("api://util/delay/soon", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(broken.body, b"Error, delay 0.0 second.");
+    }
+
+    #[tokio::test]
+    async fn regex_reports_the_qd_data_table() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let response = registry
+            .call(
+                "api://util/regex?data=a1b2c3&p=%5Cd%2B",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "{\n    \"数据\": {\n        \"1\": \"1\",\n        \"2\": \"2\",\n        \"3\": \"3\"\n    },\n    \"状态\": \"OK\"\n}"
+        );
+
+        // `re.findall` shapes an entry by the pattern's group count, and QD
+        // compiles with `re.IGNORECASE` — so the uppercase `A` is a match the
+        // pattern `[a-z]` alone would not report.
+        let grouped = registry
+            .call(
+                "api://util/regex?data=A1&p=([a-z])(%5Cd)",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(grouped.body).unwrap(),
+            "{\n    \"数据\": {\n        \"1\": [\n            \"A\",\n            \"1\"\n        ]\n    },\n    \"状态\": \"OK\"\n}"
+        );
+
+        // A pattern Python refuses is reported in 状态, without a 数据 key —
+        // the step still succeeds, exactly as QD's except branch does.
+        let broken = registry
+            .call(
+                "api://util/regex?data=a&p=(unclosed",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(broken.body).unwrap();
+        assert!(body.starts_with("{\n    \"状态\": "), "{body}");
+        assert!(!body.contains("\"数据\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn timestamp_reports_the_qd_key_set() {
+        let mut registry = PluginRegistry::default();
+        registry
+            .register(Arc::new(UtilityPlugin::default()))
+            .unwrap();
+        let response = registry
+            .call("api://util/timestamp?ts=1700000000", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let body = String::from_utf8(response.body).unwrap();
+        // The order of the keys is QD's too.
+        for expected in [
+            "\"完整时间戳\": 1700000000.0",
+            "\"时间戳\": 1700000000",
+            "\"16位时间戳\": 1700000000000000",
+            "\"北京时间\": \"2023-11-15 06:13:20\"",
+            "\"GMT格式\": \"Tue, 14 Nov 2023 22:13:20 GMT\"",
+            "\"ISO格式\": \"2023-11-14T22:13:20Z\"",
+            "\"状态\": \"200\"",
+        ] {
+            assert!(body.contains(expected), "{expected} missing from {body}");
+        }
+        // 本机时间 belongs to the "no timestamp given" branch only.
+        assert!(body.contains("\"周\":"));
+        assert!(!body.contains("\"本机时间\":"));
+        assert!(
+            body.find("\"完整时间戳\"").unwrap() < body.find("\"状态\"").unwrap(),
+            "{body}"
+        );
+
+        // Without `ts`/`dt` the body describes the host clock and carries the
+        // extra 本机时间 key.
+        let now = registry
+            .call("api://util/timestamp", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let now = String::from_utf8(now.body).unwrap();
+        assert!(now.contains("\"本机时间\":"));
+        assert!(now.contains("\"状态\": \"200\""));
+
+        // An unreadable timestamp is reported in 状态, as QD's except does.
+        let broken = registry
+            .call("api://util/timestamp?ts=soon", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(broken.body).unwrap(),
+            "{\n    \"状态\": \"could not convert string to float: \\\"soon\\\"\"\n}"
         );
     }
 

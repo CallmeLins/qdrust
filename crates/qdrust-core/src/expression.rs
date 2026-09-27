@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -5,7 +6,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Local, TimeZone};
 use fake::Fake;
-use minijinja::value::{Enumerator, Kwargs, Object, ObjectRepr, Rest};
+use minijinja::value::{Enumerator, Kwargs, Object, ObjectRepr, Rest, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, State, Value as JinjaValue};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::Rng;
@@ -1074,15 +1075,131 @@ impl Default for QdExpressionEngine {
             Ok(JinjaValue::from_object(MutableSeq(Mutex::new(items))))
         });
 
+        // The Python method calls (`value.split(",")`, `row.get("id")`) a QD
+        // template is written with. MiniJinja has no methods on builtin values
+        // at all, so `compat_python` rewrites each call into this one, which
+        // dispatches on the receiver's shape at render time.
+        environment.add_function(
+            "__qdm_call",
+            |receiver: JinjaValue, name: String, args: Rest<JinjaValue>, kwargs: Kwargs| {
+                python_method(&receiver, &name, &args.0, &kwargs)
+            },
+        );
+        // `"%s" % x` — Python's printf formatting, which Jinja2 inherits from
+        // Python and MiniJinja reads as "modulo on a string" and refuses.
+        environment.add_function("__qdm_percent", |template: String, values: JinjaValue| {
+            format_percent(&template, &values)
+        });
+
+        // Jinja2 filters MiniJinja does not carry. QD renders through Jinja2,
+        // so these are part of the surface a template may use even though no
+        // QD global defines them — `{{ content|striptags }}` on the step after
+        // a site's HTML page is the one issue #33 reported.
+        environment.add_filter("striptags", |value: JinjaValue| {
+            let text = value.to_string();
+            let stripped = STRIPTAGS.replace_all(&text, "");
+            Ok::<_, Error>(collapse_whitespace(&stripped))
+        });
+
+        environment.add_filter("wordcount", |value: JinjaValue| {
+            Ok::<_, Error>(WORD.find_iter(&value.to_string()).count() as i64)
+        });
+
+        environment.add_filter(
+            "truncate",
+            |value: JinjaValue, length: Option<i64>, killwords: Option<bool>, kwargs: Kwargs| {
+                let length = kwargs
+                    .get::<Option<i64>>("length")?
+                    .or(length)
+                    .unwrap_or(255);
+                let killwords = kwargs
+                    .get::<Option<bool>>("killwords")?
+                    .or(killwords)
+                    .unwrap_or(false);
+                let end = kwargs
+                    .get::<Option<String>>("end")?
+                    .unwrap_or_else(|| "...".to_string());
+                // Jinja2's `truncate.leeway` policy: a string only five
+                // characters over the limit is left alone, because cutting it
+                // saves nothing worth an ellipsis.
+                let leeway = kwargs.get::<Option<i64>>("leeway")?.unwrap_or(5);
+                Ok::<_, Error>(truncate(
+                    &value.to_string(),
+                    length,
+                    killwords,
+                    &end,
+                    leeway,
+                ))
+            },
+        );
+
+        environment.add_filter(
+            "wordwrap",
+            |value: JinjaValue,
+             width: Option<i64>,
+             break_long_words: Option<bool>,
+             wrapstring: Option<String>,
+             kwargs: Kwargs| {
+                let width = kwargs.get::<Option<i64>>("width")?.or(width).unwrap_or(79);
+                let break_long_words = kwargs
+                    .get::<Option<bool>>("break_long_words")?
+                    .or(break_long_words)
+                    .unwrap_or(true);
+                let wrapstring = kwargs
+                    .get::<Option<String>>("wrapstring")?
+                    .or(wrapstring)
+                    .unwrap_or_else(|| "\n".to_string());
+                Ok::<_, Error>(wordwrap(
+                    &value.to_string(),
+                    width.max(1) as usize,
+                    break_long_words,
+                    &wrapstring,
+                ))
+            },
+        );
+
+        environment.add_filter("center", |value: JinjaValue, width: Option<i64>| {
+            Ok::<_, Error>(center(
+                &value.to_string(),
+                width.unwrap_or(80).max(0) as usize,
+            ))
+        });
+
+        // Jinja2 takes these two flags positionally as well as by name
+        // (`filesizeformat(true)`, `xmlattr(false)`), so the positional slot and
+        // the keyword are both read, with the keyword winning when it is given.
+        environment.add_filter(
+            "filesizeformat",
+            |value: JinjaValue, binary: Option<bool>, kwargs: Kwargs| {
+                let binary = kwargs
+                    .get::<Option<bool>>("binary")?
+                    .or(binary)
+                    .unwrap_or(false);
+                Ok::<_, Error>(filesizeformat(&value.to_string(), binary))
+            },
+        );
+
+        environment.add_filter(
+            "xmlattr",
+            |value: JinjaValue, autospace: Option<bool>, kwargs: Kwargs| {
+                let autospace = kwargs
+                    .get::<Option<bool>>("autospace")?
+                    .or(autospace)
+                    .unwrap_or(true);
+                Ok::<_, Error>(xmlattr(&value, autospace))
+            },
+        );
+
         Self { environment }
     }
 }
 
 impl QdExpressionEngine {
     pub fn evaluate(&self, expression: &str, variables: &BTreeMap<String, Value>) -> Result<Value> {
+        let source = compat_python_expression(expression);
         let compiled = self
             .environment
-            .compile_expression(expression)
+            .compile_expression(&source)
             .context("invalid QD expression")?;
         let value = compiled
             .eval(variables)
@@ -1095,7 +1212,7 @@ impl QdExpressionEngine {
     /// as `{{ md5(x) }}` work in plain task URLs, headers and bodies too.
     pub fn render(&self, template: &str, variables: &BTreeMap<String, Value>) -> Result<String> {
         self.environment
-            .render_str(&compat_mutable_lists(template), variables)
+            .render_str(&compat_python_template(template), variables)
             .context("cannot render QD template value")
     }
 
@@ -1192,14 +1309,32 @@ impl QdExpressionEngine {
         expression: &str,
         variables: &BTreeMap<String, Value>,
     ) -> Result<bool> {
+        let source = compat_python_expression(expression);
         let compiled = self
             .environment
-            .compile_expression(expression)
+            .compile_expression(&source)
             .context("invalid QD condition")?;
         Ok(compiled
             .eval(variables)
             .context("cannot evaluate QD condition")?
             .is_true())
+    }
+}
+
+/// The two entry points the engine's own paths go through, so every rewrite
+/// happens in one place: [`rewrite_template`] for a `render_str` body and
+/// [`rewrite_expression`] for a bare condition or loop source.
+fn compat_python_template(source: &str) -> Cow<'_, str> {
+    match rewrite_template(source) {
+        Some(rewritten) => Cow::Owned(rewritten),
+        None => Cow::Borrowed(source),
+    }
+}
+
+fn compat_python_expression(source: &str) -> Cow<'_, str> {
+    match rewrite_expression(source) {
+        Some(rewritten) => Cow::Owned(rewritten),
+        None => Cow::Borrowed(source),
     }
 }
 
@@ -1285,7 +1420,7 @@ fn undeclared_names(source: &str) -> HashSet<String> {
 /// because Jinja2's `{% set %}` does not persist across `{% for %}` iterations
 /// (verified against MiniJinja: a `{% set parts = parts + [x] %}` rewrite loses
 /// every iteration but the last). When a template declares its accumulator with
-/// `{% set name = [] %}` (see [`compat_mutable_lists`]) the declaration is
+/// `{% set name = [] %}` (see [`rewrite_literal_lists`]) the declaration is
 /// routed here instead, and the familiar calls mutate the shared object.
 /// Everywhere else — iteration, `|length`, indexing, `|join`, comparisons,
 /// serialization into extracted variables — it behaves like a plain array.
@@ -1437,11 +1572,11 @@ const MUTATOR_CALLS: &[&str] = &["append(", "extend(", "insert(", "pop(", "remov
 /// function returns, non-literal assignments) still fail — those are shared
 /// MiniJinja values and cannot be swapped under a name the template did not
 /// declare with a literal.
-fn compat_mutable_lists(source: &str) -> std::borrow::Cow<'_, str> {
+fn rewrite_literal_lists(source: &str) -> Cow<'_, str> {
     let looks_mutating =
         source.contains('.') && MUTATOR_CALLS.iter().any(|call| source.contains(call));
     if !looks_mutating {
-        return std::borrow::Cow::Borrowed(source);
+        return Cow::Borrowed(source);
     }
     static SET_LIST_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         // Flat literals only: no nested brackets or braces inside, so strings
@@ -1450,6 +1585,1511 @@ fn compat_mutable_lists(source: &str) -> std::borrow::Cow<'_, str> {
         Regex::new(r"\{%(-?)\s*set\s+([A-Za-z_]\w*)\s*=\s*(\[[^\[\]{}]*\])\s*(-?)%\}").unwrap()
     });
     SET_LIST_LITERAL.replace_all(source, "{%${1} set ${2} = __qd_list(${3}) ${4}%}")
+}
+
+/// Rewrite a whole QD template's Python spellings before MiniJinja parses it.
+///
+/// Nothing outside `{{ … }}` and `{% … %}` is touched, so a literal HTML page
+/// or a JavaScript body that happens to contain `.split(` is copied through
+/// byte for byte. Inside a tag the two spellings MiniJinja has no equivalent
+/// for are rewritten:
+///
+/// * `{% set parts = [] %}` into a mutable accumulator (issue #27), because
+///   MiniJinja's `[]` carries no methods and Jinja2's `{% set %}` does not
+///   persist across `{% for %}` iterations — which is why QD templates build a
+///   list with `.append` in the first place. See [`MutableSeq`].
+/// * `value.split(",")` and `"%s" % x` into `__qdm_call` / `__qdm_percent`
+///   calls, because MiniJinja has no methods on builtin values (`str` and
+///   `dict` alike) and reads `%` on a string as modulo.
+fn rewrite_template(source: &str) -> Option<String> {
+    let declared = rewrite_literal_lists(source);
+    let declared_changed = matches!(declared, Cow::Owned(_));
+    let mut out = String::with_capacity(declared.len());
+    let mut changed = declared_changed;
+    let mut rest = declared.as_ref();
+    loop {
+        let Some(position) = rest.find('{') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..position]);
+        let tail = &rest[position..];
+        let (end, expression) = if tail.starts_with("{{") {
+            ("}}", true)
+        } else if tail.starts_with("{%") {
+            ("%}", true)
+        } else if tail.starts_with("{#") {
+            ("#}", false)
+        } else {
+            out.push('{');
+            rest = &tail[1..];
+            continue;
+        };
+        let Some(offset) = find_delimiter(&tail[2..], end) else {
+            // An unterminated tag: the template is broken, and the engine's own
+            // complaint is more useful than anything guessed here.
+            out.push_str(tail);
+            break;
+        };
+        let whole = 2 + offset + end.len();
+        if expression && let Some(rewritten) = rewrite_expression(&tail[2..2 + offset]) {
+            out.push_str(&tail[..2]);
+            out.push_str(&rewritten);
+            out.push_str(end);
+            changed = true;
+        } else {
+            out.push_str(&tail[..whole]);
+        }
+        rest = &tail[whole..];
+    }
+    changed.then_some(out)
+}
+
+/// Rewrite a bare expression — the shape `{% if … %}` conditions and `{% for … %}`
+/// sources are evaluated in, which are not wrapped in delimiters of their own.
+fn rewrite_expression(source: &str) -> Option<String> {
+    // `%` first: its right-hand side is scanned as a whole, and the call it
+    // produces is an ordinary primary for the method pass.
+    let percent = rewrite_percent(source);
+    let methods = rewrite_methods(percent.as_deref().unwrap_or(source));
+    match (percent, methods) {
+        (None, None) => None,
+        (Some(percent), None) => Some(percent),
+        (None, Some(methods)) => Some(methods),
+        (Some(_), Some(methods)) => Some(methods),
+    }
+}
+
+/// Rewrite `value.method(…)` into `__qdm_call(value, "method", …)`.
+///
+/// A call is only rewritten when the receiver is one this layer can name: a
+/// primary expression it has just copied (an identifier chain, a string, a
+/// group, or an earlier rewritten call) immediately followed by the dot. Calls
+/// on anything else are left as written, so they fail with the engine's own
+/// message instead of being mistranslated.
+fn rewrite_methods(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    // Where the primary that just ended starts in `out`, and where it ends in
+    // the input. A following `.method(…)` replaces the primary in place, and a
+    // following group extends it (`f(x)`, `a[0]`), so both need its start.
+    let mut primary_start: Option<usize> = None;
+    let mut primary_stop: Option<usize> = None;
+    let mut changed = false;
+    while index < text.len() {
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("index always sits on a character boundary");
+        let length = character.len_utf8();
+        match character {
+            '\'' | '"' => {
+                let Some(end) = string_end(text, index) else {
+                    out.push_str(&text[index..]);
+                    return changed.then_some(out);
+                };
+                primary_start = Some(out.len());
+                out.push_str(&text[index..end]);
+                primary_stop = Some(end);
+                index = end;
+            }
+            '(' | '[' | '{' => {
+                let Some(end) = group_end(text, index) else {
+                    out.push_str(&text[index..]);
+                    return changed.then_some(out);
+                };
+                // The interior is rewritten too: `md5(content.strip())` holds a
+                // call the outer scan would otherwise copy through untouched.
+                let inner = rewrite_methods(&text[index + 1..end - 1]);
+                changed |= inner.is_some();
+                let interior = inner.as_deref().unwrap_or(&text[index + 1..end - 1]);
+                let group = format!("{character}{interior}{}", &text[end - 1..end]);
+                if primary_stop != Some(index) {
+                    // A group on its own is a primary of its own.
+                    primary_start = Some(out.len());
+                }
+                out.push_str(&group);
+                primary_stop = Some(end);
+                index = end;
+            }
+            '.' if primary_stop == Some(index) => {
+                let name_start = index + 1;
+                let name_end = identifier_end(text, name_start);
+                let name = &text[name_start..name_end];
+                let open = skip_spaces(text, name_end);
+                if name_end > name_start
+                    && PYTHON_METHODS.contains(&name)
+                    && text[open..].starts_with('(')
+                    && let Some(close) = group_end(text, open)
+                {
+                    let start = primary_start.expect("a primary ends at the dot");
+                    let receiver = out[start..].to_string();
+                    let args = rewrite_methods(&text[open + 1..close - 1])
+                        .unwrap_or_else(|| text[open + 1..close - 1].to_string());
+                    let call = match args.trim().is_empty() {
+                        true => format!("__qdm_call({receiver}, \"{name}\")"),
+                        false => format!("__qdm_call({receiver}, \"{name}\", {args})"),
+                    };
+                    // The receiver is already in `out`; the call replaces it.
+                    out.replace_range(start.., &call);
+                    primary_start = Some(start);
+                    primary_stop = Some(close);
+                    changed = true;
+                    index = close;
+                    continue;
+                }
+                if name_end > name_start {
+                    // A plain attribute access extends the primary instead of
+                    // starting a new one, so `a.b.c(…)` reads the method off
+                    // the whole chain.
+                    out.push_str(&format!(".{name}"));
+                    primary_stop = Some(name_end);
+                    index = name_end;
+                    continue;
+                }
+                out.push('.');
+                index += 1;
+            }
+            _ if character.is_alphanumeric() || character == '_' => {
+                let end = identifier_end(text, index);
+                primary_start = Some(out.len());
+                out.push_str(&text[index..end]);
+                primary_stop = Some(end);
+                index = end;
+            }
+            _ => {
+                out.push(character);
+                index += length;
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Rewrite a string literal's `%` formatting into `__qdm_percent(literal, …)`.
+///
+/// Python reads `%` on a `str` as printf formatting and on a number as modulo,
+/// and Jinja2 inherits both from Python; MiniJinja reads only the modulo. Only
+/// a literal left-hand side is rewritten, because that is the case where the
+/// reading is known without evaluating anything — and the right-hand side is
+/// cut at the end of the postfix expression, since Python's `%` binds tighter
+/// than `+`.
+fn rewrite_percent(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < text.len() {
+        let character = text[index..]
+            .chars()
+            .next()
+            .expect("index always sits on a character boundary");
+        if character != '\'' && character != '"' {
+            out.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+        let Some(literal_end) = string_end(text, index) else {
+            out.push_str(&text[index..]);
+            break;
+        };
+        let after = skip_spaces(text, literal_end);
+        let remainder = &text[after..];
+        // `%%` and `%=` are not formatting, and neither is anything that is
+        // not the operator.
+        if !remainder.starts_with('%') || remainder.starts_with("%%") || remainder.starts_with("%=")
+        {
+            out.push_str(&text[index..literal_end]);
+            index = literal_end;
+            continue;
+        }
+        let Some(values_end) = primary_end(text, after + 1) else {
+            out.push_str(&text[index..literal_end]);
+            index = literal_end;
+            continue;
+        };
+        out.push_str("__qdm_percent(");
+        out.push_str(&text[index..literal_end]);
+        out.push_str(", ");
+        out.push_str(text[after + 1..values_end].trim());
+        out.push(')');
+        changed = true;
+        index = values_end;
+    }
+    changed.then_some(out)
+}
+
+/// The end of the closing delimiter of a tag, skipping over string literals so
+/// that `{{ "}}" }}` is one tag and not two.
+fn find_delimiter(text: &str, end: &str) -> Option<usize> {
+    let first = end.as_bytes()[0];
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < text.len() {
+        match bytes[index] {
+            b'\'' | b'"' => index = string_end(text, index)?,
+            byte if byte == first && text[index..].starts_with(end) => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// The index just past the quoted string starting at `start`, backslash escapes
+/// honoured. An unterminated string yields `None`.
+fn string_end(text: &str, start: usize) -> Option<usize> {
+    let quote = text[start..].chars().next()?;
+    let mut index = start + quote.len_utf8();
+    let mut escaped = false;
+    for character in text[index..].chars() {
+        index += character.len_utf8();
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// The index just past the `(`/`[`/`{` group starting at `start`, nesting
+/// counted and string literals skipped.
+fn group_end(text: &str, start: usize) -> Option<usize> {
+    let open = text[start..].chars().next()?;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < text.len() {
+        let character = text[index..].chars().next()?;
+        match character {
+            '\'' | '"' => index = string_end(text, index)?,
+            character if character == open => {
+                depth += 1;
+                index += character.len_utf8();
+            }
+            character if character == close => {
+                depth = depth.saturating_sub(1);
+                index += character.len_utf8();
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            character => index += character.len_utf8(),
+        }
+    }
+    None
+}
+
+/// The index just past the identifier starting at `start`.
+fn identifier_end(text: &str, start: usize) -> usize {
+    let mut index = start;
+    for character in text[start..].chars() {
+        if character.is_alphanumeric() || character == '_' {
+            index += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn skip_spaces(text: &str, start: usize) -> usize {
+    let mut index = start;
+    for character in text[start..].chars() {
+        if character.is_whitespace() {
+            index += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+/// The end of the postfix expression starting at or after `start`: a primary
+/// (a literal, a group or a name) followed by any chain of calls, indexes and
+/// attributes.
+fn primary_end(text: &str, start: usize) -> Option<usize> {
+    let mut index = skip_spaces(text, start);
+    let character = text.get(index..)?.chars().next()?;
+    index = match character {
+        '\'' | '"' => string_end(text, index)?,
+        '(' | '[' | '{' => group_end(text, index)?,
+        _ if character.is_alphanumeric() || character == '_' => identifier_end(text, index),
+        _ => return None,
+    };
+    loop {
+        let next = skip_spaces(text, index);
+        match text.get(next..).and_then(|rest| rest.chars().next()) {
+            Some('(' | '[') => index = group_end(text, next)?,
+            Some('.') => {
+                let name_end = identifier_end(text, next + 1);
+                if name_end == next + 1 {
+                    return Some(index);
+                }
+                index = name_end;
+            }
+            // The end of the text (or anything that cannot continue a postfix)
+            // ends the primary.
+            _ => return Some(index),
+        }
+    }
+}
+
+/// `<!-- … -->` and `<tag …>` runs, for `striptags`.
+static STRIPTAGS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)(<!--.*?-->|<[^>]*>)").expect("striptags pattern"));
+
+/// Python's `\w+` runs, for `wordcount`.
+static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").expect("word pattern"));
+
+/// Jinja2's `striptags`: remove comments and tags, then read what is left as
+/// words — every run of whitespace becomes a single space.
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Jinja2's `truncate`. `length` counts the ellipsis, `leeway` is the slack the
+/// `truncate.leeway` policy grants before anything is cut, and `killwords`
+/// decides whether a word may be cut in half — Jinja2 otherwise backs up to the
+/// last whole word.
+fn truncate(value: &str, length: i64, killwords: bool, end: &str, leeway: i64) -> String {
+    let length = length.max(0) as usize;
+    let leeway = leeway.max(0) as usize;
+    let characters: Vec<char> = value.chars().collect();
+    if characters.len() <= length + leeway {
+        return value.to_string();
+    }
+    let keep = length
+        .saturating_sub(end.chars().count())
+        .min(characters.len());
+    let head: String = characters[..keep].iter().collect();
+    let head = if killwords {
+        head
+    } else {
+        match head.rsplit_once(' ') {
+            Some((before, _)) => before.to_string(),
+            None => head,
+        }
+    };
+    format!("{head}{end}")
+}
+
+/// Jinja2's `wordwrap`: a greedy wrap on whitespace, with a word longer than
+/// the width broken when `break_long_words` allows it.
+fn wordwrap(value: &str, width: usize, break_long_words: bool, wrapstring: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let mut word = word.to_string();
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        while break_long_words && word.chars().count() > width {
+            let split = word
+                .char_indices()
+                .nth(width)
+                .map(|(index, _)| index)
+                .unwrap_or(word.len());
+            lines.push(word[..split].to_string());
+            word = word[split..].to_string();
+        }
+        if current.is_empty() {
+            current = word;
+        } else {
+            current.push(' ');
+            current.push_str(&word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines.join(wrapstring)
+}
+
+/// Python's `str.center`: the odd character of padding goes on the right.
+fn center(value: &str, width: usize) -> String {
+    let length = value.chars().count();
+    if length >= width {
+        return value.to_string();
+    }
+    let padding = width - length;
+    let left = padding / 2;
+    format!("{}{value}{}", " ".repeat(left), " ".repeat(padding - left))
+}
+
+/// Jinja2's `filesizeformat`, unit table included.
+fn filesizeformat(value: &str, binary: bool) -> String {
+    let bytes: f64 = value.trim().parse().unwrap_or_default();
+    let base = if binary { 1024.0 } else { 1000.0 };
+    let prefixes = if binary {
+        ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"]
+    } else {
+        ["kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
+    };
+    if bytes == 1.0 {
+        return "1 Byte".to_string();
+    }
+    if bytes < base {
+        return format!("{} Bytes", bytes as i64);
+    }
+    let mut prefix = prefixes[0];
+    for (index, candidate) in prefixes.iter().enumerate() {
+        let unit = base.powi(index as i32 + 2);
+        prefix = *candidate;
+        if bytes < unit {
+            return format!("{:.1} {candidate}", base * bytes / unit);
+        }
+    }
+    let unit = base.powi(prefixes.len() as i32 + 1);
+    format!("{:.1} {prefix}", base * bytes / unit)
+}
+
+/// Jinja2's `xmlattr`: `key="value"` pairs, `None` and undefined entries
+/// dropped, and a leading space unless `autospace` is off.
+fn xmlattr(value: &JinjaValue, autospace: bool) -> String {
+    let Ok(keys) = value.try_iter() else {
+        return String::new();
+    };
+    let rendered: Vec<String> = keys
+        .filter_map(|key| {
+            let entry = value.get_item(&key).ok()?;
+            if entry.is_none() || entry.is_undefined() {
+                return None;
+            }
+            Some(format!(
+                "{}=\"{}\"",
+                key,
+                escape_attribute(&entry.to_string())
+            ))
+        })
+        .collect();
+    if rendered.is_empty() {
+        return String::new();
+    }
+    let attributes = rendered.join(" ");
+    if autospace {
+        format!(" {attributes}")
+    } else {
+        attributes
+    }
+}
+
+/// The escaping markupsafe's `escape` writes for an attribute value.
+fn escape_attribute(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The Python method calls the compatibility layer maps onto engine calls.
+///
+/// MiniJinja has no methods on builtin values at all — a `str` or a `dict`
+/// answers "unknown method" — while a QD template is Python, so
+/// [`compat_python`] rewrites each call into `__qdm_call` before parsing. The
+/// list is the set QD templates reach for; a name outside it is left as written
+/// and fails loudly rather than quietly reading as a key lookup.
+///
+/// The list mutators (`append`, `sort`, ...) are deliberately absent: those
+/// need a receiver that can actually be written to, which is what
+/// [`MutableSeq`] provides for a template's own `{% set x = [] %}`.
+const PYTHON_METHODS: &[&str] = &[
+    // str
+    "capitalize",
+    "casefold",
+    "center",
+    "count",
+    "endswith",
+    "expandtabs",
+    "find",
+    "format",
+    "index",
+    "isalnum",
+    "isalpha",
+    "isdecimal",
+    "isdigit",
+    "islower",
+    "isnumeric",
+    "isspace",
+    "istitle",
+    "isupper",
+    "join",
+    "ljust",
+    "lower",
+    "lstrip",
+    "partition",
+    "removeprefix",
+    "removesuffix",
+    "replace",
+    "rfind",
+    "rindex",
+    "rjust",
+    "rpartition",
+    "rsplit",
+    "rstrip",
+    "split",
+    "splitlines",
+    "startswith",
+    "strip",
+    "swapcase",
+    "title",
+    "upper",
+    "zfill",
+    // dict
+    "copy",
+    "get",
+    "items",
+    "keys",
+    "setdefault",
+    "values",
+    // list / tuple
+    "index",
+    "count",
+];
+
+/// Dispatch one rewritten Python method call.
+///
+/// The receiver's shape decides what a name means: `get`/`keys`/`items` are a
+/// mapping's, `index`/`count` a sequence's, and everything else reads the
+/// receiver as text — which is what a QD variable is, since extraction only
+/// ever stores strings and JSON.
+fn python_method(
+    receiver: &JinjaValue,
+    name: &str,
+    args: &[JinjaValue],
+    kwargs: &Kwargs,
+) -> Result<JinjaValue, Error> {
+    if receiver.kind() == ValueKind::Map
+        && let Some(result) = mapping_method(receiver, name, args)
+    {
+        return result;
+    }
+    if matches!(receiver.kind(), ValueKind::Seq | ValueKind::Iterable)
+        && let Some(result) = sequence_method(receiver, name, args)
+    {
+        return result;
+    }
+    match string_method(receiver, name, args, kwargs) {
+        Some(result) => result,
+        None => Err(Error::new(
+            ErrorKind::UnknownMethod,
+            format!("{} has no method named {name}", receiver.kind()),
+        )),
+    }
+}
+
+/// A `dict` method, or `None` when `name` is not one.
+fn mapping_method(
+    receiver: &JinjaValue,
+    name: &str,
+    args: &[JinjaValue],
+) -> Option<Result<JinjaValue, Error>> {
+    let result = match name {
+        "get" | "setdefault" => {
+            let Some(key) = args.first() else {
+                return Some(Err(argument_count(name, 0, 1)));
+            };
+            // Python's `setdefault` also *stores* the default; a mapping that
+            // arrived as an extracted variable cannot be written to here, so
+            // the value the expression reads is what comes back.
+            match receiver.get_item(key) {
+                Ok(value) if !value.is_undefined() => Ok(value),
+                _ => Ok(args.get(1).cloned().unwrap_or(JinjaValue::from(()))),
+            }
+        }
+        "keys" => Ok(JinjaValue::from_iter(receiver.try_iter().ok()?)),
+        "values" => {
+            let keys: Vec<JinjaValue> = receiver.try_iter().ok()?.collect();
+            Ok(JinjaValue::from_iter(
+                keys.iter().filter_map(|key| receiver.get_item(key).ok()),
+            ))
+        }
+        "items" => {
+            let keys: Vec<JinjaValue> = receiver.try_iter().ok()?.collect();
+            Ok(JinjaValue::from_iter(keys.iter().filter_map(|key| {
+                receiver
+                    .get_item(key)
+                    .ok()
+                    .map(|value| JinjaValue::from_iter([key.clone(), value]))
+            })))
+        }
+        "copy" => Ok(receiver.clone()),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// A list/tuple method, or `None` when `name` is not one.
+fn sequence_method(
+    receiver: &JinjaValue,
+    name: &str,
+    args: &[JinjaValue],
+) -> Option<Result<JinjaValue, Error>> {
+    let items: Vec<JinjaValue> = receiver.try_iter().ok()?.collect();
+    let needle = || {
+        args.first()
+            .cloned()
+            .ok_or_else(|| argument_count(name, 0, 1))
+    };
+    let result = match name {
+        "index" => match needle() {
+            Err(error) => Err(error),
+            Ok(needle) => match items.iter().position(|item| *item == needle) {
+                Some(position) => Ok(JinjaValue::from(position as i64)),
+                None => Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "list.index(x): x not in list",
+                )),
+            },
+        },
+        "count" => match needle() {
+            Err(error) => Err(error),
+            Ok(needle) => Ok(JinjaValue::from(
+                items.iter().filter(|item| **item == needle).count() as i64,
+            )),
+        },
+        "copy" => Ok(JinjaValue::from_iter(items)),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// A `str` method, or `None` when `name` is not one this layer reads.
+fn string_method(
+    receiver: &JinjaValue,
+    name: &str,
+    args: &[JinjaValue],
+    kwargs: &Kwargs,
+) -> Option<Result<JinjaValue, Error>> {
+    let text = receiver.to_string();
+    let at = |index: usize| args.get(index);
+    let result = match name {
+        "upper" => Ok(JinjaValue::from(text.to_uppercase())),
+        "lower" | "casefold" => Ok(JinjaValue::from(text.to_lowercase())),
+        "capitalize" => {
+            let mut characters = text.chars();
+            Ok(JinjaValue::from(match characters.next() {
+                None => String::new(),
+                Some(first) => first
+                    .to_uppercase()
+                    .chain(characters.as_str().to_lowercase().chars())
+                    .collect::<String>(),
+            }))
+        }
+        "title" => Ok(JinjaValue::from(
+            text.split_whitespace()
+                .map(|word| {
+                    let mut characters = word.chars();
+                    match characters.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().chain(characters).collect::<String>(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        )),
+        "swapcase" => Ok(JinjaValue::from(
+            text.chars()
+                .flat_map(|character| {
+                    if character.is_uppercase() {
+                        character.to_lowercase().collect::<Vec<_>>()
+                    } else {
+                        character.to_uppercase().collect::<Vec<_>>()
+                    }
+                })
+                .collect::<String>(),
+        )),
+        "strip" | "lstrip" | "rstrip" => {
+            let characters = at(0).map(JinjaValue::to_string);
+            let trimmed = match (name, characters) {
+                ("strip", Some(chars)) => text.trim_matches(|c| chars.contains(c)),
+                ("strip", None) => text.trim(),
+                ("lstrip", Some(chars)) => text.trim_start_matches(|c| chars.contains(c)),
+                ("lstrip", None) => text.trim_start(),
+                (_, Some(chars)) => text.trim_end_matches(|c| chars.contains(c)),
+                (_, None) => text.trim_end(),
+            };
+            Ok(JinjaValue::from(trimmed))
+        }
+        "split" | "rsplit" => {
+            let separator = at(0).map(JinjaValue::to_string);
+            let maxsplit = at(1).and_then(int_argument);
+            match python_split(&text, separator.as_deref(), maxsplit, name == "rsplit") {
+                Ok(parts) => Ok(JinjaValue::from_iter(parts)),
+                Err(error) => Err(error),
+            }
+        }
+        "splitlines" => {
+            let keepends = at(0).is_some_and(JinjaValue::is_true);
+            Ok(JinjaValue::from_iter(
+                python_splitlines(&text, keepends)
+                    .into_iter()
+                    .map(JinjaValue::from),
+            ))
+        }
+        "replace" => {
+            let (Some(old), Some(new)) = (at(0), at(1)) else {
+                return Some(Err(argument_count("replace", args.len(), 2)));
+            };
+            let count = at(2).and_then(int_argument);
+            let old = old.to_string();
+            let new = new.to_string();
+            Ok(JinjaValue::from(match count {
+                Some(count) if count >= 0 => text.replacen(&old, &new, count as usize),
+                _ => text.replace(&old, &new),
+            }))
+        }
+        "join" => {
+            let Some(iterable) = at(0) else {
+                return Some(Err(argument_count("join", 0, 1)));
+            };
+            match iterable.try_iter() {
+                Ok(items) => Ok(JinjaValue::from(
+                    items
+                        .map(|item| item.to_string())
+                        .collect::<Vec<_>>()
+                        .join(&text),
+                )),
+                Err(_) => Err(not_a_list("join", iterable)),
+            }
+        }
+        "startswith" | "endswith" => {
+            let Some(prefix) = at(0) else {
+                return Some(Err(argument_count(name, 0, 1)));
+            };
+            let window = char_slice(
+                &text,
+                at(1).and_then(int_argument),
+                at(2).and_then(int_argument),
+            );
+            let candidates: Vec<String> = match prefix.try_iter() {
+                Ok(items) => items.map(|item| item.to_string()).collect(),
+                Err(_) => vec![prefix.to_string()],
+            };
+            let matched = candidates.iter().any(|candidate| {
+                if name == "startswith" {
+                    window.starts_with(candidate.as_str())
+                } else {
+                    window.ends_with(candidate.as_str())
+                }
+            });
+            Ok(JinjaValue::from(matched))
+        }
+        "find" | "rfind" | "index" | "rindex" => {
+            let Some(needle) = at(0) else {
+                return Some(Err(argument_count(name, 0, 1)));
+            };
+            let start = at(1).and_then(int_argument);
+            let end = at(2).and_then(int_argument);
+            let window = char_slice(&text, start, end);
+            // Python reports the match's index in the whole string, so the
+            // window's own offset is added back — and with no `start` that
+            // offset is zero, not the length of the whole text.
+            let offset = resolve_bound(text.chars().count() as i64, start, 0);
+            let needle = needle.to_string();
+            let found = if name.starts_with('r') {
+                window.rfind(&needle)
+            } else {
+                window.find(&needle)
+            };
+            match found {
+                Some(index) => Ok(JinjaValue::from(
+                    offset + window[..index].chars().count() as i64,
+                )),
+                None if name.ends_with("index") => Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "substring not found",
+                )),
+                None => Ok(JinjaValue::from(-1i64)),
+            }
+        }
+        "count" => {
+            let Some(needle) = at(0) else {
+                return Some(Err(argument_count("count", 0, 1)));
+            };
+            let block = char_slice(
+                &text,
+                at(1).and_then(int_argument),
+                at(2).and_then(int_argument),
+            );
+            Ok(JinjaValue::from(
+                block.matches(&needle.to_string()).count() as i64
+            ))
+        }
+        "zfill" | "ljust" | "rjust" | "center" => {
+            let Some(width) = at(0).and_then(int_argument) else {
+                return Some(Err(argument_count(name, args.len(), 1)));
+            };
+            let fill = at(1)
+                .map(JinjaValue::to_string)
+                .and_then(|value| value.chars().next())
+                .unwrap_or(' ');
+            Ok(JinjaValue::from(pad(&text, width, fill, name)))
+        }
+        "format" => return Some(python_str_format(&text, args, kwargs)),
+        "removeprefix" => {
+            let Some(prefix) = at(0) else {
+                return Some(Err(argument_count("removeprefix", 0, 1)));
+            };
+            let prefix = prefix.to_string();
+            Ok(JinjaValue::from(
+                text.strip_prefix(&prefix).unwrap_or(&text).to_string(),
+            ))
+        }
+        "removesuffix" => {
+            let Some(suffix) = at(0) else {
+                return Some(Err(argument_count("removesuffix", 0, 1)));
+            };
+            let suffix = suffix.to_string();
+            Ok(JinjaValue::from(
+                text.strip_suffix(&suffix).unwrap_or(&text).to_string(),
+            ))
+        }
+        "partition" | "rpartition" => {
+            let Some(separator) = at(0) else {
+                return Some(Err(argument_count(name, 0, 1)));
+            };
+            let separator = separator.to_string();
+            let split = if name == "partition" {
+                text.find(&separator)
+            } else {
+                text.rfind(&separator)
+            };
+            let parts = match split {
+                Some(index) => vec![
+                    text[..index].to_string(),
+                    separator.clone(),
+                    text[index + separator.len()..].to_string(),
+                ],
+                None if name == "partition" => vec![text.clone(), String::new(), String::new()],
+                None => vec![String::new(), String::new(), text.clone()],
+            };
+            Ok(JinjaValue::from_iter(parts))
+        }
+        "expandtabs" => {
+            let size = at(0).and_then(int_argument).unwrap_or(8).max(0) as usize;
+            let mut out = String::with_capacity(text.len());
+            let mut column = 0usize;
+            for character in text.chars() {
+                match character {
+                    '\t' if size > 0 => {
+                        let padding = size - column % size;
+                        out.push_str(&" ".repeat(padding));
+                        column += padding;
+                    }
+                    '\t' => column += 1,
+                    '\n' | '\r' => {
+                        out.push(character);
+                        column = 0;
+                    }
+                    other => {
+                        out.push(other);
+                        column += 1;
+                    }
+                }
+            }
+            Ok(JinjaValue::from(out))
+        }
+        // Rust's `char` predicates are the Unicode readings Python's are
+        // modelled on; they agree with Python on every character a template
+        // could be testing.
+        "isdigit" | "isdecimal" | "isnumeric" => Ok(JinjaValue::from(
+            !text.is_empty() && text.chars().all(|character| character.is_numeric()),
+        )),
+        "isalpha" => Ok(JinjaValue::from(
+            !text.is_empty() && text.chars().all(char::is_alphabetic),
+        )),
+        "isalnum" => Ok(JinjaValue::from(
+            !text.is_empty() && text.chars().all(char::is_alphanumeric),
+        )),
+        "isspace" => Ok(JinjaValue::from(
+            !text.is_empty() && text.chars().all(char::is_whitespace),
+        )),
+        "islower" => Ok(JinjaValue::from(
+            text.chars().any(char::is_lowercase) && !text.chars().any(char::is_uppercase),
+        )),
+        "isupper" => Ok(JinjaValue::from(
+            text.chars().any(char::is_uppercase) && !text.chars().any(char::is_lowercase),
+        )),
+        "istitle" => Ok(JinjaValue::from(
+            !text.is_empty()
+                && text
+                    .split_whitespace()
+                    .all(|word| word.chars().next().is_some_and(char::is_uppercase)),
+        )),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Python's `str.split`/`str.rsplit`, including the no-separator form: runs of
+/// whitespace are the separators and the empty strings between them are
+/// dropped, which is what `"a  b".split()` returns and `"a  b".split(" ")` does
+/// not.
+fn python_split(
+    text: &str,
+    separator: Option<&str>,
+    maxsplit: Option<i64>,
+    from_right: bool,
+) -> Result<Vec<JinjaValue>, Error> {
+    let maxsplit = maxsplit
+        .filter(|maxsplit| *maxsplit >= 0)
+        .map(|maxsplit| maxsplit as usize);
+    let parts: Vec<String> = match separator {
+        Some("") => {
+            return Err(Error::new(ErrorKind::InvalidOperation, "empty separator"));
+        }
+        Some(separator) => match (maxsplit, from_right) {
+            (Some(maxsplit), false) => text
+                .splitn(maxsplit + 1, separator)
+                .map(str::to_string)
+                .collect(),
+            (Some(maxsplit), true) => {
+                let mut parts: Vec<String> = text
+                    .rsplitn(maxsplit + 1, separator)
+                    .map(str::to_string)
+                    .collect();
+                parts.reverse();
+                parts
+            }
+            (None, false) => text.split(separator).map(str::to_string).collect(),
+            (None, true) => text.rsplit(separator).map(str::to_string).collect(),
+        },
+        None => match (maxsplit, from_right) {
+            // Python strips the leading whitespace first, so the first split
+            // lands on real content rather than on the run before it.
+            (Some(0), _) => vec![text.trim_start().to_string()],
+            (Some(maxsplit), false) => {
+                let mut parts = Vec::new();
+                let mut rest = text.trim_start();
+                while parts.len() < maxsplit {
+                    let trimmed = rest.trim_start();
+                    let Some(index) = trimmed.find(char::is_whitespace) else {
+                        rest = trimmed;
+                        break;
+                    };
+                    parts.push(trimmed[..index].to_string());
+                    rest = &trimmed[index..];
+                }
+                parts.push(rest.trim().to_string());
+                parts
+            }
+            (Some(maxsplit), true) => {
+                let mut parts: Vec<String> = text
+                    .trim_end()
+                    .rsplitn(maxsplit + 1, char::is_whitespace)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                parts.reverse();
+                parts
+            }
+            (None, _) => text.split_whitespace().map(str::to_string).collect(),
+        },
+    };
+    Ok(parts.into_iter().map(JinjaValue::from).collect())
+}
+
+/// Python's `str.splitlines`: the Unicode line boundaries, with the break kept
+/// when `keepends` asks for it.
+fn python_splitlines(text: &str, keepends: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if !is_line_boundary(character) {
+            current.push(character);
+            continue;
+        }
+        let mut boundary = character.to_string();
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            characters.next();
+            boundary.push('\n');
+        }
+        if keepends {
+            current.push_str(&boundary);
+            lines.push(std::mem::take(&mut current));
+        } else {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// The characters Python's `str.splitlines` treats as a line break.
+fn is_line_boundary(character: char) -> bool {
+    matches!(
+        character,
+        '\n' | '\r'
+            | '\u{b}'
+            | '\u{c}'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Python's `str.zfill`/`ljust`/`rjust`/`center`, all of which pad to `width`
+/// characters and never truncate.
+fn pad(text: &str, width: i64, fill: char, kind: &str) -> String {
+    let length = text.chars().count() as i64;
+    if width <= length {
+        return text.to_string();
+    }
+    let padding = (width - length) as usize;
+    match kind {
+        "ljust" => format!("{text}{}", fill.to_string().repeat(padding)),
+        "rjust" => format!("{}{text}", fill.to_string().repeat(padding)),
+        "center" => {
+            let left = padding / 2;
+            format!(
+                "{}{text}{}",
+                fill.to_string().repeat(left),
+                fill.to_string().repeat(padding - left)
+            )
+        }
+        // `zfill` puts the zeros after the sign, and pads with a zero whatever
+        // the fill character is.
+        _ => match text.strip_prefix(['-', '+']) {
+            Some(rest) => format!("{}{}{rest}", &text[..1], "0".repeat(padding)),
+            None => format!("{}{text}", "0".repeat(padding)),
+        },
+    }
+}
+
+/// Python's `str.format`: `{}`/`{0}`/`{name}` fields with an optional
+/// `!conversion` and `:spec`, and `{{`/`}}` for literal braces.
+fn python_str_format(
+    template: &str,
+    args: &[JinjaValue],
+    kwargs: &Kwargs,
+) -> Result<JinjaValue, Error> {
+    let mut out = String::with_capacity(template.len());
+    let mut characters = template.chars().peekable();
+    // Python keeps automatic and manual numbering separate and refuses to mix
+    // them; tracking the next automatic index is enough to match the field
+    // resolution templates rely on.
+    let mut automatic = 0usize;
+    while let Some(character) = characters.next() {
+        match character {
+            '{' if characters.peek() == Some(&'{') => {
+                characters.next();
+                out.push('{');
+            }
+            '}' if characters.peek() == Some(&'}') => {
+                characters.next();
+                out.push('}');
+            }
+            '{' => {
+                let mut field = String::new();
+                let mut closed = false;
+                for character in characters.by_ref() {
+                    if character == '}' {
+                        closed = true;
+                        break;
+                    }
+                    field.push(character);
+                }
+                let unmatched = || {
+                    Error::new(
+                        ErrorKind::InvalidOperation,
+                        "expected '}' before end of string",
+                    )
+                };
+                if !closed {
+                    return Err(unmatched());
+                }
+                out.push_str(&format_field(&field, args, kwargs, &mut automatic)?);
+            }
+            '}' => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "single '}' encountered in format string",
+                ));
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(JinjaValue::from(out))
+}
+
+/// One `{…}` replacement field of `str.format`: `[name][!conversion][:spec]`.
+fn format_field(
+    field: &str,
+    args: &[JinjaValue],
+    kwargs: &Kwargs,
+    automatic: &mut usize,
+) -> Result<String, Error> {
+    let (field, spec) = match field.split_once(':') {
+        Some((field, spec)) => (field, Some(spec)),
+        None => (field, None),
+    };
+    let (field, conversion) = match field.split_once('!') {
+        Some((field, conversion)) => (field, Some(conversion.to_string())),
+        None => (field, None),
+    };
+    let name_end = field.find(['.', '[']).unwrap_or(field.len());
+    let (name, mut accessors) = field.split_at(name_end);
+    let mut value = if name.is_empty() {
+        let index = *automatic;
+        *automatic += 1;
+        args.get(index).cloned().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                format!("Replacement index {index} out of range for positional args tuple"),
+            )
+        })?
+    } else if let Ok(index) = name.parse::<usize>() {
+        *automatic = index + 1;
+        args.get(index).cloned().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                format!("Replacement index {index} out of range for positional args tuple"),
+            )
+        })?
+    } else {
+        kwargs
+            .get::<Option<JinjaValue>>(name)?
+            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, format!("KeyError: {name:?}")))?
+    };
+    while !accessors.is_empty() {
+        if let Some(rest) = accessors.strip_prefix('.') {
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            let key = JinjaValue::from(&rest[..end]);
+            value = require_item(&value, &key, &format!("attribute {:?}", &rest[..end]))?;
+            accessors = &rest[end..];
+            continue;
+        }
+        let rest = accessors
+            .strip_prefix('[')
+            .ok_or_else(|| Error::new(ErrorKind::InvalidOperation, "invalid format field"))?;
+        let end = rest.find(']').ok_or_else(|| {
+            Error::new(ErrorKind::InvalidOperation, "unclosed '[' in format field")
+        })?;
+        let key = rest[..end].trim_matches(['\'', '"']);
+        let key = match key.parse::<usize>() {
+            Ok(index) => JinjaValue::from(index as i64),
+            Err(_) => JinjaValue::from(key),
+        };
+        value = require_item(&value, &key, &format!("KeyError: {:?}", &rest[..end]))?;
+        accessors = &rest[end + 1..];
+    }
+    if matches!(conversion.as_deref(), Some("r" | "a")) {
+        return Ok(python_repr(&value));
+    }
+    match spec {
+        Some(spec) if !spec.is_empty() => python_format(&value, spec),
+        _ => Ok(value.to_string()),
+    }
+}
+
+/// Python's `repr`, for `%r` and the `!r` conversion: strings are quoted (and
+/// escaped) where every other kind renders as its own text.
+fn python_repr(value: &JinjaValue) -> String {
+    match value.kind() {
+        ValueKind::String => {
+            let escaped = value.to_string().replace('\\', "\\\\").replace('\'', "\\'");
+            format!("'{escaped}'")
+        }
+        ValueKind::None => "None".to_string(),
+        ValueKind::Bool => if value.is_true() { "True" } else { "False" }.to_string(),
+        ValueKind::Seq | ValueKind::Iterable => {
+            let items: Vec<String> = value
+                .try_iter()
+                .map(|items| items.map(|item| python_repr(&item)).collect())
+                .unwrap_or_default();
+            format!("[{}]", items.join(", "))
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Python's printf-style formatting: `template % values`, over a single value,
+/// a tuple/list of them or a mapping (`%(name)s`).
+fn format_percent(template: &str, values: &JinjaValue) -> Result<String, Error> {
+    let mapping = (values.kind() == ValueKind::Map).then_some(values);
+    let positional: Vec<JinjaValue> = match mapping {
+        Some(_) => Vec::new(),
+        None => match values.kind() {
+            ValueKind::Seq | ValueKind::Iterable => values
+                .try_iter()
+                .map_err(|err| Error::new(ErrorKind::InvalidOperation, err.to_string()))?
+                .collect(),
+            _ => vec![values.clone()],
+        },
+    };
+
+    let mut next = 0usize;
+    let mut out = String::with_capacity(template.len());
+    let mut characters = template.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            out.push(character);
+            continue;
+        }
+        if characters.peek() == Some(&'%') {
+            characters.next();
+            out.push('%');
+            continue;
+        }
+        if characters.peek() == Some(&'(') {
+            characters.next();
+            let mut name = String::new();
+            for character in characters.by_ref() {
+                if character == ')' {
+                    break;
+                }
+                name.push(character);
+            }
+            let Some(mapping) = mapping else {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "format requires a mapping",
+                ));
+            };
+            let value = require_item(
+                mapping,
+                &JinjaValue::from(name.as_str()),
+                &format!("KeyError: {name:?}"),
+            )?;
+            let (flags, width, precision, kind) = read_conversion(&mut characters)?;
+            out.push_str(&percent_conversion(kind, &value, &flags, width, precision)?);
+            continue;
+        }
+        let (flags, width, precision, kind) = read_conversion(&mut characters)?;
+        let Some(value) = positional.get(next).cloned() else {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "not enough arguments for format string",
+            ));
+        };
+        next += 1;
+        out.push_str(&percent_conversion(kind, &value, &flags, width, precision)?);
+    }
+    Ok(out)
+}
+
+/// The flags, width, precision and conversion character of one `%` conversion.
+fn read_conversion<I: Iterator<Item = char>>(
+    characters: &mut std::iter::Peekable<I>,
+) -> Result<(String, Option<usize>, Option<usize>, char), Error> {
+    let mut flags = String::new();
+    while matches!(
+        characters.peek().copied(),
+        Some('-' | '+' | ' ' | '0' | '#')
+    ) {
+        flags.push(characters.next().expect("peeked"));
+    }
+    let mut width = String::new();
+    while characters.peek().is_some_and(char::is_ascii_digit) {
+        width.push(characters.next().expect("peeked"));
+    }
+    let mut precision = None;
+    if characters.peek() == Some(&'.') {
+        characters.next();
+        let mut digits = String::new();
+        while characters.peek().is_some_and(char::is_ascii_digit) {
+            digits.push(characters.next().expect("peeked"));
+        }
+        precision = Some(digits.parse::<usize>().unwrap_or(0));
+    }
+    let Some(kind) = characters.next() else {
+        return Err(Error::new(ErrorKind::InvalidOperation, "incomplete format"));
+    };
+    Ok((flags, width.parse::<usize>().ok(), precision, kind))
+}
+
+/// One printf conversion, rendered and padded.
+fn percent_conversion(
+    kind: char,
+    value: &JinjaValue,
+    flags: &str,
+    width: Option<usize>,
+    precision: Option<usize>,
+) -> Result<String, Error> {
+    let integer = || -> Result<i64, Error> {
+        let text = value.to_string();
+        text.parse::<i64>()
+            .or_else(|_| text.parse::<f64>().map(|number| number.trunc() as i64))
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "a number is required for this conversion",
+                )
+            })
+    };
+    let float = || -> Result<f64, Error> {
+        value.to_string().parse::<f64>().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidOperation,
+                "a number is required for this conversion",
+            )
+        })
+    };
+    let mut body = match kind {
+        's' => match precision {
+            Some(precision) => value.to_string().chars().take(precision).collect(),
+            None => value.to_string(),
+        },
+        'r' | 'a' => python_repr(value),
+        'd' | 'i' | 'u' => integer()?.to_string(),
+        'f' | 'F' => format!("{:.*}", precision.unwrap_or(6), float()?),
+        'e' => format!("{:.*e}", precision.unwrap_or(6), float()?),
+        'E' => format!("{:.*E}", precision.unwrap_or(6), float()?),
+        'g' | 'G' => {
+            let rendered = general_float(float()?, precision.unwrap_or(6));
+            if kind == 'G' {
+                rendered.to_uppercase()
+            } else {
+                rendered
+            }
+        }
+        'x' => format!("{:x}", integer()?),
+        'X' => format!("{:X}", integer()?),
+        'o' => format!("{:o}", integer()?),
+        'c' => match value.kind() {
+            ValueKind::Number => char::from_u32(integer()?.max(0) as u32)
+                .map(|character| character.to_string())
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::InvalidOperation, "not a valid character code")
+                })?,
+            _ => value
+                .to_string()
+                .chars()
+                .next()
+                .map(|character| character.to_string())
+                .unwrap_or_default(),
+        },
+        other => {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                format!("unsupported format character {other:?}"),
+            ));
+        }
+    };
+
+    let length = body.chars().count();
+    if let Some(width) = width.filter(|width| *width > length) {
+        let padding = width - length;
+        if flags.contains('-') {
+            body.push_str(&" ".repeat(padding));
+        } else if flags.contains('0')
+            && matches!(
+                kind,
+                'd' | 'i' | 'u' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 'x' | 'X' | 'o'
+            )
+        {
+            // A zero-padded number keeps its sign in front of the zeros.
+            body = match body.strip_prefix(['-', '+']) {
+                Some(rest) => format!("{}{}{rest}", &body[..1], "0".repeat(padding)),
+                None => format!("{}{body}", "0".repeat(padding)),
+            };
+        } else {
+            body = format!("{}{body}", " ".repeat(padding));
+        }
+    }
+    Ok(body)
+}
+
+/// Python's `%g`: the shorter of the exponent and decimal forms, with trailing
+/// zeros removed.
+fn general_float(number: f64, precision: usize) -> String {
+    if number == 0.0 {
+        return "0".to_string();
+    }
+    let precision = precision.max(1);
+    let exponent = number.abs().log10().floor() as i32;
+    let rendered = if exponent < -4 || exponent >= precision as i32 {
+        format!("{:.*e}", precision - 1, number)
+    } else {
+        format!(
+            "{:.*}",
+            (precision as i32 - 1 - exponent).max(0) as usize,
+            number
+        )
+    };
+    match rendered.find(['e', 'E']) {
+        Some(exponent_at) => {
+            let (mantissa, exponent_part) = rendered.split_at(exponent_at);
+            format!(
+                "{}{exponent_part}",
+                mantissa.trim_end_matches('0').trim_end_matches('.')
+            )
+        }
+        None => rendered
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
+    }
+}
+
+/// Look a key up on a value the way Python's `[]` and attribute access do: a
+/// missing key is an error rather than an undefined value that would render as
+/// nothing and hide the mistake.
+fn require_item(value: &JinjaValue, key: &JinjaValue, what: &str) -> Result<JinjaValue, Error> {
+    match value.get_item(key) {
+        Ok(resolved) if !resolved.is_undefined() => Ok(resolved),
+        _ => Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!("{what} is not defined"),
+        )),
+    }
+}
+
+/// Python's `s[start:end]`: negative bounds count from the end, out-of-range
+/// bounds saturate, and a missing bound is the corresponding end of the string.
+/// Python's bound resolution for a slice: a negative bound counts from the end
+/// and is clamped at zero, a positive one is clamped at the length, and a
+/// missing one takes the fallback.
+fn resolve_bound(length: i64, bound: Option<i64>, fallback: i64) -> i64 {
+    match bound {
+        Some(bound) if bound < 0 => (length + bound).max(0),
+        Some(bound) => bound.min(length),
+        None => fallback,
+    }
+}
+
+fn char_slice(text: &str, start: Option<i64>, end: Option<i64>) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let length = characters.len() as i64;
+    let start = resolve_bound(length, start, 0);
+    let end = resolve_bound(length, end, length);
+    if end <= start {
+        return String::new();
+    }
+    characters[start as usize..end as usize].iter().collect()
+}
+
+/// An integer argument, tolerating the numeric strings a template's extracted
+/// values are.
+fn int_argument(value: &JinjaValue) -> Option<i64> {
+    if let Ok(number) = i64::try_from(value.clone()) {
+        return Some(number);
+    }
+    let text = value.to_string();
+    text.parse::<i64>()
+        .or_else(|_| text.parse::<f64>().map(|number| number.trunc() as i64))
+        .ok()
 }
 
 fn parse_i64(value: &JinjaValue) -> Result<i64, Error> {
@@ -2304,17 +3944,17 @@ mod tests {
     fn the_rewrite_leaves_templates_without_mutators_alone() {
         let source = "{% set parts = [] %}{{ parts|length }}";
         assert!(matches!(
-            compat_mutable_lists(source),
+            compat_python_template(source),
             std::borrow::Cow::Borrowed(_)
         ));
 
         let source = "{% set parts = [] %}{% set _ = parts.append(1) %}";
-        let rewritten = compat_mutable_lists(source);
+        let rewritten = compat_python_template(source);
         assert!(rewritten.contains("__qd_list([])"));
         // Whitespace-control dashes survive, and a seeded literal is carried
         // into the mutable object.
         let rewritten =
-            compat_mutable_lists("{%- set parts = ['a'] -%}{% set _ = parts.append(1) %}");
+            compat_python_template("{%- set parts = ['a'] -%}{% set _ = parts.append(1) %}");
         assert!(rewritten.contains("{%- set parts = __qd_list(['a']) -%}"));
     }
 
@@ -2326,6 +3966,165 @@ mod tests {
             QdExpressionEngine::default()
                 .known_names()
                 .contains("__qd_list")
+        );
+    }
+
+    /// QD templates call Python's string methods on extracted text, and this
+    /// engine has to answer them: a bare MiniJinja value has no methods at all
+    /// ("unknown method"), and extraction only ever stores strings and JSON, so
+    /// `s.strip()` is how a template cleans a scraped value up.
+    #[test]
+    fn python_string_methods_read_extracted_text() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("s".to_string(), json!("  Hello, World  "));
+        variables.insert("csv".to_string(), json!("a,b,,c"));
+
+        let rendered = engine
+            .render(
+                "{{ s.strip() }}|{{ s.strip().lower() }}|{{ s.strip().replace('l', 'L') }}|\
+                 {{ csv.split(',')|join(';') }}|{{ csv.split(',')[0] }}|\
+                 {{ csv.split(',')|length }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "Hello, World|hello, world|HeLLo, WorLd|a;b;;c|a|4"
+        );
+
+        // A literal receiver is rewritten the same way, and the predicates and
+        // padding take their Python meanings.
+        let rendered = engine
+            .render(
+                "{{ 'abc'.startswith('ab') }}|{{ 'abc'.endswith(('x', 'c')) }}|\
+                 {{ 'abcabc'.find('c') }}|{{ 'abcabc'.rfind('c') }}|\
+                 {{ '7'.zfill(3) }}|{{ 'ab'.center(6, '-') }}|\
+                 {{ '{}-{}'.format('a', 'b') }}",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(rendered, "True|True|2|5|007|--ab--|a-b");
+    }
+
+    /// A `dict` receiver answers `get`/`keys`/`values`/`items`, which is how a
+    /// JSON extraction is walked.
+    #[test]
+    fn python_dict_methods_read_extracted_objects() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("o".to_string(), json!({"a": 1, "b": 2}));
+
+        let rendered = engine
+            .render(
+                "{{ o.get('a') }}|{{ o.get('z', 'dflt') }}|{{ o.keys()|join(',') }}|\
+                 {{ o.values()|join(',') }}|{{ o.items()|length }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "1|dflt|a,b|1,2|2");
+
+        // The documented loop form, which unpacks each pair the method returns.
+        let rendered = engine
+            .render(
+                "{% for k, v in o.items() %}{{ k }}={{ v }};{% endfor %}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "a=1;b=2;");
+    }
+
+    /// A name that is not a method stays a call to nothing — the rewrite must
+    /// not invent one and must not silently swallow the error.
+    #[test]
+    fn an_unknown_method_is_reported_rather_than_guessed() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("s".to_string(), json!("x"));
+
+        let error = engine.render("{{ s.nope() }}", &variables).unwrap_err();
+        assert!(format!("{error:#}").contains("nope"), "{error:#}");
+    }
+
+    /// The Jinja2 filters QD templates lean on that a bare MiniJinja does not
+    /// carry. `striptags` is the pcbeta template's, the rest come with it.
+    #[test]
+    fn the_jinja2_builtin_filters_qd_templates_use() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::new();
+
+        let rendered = engine
+            .render("{{ '<p>Hello   <b>World</b></p>'|striptags }}", &variables)
+            .unwrap();
+        assert_eq!(rendered, "Hello World");
+
+        let rendered = engine
+            .render("{{ 'Hello big world'|wordcount }}", &variables)
+            .unwrap();
+        assert_eq!(rendered, "3");
+
+        // `truncate` counts the ellipsis in `length` and, without `killwords`,
+        // backs up to the last whole word; `leeway` is pinned so the boundary
+        // is the one under test.
+        let rendered = engine
+            .render(
+                "{{ 'foo bar baz qux'|truncate(9, true, leeway=0) }}|\
+                 {{ 'foo bar baz qux'|truncate(9, false, leeway=0) }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "foo ba...|foo...");
+
+        let rendered = engine
+            .render("{{ 'aaa bbb ccc'|wordwrap(7) }}", &variables)
+            .unwrap();
+        assert_eq!(rendered, "aaa bbb\nccc");
+
+        let rendered = engine.render("{{ 'ab'|center(6) }}", &variables).unwrap();
+        assert_eq!(rendered, "  ab  ");
+
+        let rendered = engine
+            .render(
+                "{{ 1|filesizeformat }}|{{ 1000|filesizeformat }}|\
+                 {{ 1024|filesizeformat(true) }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, "1 Byte|1.0 kB|1.0 KiB");
+
+        // `xmlattr` drops a null entry and escapes the rest, with the leading
+        // space Jinja2 writes.
+        let rendered = engine
+            .render(
+                r#"{{ {'class': 'btn"x', 'id': none}|xmlattr }}"#,
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(rendered, r#" class="btn&#34;x""#);
+    }
+
+    /// `"%s" % x`, which QD templates use to build URLs and messages. The left
+    /// operand is a string literal, so the rewrite knows what it is reading.
+    #[test]
+    fn the_percent_operator_formats_like_python() {
+        let engine = QdExpressionEngine::default();
+        let mut variables = BTreeMap::new();
+        variables.insert("name".to_string(), json!("World"));
+        variables.insert("fields".to_string(), json!({"n": "Bob", "c": 3}));
+        variables.insert("args".to_string(), json!(["a", "b"]));
+
+        let rendered = engine
+            .render(
+                "{{ 'Hello, %s!' % name }}|{{ '%d items' % 42 }}|\
+                 {{ '%05.2f' % 3.14159 }}|{{ '%x' % 255 }}|{{ '%s%%' % 5 }}|\
+                 {{ '%(n)s has %(c)d' % fields }}|{{ '%s-%s' % args }}|\
+                 {{ '%s-%s' % ('a', 'b') }}",
+                &variables,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "Hello, World!|42 items|03.14|ff|5%|Bob has 3|a-b|a-b"
         );
     }
 
