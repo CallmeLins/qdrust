@@ -1420,18 +1420,26 @@ impl QdFlags {
     /// refuses as well (`[^]`, a variable-width look-behind) and the linear
     /// engine's complaint — the narrower of the two — is the one reported.
     ///
-    /// The error is a plain string because the two ways to fail have different
-    /// error types: the translation refuses a `{2,1}`, and the engines refuse
-    /// everything neither of them can read.
+    /// The error is a plain string because the three ways to fail have
+    /// different error types: the translation refuses a `{2,1}`, the engines
+    /// refuse everything neither of them can read, and a conditional group can
+    /// branch on a group the pattern does not have — which only the compiled
+    /// pattern knows.
     fn build(self, pattern: &str, body: &str) -> std::result::Result<CompiledRegex, String> {
-        let body = translate_from_python(body)?;
-        match self.linear(&body) {
-            Ok(regex) => Ok(CompiledRegex::Linear(regex)),
-            Err(error) => match self.backtracking(&body) {
-                Ok(regex) => Ok(CompiledRegex::Backtracking {
-                    regex: Box::new(regex),
-                    pattern: pattern.to_string(),
-                }),
+        let translated = translate_from_python(body)?;
+        match self.linear(&translated.body) {
+            Ok(regex) => {
+                translated.check_conditions(regex.capture_names(), regex.captures_len())?;
+                Ok(CompiledRegex::Linear(regex))
+            }
+            Err(error) => match self.backtracking(&translated.body) {
+                Ok(regex) => {
+                    translated.check_conditions(regex.capture_names(), regex.captures_len())?;
+                    Ok(CompiledRegex::Backtracking {
+                        regex: Box::new(regex),
+                        pattern: pattern.to_string(),
+                    })
+                }
                 Err(_) => Err(error.to_string()),
             },
         }
@@ -1513,12 +1521,31 @@ impl QdFlags {
 /// The fifth is a `[` inside a class, which Python reads as one more member of
 /// the set and Rust reads as the start of a POSIX class.
 ///
-/// Two things it does not translate but refuses, because translating them would
-/// mean guessing and a wrong guess matches the wrong text rather than failing:
-/// `{m,n}` with `m > n`, which is a syntax error in Python and a match in the
-/// fallback engine; and `\N{...}`, which Python reads as a named character and
-/// the fallback engine reads as "not a newline".
-fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'static str> {
+/// The sixth is a backslash before a digit: `\012` is the newline and `\123` is
+/// `S` in Python, and a back-reference only when the digits are not one of
+/// those. Both engines read every one of them as a back-reference. The digits
+/// Python allows, and the values it refuses, are [`python_numbered_escape`]'s.
+///
+/// Beyond those it refuses constructs, in both directions.
+///
+/// Two are Python's syntax that the engines would misread: `{m,n}` with
+/// `m > n`, which is a syntax error in Python and a match in the fallback
+/// engine, and `\N{...}`, which Python reads as a named character and the
+/// fallback engine reads as "not a newline".
+///
+/// Three are patterns Python *refuses* that the engines here would run, so that
+/// a template could work here and fail in QD: `(?<name>...)` and the
+/// backtracking verbs `(*FAIL)` and friends, and an inline flag turned off
+/// outside a group. Refusing them is what keeps "it runs" from meaning
+/// something different here than it does in QD. The flag groups are
+/// [`inline_flag_group`]'s, and all three are [`refuse_unknown_group`]'s.
+///
+/// What it reads but does not translate is the groups, because a conditional
+/// group has to branch on one: [`python_group`] refuses one that names a group
+/// Python has not read yet, and leaves the group *number* to
+/// [`Translated::check_conditions`], since Python lets the reference come
+/// before the group it names.
+fn translate_from_python(body: &str) -> std::result::Result<Translated<'_>, &'static str> {
     let characters: Vec<char> = body.chars().collect();
     let mut translated = String::with_capacity(body.len());
     let mut changed = false;
@@ -1526,6 +1553,11 @@ fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'stat
     let mut in_class = false;
     // A `]` that opens a class body is a literal, and so is one after `[^`.
     let mut class_head = false;
+    // The capturing groups read so far, named ones included, because their
+    // order is what numbers them and a conditional group may only name a group
+    // Python has already read.
+    let mut groups: Vec<Option<String>> = Vec::new();
+    let mut conditions: Vec<(usize, Option<String>)> = Vec::new();
     while index < characters.len() {
         let character = characters[index];
         // An escape owns the character after it, `{` and `}` included.
@@ -1546,6 +1578,24 @@ fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'stat
             // the Unicode name table, and a refusal is the honest alternative.
             if escaped == Some('N') {
                 return Err(r"`\N`, Python's named-character escape");
+            }
+            // A digit is a character in Python more often than the engines'
+            // back-reference, which is the one reading they have.
+            if escaped.is_some_and(|escaped| escaped.is_ascii_digit()) {
+                let digits: Vec<char> = characters[index + 1..]
+                    .iter()
+                    .take_while(|character| character.is_ascii_digit())
+                    .copied()
+                    .collect();
+                if let NumberedEscape::Octal { text, span } =
+                    python_numbered_escape(&digits, in_class)?
+                {
+                    translated.push_str(&text);
+                    changed = true;
+                    index += 1 + span;
+                    class_head = false;
+                    continue;
+                }
             }
             if let Some(literal) = escaped.filter(|escaped| means_itself(*escaped)) {
                 translated.push(literal);
@@ -1602,17 +1652,44 @@ fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'stat
             index += 1;
             continue;
         }
-        // `(?(id)yes|no)` is Python's conditional group, and it is the one
-        // construct here that neither engine can express: it branches on
-        // whether another group took part in the match, which is not something
-        // an alternation, a look-around or a back-reference can stand in for.
-        // Both engines already refuse it, but they refuse the parenthesis, so
-        // the construct is named instead.
-        if character == '('
-            && characters.get(index + 1) == Some(&'?')
-            && characters.get(index + 2) == Some(&'(')
-        {
-            return Err("a conditional group, `(?(id)yes|no)`");
+        // A group open, which is where the constructs Python and the engines
+        // disagree about live, and where the groups a conditional group may
+        // branch on are read.
+        if character == '(' {
+            match python_group(&characters[index..])? {
+                Group::Capturing(name) => groups.push(name),
+                Group::Plain => {}
+                // Python reads group 0 as the whole match, and will not take it
+                // as a condition.
+                Group::Conditional(Condition::Number(0)) => {
+                    return Err("a conditional group branching on group 0");
+                }
+                Group::Conditional(Condition::Number(number)) => conditions.push((number, None)),
+                Group::Conditional(Condition::Name(name)) => {
+                    let Some(group) = groups
+                        .iter()
+                        .position(|seen| seen.as_deref() == Some(name.as_str()))
+                    else {
+                        return Err("a conditional group naming a group not read before it");
+                    };
+                    // The number for the name, because the fallback engine reads
+                    // the name but never finds the group: measured,
+                    // `(?P<x>a)?(?(x)b|c)` matches `bc` and not `ab`, so the
+                    // `yes` branch is unreachable through a name there. The
+                    // number for the same group takes it. That the number is the
+                    // right one is [`Translated::check_conditions`]'s.
+                    let number = group + 1;
+                    translated.push_str(&format!("(?({number})"));
+                    changed = true;
+                    index += 4 + name.chars().count();
+                    class_head = false;
+                    conditions.push((number, Some(name)));
+                    continue;
+                }
+                // An assertion or a quoted name, which Python refuses as well,
+                // so the fallback engine's own complaint is the one reported.
+                Group::Conditional(Condition::Other) => {}
+            }
         }
         if character == '{' {
             let Some(repetition) = python_repetition(&characters[index..]) else {
@@ -1641,10 +1718,294 @@ fn translate_from_python(body: &str) -> std::result::Result<Cow<'_, str>, &'stat
         translated.push(character);
         index += 1;
     }
-    Ok(if changed {
-        Cow::Owned(translated)
+    Ok(Translated {
+        body: if changed {
+            Cow::Owned(translated)
+        } else {
+            Cow::Borrowed(body)
+        },
+        conditions,
+    })
+}
+
+/// What the dialect layer made of a pattern: the text to compile, and the one
+/// verdict it cannot reach on its own.
+struct Translated<'a> {
+    body: Cow<'a, str>,
+    /// Every conditional group's branch target, in the order they were read: the
+    /// group number, and the name it was written as when it was written as one.
+    ///
+    /// Whether those groups exist is what the compiled pattern knows and a
+    /// reading of the pattern cannot, and Python lets the branch name a group
+    /// that comes later — measured: `(?(2)a|b)(x)(y)` is legal and
+    /// `(a)(?(2)b|c)` is not.
+    conditions: Vec<(usize, Option<String>)>,
+}
+
+impl Translated<'_> {
+    /// A conditional group may only branch on a group the pattern has, and a
+    /// branch written as a name has to have been translated to the right number.
+    ///
+    /// The compiled pattern is what decides both. The fallback engine — which is
+    /// the one that implements the construct — takes any number at all and reads
+    /// a missing group as "did not take part", so a template could branch on
+    /// group 2 of a one-group pattern and get an answer QD would never have
+    /// produced. Its own capture names are also the only authority on whether
+    /// the number a name was translated to is that name's group, which is a
+    /// question this layer answers from its own reading of the pattern —
+    /// `(?x)` comments and `(?#…)` are the places that reading could be wrong,
+    /// and a wrong number is a wrong branch rather than an error.
+    fn check_conditions<'a>(
+        &self,
+        names: impl Iterator<Item = Option<&'a str>>,
+        captures_len: usize,
+    ) -> std::result::Result<(), String> {
+        if self.conditions.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<Option<&str>> = names.collect();
+        for (group, name) in &self.conditions {
+            // `captures_len` counts the whole match as group 0, so the groups
+            // themselves are the numbers below it.
+            if *group >= captures_len {
+                return Err(format!(
+                    "a conditional group branching on group {group}, which does not exist"
+                ));
+            }
+            if let Some(name) = name
+                && names.get(*group) != Some(&Some(name.as_str()))
+            {
+                return Err(format!(
+                    "a conditional group naming `{name}`, which is not group {group} of the pattern"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a `(` at the start of `characters` opens, as far as this layer cares.
+enum Group {
+    /// A group that captures, named or not. The order of these is what numbers
+    /// them, which is what a conditional group written as a name is translated
+    /// to.
+    Capturing(Option<String>),
+    /// A group that captures nothing: `(?:...)`, a look-around, a comment, an
+    /// inline flag group, another conditional group.
+    Plain,
+    /// A `(?(...)yes|no)` conditional group.
+    Conditional(Condition),
+}
+
+/// The group a conditional group branches on.
+enum Condition {
+    /// A group number, whose existence waits for the compiled pattern.
+    Number(usize),
+    /// A group name, which has to have been read already.
+    Name(String),
+    /// Neither — an assertion or a quoted name. Python refuses those as well,
+    /// so the engines' own complaint is the one reported.
+    Other,
+}
+
+/// Read the `(` at the start of `characters`.
+///
+/// The condition of a conditional group is the one thing here that has to be
+/// read rather than translated. Python takes a group number or the name of a
+/// group it has already read — measured: `(?(n)a|b)(?P<n>x)` is an error and
+/// `(?(2)a|b)(x)(y)` is not — while the fallback engine takes anything at all,
+/// numbers included. Refusing the shapes Python refuses is what keeps a
+/// conditional branch from being taken where QD would not have run the pattern.
+fn python_group(characters: &[char]) -> std::result::Result<Group, &'static str> {
+    // `(*FAIL)` and the other backtracking verbs, which the fallback engine
+    // implements. Python reads the `*` as a repetition of nothing and refuses
+    // the pattern, so this is the one shape here that is not reached through a
+    // `?`.
+    if characters.get(1) == Some(&'*') {
+        return Err("a backtracking verb, `(*FAIL)` and friends, which Python has no syntax for");
+    }
+    // A bare `(` is the one capturing group Python writes without a `?`.
+    if characters.get(1) != Some(&'?') {
+        return Ok(Group::Capturing(None));
+    }
+    if let Some(reason) = refuse_unknown_group(characters) {
+        return Err(reason);
+    }
+    match characters.get(2) {
+        // `(?(id)yes|no)` branches on whether another group took part in the
+        // match, which the fallback engine implements and the linear one does
+        // not — so a pattern with one always takes the fallback.
+        Some('(') => Ok(Group::Conditional(python_condition(&characters[3..]))),
+        Some('P') if characters.get(3) == Some(&'<') => Ok(python_named_group(characters)),
+        _ => Ok(Group::Plain),
+    }
+}
+
+/// The name of a `(?P<name>...)` group, for as long as it looks like one. A
+/// `(?P<name>` that is not closed is not a named group at all, and the engines
+/// refuse it on their own.
+fn python_named_group(characters: &[char]) -> Group {
+    let length = characters[4..]
+        .iter()
+        .take_while(|character| character.is_alphanumeric() || **character == '_')
+        .count();
+    if length == 0 || characters.get(4 + length) != Some(&'>') {
+        return Group::Plain;
+    }
+    Group::Capturing(Some(characters[4..4 + length].iter().collect()))
+}
+
+/// The group a `(?(...)` branches on, read the way Python reads one: digits, or
+/// a name, either of them closed by the `)`.
+fn python_condition(characters: &[char]) -> Condition {
+    let number: String = characters
+        .iter()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if !number.is_empty() {
+        return match characters.get(number.chars().count()) {
+            // A number too large for `usize` cannot be a group either, and
+            // saturating keeps it that way.
+            Some(&')') => Condition::Number(number.parse().unwrap_or(usize::MAX)),
+            _ => Condition::Other,
+        };
+    }
+    let name: String = characters
+        .iter()
+        .take_while(|character| character.is_alphanumeric() || **character == '_')
+        .collect();
+    match characters.get(name.chars().count()) {
+        Some(&')') if !name.is_empty() => Condition::Name(name),
+        _ => Condition::Other,
+    }
+}
+
+/// The `(?` forms Python reads and the engines here do not, refused by name so
+/// the message says which construct it was instead of complaining about a
+/// parenthesis.
+///
+/// The refusal is the awkward direction — a pattern Python would never run that
+/// both engines accept, which was measured: `(?<n>a)` and `(*FAIL)` both
+/// compile here. A template that used them would work here and fail in QD, so
+/// refusing them is what keeps "it runs" meaning the same thing in both.
+fn refuse_unknown_group(characters: &[char]) -> Option<&'static str> {
+    match characters.get(2) {
+        // A look-behind opens with the same two characters and Python reads it,
+        // so only a `<` that is not `(?<=` or `(?<!` is a named group.
+        Some('<') if !matches!(characters.get(3), Some(&'=') | Some(&'!')) => {
+            Some("a group named `(?<name>...)`, which Python spells `(?P<name>...)`")
+        }
+        _ => inline_flag_group(characters),
+    }
+}
+
+/// The inline flag groups Python and the engines disagree about.
+///
+/// `(?a)` is the ASCII flag. It narrows `\w`, `\W`, `\d`, `\D`, `\s`, `\S`,
+/// `\b` and `\B` to ASCII, and — with `i` — narrows case folding too, so
+/// `(?ai)é` does not match `É`. Neither engine has it: the linear one knows
+/// `(?-u:...)`, which narrows the shorthands but also makes `.` match any byte,
+/// and the fallback engine refuses to change Unicode mode inline at all. A
+/// translation of the eight shorthands alone would leave `\b` and the case
+/// folding reading text Python would not match, and a wrong match is worse than
+/// an error, so the flag is refused rather than half-translated.
+///
+/// Python refuses a flag *turned off* outside a group the same way — it wants
+/// `(?-i:...)`, and it wants the `:` — and the engines accept `(?-i)`, so the
+/// sign counts as a refusal here too.
+fn inline_flag_group(characters: &[char]) -> Option<&'static str> {
+    let mut length = 0;
+    let mut turned_off = false;
+    while let Some(flag) = characters.get(2 + length) {
+        match *flag {
+            '-' => turned_off = true,
+            'a' | 'i' | 'L' | 'm' | 's' | 'u' | 'x' => {}
+            _ => break,
+        }
+        length += 1;
+    }
+    let flags = &characters[2..2 + length];
+    let scoped = characters.get(2 + length) == Some(&':');
+    // Anything else opening with `(?` is either not a flag group, or one the
+    // engines do not take either and their message says more about it. `(?L)`
+    // and `(?x)` land here and are refused by both engines already.
+    if flags.is_empty() || (!scoped && characters.get(2 + length) != Some(&')')) {
+        return None;
+    }
+    if flags.contains(&'a') {
+        Some("the ASCII flag, `(?a)`, which neither engine here can express")
+    } else if turned_off && !scoped {
+        Some("an inline flag turned off outside a group, which Python spells `(?-i:...)`")
     } else {
-        Cow::Borrowed(body)
+        None
+    }
+}
+
+/// What a backslash before a digit is.
+enum NumberedEscape {
+    /// A character: the text to write for it and how many digits it spans.
+    Octal { text: String, span: usize },
+    /// A back-reference, which both engines already read the way Python does.
+    BackReference,
+}
+
+/// Read the digits of a numeric escape, which is where Python and the engines
+/// part ways: Python reads `\012` as the newline and `\123` as `S`, and both
+/// engines read them as a back-reference to group 12 and group 123.
+///
+/// The rule is `sre_parse`'s, and it is three cases rather than a grammar: a
+/// leading `0` takes at most two more octal digits; three octal digits are a
+/// character whatever the leading digit is; anything else is a back-reference.
+/// That is why `\0377` is `\x1f` and a literal `7`, and why `\128` is a
+/// back-reference to group 12 and a literal `8` — the third digit has to be
+/// octal for the three-digit reading, and `8` is not.
+///
+/// Inside a class every numeric escape is a character, which is why `[\1]` is
+/// `\x01` and `[\19]` is `\x01` and a literal `9`; Python reads `[\12]` as the
+/// newline, which is exactly what this translation has to reproduce.
+///
+/// A value above `\377` is refused rather than truncated, as Python refuses it:
+/// `\400` is an error there, and the fallback engine would otherwise have read
+/// it as a back-reference to group 400. `[\8]` is left alone, because Python
+/// refuses that escape too and both engines refuse the class it appears in.
+///
+/// One divergence is left open: with twelve groups, `\128` is group 12 and a
+/// literal `8` in Python and group 128 — which does not exist — in the engines,
+/// so the pattern is refused here rather than run. The answer is wrong only in
+/// being louder than QD's.
+fn python_numbered_escape(
+    digits: &[char],
+    in_class: bool,
+) -> std::result::Result<NumberedEscape, &'static str> {
+    let Some(&first) = digits.first() else {
+        return Ok(NumberedEscape::BackReference);
+    };
+    let octal_digits = digits
+        .iter()
+        .take_while(|digit| ('0'..='7').contains(*digit))
+        .count();
+    let span = if first == '0' {
+        // The zero, and at most two more.
+        1 + (octal_digits - 1).min(2)
+    } else if in_class {
+        match octal_digits {
+            0 => return Ok(NumberedEscape::BackReference),
+            count => count.min(3),
+        }
+    } else if octal_digits >= 3 {
+        3
+    } else {
+        return Ok(NumberedEscape::BackReference);
+    };
+    let value = digits[..span].iter().fold(0u32, |value, digit| {
+        value * 8 + (*digit as u32 - '0' as u32)
+    });
+    if value > 0o377 {
+        return Err("an octal escape above `\\377`, which Python refuses");
+    }
+    Ok(NumberedEscape::Octal {
+        text: format!("\\x{value:02x}"),
+        span,
     })
 }
 
@@ -3131,23 +3492,19 @@ mod tests {
         assert_eq!(extract(r"a\nb", "a\nb").unwrap(), Some(json!("a\nb")));
     }
 
-    /// What is left of Python's dialect that neither engine here reads.
+    /// The oniguruma vocabulary the fallback engine knows and Python does not.
     ///
-    /// The list is short, and it is measured rather than guessed: over all 6182
-    /// regexes in the 387 qd-today/templates, none lands here (the single
-    /// corpus pattern that is refused — `[^]` in `糖果VR资源网` — is refused for
-    /// an unclosed class, which Python refuses as well). These two shapes are
-    /// what a probe of the dialect turned up, and they are refused with the
-    /// engine's own complaint rather than mistranslated into something that
-    /// would match the wrong text.
+    /// None of it is a mistake to refuse: `\h` is a horizontal space, `\R` a
+    /// line break, `\X` a grapheme and `\p{...}` a Unicode property in that
+    /// engine, and Python has no reading of any of them. Left alone, a pattern
+    /// QD rejects would start working here.
+    ///
+    /// The list is measured rather than guessed: over all 6182 regexes in the
+    /// 387 qd-today/templates, none of these appears (the single corpus pattern
+    /// that is refused — `[^]` in `糖果VR资源网` — is refused for an unclosed
+    /// class, which Python refuses as well).
     #[test]
-    fn the_rest_of_pythons_dialect_is_refused() {
-        // `\101` is `A` in Python: three octal digits make an octal escape.
-        assert!(extract(r"\101", "A").is_err());
-        // `(?a)` asks for ASCII semantics, which no Rust engine has.
-        assert!(extract(r"(?a)\w+", "abc").is_err());
-        // So do the oniguruma escapes the fallback engine knows and Python
-        // does not: `\h`, `\R`, `\X`, `\p{...}`.
+    fn the_oniguruma_vocabulary_python_does_not_have_is_refused() {
         for pattern in [r"\h", r"\R", r"\X", r"\p{L}", r"\K"] {
             assert!(extract(pattern, "a").is_err(), "{pattern}");
         }
@@ -3203,6 +3560,15 @@ mod tests {
     /// name as literal text. That compiles and matches the wrong thing, which
     /// is worse than refusing: reading it properly needs the Unicode name
     /// table, so the translation refuses it instead.
+    ///
+    /// The refusal is the one gap left in the dialect layer that a library
+    /// could close — `unicode_names2::character` reads a name the way
+    /// `unicodedata.lookup` does, both of them case-insensitive and neither
+    /// accepting the loose `GREEK-SMALL-LETTER-ALPHA` spelling. Two things
+    /// stopped it: no template in qd-today writes `\N{...}` (measured: none of
+    /// the 6182 patterns, and none of the 387 templates' text), and the crate's
+    /// `Unicode-DFS-2016` licence is not on `deny.toml`'s list, so taking the
+    /// dependency is a licensing decision as well as 500 KB of tables.
     #[test]
     fn a_named_character_escape_is_refused_rather_than_misread() {
         assert!(extract(r"\N{BULLET}", "•").is_err());
@@ -3212,6 +3578,160 @@ mod tests {
             extract(r"\\N\{BULLET\}", r"\N{BULLET}").unwrap(),
             Some(json!(r"\N{BULLET}"))
         );
+    }
+
+    /// A numeric escape is a character in Python far more often than it is a
+    /// back-reference, and both engines only know the back-reference.
+    ///
+    /// The cases are `sre_parse`'s three, and the values were read off the
+    /// reference interpreter rather than inferred: `\012` is the newline,
+    /// `\123` is `S`, `\0377` is `\x1f` and a literal `7`, `\128` is a
+    /// back-reference and not octal because `8` is not an octal digit, and
+    /// `\400` is refused for being above `\377`.
+    #[test]
+    fn a_numeric_escape_is_read_the_way_python_reads_it() {
+        assert_eq!(extract(r"\012", "\n").unwrap(), Some(json!("\n")));
+        assert_eq!(extract(r"\123", "S").unwrap(), Some(json!("S")));
+        assert_eq!(extract(r"\000", "\0").unwrap(), Some(json!("\0")));
+        assert_eq!(extract(r"\0", "\0").unwrap(), Some(json!("\0")));
+        // Two octal digits after the zero, and no more: the third is literal.
+        assert_eq!(
+            extract(r"\0377", "\u{1f}7").unwrap(),
+            Some(json!("\u{1f}7"))
+        );
+        // `\08` is the zero and then a literal `8`.
+        assert_eq!(extract(r"\08", "\u{0}8").unwrap(), Some(json!("\u{0}8")));
+
+        // Inside a class every numeric escape is a character, so `[\1]` is the
+        // byte and not the group Python has never been told about.
+        assert_eq!(extract(r"[\1]", "\u{1}").unwrap(), Some(json!("\u{1}")));
+        assert_eq!(extract(r"[\012]", "\n").unwrap(), Some(json!("\n")));
+        assert_eq!(extract(r"[\123]", "S").unwrap(), Some(json!("S")));
+        assert_eq!(extract(r"[\19]", "\u{1}").unwrap(), Some(json!("\u{1}")));
+        assert_eq!(
+            extract(r"[\0377]", "\u{1f}").unwrap(),
+            Some(json!("\u{1f}"))
+        );
+
+        // Above `\377`, and `[\8]`, where there is no octal digit at all:
+        // Python refuses both, and so does this.
+        assert!(extract(r"\400", "").is_err());
+        assert!(extract(r"\777", "").is_err());
+        assert!(extract(r"[\400]", "").is_err());
+        assert!(extract(r"[\8]", "8").is_err());
+
+        // The back-references the engines already read, left alone.
+        assert_eq!(extract(r"(a)\1", "aa").unwrap(), Some(json!("a")));
+        assert_eq!(extract(r"(a)(?(1)b)", "ab").unwrap(), Some(json!("a")));
+    }
+
+    /// `(?(id)yes|no)` branches on whether another group took part in the
+    /// match. The fallback engine implements it, so it runs here; what has to be
+    /// refused is the condition Python would not take, or the branch would be
+    /// taken on a group QD never had.
+    #[test]
+    fn a_conditional_group_branches_the_way_python_branches_it() {
+        // What QD stores for a pattern with groups is the first group, so the
+        // branch is observed through one that wraps the whole thing: `ab` when
+        // the group took part, `c` when it did not.
+        assert_eq!(
+            extract(r"((a)?(?(2)b|c))", "ab").unwrap(),
+            Some(json!("ab"))
+        );
+        assert_eq!(extract(r"((a)?(?(2)b|c))", "bc").unwrap(), Some(json!("c")));
+        // A named condition, and the case with no `|else` at all.
+        assert_eq!(
+            extract(r"((?P<x>a)?(?(x)b|c))", "ab").unwrap(),
+            Some(json!("ab"))
+        );
+        assert_eq!(
+            extract(r"((?P<x>a)?(?(x)b|c))", "bc").unwrap(),
+            Some(json!("c"))
+        );
+        assert_eq!(extract(r"(a)(?(1)b)", "ab").unwrap(), Some(json!("a")));
+        // A condition that names a group coming later is legal — measured on the
+        // reference interpreter, where `(?(2)a|b)(x)(y)` compiles and
+        // `(?(n)a|b)(?P<n>x)` does not — but the branch it takes is always the
+        // `|no` one, because the group has not taken part yet when the condition
+        // is read. Python matches `bxy` here and not `axy`, and so does this.
+        assert_eq!(
+            extract(r"(?(2)a|b)(x)(y)", "bxy").unwrap(),
+            Some(json!("x"))
+        );
+        assert_eq!(extract(r"(?(2)a|b)(x)(y)", "axy").unwrap(), None);
+
+        // A group number the pattern does not have, group 0, a name that was
+        // never defined, and a name defined only after the branch.
+        for pattern in [
+            r"(a)(?(2)b|c)",
+            r"(?(1)a|b)",
+            r"(a)(?(0)b|c)",
+            r"(a)(?(a)b|c)",
+            r"(?(n)a|b)(?P<n>x)",
+        ] {
+            let error = extract(pattern, "ab").unwrap_err().to_string();
+            assert!(error.contains("conditional group"), "{pattern}: {error}");
+        }
+        // An assertion and a quoted name are refused by the fallback engine as
+        // well, so those patterns stay refused without a condition to check.
+        assert!(extract(r"(a)(?(?=a)b|c)", "ab").is_err());
+        assert!(extract(r"(a)(?('a')b|c)", "ab").is_err());
+
+        // A `(` inside a `(?x)` comment is not a group, so the number this layer
+        // counts for a name comes out one too high here — Python reads this
+        // pattern and calls `x` group 1. A wrong number is a wrong branch, which
+        // is worse than an error, so every condition is judged against the
+        // engine's own group count and capture names, and this one is refused
+        // rather than branched on group 2.
+        let error = extract("(?x)# (\n(?P<x>a)?(?(x)b|c)", "ab")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("conditional group"), "{error}");
+        // The number a condition is written as is passed through untouched, so
+        // the same pattern with a number is judged the same way — and Python
+        // refuses it too (`invalid group reference 3`, because the `(` in the
+        // comment is not a group there either).
+        let error = extract("(?x)# (\n((a)?(?(3)b|c))", "ab")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("group 3"), "{error}");
+        // The name check is what catches a miscount that still lands on a group
+        // the engine has: here the comment's `(` pushes `x` to number 2, and
+        // group 2 is `y` — the branch would be taken on the wrong group. Python
+        // reads this pattern and matches `ac`; refusing is the loud side of that.
+        let error = extract("(?x)# (\n(?P<x>a)(?P<y>b)?(?(x)c|d)", "ac")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("naming `x`"), "{error}");
+    }
+
+    /// Three things Python refuses and the engines accept, which is the
+    /// direction that matters: a template written here would work and then fail
+    /// in QD.
+    #[test]
+    fn what_python_refuses_the_engines_will_not_take() {
+        // `(?<name>...)` is PCRE's spelling; Python spells it `(?P<name>...)`.
+        assert!(extract(r"(?<n>a)", "a").is_err());
+        assert!(extract(r"(?<>)", "").is_err());
+        // The backtracking verbs.
+        assert!(extract(r"(*FAIL)a", "a").is_err());
+        assert!(extract(r"a(*SKIP)b", "ab").is_err());
+        // A flag turned off outside a group, where Python wants `(?-i:...)`.
+        assert!(extract(r"(?-i)a", "a").is_err());
+        // The ASCII flag, which neither engine can express.
+        let error = extract(r"(?a)\w", "a").unwrap_err().to_string();
+        assert!(error.contains("ASCII flag"), "{error}");
+        assert!(extract(r"(?a:\w)", "a").is_err());
+
+        // What Python and the engines do agree on is untouched.
+        assert_eq!(extract(r"(?<=a)b", "ab").unwrap(), Some(json!("b")));
+        assert_eq!(extract(r"(?<!x)b", "ab").unwrap(), Some(json!("b")));
+        assert_eq!(extract(r"(?i)A", "a").unwrap(), Some(json!("a")));
+        assert_eq!(extract(r"(?s).", "\n").unwrap(), Some(json!("\n")));
+        assert_eq!(extract(r"(?u)a", "a").unwrap(), Some(json!("a")));
+        assert_eq!(extract(r"(?x) a b", "ab").unwrap(), Some(json!("ab")));
+        assert_eq!(extract(r"(?:a)b", "ab").unwrap(), Some(json!("ab")));
+        assert_eq!(extract(r"(?P<n>a)", "a").unwrap(), Some(json!("a")));
     }
 
     /// Python reads `{` as a repetition only when a well-formed one follows,
@@ -3247,17 +3767,6 @@ mod tests {
         assert_eq!(extract(r#"a{,}"#, "aaa").unwrap(), Some(json!("aaa")));
         // Still a repetition, so still refused by both engines.
         assert!(extract(r#"a{2,1}"#, "aaa").is_err());
-    }
-
-    /// `(?(id)yes|no)` branches on whether another group took part in the
-    /// match, which neither engine here can express — and both refuse the
-    /// parenthesis rather than the construct, so the refusal names it.
-    #[test]
-    fn a_conditional_group_is_named_when_it_is_refused() {
-        for pattern in [r"(a)?(?(1)b|c)", r"(?P<x>a)?(?(x)b|c)"] {
-            let error = extract(pattern, "ab").unwrap_err().to_string();
-            assert!(error.contains("conditional group"), "{pattern}: {error}");
-        }
     }
 
     /// The encoding QD's `utils.decode` picks, source by source. Each case
