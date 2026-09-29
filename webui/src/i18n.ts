@@ -108,6 +108,8 @@ const zh = {
   configured: "已配置",
   scheduledEnabled: "调度已启用",
   hasResults: "有运行结果",
+  lastFailed: "最近失败",
+  lastRunFailed: "上次运行未通过",
   // tasks
   newTask: "新建任务",
   editTask: "编辑任务",
@@ -623,6 +625,8 @@ const en: Record<MessageKey, string> = {
   configured: "configured",
   scheduledEnabled: "scheduling enabled",
   hasResults: "has run results",
+  lastFailed: "Recent failure",
+  lastRunFailed: "last run did not pass",
   // tasks
   newTask: "New task",
   editTask: "Edit task",

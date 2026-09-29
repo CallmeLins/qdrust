@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, newestTemplatesFirst, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, newestTemplatesFirst, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -225,3 +225,45 @@ describe("newestTemplatesFirst / orderTemplatesForNewTask", () => {
 });
 
 
+
+describe("taskOutcome", () => {
+  // The shape the scheduler writes: a successful run has an HTTP status and no
+  // error; a transport failure has neither status nor error-free outcome.
+  it("reads a successful run as ok", () => {
+    expect(taskOutcome({ disabled: false, last_status: 200, last_error: null })).toBe("ok");
+  });
+
+  // The bug this replaces: `last_status == null` was read as 正常, so every
+  // failure that never got a response — TLS, DNS, timeout — showed healthy.
+  it("reads a failure without an HTTP status as failed, not ok", () => {
+    expect(
+      taskOutcome({
+        disabled: false,
+        last_status: null,
+        last_error: "connection error: received fatal alert: BadRecordMac",
+      })
+    ).toBe("failed");
+  });
+
+  it("still reads a 4xx or 5xx with no error as failed", () => {
+    for (const status of [400, 403, 500, 503]) {
+      expect(taskOutcome({ disabled: false, last_status: status, last_error: null })).toBe("failed");
+    }
+  });
+
+  it("reads a task that has never run as ok", () => {
+    expect(taskOutcome({ disabled: false, last_status: null, last_error: null })).toBe("ok");
+    expect(taskOutcome({ disabled: false, last_status: null })).toBe("ok");
+  });
+
+  it("lets disabled win over any outcome, including a recorded failure", () => {
+    expect(taskOutcome({ disabled: true, last_status: null, last_error: "boom" })).toBe("disabled");
+    expect(taskOutcome({ disabled: true, last_status: 500, last_error: null })).toBe("disabled");
+  });
+
+  // A stale error next to a fresh 2xx: the success branch must not be shadowed
+  // by a previous failure, because the server clears `last_error` on success.
+  it("treats a non-empty error as authoritative over the status", () => {
+    expect(taskOutcome({ disabled: false, last_status: 200, last_error: "stale" })).toBe("failed");
+  });
+});

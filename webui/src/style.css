@@ -408,7 +408,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   background-color: rgb(var(--card-surface));
   border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
   box-shadow: var(--card-shadow);
-  display: grid; grid-template-columns: repeat(3, 1fr); overflow: hidden;
+  display: grid; grid-template-columns: repeat(4, 1fr); overflow: hidden;
 }
 .stats > div { position: relative; min-height: 128px; padding: 24px 26px; display: flex; flex-direction: column; }
 .stats > div + div { border-left: 1px solid var(--line); }
@@ -1186,7 +1186,7 @@ code {
   .breadcrumb { margin-right: auto; margin-left: 8px; }
   .account-name { display: none; }
   .page { width: calc(100% - 32px); padding-top: 26px; }
-  .stats { grid-template-columns: 1fr; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
   .stats > div { min-height: 92px; }
   .stats > div + div { border-top: 1px solid var(--line); border-left: 0; }
   .page-heading { align-items: flex-start; }

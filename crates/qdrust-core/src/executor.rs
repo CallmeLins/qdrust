@@ -131,6 +131,14 @@ pub struct ExecutionContext {
     pub variables: BTreeMap<String, Value>,
     pub remaining_requests: usize,
     pub loop_limit: usize,
+    /// The HTTP status of the last response, or `None` if no response ever
+    /// arrived — a TLS, DNS or timeout failure — and before the first request.
+    ///
+    /// The two are deliberately not merged with a sentinel: a template can read
+    /// this through `extract.from: status`, where "no status" and "status 0"
+    /// would be different answers. Whichever caller persists it must pair it
+    /// with the error, because `None` alone does not mean "healthy" — see
+    /// `record_run` and the WebUI's `taskOutcome`.
     pub last_status: Option<u16>,
     pub last_headers: Vec<(String, String)>,
     pub last_body: String,

@@ -211,3 +211,27 @@ export function localLoginAvailable(policy: AuthPolicy | null): boolean {
 export function ssoOnly(policy: AuthPolicy | null): boolean {
   return policy?.auth_mode === "oidc";
 }
+
+/** The lifecycle a task row is in, as the task list shows it. */
+export type TaskOutcome = "disabled" | "ok" | "failed";
+
+/**
+ * Classify a task for the status pill.
+ *
+ * `last_error` decides before `last_status` does, because a run that never got
+ * a response — a TLS failure, DNS, a timeout — is recorded with `status: None`
+ * (`record_run(task_id, None, Some(message))` in the scheduler) and its HTTP
+ * code is `null`. Reading `last_status == null` as "正常" therefore labelled
+ * every transport failure healthy, which is the one case an operator most needs
+ * to see. The server keeps that column nullable on purpose: "no HTTP status"
+ * and "HTTP status 0" are different facts, and a sentinel would also leak into
+ * `extract.from: status` in user templates.
+ *
+ * A task that has never run has both fields empty and is healthy.
+ */
+export function taskOutcome(task: { disabled: boolean; last_status: number | null; last_error?: string | null }): TaskOutcome {
+  if (task.disabled) return "disabled";
+  if (task.last_error) return "failed";
+  if (task.last_status == null) return "ok";
+  return task.last_status < 400 ? "ok" : "failed";
+}

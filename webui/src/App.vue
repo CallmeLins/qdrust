@@ -9,7 +9,7 @@ import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
-import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly } from "./utils";
+import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
@@ -344,7 +344,11 @@ const {
 watch([search, groupFilter], resetTasksPage);
 
 const activeCount = computed(() => tasks.value.filter((task) => !task.disabled).length);
-const successCount = computed(() => tasks.value.filter((task) => task.last_status != null && task.last_status < 400).length);
+// Counted by outcome, not by raw column: `last_status` is null for every
+// transport failure, so the old `last_status != null && < 400` test reported
+// those as "not a success" but never as a failure either.
+const successCount = computed(() => tasks.value.filter((task) => taskOutcome(task) === "ok").length);
+const failedCount = computed(() => tasks.value.filter((task) => taskOutcome(task) === "failed").length);
 const taskName = (taskId: number) => tasks.value.find((task) => task.id === taskId)?.name ?? `#${taskId}`;
 const channelName = (id: number) => channels.value.find((c) => c.id === id)?.name ?? `#${id}`;
 
@@ -609,9 +613,9 @@ function runStatusLabel(status: string): string {
   return key ? t(key) : status;
 }
 function taskStatusLabel(task: Task): string {
-  if (task.disabled) return "禁用";
-  if (task.last_status == null) return "正常";
-  return task.last_status < 400 ? "正常" : "失败";
+  const outcome = taskOutcome(task);
+  if (outcome === "disabled") return "禁用";
+  return outcome === "failed" ? "失败" : "正常";
 }
 /** QD 式日志列：成功显示 __log__ 摘要，失败显示错误详情 */
 function runLogText(run: Run): string {
@@ -2208,6 +2212,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div><span>{{ t('totalTasks') }}</span><strong>{{ tasks.length }}</strong><small><CalendarClock :size="14" />{{ t('configured') }}</small></div>
           <div><span>{{ t('enabledTasks') }}</span><strong>{{ activeCount }}</strong><small class="positive"><Activity :size="14" />{{ t('scheduledEnabled') }}</small></div>
           <div><span>{{ t('lastSuccess') }}</span><strong>{{ successCount }}</strong><small><Check :size="14" />{{ t('hasResults') }}</small></div>
+          <div><span>{{ t('lastFailed') }}</span><strong :class="{ 'run-bad': failedCount > 0 }">{{ failedCount }}</strong><small :class="{ 'run-bad': failedCount > 0 }"><XCircle :size="14" />{{ t('lastRunFailed') }}</small></div>
         </section>
 
         <section class="task-section">
