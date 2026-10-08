@@ -30,7 +30,7 @@ A：单实例基于 SQLite 事务 + 租约保证不重复执行；多实例共�
 A：因为任务的请求完全由**模板**决定——调度器执行时直接重放模板（多页模板常混合 GET/POST），任务自带的这几个字段从来不会被使用。所以新建任务必须先选模板，请求方法 / URL 只在任务列表里作为模板首条请求的镜像展示。唯一例外是**早于该改动的存量任务**（没有绑定模板、自带一条请求），编辑它们时模板下拉会保留「（无模板）」选项，其原有请求也不会被改动。
 
 **Q：插件 / `api://util` 工具不全？**
-A：`api://util/*` 已对齐 QD 的核心工具（时间 / 编码 / 哈希 / 正则 / JSON / RSA / GB2312 / 字符串替换 / OCR）， toolbox 与 notepad 属 Web 工具箱页面，不在模板 API 范围内，未移植。
+A：`api://util/*` 只实现了模板真正会用到的那批（时间 / 编码 / 哈希 / 正则 / JSON / RSA / GB2312 / 字符串替换 / 延迟 / OCR，完整清单见[参考 · api:// 内置路由](reference.md)）。「工具箱」与「记事本」是 QD Web 页面上的功能，不在模板 API 范围内，未移植 —— `api://util/toolbox/*` **整个命名空间都没有注册**，模板里写了它会在运行时直接失败，报 `plugin action unavailable: util/toolbox/…`。这类模板要在 qdrust 上跑，得把该步骤去掉或改写：任务自带的**变量表**（`PUT /api/v1/tasks/{id}` 的 `variables`，也就是建任务时「模板变量预填」的那份）可以给模板喂值，但**模板本身没有写入能力**，所以「跨运行记一笔状态」这种用法没有等价物，需要的话用外部脚本维护该变量的值。
 
 **Q：站点要 JS 生成签名 / 过验证码，纯 HAR 跑不了怎么办？**
 A：用 `api://browser/*` 无头浏览器插件。配置 `QDRUST_BROWSER_URL` 后启用，模板里插入 `api://browser/eval`（执行 JS 取 token/签名）、`api://browser/content`（抓渲染后 HTML）、或 `api://browser/screenshot`（截图），再用 `extract_variables` 把结果提成变量回填。详见 [浏览器插件（无头浏览器签到）](browser-plugin.md)。

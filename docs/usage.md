@@ -133,9 +133,21 @@ WebUI 提供可视化编辑器，可直接增删改请求、设置请求头 / �
 
 可视化调度器支持固定间隔与 cron；「随机延迟」可让同一任务的多次执行在时间上打散，避免被目标站点识别为固定节奏。模板变量支持在创建任务时**预填**默认值。
 
+### cron 要写几段
+
+`cron` 必须是 **6 段或 7 段，第一段是秒**：`秒 分 时 日 月 周 [年]`，此外也接受 `@daily` 这类单 token 简写。这跟旧 QD 常见的 **5 段**（`分 时 日 月 周`）**不通用**，从 QD 迁过来的任务要在最前面补一个秒位：
+
+| 旧 QD（5 段） | 这里（6 段） | 含义 |
+|---|---|---|
+| `21 03 * * *` | `0 21 03 * * *` | 每天 03:21 |
+| `0 9 * * *` | `0 0 9 * * *` | 每天 09:00 |
+| `*/30 * * * *` | `0 */30 * * * *` | 每 30 分钟 |
+
+段数不对会当场被拒（`422 validation_error`，message 形如 `invalid cron expression "0 9 * * *": expected 6-7 fields (sec min hour day-of-month month day-of-week [year]) or a shorthand like @daily`）。WebUI 的可视化调度器生成的就是 7 段格式，只有手工填写或脚本批量导入时才需要注意这一点。
+
 ### 时区与夏令时
 
-cron 按每个任务各自的 IANA 时区（`timezone` 字段）求值，**DST 感知**：设 `America/New_York` 的任务，`0 9 * * *` 会全年在当地 09:00 触发，无需为冬令/夏令手改 cron。任务未设 `timezone` 时使用服务端 `QDRUST_DEFAULT_TIMEZONE`（默认 `Asia/Shanghai`）。WebUI 中任务列表与运行历史的「上次运行/开始时间」也按该任务时区展示（未设时区则用查看者浏览器本地时区）。
+cron 按每个任务各自的 IANA 时区（`timezone` 字段）求值，**DST 感知**：设 `America/New_York` 的任务，`0 0 9 * * *` 会全年在当地 09:00 触发，无需为冬令/夏令手改 cron。任务未设 `timezone` 时使用服务端 `QDRUST_DEFAULT_TIMEZONE`（默认 `Asia/Shanghai`）。WebUI 中任务列表与运行历史的「上次运行/开始时间」也按该任务时区展示（未设时区则用查看者浏览器本地时区）。
 
 ## 运行日志与历史
 

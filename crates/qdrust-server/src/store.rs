@@ -3456,9 +3456,19 @@ fn validate(name: &str, schedule: &str, url: Option<&str>, timezone: Option<&str
     if name.trim().is_empty() {
         return Err(anyhow!("name cannot be empty"));
     }
-    schedule
-        .parse::<cron::Schedule>()
-        .context("invalid cron expression")?;
+    // The parse error underneath only says the expression did not match the
+    // grammar — nothing about the field count — and this message is the whole
+    // of what a caller sees of the 422 body (`ApiError::Unprocessable` renders
+    // the outer context only). A QD task migrated with its 5-field expression
+    // lands here, so name the shape instead of leaving them to guess.
+    schedule.parse::<cron::Schedule>().with_context(|| {
+        // `:?` quotes the expression, which makes a stray trailing space or
+        // newline (both easy to paste in) visible rather than invisible.
+        format!(
+            "invalid cron expression {schedule:?}: expected 6-7 fields \
+             (sec min hour day-of-month month day-of-week [year]) or a shorthand like @daily"
+        )
+    })?;
     if let Some(url) = url {
         reqwest::Url::parse(url).context("invalid task URL")?;
     }
@@ -3548,6 +3558,37 @@ mod tests {
                 body: None,
             })],
         }
+    }
+
+    /// A cron rejected here is reported to the caller as this one line, so the
+    /// hint has to carry the field count on its own: the cron crate's own error
+    /// says only that the expression did not match, which is exactly the
+    /// message a QD task migrated with its 5-field expression would have
+    /// gotten with no way to tell why.
+    #[test]
+    fn a_rejected_cron_says_which_shape_was_expected() {
+        let error = validate("task", "0 9 * * *", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "expected 6-7 fields (sec min hour day-of-month month day-of-week [year])"
+            ),
+            "{error}"
+        );
+        // Quoted, so the expression that was rejected is identifiable even when
+        // it differs from the intended one only by whitespace.
+        assert!(
+            error.starts_with("invalid cron expression \"0 9 * * *\":"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_six_or_seven_field_cron_and_the_shorthands_are_accepted() {
+        validate("task", "0 0 9 * * *", None, None).unwrap();
+        validate("task", "0 0 9 * * * 2027", None, None).unwrap();
+        validate("task", "@daily", None, None).unwrap();
     }
 
     #[tokio::test]
