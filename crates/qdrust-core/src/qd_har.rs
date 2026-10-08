@@ -190,10 +190,14 @@ impl QdHarEntry {
             rule.validate()?;
         }
         for rule in &self.extract_variables {
-            ensure!(
-                !rule.name.trim().is_empty(),
-                "extract variable name is empty"
-            );
+            // The name is deliberately not required. QD's editor adds a blank
+            // row the moment ADD is pressed (`{name: '', re: '', from:
+            // 'content'}`, `web/tpl/har/entry_editor.html`) and its runner
+            // writes to `variables[name]` without ever looking at the name, so a
+            // pattern with no name is a normal thing for an exported template to
+            // carry — the gmgard template in `tests/fixtures` has one. Rejecting
+            // it here turned a row that does nothing into a template that will
+            // not import at all.
             rule.rule.validate()?;
         }
         Ok(())
@@ -561,6 +565,42 @@ mod tests {
         assert_eq!(entry.success_asserts.len(), 1);
         assert_eq!(entry.extract_variables.len(), 1);
         assert_eq!(entry.extract_variables[0].name, "token");
+    }
+
+    /// One press of QD's ADD button inserts `{name: '', re: '', from:
+    /// 'content'}`, and QD's runner writes to `variables[name]` without ever
+    /// looking at the name — so a row with a pattern and no name is a normal
+    /// thing for an exported template to carry. The gmgard template in
+    /// `tests/fixtures` has one, and requiring the name turned that unused row
+    /// into a template that would not import at all.
+    #[test]
+    fn an_extract_row_without_a_name_is_accepted_and_kept() {
+        let raw = json!([{
+            "comment": "追加记事本",
+            "request": {
+                "method": "POST",
+                "url": "api://util/toolbox/notepad",
+                "headers": [],
+                "cookies": [],
+                "data": "f=write&data=x"
+            },
+            "rule": {
+                "success_asserts": [{"re": "200", "from": "status"}],
+                "failed_asserts": [],
+                "extract_variables": [{"name": "", "re": "([sS]*)", "from": "content"}]
+            }
+        }]);
+        let har = QdHar::parse_qd(raw).expect("a nameless extract row must not fail the import");
+        QdProgram::compile(&har).expect("a nameless extract row must not fail the compile");
+        // Kept rather than dropped: the pattern is the author's, and the one
+        // thing missing is the name they have not typed yet.
+        assert_eq!(har.entries()[0].extract_variables[0].rule.re, "([sS]*)");
+        // And it is not an input: only a name could make it one.
+        assert!(
+            !har.variables().iter().any(String::is_empty),
+            "a nameless extract must not become a task variable: {:?}",
+            har.variables()
+        );
     }
 
     #[test]

@@ -754,7 +754,10 @@ impl QdExecutor {
         .map_err(with_response)?;
         for rule in &entry.extract_variables {
             // QD uses an empty extraction expression as a no-op placeholder.
-            if rule.rule.re.is_empty() {
+            // A rule with a pattern but no name is one too: QD stores the value
+            // under `variables[""]`, which no template can read back — the name
+            // is the only thing it could have been for, and it is missing.
+            if rule.rule.re.is_empty() || rule.name.trim().is_empty() {
                 continue;
             }
             let pattern = self.render(&rule.rule.re, context)?;
