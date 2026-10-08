@@ -607,6 +607,16 @@ fn default_true() -> bool {
     true
 }
 
+/// Body of a notepad write: the whole new value for one slot.
+///
+/// The entire value rather than a patch or an append, because that is what the
+/// page's editor holds. The template-facing `f=append` stays a template
+/// concern: a user editing a slot reads it, edits the text, and saves it back.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetNotepad {
+    pub content: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NotificationAction {
     pub id: i64,

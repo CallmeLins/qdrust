@@ -313,13 +313,87 @@ fn capability_list(capabilities: &[PluginCapability]) -> String {
         .join(",")
 }
 
+/// QD's `NOTEPAD_LIMIT`, default 20: the most slots one account may hold.
+///
+/// A constant rather than a setting, like the content limit below: 20 slots is
+/// already far past what a template needs, and the number is not something a
+/// deployment has ever had to change. Every path a slot can be born on — a
+/// template's `f=add` and the notepad page's "new slot" — enforces it from this
+/// one value.
+pub const NOTEPAD_LIMIT: usize = 20;
+
+/// The most text one slot may hold, as written by a template.
+///
+/// QD puts no bound here at all, so this is a deliberate difference: a template
+/// writes without one, and every other limit in this repo (`response_limit`,
+/// `request_limit`, the 300s run deadline) exists for the same reason. The value
+/// matches the default `response_limit`, so a value that can be stored can also
+/// be read back through a normal step — a larger cap would let a template write
+/// something it can never read.
+///
+/// The notepad page reads such a value back whatever its size, but it writes
+/// through a smaller bound of its own — see `NOTEPAD_EDIT_LIMIT` in
+/// `qdrust-server`, and the note there on why the two cannot be one number.
+const NOTEPAD_CONTENT_LIMIT: usize = 5 * 1024 * 1024;
+
+/// QD writes both of these as the response body of a failed notepad call, so a
+/// template author sees one or the other depending on which route they hit. The
+/// comma differs between the two in QD itself (`util.py`), which is why the two
+/// spellings are kept apart here rather than normalised to one.
+const NOTEPAD_INCOMPLETE: &str = "参数不完整，请确认";
+const NOTEPAD_INCOMPLETE_LIST: &str = "参数不完整, 请确认";
+
+/// What one notepad slot holds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotepadSlot {
+    /// No row for this slot. QD auto-creates slot 1 on first use and refuses
+    /// any other missing slot with 「记事本不存在」, so this is a branch the
+    /// caller has to take rather than an error.
+    Missing,
+    /// A row exists. `None` is QD's NULL content — the state a slot it created
+    /// itself is in, and the state `append` tells apart from `""` (it joins with
+    /// a CRLF only when something is already stored).
+    Stored(Option<String>),
+}
+
+/// Cross-run storage behind `api://util/toolbox/notepad`.
+///
+/// QD keeps a notepad as a `(userid, notepadid, content)` row and lets a
+/// template read one, overwrite it, or append to it. Only the caller knows whose
+/// notepad that is and where it lives: `qdrust-core` cannot reach the server's
+/// database, and the CLI has no database at all. So the plugin is handed this
+/// instead, and **whose** notepad it is belongs to the implementation, not to a
+/// parameter here — which is also what keeps the account out of the URL.
+pub trait NotepadStore: Send + Sync + std::fmt::Debug {
+    fn read<'a>(
+        &'a self,
+        slot: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<NotepadSlot>> + Send + 'a>>;
+
+    /// Create or overwrite one slot. `None` is QD's NULL content, which is what
+    /// a freshly created slot holds until something writes to it.
+    fn write<'a>(
+        &'a self,
+        slot: i64,
+        content: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Every slot this account holds, in any order.
+    fn slots<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<i64>>> + Send + 'a>>;
+
+    fn remove<'a>(&'a self, slot: i64) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+}
+
 /// The built-in `util` plugin: every QD `api://util/...` route that is not
 /// handled by a registered plugin.
 ///
-/// All but one action are pure computation. The exception is `dddd/*`, which
-/// forwards to a DdddOCR server the template names through `_server` — that
-/// forward leaves this process, so it carries the shared guard rather than a
-/// client of this module's own.
+/// All but two actions are pure computation. `dddd/*` forwards to a DdddOCR
+/// server the template names through `_server` — that forward leaves this
+/// process, so it carries the shared guard rather than a client of this
+/// module's own. `toolbox/notepad` is the other: it keeps state across runs, so
+/// it needs a [`NotepadStore`] handed in from outside. Everything else stays
+/// pure, which is why the notepad arrives as an injected dependency rather than
+/// this plugin growing a database of its own.
 pub struct UtilityPlugin {
     manifest: PluginManifest,
     /// Snapshotted at construction, because the executor is built per run from
@@ -327,6 +401,10 @@ pub struct UtilityPlugin {
     /// for the same reason the run policy is — a switch that needs a restart
     /// reads as a switch that does not work.
     policy: OutboundPolicy,
+    /// `None` in the CLI and in most tests, where there is no database to keep
+    /// a notepad in. The action reports that rather than pretending to store
+    /// anything.
+    notepad: Option<Arc<dyn NotepadStore>>,
 }
 
 impl UtilityPlugin {
@@ -340,7 +418,16 @@ impl UtilityPlugin {
                 capabilities: Vec::new(),
             },
             policy,
+            notepad: None,
         }
+    }
+
+    /// Attach the cross-run storage `api://util/toolbox/notepad` writes to. Kept
+    /// separate from [`Self::with_policy`] so the wiring that hands the plugin
+    /// its outbound policy stays one call site the SSRF guard test can pin.
+    pub fn with_notepad(mut self, notepad: Option<Arc<dyn NotepadStore>>) -> Self {
+        self.notepad = notepad;
+        self
     }
 }
 
@@ -950,9 +1037,222 @@ impl Plugin for UtilityPlugin {
                         body: body.into_bytes(),
                     })
                 }
+                // QD 兼容（qd web/handlers/util.py ToolboxNotepadHandler）：模板的
+                // 跨运行状态。槽位是「账号 + id_notepad」两元组，值是一整块文本，
+                // read / write / append 三个动作，而且**不管读写都把当前值当响应体
+                // 返回** —— 模板正是靠这一点把刷新后的 cookie 接回下一次运行。
+                //
+                // 与 QD 只有两处差别，都记在 docs/reference.md：账号取自这次运行
+                // 而不是 URL 里的 email/pwd（模板里不该出现账号密码），以及写入有上限。
+                "toolbox/notepad" => {
+                    notepad_slot_action(self.notepad.as_deref(), request, false).await
+                }
+                "toolbox/notepad/list" => {
+                    notepad_slot_action(self.notepad.as_deref(), request, true).await
+                }
+                // QD also registers `toolbox/<digits>/notepad[/<digits>]`. Its own
+                // POST handler ignores those path segments — it re-reads
+                // `id_notepad` from the query and takes the account from email/pwd
+                // — so there is nothing to port beyond saying which spelling
+                // works. Without this arm the generic message below would read as
+                // if the whole namespace were missing.
+                action if action.starts_with("toolbox/") => bail!(
+                    "unsupported toolbox route: util/{action} \
+                     (util/toolbox/notepad and util/toolbox/notepad/list are the ported \
+                     spellings; pass the slot as id_notepad in the query)"
+                ),
                 action => bail!("plugin action unavailable: util/{action}"),
             }
         })
+    }
+}
+
+/// `api://util/toolbox/notepad` and `api://util/toolbox/notepad/list`, ported
+/// from QD's `ToolboxNotepadHandler` and `ToolboxNotepadListHandler`.
+///
+/// Failures answer as a **400 response carrying QD's own message**, not as an
+/// executor error. QD catches its exception, writes the text and sets 400, so a
+/// template receives a response and its own assertions decide what that means;
+/// bailing would abort the step instead, which is a different outcome for the
+/// same template.
+async fn notepad_slot_action(
+    notepad: Option<&dyn NotepadStore>,
+    request: &PluginRequest,
+    list: bool,
+) -> Result<PluginResponse> {
+    let Some(notepad) = notepad else {
+        // Not a template error: this run has no storage behind it. The CLI has
+        // no database, and saying so beats "action unavailable", which would
+        // read as if the route were never ported.
+        bail!(
+            "plugin action unavailable: util/{} \
+             (no notepad storage is attached to this run)",
+            request.action
+        );
+    };
+    // QD reads every argument the same way whether it arrives as a query or as a
+    // form body, and `merge_form_into_query` has already merged the two before
+    // the call reaches here — so `data=` can be a POST body, which is what QD's
+    // own HAR editor emits.
+    let arg = |name: &str| request.query.get(name).map(String::as_str);
+
+    let flag = arg("f").unwrap_or(if list { "list" } else { "" });
+    if flag.is_empty() {
+        // The two routes spell this message differently in QD, so the two
+        // spellings are kept: which route a template hit is what decides it.
+        return Ok(notepad_error(if list {
+            NOTEPAD_INCOMPLETE_LIST
+        } else {
+            NOTEPAD_INCOMPLETE
+        }));
+    }
+
+    // The slot comes from the query on both routes, which is what QD's own POST
+    // does even when the path form carries one. The defaults differ between the
+    // two routes in QD: the notepad route defaults to slot 1, the list route to
+    // "unassigned", which QD spells -1.
+    let raw_slot = arg("id_notepad").unwrap_or(if list { "" } else { "1" });
+    let slot = if list && raw_slot.is_empty() {
+        -1
+    } else {
+        match raw_slot.parse::<i64>() {
+            Ok(slot) => slot,
+            Err(_) => {
+                // QD's `int(...)` raises here and it writes that exception's
+                // text, which is a Python artifact rather than a contract; this
+                // says the same thing in a form worth reading.
+                return Ok(notepad_error(&format!(
+                    "id_notepad 不是一个整数: {raw_slot}"
+                )));
+            }
+        }
+    };
+
+    if list {
+        return notepad_list_action(notepad, request, flag, slot).await;
+    }
+
+    let stored = match notepad.read(slot).await? {
+        // QD creates slot 1 on first use — the slot a template gets without
+        // asking — and refuses every other missing slot.
+        NotepadSlot::Missing if slot == 1 => {
+            notepad.write(slot, None).await?;
+            None
+        }
+        NotepadSlot::Missing => return Ok(notepad_error("记事本不存在")),
+        NotepadSlot::Stored(content) => content,
+    };
+
+    let data = arg("data").unwrap_or("");
+    // QD tests `write` first and both by substring, so `f=write...` writes and
+    // anything that is not an append — `f=read`, or a flag it does not know —
+    // reads. The order is the behaviour, not an accident.
+    let writing = flag.contains("write");
+    let appending = !writing && flag.contains("append");
+    let body = if writing {
+        data.to_string()
+    } else if appending {
+        // CRLF, and only when something is already stored: a slot QD just
+        // created holds NULL, not "", and appending to it does not start with a
+        // blank line.
+        match &stored {
+            Some(existing) => format!("{existing}\r\n{data}"),
+            None => data.to_string(),
+        }
+    } else {
+        stored.unwrap_or_default()
+    };
+    if writing || appending {
+        if body.len() > NOTEPAD_CONTENT_LIMIT {
+            return Ok(notepad_error(&format!(
+                "记事本内容超过上限, limit: {NOTEPAD_CONTENT_LIMIT}"
+            )));
+        }
+        notepad.write(slot, Some(body.clone())).await?;
+    }
+    // The body is the value *after* the operation, which is the whole point of
+    // the contract: the template extracts the refreshed cookie from the same
+    // step that stored it.
+    Ok(notepad_text(&body))
+}
+
+/// The management route. QD also drives this from a page this repo does not
+/// have, so here it is the only way to create a slot above 1.
+async fn notepad_list_action(
+    notepad: &dyn NotepadStore,
+    request: &PluginRequest,
+    flag: &str,
+    slot: i64,
+) -> Result<PluginResponse> {
+    let mut slots = notepad.slots().await?;
+    slots.sort_unstable();
+    if slots.is_empty() {
+        return Ok(notepad_error("无法获取该用户记事本编号"));
+    }
+    if flag.contains("add") {
+        if slots.len() >= NOTEPAD_LIMIT {
+            return Ok(notepad_error(&format!(
+                "记事本数量超过上限, limit: {NOTEPAD_LIMIT}"
+            )));
+        }
+        // QD turns an absent-or-empty `data` into NULL rather than "".
+        let content = match request.query.get("data").map(String::as_str) {
+            None | Some("") => None,
+            Some(data) => Some(data.to_string()),
+        };
+        let target = if slot == -1 {
+            slots.last().copied().unwrap_or(0) + 1
+        } else if slots.contains(&slot) {
+            return Ok(notepad_error(&format!(
+                "记事本编号已存在, id_notepad: {slot}"
+            )));
+        } else {
+            slot
+        };
+        notepad.write(target, content).await?;
+        return Ok(notepad_text(&format!("添加成功, id_notepad: {target}")));
+    }
+    if flag.contains("delete") {
+        if slot <= 0 {
+            return Ok(notepad_error("id_notepad参数不完整, 请确认"));
+        }
+        if !slots.contains(&slot) {
+            return Ok(notepad_error(&format!(
+                "记事本编号不存在, id_notepad: {slot}"
+            )));
+        }
+        if slot == 1 {
+            return Ok(notepad_error("默认记事本不能删除"));
+        }
+        notepad.remove(slot).await?;
+        return Ok(notepad_text(&format!("删除成功, id_notepad: {slot}")));
+    }
+    if flag.contains("list") {
+        // QD writes the Python list itself, so the body is `[1, 2]`, and a
+        // template that parses this body is parsing that.
+        let rendered = slots
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Ok(notepad_text(&format!("[{rendered}]")));
+    }
+    Ok(notepad_error(NOTEPAD_INCOMPLETE_LIST))
+}
+
+fn notepad_text(body: &str) -> PluginResponse {
+    PluginResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+fn notepad_error(message: &str) -> PluginResponse {
+    PluginResponse {
+        status: 400,
+        headers: BTreeMap::new(),
+        body: message.as_bytes().to_vec(),
     }
 }
 
@@ -1920,5 +2220,348 @@ mod tests {
         };
         let response = plugin.call(&request).await.unwrap();
         assert_eq!(String::from_utf8(response.body).unwrap(), "签到 secret 123");
+    }
+
+    // ---- The notepad: the one `util` route that keeps state across runs ----
+
+    /// An in-memory notepad for the tests that only care about the route.
+    /// `None` content is kept as `None`: the route tells it apart from `""`.
+    #[derive(Debug, Default)]
+    struct MockNotepad {
+        slots: std::sync::Mutex<BTreeMap<i64, Option<String>>>,
+    }
+
+    impl MockNotepad {
+        fn snapshot(&self) -> BTreeMap<i64, Option<String>> {
+            self.slots.lock().unwrap().clone()
+        }
+    }
+
+    impl NotepadStore for MockNotepad {
+        fn read<'a>(
+            &'a self,
+            slot: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<NotepadSlot>> + Send + 'a>> {
+            Box::pin(async move {
+                let content = { self.slots.lock().unwrap().get(&slot).cloned() };
+                Ok(match content {
+                    None => NotepadSlot::Missing,
+                    Some(content) => NotepadSlot::Stored(content),
+                })
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            slot: i64,
+            content: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.slots.lock().unwrap().insert(slot, content);
+                Ok(())
+            })
+        }
+
+        fn slots<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<i64>>> + Send + 'a>> {
+            Box::pin(async move {
+                let slots: Vec<i64> = self.slots.lock().unwrap().keys().copied().collect();
+                Ok(slots)
+            })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            slot: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.slots.lock().unwrap().remove(&slot);
+                Ok(())
+            })
+        }
+    }
+
+    /// One notepad call. The status comes back with the body because QD reports
+    /// a notepad failure as a 400 *response* — a template sees it and its own
+    /// assertions decide what it means.
+    async fn notepad_call(notepad: Option<Arc<MockNotepad>>, url: &str) -> (u16, String) {
+        let handle = notepad.map(|notepad| notepad as Arc<dyn NotepadStore>);
+        let plugin = UtilityPlugin::default().with_notepad(handle);
+        let request = PluginRequest::from_api_url(url).unwrap();
+        let response = plugin.call(&request).await.unwrap();
+        (response.status, String::from_utf8(response.body).unwrap())
+    }
+
+    /// What a QD template actually relies on: the body is the value *after* the
+    /// operation, so the step that stores a refreshed cookie is also the step
+    /// that hands it back for `extract_variables`.
+    #[tokio::test]
+    async fn the_notepad_returns_the_stored_value_from_every_operation() {
+        let notepad = Arc::new(MockNotepad::default());
+
+        // Reading slot 1 before anything wrote it creates it, empty — QD's own
+        // auto-create, and the reason its message is not 「记事本不存在」.
+        let (status, body) =
+            notepad_call(Some(notepad.clone()), "api://util/toolbox/notepad?f=read").await;
+        assert_eq!((status, body.as_str()), (200, ""));
+        assert_eq!(notepad.snapshot(), BTreeMap::from([(1, None)]));
+
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=write&data=cookie%3Da",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "cookie=a"));
+
+        let (status, body) =
+            notepad_call(Some(notepad.clone()), "api://util/toolbox/notepad?f=read").await;
+        assert_eq!((status, body.as_str()), (200, "cookie=a"));
+
+        // Append joins with a CRLF and returns the joined value.
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=append&data=b",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "cookie=a\r\nb"));
+        assert_eq!(
+            notepad.snapshot().get(&1),
+            Some(&Some("cookie=a\r\nb".to_string()))
+        );
+    }
+
+    /// The one place NULL and `""` differ: a slot QD created itself starts
+    /// appending without a leading blank line, and a slot written empty does not.
+    #[tokio::test]
+    async fn appending_to_a_fresh_slot_does_not_start_with_a_blank_line() {
+        let notepad = Arc::new(MockNotepad::default());
+
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=append&data=first",
+        )
+        .await;
+        assert_eq!(body, "first");
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=append&data=second",
+        )
+        .await;
+        assert_eq!(body, "first\r\nsecond");
+
+        // An explicit empty write leaves `""`, not NULL, so the separator is
+        // there on the next append.
+        notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=write&data=",
+        )
+        .await;
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=append&data=x",
+        )
+        .await;
+        assert_eq!(body, "\r\nx");
+    }
+
+    /// QD tests `write` first, and by substring. `f=writeappend` therefore
+    /// writes; the order is the behaviour, not an accident.
+    #[tokio::test]
+    async fn write_wins_when_the_flag_says_both() {
+        let notepad = Arc::new(MockNotepad::default());
+        notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=write&data=first",
+        )
+        .await;
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=writeappend&data=second",
+        )
+        .await;
+        assert_eq!(body, "second");
+    }
+
+    /// QD creates slot 1 on demand and refuses every other missing slot, with
+    /// that message and as a response rather than a dead run.
+    #[tokio::test]
+    async fn only_slot_one_is_created_on_demand() {
+        let notepad = Arc::new(MockNotepad::default());
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?id_notepad=2&f=read",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (400, "记事本不存在"));
+        assert!(notepad.snapshot().is_empty(), "the refusal created a slot");
+
+        // `f` is required, and that is checked before the slot is.
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?id_notepad=3",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (400, "参数不完整，请确认"));
+    }
+
+    /// QD authenticates this route with `email`/`pwd` arguments. This port takes
+    /// the account from the run, so they are neither required nor read: a
+    /// migrated template that carries them keeps working, one without them works
+    /// too, and the password never has to sit inside a template.
+    #[tokio::test]
+    async fn the_account_never_comes_from_the_url() {
+        let notepad = Arc::new(MockNotepad::default());
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?email=a%40b.c&pwd=hunter2&f=write&data=secret",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "secret"));
+        assert_eq!(
+            notepad.snapshot().get(&1),
+            Some(&Some("secret".to_string()))
+        );
+        // Nothing from the URL but the stored value comes back: the response is
+        // the body a template extracts into a variable, and a credential in it
+        // would be a credential in the run log.
+        assert!(!body.contains("hunter2"));
+    }
+
+    /// The management route, which is also the only way a *run* can create a slot
+    /// above 1: the notepad page can make one for a person, but a template has
+    /// only this route.
+    #[tokio::test]
+    async fn the_notepad_list_route_adds_and_deletes_slots() {
+        let notepad = Arc::new(MockNotepad::default());
+
+        // Nothing yet: QD cannot name a slot for an account that has none, and
+        // this route cannot create the first one either — QD's notepad page does
+        // that, and here the notepad route's own first read does.
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=list",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (400, "无法获取该用户记事本编号"));
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=add&data=a",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (400, "无法获取该用户记事本编号"));
+
+        notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad?f=write&data=a",
+        )
+        .await;
+        assert_eq!(notepad.snapshot(), BTreeMap::from([(1, Some("a".into()))]));
+        // `f` defaults to `list` on this route, and add numbers the slot itself.
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=add&data=b",
+        )
+        .await;
+        assert_eq!(body, "添加成功, id_notepad: 2");
+        // QD writes its own Python list here, so the body is `[1, 2]`.
+        let (_, body) =
+            notepad_call(Some(notepad.clone()), "api://util/toolbox/notepad/list").await;
+        assert_eq!(body, "[1, 2]");
+
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=add&id_notepad=2&data=c",
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (400, "记事本编号已存在, id_notepad: 2")
+        );
+
+        // Slot 1 is what a template gets without asking, so it stays.
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=delete&id_notepad=1",
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (400, "默认记事本不能删除"));
+        let (_, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=delete&id_notepad=2",
+        )
+        .await;
+        assert_eq!(body, "删除成功, id_notepad: 2");
+        assert_eq!(
+            notepad.snapshot().keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// The slot cap is QD's `NOTEPAD_LIMIT`, enforced where QD enforces it: on
+    /// the add, not on a read.
+    #[tokio::test]
+    async fn the_notepad_refuses_a_slot_past_the_limit() {
+        let notepad = Arc::new(MockNotepad::default());
+        // The list route cannot create the first slot, so the first read does.
+        notepad_call(Some(notepad.clone()), "api://util/toolbox/notepad?f=read").await;
+        for _ in 2..=NOTEPAD_LIMIT {
+            let (status, body) = notepad_call(
+                Some(notepad.clone()),
+                "api://util/toolbox/notepad/list?f=add&data=x",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+        }
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            "api://util/toolbox/notepad/list?f=add",
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body, format!("记事本数量超过上限, limit: {NOTEPAD_LIMIT}"));
+    }
+
+    /// QD puts no bound on the stored text; this port does, so one template
+    /// cannot fill the database through one slot.
+    #[tokio::test]
+    async fn the_notepad_refuses_content_past_its_limit() {
+        let notepad = Arc::new(MockNotepad::default());
+        let oversized = "x".repeat(NOTEPAD_CONTENT_LIMIT + 1);
+        let (status, body) = notepad_call(
+            Some(notepad.clone()),
+            &format!("api://util/toolbox/notepad?f=write&data={oversized}"),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(
+            body,
+            format!("记事本内容超过上限, limit: {NOTEPAD_CONTENT_LIMIT}")
+        );
+        // The slot QD creates on first use is still there — that happens before
+        // the flag is read, which is QD's own order — but the oversized value is
+        // not.
+        assert_eq!(notepad.snapshot(), BTreeMap::from([(1, None)]));
+    }
+
+    /// A run whose executor was built without storage — the CLI, and any test
+    /// that does not ask for one. Saying so beats "action unavailable", which
+    /// would read as if the route had never been ported.
+    #[tokio::test]
+    async fn without_storage_the_notepad_says_nothing_is_attached() {
+        let plugin = UtilityPlugin::default();
+        let request = PluginRequest::from_api_url("api://util/toolbox/notepad?f=read").unwrap();
+        let error = plugin.call(&request).await.unwrap_err().to_string();
+        assert!(error.contains("no notepad storage is attached"), "{error}");
+    }
+
+    /// QD also registers `toolbox/<digits>/notepad[/<digits>]`. Its own POST
+    /// ignores those path segments, so there is nothing to port beyond saying
+    /// which spelling works.
+    #[tokio::test]
+    async fn the_per_user_path_spelling_says_which_one_to_use() {
+        let plugin = UtilityPlugin::default();
+        let request = PluginRequest::from_api_url("api://util/toolbox/1/notepad/2?f=read").unwrap();
+        let error = plugin.call(&request).await.unwrap_err().to_string();
+        assert!(error.contains("unsupported toolbox route"), "{error}");
+        assert!(error.contains("util/toolbox/notepad"), "{error}");
     }
 }

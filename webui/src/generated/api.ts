@@ -417,6 +417,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/notepads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listNotepads"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notepads/{notepad_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notepad_id: components["parameters"]["NotepadId"];
+            };
+            cookie?: never;
+        };
+        get: operations["getNotepad"];
+        put: operations["setNotepad"];
+        post?: never;
+        delete: operations["deleteNotepad"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/public-templates": {
         parameters: {
             query?: never;
@@ -1598,6 +1632,10 @@ export interface components {
              */
             default_locale: "zh-CN" | "en-US";
         };
+        SetNotepad: {
+            /** @description The whole new value for this slot, up to the page's edit limit */
+            content: string;
+        };
     };
     responses: {
         /** @description Authenticated session */
@@ -1679,6 +1717,7 @@ export interface components {
         CsrfToken: string;
         RunId: number;
         SubscriptionId: number;
+        NotepadId: number;
     };
     requestBodies: {
         CreateTask: {
@@ -1829,6 +1868,11 @@ export interface components {
         DecidePushRequest: {
             content: {
                 "application/json": components["schemas"]["DecidePushRequest"];
+            };
+        };
+        SetNotepad: {
+            content: {
+                "application/json": components["schemas"]["SetNotepad"];
             };
         };
     };
@@ -2611,6 +2655,94 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             422: components["responses"]["ValidationError"];
+        };
+    };
+    listNotepads: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The caller's notepad slots, in slot order, each with a preview and a size */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNotepad: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notepad_id: components["parameters"]["NotepadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One notepad slot's whole value */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    setNotepad: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notepad_id: components["parameters"]["NotepadId"];
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["SetNotepad"];
+        responses: {
+            /** @description Notepad slot overwritten */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Notepad slot created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            422: components["responses"]["ValidationError"];
+        };
+    };
+    deleteNotepad: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notepad_id: components["parameters"]["NotepadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Notepad slot deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listPublicTemplates: {

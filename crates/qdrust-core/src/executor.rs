@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::{
     expression::QdExpressionEngine,
-    plugin::{Plugin, PluginRegistry, UtilityPlugin},
+    plugin::{NotepadStore, Plugin, PluginRegistry, UtilityPlugin},
     qd_har::{QdBlock, QdHarEntry, QdHarRequest, QdNameValue, QdPostData, QdProgram, QdRule},
     template::{RequestBody, RequestStep, Step, TemplateDefinition},
 };
@@ -66,6 +66,11 @@ pub struct ExecutorOptions {
     pub loop_limit: usize,
     /// Optional HTTP/SOCKS5 proxy URL applied to outbound requests.
     pub proxy: Option<String>,
+    /// Storage for the built-in `util` plugin's `toolbox/notepad` action, which
+    /// is the one route in that plugin that keeps state across runs. The server
+    /// attaches a per-account handle; the CLI and most tests leave it `None`,
+    /// and the action then reports that nothing is attached.
+    pub notepad: Option<Arc<dyn NotepadStore>>,
 }
 
 impl Default for ExecutorOptions {
@@ -79,6 +84,7 @@ impl Default for ExecutorOptions {
             request_limit: DEFAULT_REQUEST_LIMIT,
             loop_limit: MAX_LOOP_ITERATIONS,
             proxy: None,
+            notepad: None,
         }
     }
 }
@@ -210,8 +216,12 @@ impl QdExecutor {
         let mut plugins = PluginRegistry::default();
         // The built-in plugin is handed the same policy. Its DdddOCR forward
         // leaves this process, and a second copy of the switches is exactly how
-        // that forward ends up unguarded while everything else is guarded.
-        plugins.register(Arc::new(UtilityPlugin::with_policy(policy.clone())))?;
+        // that forward ends up unguarded while everything else is guarded. The
+        // notepad handle rides along for the same class of reason: the plugin
+        // cannot reach a store of its own.
+        plugins.register(Arc::new(
+            UtilityPlugin::with_policy(policy.clone()).with_notepad(options.notepad.clone()),
+        ))?;
         Ok(Self {
             cookies: Arc::new(Jar::default()),
             policy,
@@ -2422,7 +2432,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        plugin::{PLUGIN_API_VERSION, PluginManifest, PluginRequest, PluginResponse},
+        plugin::{NotepadSlot, PLUGIN_API_VERSION, PluginManifest, PluginRequest, PluginResponse},
         qd_har::{QdHar, QdProgram},
     };
 
@@ -3065,6 +3075,85 @@ mod tests {
             "extract_variables": [{"name": "echoed", "re": "echo:(.+)", "from": "content"}]
         }]}}))
         .unwrap()
+    }
+
+    /// A notepad that records what a run wrote, so the wiring from
+    /// `ExecutorOptions` into the built-in plugin is asserted rather than
+    /// assumed: the plugin's own tests prove the route works once a store
+    /// reaches it, and this proves one does.
+    #[derive(Debug, Default)]
+    struct RecordingNotepad {
+        written: std::sync::Mutex<Option<(i64, Option<String>)>>,
+    }
+
+    impl NotepadStore for RecordingNotepad {
+        fn read<'a>(
+            &'a self,
+            _slot: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<NotepadSlot>> + Send + 'a>> {
+            Box::pin(async move { Ok(NotepadSlot::Stored(Some("stored".into()))) })
+        }
+
+        fn write<'a>(
+            &'a self,
+            slot: i64,
+            content: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                *self.written.lock().unwrap() = Some((slot, content));
+                Ok(())
+            })
+        }
+
+        fn slots<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<Vec<i64>>> + Send + 'a>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            _slot: i64,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// Both halves of the contract a template keeping state across runs uses:
+    /// the write lands in the store, and a read comes back as a variable the
+    /// next step — or the next run — can spend.
+    #[tokio::test]
+    async fn a_notepad_step_reaches_the_store_wired_through_the_options() {
+        let notepad = Arc::new(RecordingNotepad::default());
+        let executor = QdExecutor::with_options(ExecutorOptions {
+            notepad: Some(notepad.clone() as Arc<dyn NotepadStore>),
+            ..ExecutorOptions::default()
+        })
+        .unwrap();
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [
+            {
+                "checked": true,
+                "request": {"method": "GET", "url": "api://util/toolbox/notepad?f=read&id_notepad=1"},
+                "extract_variables": [{"name": "cookie", "re": "^(.+)$", "from": "content"}]
+            },
+            {
+                "checked": true,
+                "request": {"method": "GET", "url": "api://util/toolbox/notepad?f=write&id_notepad=1&data=refreshed"},
+                "success_asserts": [{"re": "refreshed", "from": "content"}]
+            }
+        ]}}))
+        .unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor
+            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(context.variables.get("cookie"), Some(&json!("stored")));
+        assert_eq!(
+            *notepad.written.lock().unwrap(),
+            Some((1, Some("refreshed".to_string())))
+        );
     }
 
     #[tokio::test]

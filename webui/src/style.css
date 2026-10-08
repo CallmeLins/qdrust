@@ -1403,3 +1403,51 @@ th.sortable .sort-idle { opacity: 0.3; }
 .templates-table td.row-actions .icon-button,
 .library-table td.row-actions .icon-button { margin-left: 6px; }
 
+/* ---------- notepad ---------- */
+/* The slot list stays narrow — it shows a preview per slot, and the editor
+   takes the rest of the width. One column below 800px, matching the layout
+   breakpoint used elsewhere. */
+.notepad-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+  padding-top: 18px;
+}
+.notepad-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.notepad-blank { padding: 4px 0 10px; }
+.notepad-blank p { margin: 0 0 6px; }
+.notepad-item {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink); font: inherit; text-align: left; cursor: pointer;
+}
+.notepad-item:hover { border-color: var(--primary); background: var(--surface-strong); }
+.notepad-item.active { border-color: var(--primary); background: var(--accent-glow); }
+.notepad-item-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+/* The stored value may be megabytes of cookie; the list shows its head only. */
+.notepad-item-preview {
+  display: block; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-3); font-size: 12px;
+}
+.notepad-new { justify-content: center; }
+.notepad-editor { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.notepad-field { display: flex; flex-direction: column; gap: 6px; color: var(--ink-2); }
+.notepad-field textarea {
+  width: 100%; padding: 12px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface); color: var(--ink);
+  font-family: var(--font-mono); font-size: 13px; line-height: 1.6;
+  resize: vertical;
+}
+.notepad-field textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow); outline: none; }
+.notepad-actions { display: flex; align-items: center; gap: 10px; }
+/* Delete is the one destructive action here, so it sits apart from save/cancel. */
+.notepad-actions .icon-button { margin-left: auto; }
+@media (max-width: 800px) {
+  .notepad-layout { grid-template-columns: minmax(0, 1fr); }
+}
+

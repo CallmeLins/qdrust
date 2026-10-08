@@ -4,7 +4,10 @@ use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
     executor::{CancellationToken, ExecutionContext, ExecutorOptions, QdExecutor, StepResult},
-    plugin::{PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, SubprocessPlugin},
+    plugin::{
+        NotepadSlot, NotepadStore, PLUGIN_API_VERSION, Plugin,
+        PluginManifest as CorePluginManifest, SubprocessPlugin,
+    },
     qd_har::{QdHar, QdProgram},
     template::Step,
 };
@@ -307,12 +310,14 @@ async fn execute_with_run(
             // Plugins are resolved per run so an edit or a disable takes effect
             // on the next execution without a restart.
             let plugins = load_plugins(&store, task.id, browser).await;
+            let notepad = load_notepad(&store, task.id).await;
             let outcome = execute_template(
                 template.clone(),
                 &cancellation,
                 &variables,
                 policy,
                 &plugins,
+                notepad,
             )
             .await;
             supervisor.abort();
@@ -752,6 +757,91 @@ pub(crate) async fn load_plugins_for_owner(
     plugins
 }
 
+/// One account's notepad — the storage `api://util/toolbox/notepad` reads and
+/// writes.
+///
+/// The account is fixed here rather than taken from the request because QD's
+/// own route identifies the user with `email`/`pwd` arguments, which would put
+/// the account password inside the template. A run already belongs to an
+/// account; that is the only identity this needs.
+pub(crate) struct OwnerNotepad {
+    store: Store,
+    owner: i64,
+}
+
+impl OwnerNotepad {
+    pub(crate) fn new(store: Store, owner: i64) -> Self {
+        Self { store, owner }
+    }
+}
+
+/// `Store` holds a connection pool and is not `Debug`, which the plugin's
+/// options require. The account is the part worth naming in a diagnostic and it
+/// is not a secret.
+impl std::fmt::Debug for OwnerNotepad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OwnerNotepad(owner={})", self.owner)
+    }
+}
+
+impl NotepadStore for OwnerNotepad {
+    fn read<'a>(
+        &'a self,
+        slot: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<NotepadSlot>> + Send + 'a>>
+    {
+        Box::pin(async move { self.store.notepad_slot(self.owner, slot).await })
+    }
+
+    fn write<'a>(
+        &'a self,
+        slot: i64,
+        content: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store
+                .notepad_write(self.owner, slot, content.as_deref())
+                .await
+        })
+    }
+
+    fn slots<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<i64>>> + Send + 'a>>
+    {
+        Box::pin(async move { self.store.notepad_slots(self.owner).await })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        slot: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.store
+                .notepad_remove(self.owner, slot)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+/// The notepad a run of this task gets: its owner's, or `None` when the owner
+/// cannot be resolved — in which case the action says nothing is attached rather
+/// than writing to a guessed account.
+async fn load_notepad(store: &Store, task_id: i64) -> Option<Arc<dyn NotepadStore>> {
+    match store.task_owner_id(task_id).await {
+        Ok(Some(owner)) => Some(Arc::new(OwnerNotepad {
+            store: store.clone(),
+            owner,
+        }) as Arc<dyn NotepadStore>),
+        Ok(None) => None,
+        Err(err) => {
+            warn!(task_id, %err, "cannot resolve task owner for the notepad");
+            None
+        }
+    }
+}
+
 fn build_plugin(manifest: &PluginManifest, plugin_id: &str) -> anyhow::Result<Arc<dyn Plugin>> {
     let capabilities =
         crate::model::plugin_capabilities(&manifest.config).map_err(|err| anyhow::anyhow!(err))?;
@@ -774,6 +864,7 @@ pub(crate) async fn execute_template(
     variables: &BTreeMap<String, Value>,
     policy: RunPolicy,
     plugins: &[Arc<dyn Plugin>],
+    notepad: Option<Arc<dyn NotepadStore>>,
 ) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
     // The one place a run's executor is built, so a policy knob cannot be
     // honoured on one path (a QD template) and quietly ignored on the other
@@ -783,6 +874,7 @@ pub(crate) async fn execute_template(
         timeout: policy.request_timeout,
         allow_private_network: policy.allow_private_network,
         allow_invalid_certificates: policy.allow_invalid_certificates,
+        notepad,
         ..ExecutorOptions::default()
     })?;
     for plugin in plugins {
@@ -1036,6 +1128,7 @@ mod tests {
             &BTreeMap::new(),
             policy(false),
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -1093,6 +1186,7 @@ mod tests {
             &BTreeMap::new(),
             policy(false),
             &[],
+            None,
         )
         .await
         .unwrap_err()
@@ -1108,6 +1202,7 @@ mod tests {
             &BTreeMap::new(),
             policy(true),
             &[],
+            None,
         )
         .await
         .expect("with the flag on the same template must go through");
@@ -1275,6 +1370,7 @@ mod tests {
             &BTreeMap::new(),
             policy(true),
             &[],
+            None,
         )
         .await
         .expect_err("a self-signed certificate must not be accepted by default");
@@ -1298,6 +1394,7 @@ mod tests {
             &BTreeMap::new(),
             policy_accepting_invalid_certs(true),
             &[],
+            None,
         )
         .await
         .expect("with the certificate switch on the same template must go through");
@@ -1397,6 +1494,7 @@ mod tests {
             &BTreeMap::new(),
             policy(false),
             &plugins,
+            None,
         )
         .await
         .unwrap();
@@ -1418,6 +1516,7 @@ mod tests {
             &BTreeMap::new(),
             policy(false),
             &[],
+            None,
         )
         .await
         .unwrap_err()

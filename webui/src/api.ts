@@ -36,6 +36,25 @@ export type BatchTaskResult = components["schemas"]["BatchTaskResult"];
 export type QdHarValidation = components["schemas"]["QdHarValidation"];
 export type TemplateTestResult = components["schemas"]["TemplateTestResult"];
 
+/** One notepad slot as the list returns it.
+ *
+ *  A preview and a size rather than the stored value: a slot may hold megabytes
+ *  because a template wrote it, and the page shows one line per slot. Opening a
+ *  slot fetches its whole value instead. */
+export interface NotepadSummary {
+  notepad_id: number;
+  content_size: number;
+  preview: string;
+  updated_at: number;
+}
+
+/** One slot's whole value, which is what the editor loads when it is opened. */
+export interface NotepadSlot {
+  notepad_id: number;
+  content: string;
+  content_size: number;
+}
+
 /** Paginated response returned by GET /api/v1/templates */
 export interface TemplatePage {
   items: Template[];
@@ -273,6 +292,17 @@ export const api = {
   updatePlugin: (id: number, enabled: boolean) => request<Plugin>(`/api/v1/plugins/${id}`, { method: "PUT", body: JSON.stringify({ enabled }) }),
   deletePlugin: (id: number) => request<void>(`/api/v1/plugins/${id}`, { method: "DELETE" }),
   invokePlugin: (id: number, action: string, query: Record<string, string>) => request<unknown>(`/api/v1/plugins/${id}/invoke`, { method: "POST", body: JSON.stringify({ action, query }) }),
+
+  // ---- notepads ----
+  /** The caller's slots, in slot order. Holds previews, not the values. */
+  notepads: () => request<NotepadSummary[]>("/api/v1/notepads"),
+  /** One slot's whole value — what the editor opens with. */
+  notepad: (slot: number) => request<NotepadSlot>(`/api/v1/notepads/${slot}`),
+  /** Save one slot. Writing a slot that does not exist creates it, which is how
+   *  the page makes a new one; the server answers 201 for that and 200 for an
+   *  overwrite, and nothing here needs to tell the two apart. */
+  setNotepad: (slot: number, content: string) => request<{ notepad_id: number; content_size: number }>(`/api/v1/notepads/${slot}`, { method: "PUT", body: JSON.stringify({ content }) }),
+  deleteNotepad: (slot: number) => request<void>(`/api/v1/notepads/${slot}`, { method: "DELETE" }),
 
   // ---- notifications ----
   notificationChannels: () => request<NotificationChannel[]>("/api/v1/notification-channels"),

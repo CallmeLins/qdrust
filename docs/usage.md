@@ -73,6 +73,26 @@ cargo run -p qdrust-cli -- validate .\template.har.json
 4. 模板页提供两种导入来源：从本地导入 QD HAR，或从订阅的模板库里挑（见[订阅模板库](#订阅模板库汇总与预览)）；挑选是先预览、保存才入库。本站公开模板经 PushRequest 审批后发布。
 > 任务只保存「模板 + 变量 + 调度」，任务列表仅展示任务名——请求方法与 URL 在列表里既冗余又难扫读，需要时到任务详情里看（那里仍会镜像模板首条请求）。早于该规则的存量任务（未绑定模板、自带一条请求）编辑时仍会保留「（无模板）」选项与其原有请求。
 
+### 模板怎么跨运行记住状态
+
+任务的**变量表**是运行期的只读种子：模板能读它，跑完不会把新值写回。要让模板自己记住东西（QD 里最常见的就是 cookie 滑动续期，其次是记页码、累计次数、去重 id），用 `api://util/toolbox/notepad` —— 和 QD 同一个接口、同一套参数。
+
+```text
+读：api://util/toolbox/notepad?f=read&id_notepad=1
+写：api://util/toolbox/notepad?f=write&id_notepad=1&data={{新值}}
+追加：api://util/toolbox/notepad?f=append&id_notepad=1&data={{新值}}
+```
+
+要点：
+
+- **不管读写，响应体都是操作之后的当前值**。所以 `f=write` 那一步既存下了新值，又能被 `extract_variables` 提取出来给后面的步骤用——一个步骤顶两步，「存」和「取」不会对不上。
+- **槽位默认是 1，第一次读它就会自动创建**，不用担心首次运行槽位不存在。其它槽位缺失会报「记事本不存在」；要在槽位 2 以上存东西，先在**记事本页面**上新建，或让模板用 `api://util/toolbox/notepad/list?f=add` 建出来。
+- 一个账号最多 20 个槽位，单个槽位最多 5 MiB。
+- **账号取自这次运行**，不读 URL 里的 `email`/`pwd`。QD 模板带着这两个参数也能跑，但它们不会被使用——不必为了迁移把账号密码写进模板。
+- **「测试」按钮跑模板一样会写状态**。测试走的是调度器同一条执行路径，所以试跑一个续期 cookie 的模板，用的就是那份真实槽位。要试而不改，先把 `f=write` / `f=append` 那几步的 `f` 改成 `read`。
+
+完整语义（`append` 的 CRLF 规则、`list` 路由的响应格式、与 QD 的三处差异）见[参考 · 记事本](reference.md#记事本utiltoolboxnotepad)。
+
 ## 可视化 HAR 编辑器
 
 WebUI 提供可视化编辑器，可直接增删改请求、设置请求头 / 表单 / 鉴权、编写 `success_asserts` 与 `extract_variables`，无需手改 JSON。

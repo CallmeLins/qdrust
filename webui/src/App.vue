@@ -2,10 +2,10 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
-  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
+  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -143,7 +143,7 @@ const showLocalForm = computed(
     (authMode.value === "login" || authMode.value === "bootstrap" || authMode.value === "register"),
 );
 
-const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notifications" | "push" | "admin" | "settings">("tasks");
+const view = ref<"tasks" | "taskRuns" | "templates" | "plugins" | "notepads" | "notifications" | "push" | "admin" | "settings">("tasks");
 const menuOpen = ref(false);
 const showCreate = ref(false);
 const showImport = ref(false);
@@ -151,6 +151,7 @@ const showHelp = ref(false);
 
 const currentViewName = computed(() => ({
   tasks: t("tasks"), taskRuns: t("runHistory"), templates: t("templates"), plugins: t("pluginsTitle"),
+  notepads: t("notepadsTitle"),
   notifications: t("notificationsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
@@ -1084,6 +1085,97 @@ async function invokePlugin(plugin: Plugin) {
   try {
     const query = JSON.parse(invokeForm.query) as Record<string, string>;
     pluginResult.value = JSON.stringify(await api.invokePlugin(plugin.id, invokeForm.action, query), null, 2);
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+
+// ---------- notepads ----------
+// The slots a template keeps state in, through `api://util/toolbox/notepad`.
+// This page is the only way to read them back: without it, whatever a template
+// stored — usually a refreshed cookie — is only visible through the head of a
+// step name in the run log.
+const notepads = ref<NotepadSummary[]>([]);
+/** The slot the editor is showing, or null when none is open. A number that is
+ *  not in `notepads` is the unsaved "new slot" the user just asked for. */
+const notepadSelected = ref<number | null>(null);
+/** The editor's buffer, and the value it was loaded with, so "is there anything
+ *  to save" is a comparison rather than a flag someone has to remember to clear. */
+const notepadContent = ref("");
+const notepadLoaded = ref("");
+const notepadDirty = computed(() => notepadContent.value !== notepadLoaded.value);
+/** What "new slot" offers: one past the highest in use. The server is what
+ *  actually enforces the slot cap, so a number past it is refused on save with
+ *  the server's own sentence rather than a second copy of the rule here. */
+const nextNotepadSlot = computed(() =>
+  notepads.value.length === 0 ? 1 : Math.max(...notepads.value.map((slot) => slot.notepad_id)) + 1
+);
+
+async function openNotepads() {
+  view.value = "notepads";
+  try {
+    notepads.value = await api.notepads();
+    // A slot deleted in another tab must not stay in the editor: the next save
+    // would silently recreate it.
+    if (notepadSelected.value != null && !notepads.value.some((slot) => slot.notepad_id === notepadSelected.value)) {
+      notepadSelected.value = null;
+      notepadContent.value = "";
+      notepadLoaded.value = "";
+    }
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+/** Load one slot into the editor. Does not ask about unsaved edits — callers
+ *  that can lose them go through `openNotepadSlot`. */
+async function selectNotepad(slot: number) {
+  try {
+    const loaded = await api.notepad(slot);
+    notepadSelected.value = slot;
+    notepadContent.value = loaded.content;
+    notepadLoaded.value = loaded.content;
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+function openNotepadSlot(slot: number) {
+  if (slot === notepadSelected.value) return;
+  if (notepadDirty.value && !window.confirm(t("notepadDiscard"))) return;
+  void selectNotepad(slot);
+}
+function newNotepad() {
+  if (notepadDirty.value && !window.confirm(t("notepadDiscard"))) return;
+  // Nothing is written yet: the server creates a slot on its first write, so a
+  // new slot the user never saves leaves no row behind.
+  notepadSelected.value = nextNotepadSlot.value;
+  notepadContent.value = "";
+  notepadLoaded.value = "";
+}
+/** Throw away the edits: re-read the slot, or blank the editor when the slot is
+ *  one that has not been created yet. */
+async function resetNotepad() {
+  const slot = notepadSelected.value;
+  if (slot == null) return;
+  if (notepads.value.some((entry) => entry.notepad_id === slot)) {
+    await selectNotepad(slot);
+  } else {
+    notepadContent.value = "";
+    notepadLoaded.value = "";
+  }
+}
+async function saveNotepad() {
+  const slot = notepadSelected.value;
+  if (slot == null) return;
+  try {
+    await api.setNotepad(slot, notepadContent.value);
+    notepadLoaded.value = notepadContent.value;
+    await openNotepads();
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function removeNotepad(slot: number) {
+  if (!window.confirm(fmt("notepadDeleteConfirm", { n: slot }))) return;
+  try {
+    await api.deleteNotepad(slot);
+    if (notepadSelected.value === slot) {
+      notepadSelected.value = null;
+      notepadContent.value = "";
+      notepadLoaded.value = "";
+    }
+    await openNotepads();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
@@ -2152,6 +2244,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <a :class="['nav-link', { active: view === 'tasks' }]" href="#" @click.prevent="view='tasks'"><LayoutDashboard :size="18" />{{ t('tasks') }}</a>
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
+        <a :class="['nav-link', { active: view === 'notepads' }]" href="#" @click.prevent="openNotepads"><NotebookPen :size="18" />{{ t('notepads') }}</a>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
         <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
@@ -2615,6 +2708,55 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <button class="icon-button" :title="t('deletePlugin')" @click="removePlugin(plugin.id, plugin.name)"><Trash2 :size="16" /></button>
           </div>
           <pre v-if="pluginResult" class="result-pre"><code>{{ pluginResult }}</code></pre>
+        </section>
+      </div>
+
+      <!-- ===== NOTEPADS ===== -->
+      <div v-else-if="view === 'notepads'" class="page">
+        <section class="page-heading">
+          <div><h1>{{ t('notepadsTitle') }}</h1><p>{{ t('notepadsHint') }}</p></div>
+          <div class="heading-actions">
+            <button class="secondary-button" @click="openNotepads"><RefreshCw :size="16" />{{ t('refresh') }}</button>
+          </div>
+        </section>
+        <section class="task-section notepad-layout">
+          <aside class="notepad-list">
+            <div v-if="notepads.length === 0" class="notepad-blank">
+              <p>{{ t('notepadEmpty') }}</p>
+              <p class="muted">{{ t('notepadEmptyHint') }}</p>
+            </div>
+            <button
+              v-for="slot in notepads"
+              :key="slot.notepad_id"
+              type="button"
+              :class="['notepad-item', { active: notepadSelected === slot.notepad_id }]"
+              @click="openNotepadSlot(slot.notepad_id)"
+            >
+              <span class="notepad-item-head">
+                <strong>{{ fmt('notepadSlot', { n: slot.notepad_id }) }}</strong>
+                <span class="muted">{{ slot.content_size }} {{ t('notepadBytes') }} · {{ formatRunTime(slot.updated_at) }}</span>
+              </span>
+              <code class="notepad-item-preview">{{ slot.preview || t('none') }}</code>
+            </button>
+            <button class="secondary-button notepad-new" type="button" @click="newNotepad">
+              <Plus :size="16" />{{ t('notepadNewSlot') }}
+            </button>
+          </aside>
+
+          <div class="notepad-editor">
+            <p v-if="notepadSelected === null" class="muted">{{ t('notepadSelect') }}</p>
+            <template v-else>
+              <label class="notepad-field">
+                <span>{{ fmt('notepadSlot', { n: notepadSelected }) }}</span>
+                <textarea v-model="notepadContent" rows="14" spellcheck="false"></textarea>
+              </label>
+              <div class="notepad-actions">
+                <button class="primary-button" type="button" :disabled="!notepadDirty" @click="saveNotepad">{{ t('save') }}</button>
+                <button class="secondary-button" type="button" :disabled="!notepadDirty" @click="resetNotepad">{{ t('cancel') }}</button>
+                <button class="icon-button" type="button" :title="t('notepadDeleteSlot')" @click="removeNotepad(notepadSelected)"><Trash2 :size="16" /></button>
+              </div>
+            </template>
+          </div>
         </section>
       </div>
 

@@ -43,7 +43,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 - `crates/qdrust-server`：基于 Axum、SQLx 和 SQLite/MySQL 的 API、认证、调度与运行管理。
 - `webui`：基于 Vue 3、TypeScript 和 Vite 的 WebUI。
 
-服务端覆盖：用户认证与会话（开放注册、忘记/重置密码、邮箱验证、CSRF 轮换）、管理员 API（用户管理、站点设置、日志清理、备份/恢复）、模板（搜索/分组/分页、可视化 HAR 编辑器、公共发布审批 PushRequest、订阅仓库自动导入）、任务（分组/批量操作、可视化调度器含随机延迟、模板变量预填）、运行记录与步骤（QD 风格运行日志、运行历史与清空）、WebSocket 实时步骤流（运行 + 订阅进度）、租约恢复、插件系统、通知、可选 Redis 会话缓存、GA 注入、运行时配置热更新以及 OpenAPI。所有用户资源均在服务端执行归属校验。
+服务端覆盖：用户认证与会话（开放注册、忘记/重置密码、邮箱验证、CSRF 轮换）、管理员 API（用户管理、站点设置、日志清理、备份/恢复）、模板（搜索/分组/分页、可视化 HAR 编辑器、公共发布审批 PushRequest、订阅仓库自动导入）、任务（分组/批量操作、可视化调度器含随机延迟、模板变量预填）、运行记录与步骤（QD 风格运行日志、运行历史与清空）、WebSocket 实时步骤流（运行 + 订阅进度）、租约恢复、插件系统、通知、可选 Redis 会话缓存、GA 注入、模板跨运行状态与记事本页面（`api://util/toolbox/notepad`，以及 Web 侧查看/编辑/删除槽位）、运行时配置热更新以及 OpenAPI。所有用户资源均在服务端执行归属校验。
 
 ---
 
@@ -104,7 +104,7 @@ qdrust 不导入旧 QD 数据库，不复用旧登录 Cookie，也不承诺兼�
 
 Phase 0-8 代码与容器已实现完成（Phase 8 状态为 Implementation Complete）；发布前仍待完成浏览器人工验收与首个镜像（amd64 / arm64）发布检查。详见 [运维与发版](docs/operations.md)。
 
-**已知未实现**：旧 QD 的「记事本」与 Web「工具箱」页面 —— 两者都是 QD Web 页面上的功能，模板侧的 `api://util/toolbox/*` 命名空间也因此没有注册；依赖它的 QD 模板（常见于跨运行保存状态，例如滑动续期 cookie）会以 `plugin action unavailable` 失败，需要改造，见[常见问题](docs/faq.md)。记事本是[立项范围](docs/reference.md)里目前唯一没有落地的能力。
+**已知未实现**：旧 QD 的 Web「工具箱」页面本身 —— 一个聚合入口。它包含的四件事在这里各有落点：推送注册与推送设置在[通知](docs/usage.md)页面、自定义推送是 `custom_http` 渠道、总日志是运行记录列表，能力都在，只是没有 QD 那一个入口页面。**记事本两侧都已就位**：模板侧 `api://util/toolbox/notepad`，Web 侧见[参考 · 记事本页面](docs/reference.md#记事本页面)。
 
 ---
 

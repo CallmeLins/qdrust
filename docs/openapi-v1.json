@@ -717,6 +717,62 @@
         }
       }
     },
+    "/api/v1/notepads": {
+      "get": {
+        "operationId": "listNotepads",
+        "responses": {
+          "200": {
+            "description": "The caller's notepad slots, in slot order, each with a preview and a size"
+          }
+        }
+      }
+    },
+    "/api/v1/notepads/{notepad_id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/NotepadId"
+        }
+      ],
+      "get": {
+        "operationId": "getNotepad",
+        "responses": {
+          "200": {
+            "description": "One notepad slot's whole value"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "operationId": "setNotepad",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/SetNotepad"
+        },
+        "responses": {
+          "200": {
+            "description": "Notepad slot overwritten"
+          },
+          "201": {
+            "description": "Notepad slot created"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteNotepad",
+        "responses": {
+          "204": {
+            "description": "Notepad slot deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/v1/public-templates": {
       "get": {
         "operationId": "listPublicTemplates",
@@ -1800,6 +1856,16 @@
           "type": "integer",
           "format": "int64"
         }
+      },
+      "NotepadId": {
+        "name": "notepad_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        }
       }
     },
     "requestBodies": {
@@ -2099,6 +2165,16 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/DecidePushRequest"
+            }
+          }
+        }
+      },
+      "SetNotepad": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SetNotepad"
             }
           }
         }
@@ -3949,6 +4025,18 @@
               "en-US"
             ],
             "description": "Language a visitor with no stored choice gets (QDRUST_DEFAULT_LOCALE)"
+          }
+        }
+      },
+      "SetNotepad": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The whole new value for this slot, up to the page's edit limit"
           }
         }
       }

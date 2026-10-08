@@ -21,8 +21,8 @@ use axum::{
 };
 use qdrust_core::executor::CancellationToken;
 use qdrust_core::plugin::{
-    PLUGIN_API_VERSION, Plugin, PluginManifest as CorePluginManifest, PluginRequest,
-    SubprocessPlugin,
+    NOTEPAD_LIMIT, NotepadSlot, NotepadStore, PLUGIN_API_VERSION, Plugin,
+    PluginManifest as CorePluginManifest, PluginRequest, SubprocessPlugin,
 };
 use qdrust_core::qd_har::{QdHar, QdProgram};
 use serde::Deserialize;
@@ -44,10 +44,10 @@ use crate::{
         CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
         DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportLibraryTemplates,
         ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetSiteSetting, TemplateSubscription, TemplateTestResult, TemplateTestStep,
-        TestTemplate, UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest,
-        UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
-        VerifyEmail,
+        ResetPassword, SetNotepad, SetSiteSetting, TemplateSubscription, TemplateTestResult,
+        TemplateTestStep, TestTemplate, UpdateNotificationAction, UpdateNotificationChannel,
+        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
@@ -404,6 +404,11 @@ pub fn router_with_auth(
         .route(
             "/api/v1/plugins/{id}/invoke",
             axum::routing::post(invoke_plugin),
+        )
+        .route("/api/v1/notepads", get(list_notepads))
+        .route(
+            "/api/v1/notepads/{notepad_id}",
+            get(get_notepad).put(set_notepad).delete(delete_notepad),
         )
         .route("/api/v1/public-templates", get(list_public_templates))
         .route(
@@ -2137,6 +2142,155 @@ async fn invoke_plugin(
     ))
 }
 
+/// The most text the page may write into one slot.
+///
+/// Deliberately *not* the template bound (5 MiB), for two reasons that both come
+/// from the HTTP layer rather than from this table.
+///
+/// axum buffers a request body up to 2 MiB by default and these routes do not
+/// raise that. A 5 MiB write would therefore be refused while the body was being
+/// read — before this handler ran — and the caller would get an opaque
+/// body-limit failure instead of the sentence below. A bound the handler can
+/// actually reach is worth more than a larger one it cannot.
+///
+/// A value this size is also already far past what the page is for: a slot holds
+/// a cookie, a page number, a count. Templates may write more than this (a
+/// stored response body) and the page reads those back at full length — only its
+/// own writes are bounded here.
+const NOTEPAD_EDIT_LIMIT: usize = 256 * 1024;
+
+/// How much of a stored value the list carries per slot.
+///
+/// A slot may hold up to `NOTEPAD_CONTENT_LIMIT` (5 MiB) and the page shows one
+/// line per slot, so the list ships a preview rather than a value the reader is
+/// not about to read. The size travels separately, so the page can still say how
+/// much a slot holds without receiving all of it.
+const NOTEPAD_PREVIEW_CHARS: usize = 120;
+
+/// The caller's own slots, in slot order.
+///
+/// The account comes from the session and never from the request. A slot holds
+/// whatever a template put there — a refreshed session cookie, most often — so
+/// letting the request name an account would be a way to read someone else's.
+async fn list_notepads(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let rows = store.notepad_rows(session.user.id).await?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let content = row.content.unwrap_or_default();
+            json!({
+                "notepad_id": row.notepad_id,
+                "content_size": content.len(),
+                "preview": content.chars().take(NOTEPAD_PREVIEW_CHARS).collect::<String>(),
+                "updated_at": row.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+/// One slot's whole value, which is what the editor loads when it is opened.
+async fn get_notepad(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(notepad_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    match store.notepad_slot(session.user.id, notepad_id).await? {
+        NotepadSlot::Missing => Err(ApiError::NotFound(
+            "notepad_not_found",
+            "Notepad slot not found",
+        )),
+        // A slot QD created but nothing has written yet holds NULL. The page has
+        // no use for that distinction — it opens an empty editor either way — so
+        // it is read as "".
+        NotepadSlot::Stored(content) => {
+            let content = content.unwrap_or_default();
+            Ok(Json(json!({
+                "notepad_id": notepad_id,
+                "content": content,
+                "content_size": content.len(),
+            })))
+        }
+    }
+}
+
+/// Create or overwrite one slot.
+///
+/// Unlike the template side — where writing to a slot that does not exist is
+/// refused for everything but slot 1, because QD refuses it — a write here
+/// creates the slot. This is the page's "new slot": QD has a separate `f=add`
+/// call for it, and an editor that made the user save-first-create-second would
+/// be a worse answer than one that does what the writer asked.
+async fn set_notepad(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(notepad_id): Path<i64>,
+    ApiJson(input): ApiJson<SetNotepad>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    if notepad_id < 1 {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "notepad slot must be a positive integer: {notepad_id}"
+        )));
+    }
+    // A bound the page can actually reach, and one that keeps a slot's value
+    // inside what the template side is willing to read back.
+    if input.content.len() > NOTEPAD_EDIT_LIMIT {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "notepad content exceeds the {NOTEPAD_EDIT_LIMIT} byte edit limit"
+        )));
+    }
+    let created = matches!(
+        store.notepad_slot(session.user.id, notepad_id).await?,
+        NotepadSlot::Missing
+    );
+    // Only a new slot can breach the cap: overwriting an existing one does not
+    // add a row, and a slot created while the cap was smaller must stay
+    // writable.
+    if created && store.notepad_slots(session.user.id).await?.len() >= NOTEPAD_LIMIT {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "notepad slot limit reached: {NOTEPAD_LIMIT}"
+        )));
+    }
+    store
+        .notepad_write(session.user.id, notepad_id, Some(&input.content))
+        .await?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(json!({
+            "notepad_id": notepad_id,
+            "content_size": input.content.len(),
+        })),
+    ))
+}
+
+/// Remove one slot. A `DELETE` for a slot that is not there answers 404 rather
+/// than success: the page asks "did that go away", and only this can say.
+async fn delete_notepad(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(notepad_id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    if store.notepad_remove(session.user.id, notepad_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(
+            "notepad_not_found",
+            "Notepad slot not found",
+        ))
+    }
+}
+
 async fn create_template(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -2225,12 +2379,22 @@ async fn test_template(
     let policy = crate::scheduler::run_policy(None, &state.settings);
     let plugins =
         crate::scheduler::load_plugins_for_owner(&state.store, session.user.id, None).await;
+    // The notepad is attached here too: a template that keeps state across runs
+    // has to be testable, and a test run that silently skipped the step would
+    // report success on something the real run then fails. QD behaves the same
+    // way, so a test run of a cookie-refreshing template does move the stored
+    // cookie — the docs say so.
+    let notepad = Some(std::sync::Arc::new(crate::scheduler::OwnerNotepad::new(
+        state.store.clone(),
+        session.user.id,
+    )) as std::sync::Arc<dyn NotepadStore>);
     let (steps, variables) = crate::scheduler::execute_template(
         template,
         &CancellationToken::new(),
         &input.variables,
         policy,
         &plugins,
+        notepad,
     )
     .await
     .map_err(ApiError::unprocessable)?;
@@ -3838,6 +4002,59 @@ mod tests {
         response_cookies(&response).join("; ")
     }
 
+    /// Register a second account. Register issues a session on success, so the
+    /// cookies it returns are all a test needs to act as that account.
+    async fn register_cookie(app: &Router, username: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": username,
+                            "password": "correct horse battery staple",
+                            "email": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_cookies(&response).join("; ")
+    }
+
+    /// `PUT` one notepad slot and report the status, which is the whole answer
+    /// these tests branch on: 201 for a slot that did not exist, 200 otherwise.
+    async fn put_notepad(app: &Router, cookie: &str, slot: i64, content: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/notepads/{slot}"))
+                    .header(COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "content": content }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Read a successful response's JSON body.
+    ///
+    /// Separate from `response_json`, which also lifts `x-request-id`: that
+    /// header belongs to the error envelope, so only a rejected response has it.
+    async fn ok_json(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     #[tokio::test]
     async fn unknown_api_uses_stable_error_contract() {
         let response = test_app()
@@ -5364,5 +5581,217 @@ mod tests {
         assert_eq!(run_ids(&all).len(), 6, "{all}");
         assert_eq!(all["has_more"], json!(false), "{all}");
         assert_eq!(all["next_cursor"], Value::Null, "{all}");
+    }
+
+    /// A slot holds whatever a template stored — a session cookie, in the case
+    /// this port was written for. Another account must not be able to read it,
+    /// list it, or delete it.
+    #[tokio::test]
+    async fn notepad_slots_stay_with_their_owner() {
+        let app = test_app().await;
+        let owner = test_auth_cookie(&app).await;
+        let stranger = register_cookie(&app, "notepad_stranger").await;
+
+        assert_eq!(
+            put_notepad(&app, &owner, 1, "qd_session=owner-cookie").await,
+            StatusCode::CREATED
+        );
+
+        // The stranger's own list is empty...
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notepads")
+                    .header(COOKIE, &stranger)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(ok_json(response).await, json!([]));
+
+        // ...the slot reads as absent...
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notepads/1")
+                    .header(COOKIE, &stranger)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // ...and cannot be deleted out from under its owner.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/notepads/1")
+                    .header(COOKIE, &stranger)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The owner still has it, untouched.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notepads/1")
+                    .header(COOKIE, &owner)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            ok_json(response).await["content"],
+            "qd_session=owner-cookie"
+        );
+    }
+
+    /// The four calls the page makes, end to end: write creates, write again
+    /// replaces, the list previews without shipping the value, read hands it
+    /// back whole, delete removes and reports a second delete as missing.
+    #[tokio::test]
+    async fn notepad_write_upserts_and_the_list_previews() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+
+        assert_eq!(
+            put_notepad(&app, &cookie, 4, "first").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            put_notepad(&app, &cookie, 4, "second value").await,
+            StatusCode::OK
+        );
+
+        // A long value is stored whole but listed as a preview.
+        let long = "c".repeat(NOTEPAD_PREVIEW_CHARS * 3);
+        assert_eq!(
+            put_notepad(&app, &cookie, 5, &long).await,
+            StatusCode::CREATED
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notepads")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = ok_json(response).await;
+        let items = body.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // Slot order, and the second write is what the slot holds.
+        assert_eq!(items[0]["notepad_id"], 4);
+        assert_eq!(items[0]["preview"], "second value");
+        assert_eq!(items[0]["content_size"], 12);
+        assert_eq!(items[1]["notepad_id"], 5);
+        assert_eq!(
+            items[1]["content_size"].as_u64().unwrap(),
+            long.len() as u64
+        );
+        assert_eq!(
+            items[1]["preview"].as_str().unwrap().chars().count(),
+            NOTEPAD_PREVIEW_CHARS
+        );
+
+        // Reading the slot gives the whole value back, not the preview.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notepads/5")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = ok_json(response).await;
+        assert_eq!(body["content"].as_str().unwrap(), long);
+        assert_eq!(body["content_size"].as_u64().unwrap(), long.len() as u64);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/notepads/5")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/notepads/5")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The bounds the page shares with the template side come from the same
+    /// constants: slots are numbered from 1, a *new* slot past the cap is
+    /// refused, and the value bound is one the handler can actually reach.
+    #[tokio::test]
+    async fn notepad_slots_are_capped_and_start_at_one() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+
+        // Slot 0 is not a slot.
+        assert_eq!(
+            put_notepad(&app, &cookie, 0, "x").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        for slot in 1..=NOTEPAD_LIMIT as i64 {
+            assert_eq!(
+                put_notepad(&app, &cookie, slot, "x").await,
+                StatusCode::CREATED,
+                "slot {slot}"
+            );
+        }
+        assert_eq!(
+            put_notepad(&app, &cookie, NOTEPAD_LIMIT as i64 + 1, "x").await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // Overwriting a slot that already exists adds no row, so a full account
+        // is not locked out of the slots it has.
+        assert_eq!(put_notepad(&app, &cookie, 1, "y").await, StatusCode::OK);
+
+        let oversized = "x".repeat(NOTEPAD_EDIT_LIMIT + 1);
+        assert_eq!(
+            put_notepad(&app, &cookie, 1, &oversized).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 }

@@ -20,6 +20,7 @@ use crate::model::{
     UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{
+    plugin::NotepadSlot,
     qd_har::QdHar,
     template::{Step, TEMPLATE_SCHEMA_VERSION, TemplateDefinition},
 };
@@ -88,9 +89,26 @@ impl Default for RunFilter {
     }
 }
 
+/// One notepad row as stored: the slot, its raw content, and when it last
+/// changed. `content` is `Option` because `NULL` and `''` are different states
+/// in this table (see the `202610080001_notepads` migration) and the template
+/// side depends on the difference.
+///
+/// This is the row, not what the API renders: the notepad page wants a preview
+/// and a size, both of which the API layer derives from `content`. Keeping the
+/// raw value here leaves the query one plain `SELECT`, with no dialect-specific
+/// substring or length function to keep in sync across SQLite and MySQL.
+#[derive(Debug, Clone)]
+pub struct NotepadRow {
+    pub notepad_id: i64,
+    pub content: Option<String>,
+    pub updated_at: i64,
+}
+
 macro_rules! define_store {
     ($module:ident, $db:ty, $pool:ty, $pool_options:ty, $options_builder:path, $migrator:expr,
-     $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $parent_check:path) => {
+     $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $notepad_upsert:expr,
+     $parent_check:path) => {
         #[allow(clippy::all)]
         pub mod $module {
             use super::*;
@@ -2181,6 +2199,98 @@ macro_rules! define_store {
         rows.into_iter().map(setting_from_row).collect()
     }
 
+    // ---- Notepads ----
+    //
+    // QD's `notepad` table, behind `api://util/toolbox/notepad`: the only place a
+    // template can keep state across runs. `owner_id` is the account the run
+    // belongs to — the plugin never reads the account from the URL.
+
+    /// One slot. `NotepadSlot::Missing` means no row at all, which QD treats as
+    /// "slot 1: create it, anything else: refuse" — so this has to stay distinct
+    /// from a row holding an empty string.
+    pub async fn notepad_slot(&self, owner_id: i64, notepad_id: i64) -> Result<NotepadSlot> {
+        let row = sqlx::query("SELECT content FROM notepads WHERE owner_id=? AND notepad_id=?")
+            .bind(owner_id)
+            .bind(notepad_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            None => Ok(NotepadSlot::Missing),
+            Some(row) => Ok(NotepadSlot::Stored(row.try_get("content")?)),
+        }
+    }
+
+    /// Create or overwrite one slot. `None` writes QD's NULL content, which is
+    /// what a slot QD created for a template holds until something writes to it.
+    pub async fn notepad_write(
+        &self,
+        owner_id: i64,
+        notepad_id: i64,
+        content: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO notepads(owner_id,notepad_id,content,updated_at) VALUES(?,?,?,?) {}",
+            $notepad_upsert
+        ))
+        .bind(owner_id)
+        .bind(notepad_id)
+        .bind(content)
+        .bind(Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn notepad_slots(&self, owner_id: i64) -> Result<Vec<i64>> {
+        let rows =
+            sqlx::query("SELECT notepad_id FROM notepads WHERE owner_id=? ORDER BY notepad_id")
+                .bind(owner_id)
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|row| row.try_get::<i64, _>("notepad_id").map_err(Into::into))
+            .collect()
+    }
+
+    /// Every slot of one account, in slot order, with its content.
+    ///
+    /// The notepad page needs a preview and a size per slot. Doing the
+    /// truncation here would mean a dialect-specific `substr`/`length` pair, and
+    /// the row count is capped by `NOTEPAD_LIMIT` anyway, so the content comes
+    /// back raw and the API layer decides what to show.
+    pub async fn notepad_rows(&self, owner_id: i64) -> Result<Vec<NotepadRow>> {
+        let rows = sqlx::query(
+            "SELECT notepad_id,content,updated_at FROM notepads WHERE owner_id=? ORDER BY notepad_id",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| -> Result<NotepadRow> {
+                Ok(NotepadRow {
+                    notepad_id: row.try_get::<i64, _>("notepad_id")?,
+                    content: row.try_get::<Option<String>, _>("content")?,
+                    updated_at: row.try_get::<i64, _>("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Delete one slot, reporting whether a row was actually removed.
+    ///
+    /// The template-facing `f=delete` ignores that flag: QD answers success for
+    /// a slot that was never there, and a template reads the response body
+    /// rather than a status code, so the port has to keep doing the same. The
+    /// notepad page, on the other hand, wants the 404.
+    pub async fn notepad_remove(&self, owner_id: i64, notepad_id: i64) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM notepads WHERE owner_id=? AND notepad_id=?")
+            .bind(owner_id)
+            .bind(notepad_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     // ---- Password reset ----
 
     pub async fn create_password_reset_token(
@@ -3123,6 +3233,7 @@ define_store!(
     "SELECT last_insert_rowid()",
     sqlite_username_cmp,
     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    "ON CONFLICT(owner_id,notepad_id) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at",
     sqlite_parent_check
 );
 
@@ -3137,6 +3248,7 @@ define_store!(
     "SELECT CAST(LAST_INSERT_ID() AS SIGNED)",
     mysql_username_cmp,
     "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
+    "ON DUPLICATE KEY UPDATE content=VALUES(content), updated_at=VALUES(updated_at)",
     no_parent_check
 );
 macro_rules! delegate {
@@ -3314,6 +3426,11 @@ impl Store {
         pub async fn get_setting(key: &str) -> Result<Option<SiteSetting>> { key };
         pub async fn set_setting(key: &str, input: &SetSiteSetting) -> Result<SiteSetting> { key, input };
         pub async fn list_settings() -> Result<Vec<SiteSetting>> {  };
+        pub async fn notepad_slot(owner_id: i64, notepad_id: i64) -> Result<NotepadSlot> { owner_id, notepad_id };
+        pub async fn notepad_write(owner_id: i64, notepad_id: i64, content: Option<&str>) -> Result<()> { owner_id, notepad_id, content };
+        pub async fn notepad_slots(owner_id: i64) -> Result<Vec<i64>> { owner_id };
+        pub async fn notepad_rows(owner_id: i64) -> Result<Vec<NotepadRow>> { owner_id };
+        pub async fn notepad_remove(owner_id: i64, notepad_id: i64) -> Result<bool> { owner_id, notepad_id };
         pub async fn create_password_reset_token(user_id: i64, ttl_seconds: i64) -> Result<(String, i64)> { user_id, ttl_seconds };
         pub async fn consume_password_reset_token(token: &str, new_password_hash: &str) -> Result<Option<i64>> { token, new_password_hash };
         pub async fn purge_expired_reset_tokens() -> Result<u64> {  };
@@ -3589,6 +3706,89 @@ mod tests {
         validate("task", "0 0 9 * * *", None, None).unwrap();
         validate("task", "0 0 9 * * * 2027", None, None).unwrap();
         validate("task", "@daily", None, None).unwrap();
+    }
+
+    /// QD's notepad, one row per (account, slot).
+    ///
+    /// The point of the test is the distinction the route depends on: "no row"
+    /// is not "a row holding NULL", because QD auto-creates slot 1 and refuses
+    /// every other missing slot, and because `append` joins with a CRLF only
+    /// when something is already stored.
+    #[tokio::test]
+    async fn a_notepad_keeps_no_row_and_null_content_apart() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        store.ready().await.unwrap();
+        // A literal hash: this test never logs in, and argon2 would put a
+        // hundred-millisecond hash in front of a five-line assertion.
+        let owner = store
+            .create_user("notepad_owner", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let other = store
+            .create_user("notepad_other", "$argon2id$test", "user")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.notepad_slot(owner.id, 1).await.unwrap(),
+            NotepadSlot::Missing
+        );
+        assert!(store.notepad_slots(owner.id).await.unwrap().is_empty());
+
+        // What QD creates for a template that reads slot 1 first: a row, NULL
+        // content.
+        store.notepad_write(owner.id, 1, None).await.unwrap();
+        assert_eq!(
+            store.notepad_slot(owner.id, 1).await.unwrap(),
+            NotepadSlot::Stored(None)
+        );
+
+        // Writing the same slot replaces it. UNIQUE (owner_id, notepad_id) plus
+        // the upsert is what keeps two rows from sharing one slot the way QD's
+        // unconstrained table allows.
+        store
+            .notepad_write(owner.id, 1, Some("cookie=a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.notepad_slot(owner.id, 1).await.unwrap(),
+            NotepadSlot::Stored(Some("cookie=a".into()))
+        );
+
+        // An empty value is stored as an empty string, which is not the NULL
+        // above — this is the difference `append` reads.
+        store.notepad_write(owner.id, 1, Some("")).await.unwrap();
+        assert_eq!(
+            store.notepad_slot(owner.id, 1).await.unwrap(),
+            NotepadSlot::Stored(Some(String::new()))
+        );
+
+        // Slots belong to one account: the same number on another account is its
+        // own cell, and a slot that account never wrote stays missing.
+        store
+            .notepad_write(other.id, 1, Some("other"))
+            .await
+            .unwrap();
+        store
+            .notepad_write(owner.id, 2, Some("second"))
+            .await
+            .unwrap();
+        assert_eq!(store.notepad_slots(owner.id).await.unwrap(), vec![1, 2]);
+        assert_eq!(
+            store.notepad_slot(other.id, 1).await.unwrap(),
+            NotepadSlot::Stored(Some("other".into()))
+        );
+        assert_eq!(
+            store.notepad_slot(other.id, 2).await.unwrap(),
+            NotepadSlot::Missing
+        );
+
+        store.notepad_remove(owner.id, 1).await.unwrap();
+        assert_eq!(
+            store.notepad_slot(owner.id, 1).await.unwrap(),
+            NotepadSlot::Missing
+        );
+        assert_eq!(store.notepad_slots(owner.id).await.unwrap(), vec![2]);
     }
 
     #[tokio::test]
