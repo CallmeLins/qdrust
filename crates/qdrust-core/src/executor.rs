@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::{
     expression::QdExpressionEngine,
-    plugin::{NotepadStore, Plugin, PluginRegistry, UtilityPlugin},
+    plugin::{NotepadStore, Plugin, PluginRegistry, PluginRequest, UtilityPlugin},
     qd_har::{QdBlock, QdHarEntry, QdHarRequest, QdNameValue, QdPostData, QdProgram, QdRule},
     template::{RequestBody, RequestStep, Step, TemplateDefinition},
 };
@@ -474,7 +474,7 @@ impl QdExecutor {
         context.remaining_requests -= 1;
 
         let method = self.render(&entry.request.method, context)?;
-        let mut url = self.render(&entry.request.url, context)?;
+        let url = self.render(&entry.request.url, context)?;
         let debug_requests = std::env::var("QDRUST_DEBUG_REQUESTS")
             .map(|value| {
                 matches!(
@@ -499,6 +499,14 @@ impl QdExecutor {
         if url.starts_with("api://") {
             // QD 兼容：api:// 请求的 POST 表单体（如 util/urldecode 的 content=...）
             // 并入查询串后交给插件，与 QD 后端 get_argument 同时读取 query 与表单体的行为一致。
+            //
+            // 合并只服务于这次调用：`call_url` 给插件和调试输出，`url` 保持模板
+            // 自己写的样子，交给 `finish_response` 记录。两者必须分开，因为合并把
+            // 表单体的值搬进了 URL，而步骤名是渲染后 URL 的前 200 字符——一次
+            // notepad 写入会让刚存下的 cookie 顺着 `run_steps.name` 落库。QD 记的
+            // 也只是模板自己写的 URL（它的表单体走独立的 HTTP body），所以这是与
+            // QD 对齐，而不是少记了什么。
+            let mut call_url = url.clone();
             if method.eq_ignore_ascii_case("POST")
                 && let Some(post_data) = entry.request.post_data.as_ref()
             {
@@ -508,16 +516,16 @@ impl QdExecutor {
                 {
                     let body = self.render(text, context)?;
                     if debug_requests {
-                        eprintln!("[qdrust:request:api-body] url={} body={}", url, body);
+                        eprintln!("[qdrust:request:api-body] url={} body={}", call_url, body);
                     }
-                    url = merge_form_into_query(&url, &body);
+                    call_url = merge_form_into_query(&call_url, &body);
                 }
             }
-            let response = self.plugins.call(&url, self.plugin_timeout).await?;
+            let response = self.plugins.call(&call_url, self.plugin_timeout).await?;
             if debug_requests {
                 eprintln!(
                     "[qdrust:request:api-response] url={} status={} body={}",
-                    url,
+                    call_url,
                     response.status,
                     bounded_preview(&String::from_utf8_lossy(&response.body))
                 );
@@ -530,6 +538,7 @@ impl QdExecutor {
                 response.status,
                 response.headers.into_iter().collect(),
                 response.body,
+                response_body_is_stored_value(&call_url),
             );
         }
         let client = self.client_for_url(&url, context).await?;
@@ -702,6 +711,7 @@ impl QdExecutor {
             status,
             headers,
             body,
+            false,
         )
     }
 
@@ -715,6 +725,11 @@ impl QdExecutor {
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        // A successful notepad call answers with the slot's contents, so its
+        // response *is* the value a template stored or read — a cookie, usually.
+        // `with_response` appends the response to every failure message, which
+        // would carry that value into `run_steps.error`; the size stands in.
+        body_is_stored_value: bool,
     ) -> Result<StepResult> {
         ensure!(
             body.len() <= self.response_limit,
@@ -736,7 +751,17 @@ impl QdExecutor {
         // QD shows the step request and response in the run log; surface both
         // so site-side rejections (e.g. result:-1 "用户名或密码为空") are
         // diagnosable from the failure message alone.
-        let response_preview = bounded_preview(&content);
+        //
+        // A successful notepad call is the exception, because there the response
+        // *is* the value: a byte count carries the same diagnostic weight (did
+        // the step answer, and how much came back) without quoting a cookie into
+        // the run log. The route's own errors arrive as 400s and stay whole, so
+        // "记事本不存在" is still readable where it is the answer.
+        let response_preview = if body_is_stored_value && status == 200 {
+            format!("<{} bytes of notepad content omitted>", body.len())
+        } else {
+            bounded_preview(&content)
+        };
         let request_digest = request_digest.to_string();
         let url = url.clone();
         let with_response = |cause: anyhow::Error| {
@@ -1032,6 +1057,19 @@ fn form_urldecode(input: &str) -> String {
     percent_encoding::percent_decode_str(&input.replace('+', " "))
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// Whether a step's response body *is* the value it just stored or read.
+///
+/// The notepad route answers with the slot's contents, so anything that quotes
+/// its response quotes what the template keeps there — a cookie, most of the
+/// time. The test is on the parsed action rather than on the URL text so the
+/// answer does not depend on how a template spelled the path, and `list` stays
+/// out of it: that action answers with slot numbers, not slot contents.
+fn response_body_is_stored_value(url: &str) -> bool {
+    PluginRequest::from_api_url(url)
+        .map(|request| request.action == "toolbox/notepad")
+        .unwrap_or(false)
 }
 
 /// Collapse whitespace and cap a text preview for failure diagnostics.
@@ -3089,9 +3127,18 @@ mod tests {
     impl NotepadStore for RecordingNotepad {
         fn read<'a>(
             &'a self,
-            _slot: i64,
+            slot: i64,
         ) -> Pin<Box<dyn Future<Output = Result<NotepadSlot>> + Send + 'a>> {
-            Box::pin(async move { Ok(NotepadSlot::Stored(Some("stored".into()))) })
+            // Slot 1 is the one the route hands a template without asking; every
+            // other slot is missing, which is the shape the route answers with a
+            // 400 for. Both are needed below.
+            Box::pin(async move {
+                Ok(if slot == 1 {
+                    NotepadSlot::Stored(Some("stored".into()))
+                } else {
+                    NotepadSlot::Missing
+                })
+            })
         }
 
         fn write<'a>(
@@ -3154,6 +3201,106 @@ mod tests {
             *notepad.written.lock().unwrap(),
             Some((1, Some("refreshed".to_string())))
         );
+    }
+
+    /// The value a template stores must not follow the step into the run log:
+    /// `run_steps.name` keeps the head of the rendered URL, and merging the form
+    /// body into that URL — which the plugin call needs — used to put a written
+    /// cookie there. QD records only the URL the template itself wrote.
+    #[tokio::test]
+    async fn a_notepad_write_keeps_its_value_out_of_the_recorded_step() {
+        let notepad = Arc::new(RecordingNotepad::default());
+        let executor = QdExecutor::with_options(ExecutorOptions {
+            notepad: Some(notepad.clone() as Arc<dyn NotepadStore>),
+            ..ExecutorOptions::default()
+        })
+        .unwrap();
+        // The value travels as a POST form body, which is what QD's own HAR
+        // editor emits for a notepad write.
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {
+                "method": "POST",
+                "url": "api://util/toolbox/notepad?f=write&id_notepad=1",
+                "headers": [],
+                "cookies": [],
+                "postData": {
+                    "mimeType": "application/x-www-form-urlencoded",
+                    "text": "data=session%3DSUPERSECRET"
+                }
+            },
+            "success_asserts": [{"re": "SUPERSECRET", "from": "content"}]
+        }]}}))
+        .unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor
+            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+            .await
+            .unwrap();
+
+        // The merge still happened for the call: the plugin wrote the value.
+        assert_eq!(
+            *notepad.written.lock().unwrap(),
+            Some((1, Some("session=SUPERSECRET".to_string())))
+        );
+        assert!(
+            !results[0].url.contains("SUPERSECRET"),
+            "the recorded step must not carry the value: {}",
+            results[0].url
+        );
+    }
+
+    /// The failure message quotes the response, and for a notepad step the
+    /// response *is* the value, so the size stands in. The route's own 400 is a
+    /// different case: there the body is the answer, and is left whole.
+    #[tokio::test]
+    async fn a_notepad_failure_message_keeps_the_value_out_of_the_log() {
+        let notepad = Arc::new(RecordingNotepad::default());
+        let executor = QdExecutor::with_options(ExecutorOptions {
+            notepad: Some(notepad as Arc<dyn NotepadStore>),
+            ..ExecutorOptions::default()
+        })
+        .unwrap();
+
+        // A read that answers and then fails its assertion: quoting the response
+        // would quote the slot's contents.
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": "api://util/toolbox/notepad?f=read&id_notepad=1"},
+            "success_asserts": [{"re": "NEVER-MATCHES", "from": "content"}]
+        }]}}))
+        .unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+        let error = executor
+            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains("stored"), "{error}");
+        assert!(
+            error.contains("bytes of notepad content omitted"),
+            "{error}"
+        );
+
+        // A missing slot answers 400 with the reason as its body — the one thing
+        // a reader needs — so the preview is untouched.
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": "api://util/toolbox/notepad?f=read&id_notepad=2"},
+            "success_asserts": [{"re": "200", "from": "status"}]
+        }]}}))
+        .unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+        let error = executor
+            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("记事本不存在"), "{error}");
+        assert!(!error.contains("omitted"), "{error}");
     }
 
     #[tokio::test]

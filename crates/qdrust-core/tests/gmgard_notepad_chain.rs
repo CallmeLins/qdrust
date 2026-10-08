@@ -23,7 +23,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use qdrust_core::executor::{ExecutionContext, ExecutorOptions, QdExecutor};
+use qdrust_core::executor::{ExecutionContext, ExecutorOptions, QdExecutor, StepResult};
 use qdrust_core::plugin::{NotepadSlot, NotepadStore};
 use qdrust_core::qd_har::{QdHar, QdProgram};
 use serde_json::{Value, json};
@@ -194,14 +194,18 @@ impl NotepadStore for MemoryNotepad {
 /// One run of the template. `id_notepad` is the only input it declares: the
 /// `qd_email`/`md5(qd_pwd)` arguments QD's editor puts in the notepad steps are
 /// left undefined on purpose, because this port takes the account from the run.
+///
+/// The step records come back too, because what they must *not* contain is part
+/// of the contract: the run log keeps the head of each rendered URL, and this
+/// template's whole payload is a cookie.
 async fn run_template(
     executor: &QdExecutor,
     program: &qdrust_core::qd_har::QdProgram,
-) -> Result<BTreeMap<String, Value>> {
+) -> Result<(BTreeMap<String, Value>, Vec<StepResult>)> {
     let variables = BTreeMap::from([("id_notepad".to_string(), Value::from(1))]);
     let mut context = ExecutionContext::new(variables);
-    executor.execute(program, &mut context).await?;
-    Ok(context.variables)
+    let steps = executor.execute(program, &mut context).await?;
+    Ok((context.variables, steps))
 }
 
 #[tokio::test]
@@ -226,7 +230,7 @@ async fn the_reported_gmgard_template_carries_its_cookie_across_runs() -> Result
     })?;
 
     // --- First run: spend the seeded cookie, store the refreshed one. ---
-    let first = run_template(&executor, &program).await?;
+    let (first, first_steps) = run_template(&executor, &program).await?;
     let log = first
         .get("__log__")
         .and_then(Value::as_str)
@@ -247,8 +251,20 @@ async fn the_reported_gmgard_template_carries_its_cookie_across_runs() -> Result
         "the punch must use the cookie the same run just stored"
     );
 
+    // The cookies are the template's payload, and the run log keeps the head of
+    // every rendered URL — so no step may be recorded with one in it. The
+    // notepad steps carry the value as a POST form body; merging that body into
+    // the URL for the call must not reach the record.
+    let recorded: Vec<&str> = first_steps.iter().map(|step| step.url.as_str()).collect();
+    assert!(
+        recorded
+            .iter()
+            .all(|url| !url.contains("TICK-1") && !url.contains(SEED)),
+        "no step may carry the cookie into the run log: {recorded:#?}"
+    );
+
     // --- Second run: the whole point — it starts from what run one left. ---
-    let second = run_template(&executor, &program).await?;
+    let (second, second_steps) = run_template(&executor, &program).await?;
     assert!(
         second.contains_key("__log__"),
         "second run must produce its own log line"
@@ -262,6 +278,11 @@ async fn the_reported_gmgard_template_carries_its_cookie_across_runs() -> Result
         notepad.stored(1).as_deref(),
         Some(".AspNetCore.Identity.Application=TICK-2"),
         "and store the cookie it refreshed in turn"
+    );
+    let recorded: Vec<&str> = second_steps.iter().map(|step| step.url.as_str()).collect();
+    assert!(
+        recorded.iter().all(|url| !url.contains("TICK-")),
+        "the second run must keep its cookie out of the log too: {recorded:#?}"
     );
     Ok(())
 }
