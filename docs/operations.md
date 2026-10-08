@@ -65,7 +65,7 @@ machine that was patched and leaves every other deployment failing.
 - Import and edit a representative legacy QD HAR.
 - Create a task, run it immediately, inspect steps, and cancel an active run.
 - Publish and copy a public template.
-- Create a note, plugin, Webhook channel, and notification action.
+- Create a plugin, Webhook channel, and notification action.
 - Repeat the main workflow at desktop and mobile widths.
 - Verify a second user cannot access the first user's resources.
 
