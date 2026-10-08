@@ -83,7 +83,7 @@ cargo run -p qdrust-server
 | [模板表达式与内置工具](docs/expressions.md) | Jinja2 过滤器 / 函数清单与 `api://util/*` 工具表 |
 | [常见问题](docs/faq.md) | 部署、调度、通知、认证等高频问题 |
 | [运维与发版](docs/operations.md) | SQLite 备份 / 恢复、发布检查清单（本地门禁 / 浏览器验收 / 发布门禁） |
-| [参考](docs/reference.md) | API 错误码约定、与旧 QD 的兼容范围、立项期功能矩阵 |
+| [参考](docs/reference.md) | API 错误码约定、与旧 QD 的兼容范围、立项期规划范围 |
 | [OpenAPI 契约](docs/openapi-v1.json) | 完整 API 定义（运行时可取 `GET /api/v1/openapi.json`） |
 | [架构决策记录](docs/adr/) | ADR-0001 ~ 0008：workspace、QD HAR 契约、数据库、运行时状态、表达式、插件、WebUI、SSRF/DNS |
 | [设计档案](docs/design/) | 迁移计划、认证改造设计（OIDC / Header）、威胁模型——已完工的历史设计文档 |
@@ -103,6 +103,8 @@ qdrust 不导入旧 QD 数据库，不复用旧登录 Cookie，也不承诺兼�
 ## 项目状态
 
 Phase 0-8 代码与容器已实现完成（Phase 8 状态为 Implementation Complete）；发布前仍待完成浏览器人工验收与首个镜像（amd64 / arm64）发布检查。详见 [运维与发版](docs/operations.md)。
+
+**已知未实现**：旧 QD 的「记事本」与 Web「工具箱」页面 —— 两者都是 QD Web 页面上的功能，模板侧的 `api://util/toolbox/*` 命名空间也因此没有注册；依赖它的 QD 模板（常见于跨运行保存状态，例如滑动续期 cookie）会以 `plugin action unavailable` 失败，需要改造，见[常见问题](docs/faq.md)。记事本是[立项范围](docs/reference.md)里目前唯一没有落地的能力。
 
 ---
 
