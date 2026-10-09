@@ -2,7 +2,7 @@
 
 > 返回 [README](../README.md)
 
-`qdrust-mcp` 是一个 **stdio MCP server**，把一个 qdrust 实例的 REST API 暴露给 MCP 客户端（Claude Desktop、Cursor、Cline、Deepseek Harness 等），让模型直接建任务、跑任务、看运行结果，不用切到 WebUI。
+`qdrust-mcp` 是一个 **stdio MCP server**，把一个 qdrust 实例的 REST API 暴露给 MCP 客户端（Claude Desktop、Cursor、Cline、Deepseek Harness 等），让模型直接建任务、跑任务、看运行结果、读写记事本槽位，不用切到 WebUI。
 
 它是**纯 Python、不需要编译**的：本质只是一个带 Bearer 认证的 HTTP 客户端，每个工具对应一次 qdrust REST 调用。代码在 [`mcp/`](../mcp/)，用 [`uv`](https://docs.astral.sh/uv/) 运行——uv 会自己下载 Python，你不需要单独装 Python。
 
@@ -41,7 +41,8 @@ MCP 客户端会通过 `uvx` 拉起它，所以需要 uv：
 ```
 
 - Windows 路径要写成双反斜杠：`"C:\\Users\\you\\qdrust\\mcp"`。
-- `QDRUST_URL` 默认 `http://localhost:8923`；反代到二级目录要带前缀，如 `https://example.com/qd`。
+- `QDRUST_URL` 默认 `http://localhost:8923`；反代到二级目录要带前缀，如 `https://example.com/qd`（漏掉前缀的症状见[自检与排障](#自检与排障)）。
+- 可选 `QDRUST_TIMEOUT`：单次请求超时秒数，默认 `120`。模板步骤多、或服务端自身的请求超时配得比它长时，要调大。
 - 这套配置里藏着令牌，**别提交进仓库、别贴到聊天里**（用下面的 AI 提示词时也一样，用完顺手删掉那条消息）。
 
 **方式 B：先装到 PATH，配置更干净**
@@ -104,8 +105,9 @@ uv tool install --from /absolute/path/to/qdrust/mcp qdrust-mcp
    a. 直接跑一次 `uvx --from <仓库绝对路径>/mcp qdrust-mcp`（把 stdin 关掉即可）：
       能起来就说明依赖没问题；缺 token 时只会打印一行 "QDRUST_TOKEN is required" 并以码 2 退出。
    b. 用令牌验证 REST：`curl -H "Authorization: Bearer <令牌>" <地址>/api/v1/tasks`
-      期望 200 且返回 `[]` 或任务数组。
-   c. 如果客户端可脚本化，确认能列出 18 个工具（list_tasks、create_task、run_task …）。
+      期望 200 且返回 `[]` 或任务数组；如果回来的是 HTML，说明这个地址不是 API（多半漏了反代前缀），
+      先改对再继续。
+   c. 如果客户端可脚本化，确认能列出 23 个工具（list_tasks、create_task、run_task …）。
 5. 告诉我需要重启哪个客户端，并提醒我把刚才那条带令牌的消息删掉。
 
 【约束】
@@ -121,20 +123,23 @@ uv tool install --from /absolute/path/to/qdrust/mcp qdrust-mcp
 
 | 工具 | 对应接口 | 说明 |
 |---|---|---|
-| `list_tasks` / `get_task` | `GET /api/v1/tasks[/{id}]` | 任务列表（可按 `grp` 过滤）/ 单个任务 |
-| `create_task` | `POST /api/v1/tasks` | 建任务；绑定 `template_id` 时请求由模板决定 |
-| `update_task` | `PUT /api/v1/tasks/{id}` | **只改传了的字段**，省略即保持原值 |
+| `list_tasks` / `get_task` | `GET /api/v1/tasks[/{id}]` | 任务列表（`grp` 按分组过滤）/ 单个任务 |
+| `create_task` | `POST /api/v1/tasks` | 建任务；绑定 `template_id` 时请求由模板决定，否则传 `url`（+ `method`/`headers`/`body`） |
+| `update_task` | `PUT /api/v1/tasks/{id}` | **只改传了的字段**，省略即保持原值；`clear=[…]` 显式清空某个字段（如 `clear=["grp"]`） |
 | `delete_task` | `DELETE /api/v1/tasks/{id}` | 删任务及其运行记录 |
 | `run_task` | `POST /api/v1/tasks/{id}/run` | 立即运行，返回新的 run |
 | `cancel_run` | `POST /api/v1/runs/{id}/cancel` | 取消执行中的 run |
-| `list_runs` | `GET /api/v1/runs` | 聚合运行日志，可按 `status` / `task_id` / `limit` 过滤 |
+| `delete_run` | `DELETE /api/v1/runs/{id}` | 删一条运行记录及其步骤 |
+| `list_runs` | `GET /api/v1/runs` | 聚合运行日志，可按 `status` / `task_id` / `limit` 过滤，`before_id` 往回翻页 |
 | `list_task_runs` | `GET /api/v1/tasks/{id}/runs` | 某任务的运行历史 |
 | `get_run_steps` | `GET /api/v1/runs/{id}/steps` | 单次运行的逐步结果 |
 | `batch_tasks` | `POST /api/v1/tasks/batch` | 批量 `enable` / `disable` / `delete` / `run` |
 | `list_task_groups` | `GET /api/v1/task-groups` | 分组名 |
-| `list_templates` / `get_template` | `GET /api/v1/templates[/{id}]` | 模板列表（可搜索）/ 单个模板（含变量与默认值） |
+| `list_templates` / `get_template` | `GET /api/v1/templates[/{id}]` | 模板列表（可按 `q` / `grp` 搜索，`cursor` 翻页）/ 单个模板（含变量与默认值） |
 | `test_template` | `POST /api/v1/templates/{id}/test` | 用给定变量试跑模板，**不建任务、不落运行记录** |
 | `import_template` | `POST /api/v1/templates/import-qd-har` | 导入 QD HAR |
+| `list_notepads` | `GET /api/v1/notepads` | 记事本槽位一览（编号、大小、预览） |
+| `get_notepad` / `set_notepad` / `delete_notepad` | `/api/v1/notepads/{notepad_id}` 的 `GET` / `PUT` / `DELETE` | 读 / 建或覆盖 / 删一个槽位；写入上限 256 KiB |
 | `list_notification_channels` | `GET /api/v1/notification-channels` | 通知渠道 |
 | `bind_notification` | `POST /api/v1/notification-actions/batch` | 把渠道绑到一个或多个任务（默认 `failure`） |
 
@@ -143,6 +148,8 @@ uv tool install --from /absolute/path/to/qdrust/mcp qdrust-mcp
 - **单独跑一次**：`uvx --from <路径>/mcp qdrust-mcp`。缺 token 会打印 `qdrust-mcp: QDRUST_TOKEN is required …` 并以码 2 退出；这是配置问题，不是依赖问题。
 - **验证令牌**：`curl -H "Authorization: Bearer $QDRUST_TOKEN" https://你的域名/api/v1/tasks` → 200。返回 401 说明令牌被撤销或过期。
 - **客户端里看不到工具**：九成是客户端进程的 `PATH` 里没有 `uvx`（GUI 应用不继承终端 PATH）。用 `uv tool install` 装好后把 `command` 写成绝对路径即可。
+- **工具报「… is not JSON」或一条 3xx**：`QDRUST_URL` 没指到 API。反代到二级目录漏了前缀时，请求会落到 WebUI 的页面（`index.html`，200 + `text/html`）或一次重定向，而不是 JSON。
+- **工具报超时**：一次请求超过 `QDRUST_TIMEOUT`（默认 120 秒）就放弃。模板步骤多或服务端请求超时更长时，把它调大。
 - **工具调用报错**：错误会以工具错误返回并带上 qdrust 自己的 message（例如 `qdrust returned 422: task URL is required when no template is bound`），照它改参数即可。
 - **出站限制**：MCP 只是转发到 qdrust，所有出站请求仍走 qdrust 的同一道闸门（SSRF、请求数/循环/超时上限），`test_template` 与真实运行同策略。
 
@@ -150,3 +157,4 @@ uv tool install --from /absolute/path/to/qdrust/mcp qdrust-mcp
 
 - **令牌目前没有 scope**：任何令牌都拥有其属主的全部权限。要细分 read / write 需要给服务端所有写接口加统一关口，属于后续可加项。
 - 工具名是**客户端契约**：改名会让已保存的客户端配置失效，所以有一条测试把工具集合钉住（`mcp/tests/test_server.py`）。
+- **依赖不锁版本**：仓库不提交 `mcp/uv.lock`，所以每次 `uvx` 拉到的可能是更新的 MCP SDK；能变的行为由测试钉住（工具集合、上报的版本号）。CI 会用**最新版**与 `pyproject.toml` 里的**下界**（`mcp>=1.22`，更老的版本在现代 pydantic 下装不起来）各跑一遍。
