@@ -11,8 +11,9 @@ content at all — an empty result has to read as `[]`, not as silence.
 Run it over stdio with ``qdrust-mcp`` (installed entry point) or
 ``python -m qdrust_mcp.server``. Configuration is environment-only:
 
-- ``QDRUST_URL``   base URL of the qdrust server (default ``http://localhost:8923``)
-- ``QDRUST_TOKEN`` a personal access token (``qd_...``) from Settings → API tokens
+- ``QDRUST_URL``     base URL of the qdrust server (default ``http://localhost:8923``)
+- ``QDRUST_TOKEN``   a personal access token (``qd_...``) from Settings → API tokens
+- ``QDRUST_TIMEOUT`` per-request timeout in seconds (default 120)
 """
 
 from __future__ import annotations

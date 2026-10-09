@@ -13,10 +13,11 @@ from typing import Any
 import httpx
 
 DEFAULT_URL = "http://localhost:8923"
+DEFAULT_TIMEOUT = 120.0
 
 
 class QdrustError(RuntimeError):
-    """A refused or failed request, carrying qdrust's own message."""
+    """A refused or failed request, or an argument the API cannot express."""
 
 
 def present(**fields: Any) -> dict[str, Any]:
@@ -27,6 +28,40 @@ def present(**fields: Any) -> dict[str, Any]:
     empty string is kept.
     """
     return {name: value for name, value in fields.items() if value is not None}
+
+
+def _query(params: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Only the parameters that carry a value.
+
+    A blank string is dropped, ``None`` is dropped. ``?grp=`` would ask the
+    server for the tasks whose group is the empty string, and an ungrouped task
+    holds NULL — so "I did not mean to filter" would silently return nothing.
+    """
+    kept = {
+        name: value
+        for name, value in (params or {}).items()
+        if value is not None and not (isinstance(value, str) and not value.strip())
+    }
+    return kept or None
+
+
+def _resolve_timeout() -> float:
+    raw = os.environ.get("QDRUST_TIMEOUT")
+    if not raw or not raw.strip():
+        return DEFAULT_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        raise QdrustError(f"QDRUST_TIMEOUT must be a number of seconds, got {raw!r}") from None
+    if timeout <= 0:
+        raise QdrustError(f"QDRUST_TIMEOUT must be positive, got {raw!r}")
+    return timeout
+
+
+def _preview(response: httpx.Response, limit: int = 300) -> str:
+    """The head of a body we could not parse, for an error message."""
+    text = response.content[:limit].decode("utf-8", errors="replace")
+    return text + ("…" if len(response.content) > limit else "")
 
 
 def _summarise(response: httpx.Response) -> str:
@@ -49,7 +84,7 @@ class QdrustClient:
         base_url: str | None = None,
         token: str | None = None,
         *,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         http: httpx.Client | None = None,
     ) -> None:
         self.base_url = (base_url or os.environ.get("QDRUST_URL") or DEFAULT_URL).rstrip("/")
@@ -60,7 +95,7 @@ class QdrustClient:
                 "under Settings -> API tokens"
             )
         self.token = token
-        self._http = http or httpx.Client(timeout=timeout)
+        self._http = http or httpx.Client(timeout=timeout or _resolve_timeout())
 
     def close(self) -> None:
         self._http.close()
@@ -75,24 +110,41 @@ class QdrustClient:
         params: dict[str, Any] | None = None,
         json: Any | None = None,
     ) -> Any:
-        query = {k: v for k, v in (params or {}).items() if v is not None}
         # The credentials are set per request, not on the client, so an injected
         # client (tests) sends them too and the token has one home.
         response = self._http.request(
             method,
             f"{self.base_url}{path}",
-            params=query or None,
+            params=_query(params),
             json=json,
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
             },
         )
+        # A redirect means the base URL is not the API itself: a reverse proxy
+        # mounted under a prefix (QDRUST_URL without it) answers with the SPA.
+        # Saying so beats an unparsable body two lines further down.
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("location") or "?"
+            raise QdrustError(
+                f"qdrust answered {response.status_code} (redirect to {location}): "
+                "QDRUST_URL does not point at the API — check the URL and its prefix"
+            )
         if response.status_code >= 400:
             raise QdrustError(f"qdrust returned {response.status_code}: {_summarise(response)}")
         if not response.content:
             return None
-        return response.json()
+        try:
+            return response.json()
+        except ValueError:
+            # A 200 that is not JSON is the other half of the wrong-URL story:
+            # the SPA fallback serves index.html with 200 for any unknown path.
+            content_type = response.headers.get("content-type", "unknown type")
+            raise QdrustError(
+                f"qdrust returned {response.status_code} {content_type}, which is not JSON: "
+                f"{_preview(response)!r} — is QDRUST_URL pointing at the API root?"
+            ) from None
 
     def get(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         return self.request("GET", path, params=params)

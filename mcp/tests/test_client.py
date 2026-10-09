@@ -52,6 +52,22 @@ def test_list_tasks_passes_the_group() -> None:
     assert seen["url"] == "http://qd.test/api/v1/tasks?grp=daily"
 
 
+def test_a_blank_group_is_no_filter_at_all() -> None:
+    # `?grp=` would ask for the tasks grouped under "" — an ungrouped task holds
+    # NULL, so it would silently match nothing.
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler)
+    client.list_tasks("")
+    assert seen["url"] == "http://qd.test/api/v1/tasks"
+    client.list_tasks("   ")
+    assert seen["url"] == "http://qd.test/api/v1/tasks"
+
+
 def test_update_task_sends_only_the_fields_the_caller_set() -> None:
     seen = {}
 
@@ -138,3 +154,42 @@ def test_an_empty_success_body_is_not_parsed_as_json() -> None:
         return httpx.Response(204)
 
     assert make_client(handler).delete_task(5) is None
+
+
+def test_a_redirect_names_the_likely_cause() -> None:
+    # A proxy mounted under a prefix answers with the SPA, not the API.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "/qd/"})
+
+    with pytest.raises(QdrustError) as raised:
+        make_client(handler).list_tasks()
+    assert "QDRUST_URL does not point at the API" in str(raised.value)
+
+
+def test_a_200_that_is_html_is_reported_as_such() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<!doctype html><title>qdrust</title>",
+            headers={"content-type": "text/html"},
+        )
+
+    with pytest.raises(QdrustError) as raised:
+        make_client(handler).list_tasks()
+    message = str(raised.value)
+    assert "not JSON" in message
+    assert "text/html" in message
+    assert "<!doctype html>" in message
+
+
+def test_the_timeout_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QDRUST_TIMEOUT", "5")
+    assert QdrustClient("http://qd.test", "qd_test")._http.timeout.connect == 5.0
+
+    monkeypatch.setenv("QDRUST_TIMEOUT", "not-a-number")
+    with pytest.raises(QdrustError, match="must be a number"):
+        QdrustClient("http://qd.test", "qd_test")
+
+    monkeypatch.setenv("QDRUST_TIMEOUT", "0")
+    with pytest.raises(QdrustError, match="must be positive"):
+        QdrustClient("http://qd.test", "qd_test")
