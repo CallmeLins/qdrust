@@ -451,6 +451,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["listApiTokens"];
+        put?: never;
+        post: operations["createApiToken"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revokeApiToken"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/public-templates": {
         parameters: {
             query?: never;
@@ -1170,6 +1202,11 @@ export interface components {
             last_error: string | null;
             /** @description Group label (QD _groups equivalent) */
             grp?: string | null;
+            /**
+             * Format: int64
+             * @description Number of notification bindings this task has (0 = no notification)
+             */
+            notification_action_count?: number;
         };
         Run: {
             /** Format: int64 */
@@ -1358,6 +1395,27 @@ export interface components {
             requests: number;
             controls: number;
             extract_variables: number;
+        };
+        ApiToken: {
+            /** Format: int64 */
+            id: number;
+            name: string;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: int64 */
+            last_used_at?: number | null;
+            /** Format: int64 */
+            expires_at?: number | null;
+        };
+        IssuedApiToken: {
+            /** @description Plaintext token, shown once */
+            token: string;
+            api_token: components["schemas"]["ApiToken"];
+        };
+        CreateApiToken: {
+            name: string;
+            /** @description Omit or null for no expiry */
+            expires_in_days?: number | null;
         };
         TestTemplate: {
             variables?: {
@@ -2742,6 +2800,75 @@ export interface operations {
                 };
                 content?: never;
             };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listApiTokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal access tokens (secrets omitted) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiToken"][];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    createApiToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateApiToken"];
+            };
+        };
+        responses: {
+            /** @description Token created; the plaintext is returned once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedApiToken"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            422: components["responses"]["ValidationError"];
+        };
+    };
+    revokeApiToken: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Token revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
         };
     };

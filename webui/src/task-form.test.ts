@@ -93,3 +93,25 @@ describe("task form template variables", () => {
     expect(app).toMatch(/@click="runTemplateTest"/);
   });
 });
+
+/**
+ * Issue #40: the task list bell (state + one-click toggle) and the task
+ * dialog's notification block, which is where a specific channel is chosen.
+ */
+describe("task notification binding", () => {
+  it("shows and toggles the bound state from the task row", () => {
+    expect(app).toContain("toggleTaskNotifications");
+    expect(app).toMatch(/task\.notification_action_count/);
+    expect(app).toContain("BellOff");
+  });
+
+  it("edits the binding from the task dialog", () => {
+    expect(app).toContain("notifyEnabled");
+    expect(app).toContain("syncTaskNotifications");
+  });
+
+  it("clears every binding of a task through the API client", () => {
+    const api = readFileSync(new URL("./api.ts", import.meta.url), "utf8");
+    expect(api).toContain("clearTaskNotificationActions");
+  });
+});

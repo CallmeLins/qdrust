@@ -960,6 +960,13 @@ code {
   flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--ink-3); font-size: 11px;
 }
+/* Task dialog: the notification switch and its channel picker (issue #40). The
+   list reuses `.check-list`, only shorter — the dialog already scrolls. */
+.notify-block { display: grid; gap: 8px; }
+.notify-channels { max-height: 150px; }
+/* Row bell: filled and tinted when the task notifies, so the state reads at a
+   glance next to the other row actions. */
+.row-act.notify-on { color: var(--primary); }
 
 /* HAR import modal */
 .modal-backdrop-wide { z-index: 60; }
@@ -1061,6 +1068,13 @@ code {
 .settings-list dd { margin: 0; color: var(--ink); font-size: 13px; display: flex; align-items: center; gap: 8px; }
 .settings-list a { color: var(--accent); }
 .settings-form { margin-top: 18px; display: grid; gap: 12px; }
+/* Settings: the one-time plaintext of a freshly created API token. */
+.token-reveal {
+  display: grid; gap: 6px; margin: 12px 0; padding: 10px 12px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-s);
+  background: rgb(var(--card-surface));
+}
+.token-reveal code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .settings-form h3 { margin: 6px 0 0; color: var(--ink); font-size: 14px; }
 .settings-form label { display: grid; gap: 6px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
 .settings-form input { height: 38px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: var(--r-s); outline: 0; background: rgb(var(--card-surface)); color: var(--ink); }

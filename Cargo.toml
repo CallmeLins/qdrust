@@ -4,6 +4,7 @@ members = [
     "crates/qdrust-cli",
     "crates/qdrust-server",
     "crates/qdrust-plugin-browser",
+    "crates/qdrust-mcp",
 ]
 default-members = ["crates/qdrust-server"]
 resolver = "3"

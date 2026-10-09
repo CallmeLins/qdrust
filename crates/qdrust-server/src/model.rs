@@ -41,6 +41,34 @@ pub struct IssuedSession {
     pub expires_at: i64,
 }
 
+/// A personal access token as its owner sees it. The plaintext exists only in
+/// [`IssuedApiToken`], and only once.
+#[derive(Clone, Debug, Serialize)]
+pub struct ApiToken {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+/// Creation result: `token` is the only time the secret is readable.
+#[derive(Clone, Debug, Serialize)]
+pub struct IssuedApiToken {
+    pub token: String,
+    pub api_token: ApiToken,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateApiToken {
+    pub name: String,
+    /// Days until expiry; omit for a token that does not expire.
+    #[serde(default)]
+    pub expires_in_days: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthCredentials {
     pub username: String,
@@ -151,6 +179,11 @@ pub struct Task {
     pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub random_delay_max_seconds: Option<i64>,
+    /// How many notification bindings this task has right now. Derived on read
+    /// (see `TASK_FIELDS`) so the task list can show whether a task notifies at
+    /// all without fetching every binding; 0 means "no notification".
+    #[serde(default)]
+    pub notification_action_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variables: Option<serde_json::Value>,
 }

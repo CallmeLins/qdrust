@@ -10,14 +10,15 @@ use sqlx::{
 
 use crate::auth::{new_token, token_hash};
 use crate::model::{
-    AdminUserUpdate, AuthenticatedSession, BatchTaskOperation, CreateNotificationAction,
-    CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
-    CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim,
-    ExternalLoginResolution, ImportQdHarTemplate, IssuedSession, NotificationAction,
-    NotificationChannel, NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run,
-    RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
-    UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
-    UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
+    AdminUserUpdate, ApiToken, AuthenticatedSession, BatchTaskOperation, CreateApiToken,
+    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
+    CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity,
+    ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken,
+    IssuedSession, NotificationAction, NotificationChannel, NotificationDelivery, OidcLoginState,
+    PluginManifest, PushRequest, Run, RunStep, SetSiteSetting, SiteSetting, Task, Template,
+    TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel,
+    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
+    UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{
     plugin::NotepadSlot,
@@ -618,6 +619,107 @@ macro_rules! define_store {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(authenticated_session_from_row).transpose()
+    }
+
+    /// Mint a personal access token. The plaintext is returned once; only its
+    /// hash is stored, so a database read cannot recover it.
+    pub async fn create_api_token(
+        &self,
+        user_id: i64,
+        input: CreateApiToken,
+    ) -> Result<IssuedApiToken> {
+        let name = input.name.trim();
+        ensure!(!name.is_empty(), "token name is required");
+        ensure!(name.chars().count() <= 128, "token name is too long");
+        if let Some(days) = input.expires_in_days {
+            ensure!(days > 0, "expires_in_days must be positive");
+        }
+        // `qd_` marks the string as a qdrust token, so it can be spotted in a
+        // log or a config file rather than looking like any other hex blob.
+        let token = format!("qd_{}", crate::auth::new_token());
+        let now = Utc::now().timestamp();
+        let expires_at = input.expires_in_days.map(|days| now + days * 86_400);
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO api_tokens(user_id,name,token_hash,created_at,expires_at) VALUES (?,?,?,?,?)",
+        )
+        .bind(user_id)
+        .bind(name)
+        .bind(crate::auth::token_hash(&token))
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *conn)
+        .await?;
+        let id = self.last_insert_id(&mut conn).await?;
+        drop(conn);
+        Ok(IssuedApiToken {
+            token,
+            api_token: ApiToken {
+                id,
+                name: name.to_owned(),
+                created_at: now,
+                last_used_at: None,
+                expires_at,
+            },
+        })
+    }
+
+    pub async fn list_api_tokens(&self, user_id: i64) -> Result<Vec<ApiToken>> {
+        let rows = sqlx::query(
+            "SELECT id,name,created_at,last_used_at,expires_at FROM api_tokens WHERE user_id=? ORDER BY id DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(api_token_from_row).collect()
+    }
+
+    pub async fn delete_api_token(&self, id: i64, user_id: i64) -> Result<bool> {
+        Ok(sqlx::query("DELETE FROM api_tokens WHERE id=? AND user_id=?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    /// Resolve a bearer token to the session-shaped identity the handlers use.
+    /// A missing, expired or disabled-user token is `None`, exactly like a dead
+    /// session. The last-use stamp is best-effort so authentication never fails
+    /// because of it.
+    pub async fn authenticate_api_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<AuthenticatedSession>> {
+        let token_hash = crate::auth::token_hash(token);
+        let row = sqlx::query(
+            "SELECT u.id,u.username,u.role,u.disabled,u.email,u.email_verified,u.created_at,u.updated_at,
+                    t.expires_at
+             FROM api_tokens t JOIN users u ON u.id=t.user_id
+             WHERE t.token_hash=? AND u.disabled=0",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let expires_at: Option<i64> = row.try_get("expires_at")?;
+        if expires_at.is_some_and(|at| at <= Utc::now().timestamp()) {
+            return Ok(None);
+        }
+        let session = AuthenticatedSession {
+            user: user_from_row(&row)?,
+            // A bearer request carries no CSRF cookie, so this hash is never
+            // compared; `require_csrf` skips bearer requests instead.
+            csrf_token_hash: String::new(),
+            expires_at: expires_at.unwrap_or(0),
+        };
+        let _ = sqlx::query("UPDATE api_tokens SET last_used_at=? WHERE token_hash=?")
+            .bind(Utc::now().timestamp())
+            .bind(&token_hash)
+            .execute(&self.pool)
+            .await;
+        Ok(Some(session))
     }
 
     pub async fn revoke_session(&self, session_token: &str) -> Result<bool> {
@@ -1511,6 +1613,24 @@ macro_rules! define_store {
     pub async fn delete_notification_action(&self, id: i64, owner_id: i64) -> Result<bool> {
         Ok(sqlx::query("DELETE FROM notification_actions WHERE id=? AND task_id IN (SELECT id FROM tasks WHERE owner_id=?)")
             .bind(id).bind(owner_id).execute(&self.pool).await?.rows_affected() > 0)
+    }
+
+    /// Remove every binding of one task — what the task list's bell toggle means
+    /// by "turn notifications off". Owner-scoped through the task, like the
+    /// single-row delete above.
+    pub async fn delete_notification_actions_for_task(
+        &self,
+        task_id: i64,
+        owner_id: i64,
+    ) -> Result<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM notification_actions WHERE task_id=? AND task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
+        )
+        .bind(task_id)
+        .bind(owner_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     /// Update one task↔channel binding in place; an absent field keeps its
@@ -2910,7 +3030,7 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
     })
 }
 
-const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables FROM tasks";
+const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables,(SELECT COUNT(*) FROM notification_actions WHERE notification_actions.task_id = tasks.id) AS notification_action_count FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp,(SELECT COUNT(*) FROM tasks WHERE tasks.template_id = templates.id) AS task_count FROM templates";
 const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_at,updated_at FROM template_subscriptions";
 // `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
@@ -2947,6 +3067,16 @@ fn authenticated_session_from_row(row: &$row) -> Result<AuthenticatedSession> {
     Ok(AuthenticatedSession {
         user: user_from_row(row)?,
         csrf_token_hash: row.try_get("csrf_token_hash")?,
+        expires_at: row.try_get("expires_at")?,
+    })
+}
+
+fn api_token_from_row(row: $row) -> Result<ApiToken> {
+    Ok(ApiToken {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        created_at: row.try_get("created_at")?,
+        last_used_at: row.try_get("last_used_at")?,
         expires_at: row.try_get("expires_at")?,
     })
 }
@@ -3009,6 +3139,7 @@ fn task_from_row(row: $row) -> Result<Task> {
         priority: row.try_get("priority")?,
         timezone: row.try_get("timezone")?,
         random_delay_max_seconds: row.try_get("random_delay_max_seconds")?,
+        notification_action_count: row.try_get("notification_action_count")?,
         variables: variables
             .map(|v| serde_json::from_str(&v).context("invalid task variables in database"))
             .transpose()?,
@@ -3339,6 +3470,10 @@ impl Store {
         pub async fn purge_expired_oidc_login_states() -> Result<u64> {  };
         pub async fn create_session(user_id: i64, ttl: Duration) -> Result<IssuedSession> { user_id, ttl };
         pub async fn authenticate_session(session_token: &str) -> Result<Option<AuthenticatedSession>> { session_token };
+        pub async fn create_api_token(user_id: i64, input: CreateApiToken) -> Result<IssuedApiToken> { user_id, input };
+        pub async fn list_api_tokens(user_id: i64) -> Result<Vec<ApiToken>> { user_id };
+        pub async fn delete_api_token(id: i64, user_id: i64) -> Result<bool> { id, user_id };
+        pub async fn authenticate_api_token(token: &str) -> Result<Option<AuthenticatedSession>> { token };
         pub async fn revoke_session(session_token: &str) -> Result<bool> { session_token };
         pub async fn revoke_all_sessions(user_id: i64) -> Result<()> { user_id };
         pub async fn change_password(user_id: i64, password_hash: &str) -> Result<bool> { user_id, password_hash };
@@ -3391,6 +3526,7 @@ impl Store {
         pub async fn list_notification_actions(task_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationAction>>> { task_id, owner_id };
         pub async fn list_all_notification_actions(owner_id: i64) -> Result<Vec<NotificationAction>> { owner_id };
         pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
+        pub async fn delete_notification_actions_for_task(task_id: i64, owner_id: i64) -> Result<u64> { task_id, owner_id };
         pub async fn update_notification_action(id: i64, owner_id: i64, input: UpdateNotificationAction) -> Result<Option<NotificationAction>> { id, owner_id, input };
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
@@ -4219,6 +4355,132 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Personal access tokens (issue #41): the plaintext is returned once, only
+    /// its hash is stored, and a revoked token stops authenticating.
+    #[tokio::test]
+    async fn issues_authenticates_and_revokes_api_tokens() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("token_alice", &password_hash, "user")
+            .await
+            .unwrap();
+
+        let issued = store
+            .create_api_token(
+                alice.id,
+                CreateApiToken {
+                    name: "mcp".into(),
+                    expires_in_days: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(issued.token.starts_with("qd_"));
+        // The stored row keeps no plaintext and no hash of the plaintext that
+        // could be replayed: the list only ever carries metadata.
+        let listed = store.list_api_tokens(alice.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "mcp");
+        assert_eq!(listed[0].expires_at, None);
+
+        let session = store
+            .authenticate_api_token(&issued.token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.user.id, alice.id);
+        assert!(
+            store
+                .authenticate_api_token("qd_not-a-real-token")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Authentication stamps last use, best-effort.
+        assert!(
+            store.list_api_tokens(alice.id).await.unwrap()[0]
+                .last_used_at
+                .is_some()
+        );
+
+        assert!(
+            store
+                .delete_api_token(issued.api_token.id, alice.id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .authenticate_api_token(&issued.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Expiry and ownership are both enforced: an expired token and another
+    /// user's token id are refused.
+    #[tokio::test]
+    async fn api_token_expiry_and_ownership_are_enforced() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let alice = store
+            .create_user("token_exp_alice", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("token_exp_bob", "$argon2id$test", "user")
+            .await
+            .unwrap();
+
+        // A non-positive expiry is rejected at creation rather than stored.
+        assert!(
+            store
+                .create_api_token(
+                    alice.id,
+                    CreateApiToken {
+                        name: "bad".into(),
+                        expires_in_days: Some(0),
+                    },
+                )
+                .await
+                .is_err()
+        );
+
+        let issued = store
+            .create_api_token(
+                alice.id,
+                CreateApiToken {
+                    name: "short".into(),
+                    expires_in_days: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        // Force it into the past so the expiry check runs without waiting a day.
+        sqlx::query("UPDATE api_tokens SET expires_at=? WHERE id=?")
+            .bind(Utc::now().timestamp() - 1)
+            .bind(issued.api_token.id)
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .authenticate_api_token(&issued.token)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Bob cannot revoke a token that is not his.
+        assert!(
+            !store
+                .delete_api_token(issued.api_token.id, bob.id)
+                .await
+                .unwrap()
         );
     }
 
@@ -5162,6 +5424,108 @@ mod tests {
         let bobs = store.list_all_notification_actions(bob.id).await.unwrap();
         assert_eq!(bobs.len(), 1);
         assert_eq!(bobs[0].task_id, bobs_task.id);
+    }
+
+    /// The task list's bell (issue #40) reads a derived count and toggles it off
+    /// by clearing every binding of that task. Both are owner-scoped: a foreign
+    /// task reports nothing and clears nothing.
+    #[tokio::test]
+    async fn notification_binding_count_and_clear_are_owner_scoped() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let alice = store
+            .create_user("alice-bell", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("bob-bell", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let channel = store
+            .create_notification_channel(
+                alice.id,
+                CreateNotificationChannel {
+                    name: "hook".into(),
+                    kind: "webhook".into(),
+                    config: serde_json::json!({"url":"https://example.com/hook"}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("bell"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_for_owner(task.id, alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .notification_action_count,
+            0
+        );
+
+        store
+            .create_notification_action(
+                task.id,
+                alice.id,
+                CreateNotificationAction {
+                    channel_id: channel.id,
+                    event: "failure".into(),
+                    failure_threshold: 1,
+                    automatic_only: false,
+                    title_template: None,
+                    body_template: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .get_for_owner(task.id, alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .notification_action_count,
+            1
+        );
+
+        // Bob cannot clear a task that is not his, and the count is unchanged.
+        assert_eq!(
+            store
+                .delete_notification_actions_for_task(task.id, bob.id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .get_for_owner(task.id, alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .notification_action_count,
+            1
+        );
+
+        assert_eq!(
+            store
+                .delete_notification_actions_for_task(task.id, alice.id)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_for_owner(task.id, alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .notification_action_count,
+            0
+        );
     }
 
     #[tokio::test]

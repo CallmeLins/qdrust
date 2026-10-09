@@ -1676,6 +1676,7 @@ mod tests {
             priority: None,
             timezone: timezone.map(str::to_string),
             random_delay_max_seconds: None,
+            notification_action_count: 0,
             variables: None,
         }
     }

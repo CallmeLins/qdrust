@@ -34,6 +34,8 @@ export type PushRequest = components["schemas"]["PushRequest"];
 export type SiteSetting = components["schemas"]["SiteSetting"];
 export type BatchTaskResult = components["schemas"]["BatchTaskResult"];
 export type QdHarValidation = components["schemas"]["QdHarValidation"];
+export type ApiToken = components["schemas"]["ApiToken"];
+export type IssuedApiToken = components["schemas"]["IssuedApiToken"];
 export type TemplateTestResult = components["schemas"]["TemplateTestResult"];
 
 /** One notepad slot as the list returns it.
@@ -233,6 +235,11 @@ export const api = {
   resendVerification: () => request<{ sent: boolean; verify_token?: string; expires_at?: number }>("/api/v1/auth/resend-verification", { method: "POST" }),
   rotateCsrf: () => request<{ csrf_token: string }>("/api/v1/auth/csrf/rotate", { method: "POST" }),
 
+  // ---- personal access tokens ----
+  apiTokens: () => request<ApiToken[]>("/api/v1/tokens"),
+  createApiToken: (input: { name: string; expires_in_days?: number | null }) => request<IssuedApiToken>("/api/v1/tokens", { method: "POST", body: JSON.stringify(input) }),
+  deleteApiToken: (id: number) => request<void>(`/api/v1/tokens/${id}`, { method: "DELETE" }),
+
   // ---- templates ----
   /** One page of the paginated template list. Most callers want
    *  `allTemplates`; reach for this only to walk pages by hand. */
@@ -318,6 +325,8 @@ export const api = {
    *  to clear a template — `null` means "unchanged", not "remove". */
   updateNotificationAction: (id: number, patch: { channel_id?: number; event?: NotificationAction["event"]; failure_threshold?: number; automatic_only?: boolean; title_template?: string; body_template?: string }) => request<NotificationAction>(`/api/v1/notification-actions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteNotificationAction: (id: number) => request<void>(`/api/v1/notification-actions/${id}`, { method: "DELETE" }),
+  /** Drop every binding of one task — the task list bell's "off". */
+  clearTaskNotificationActions: (taskId: number) => request<{ removed: number }>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "DELETE" }),
   batchCreateNotificationActions: (taskIds: number[], channelId: number, event: string, failureThreshold = 1, automaticOnly = false, titleTemplate?: string, bodyTemplate?: string) => request<{ created: number }>("/api/v1/notification-actions/batch", { method: "POST", body: JSON.stringify({ task_ids: taskIds, channel_id: channelId, event, failure_threshold: failureThreshold, automatic_only: automaticOnly, title_template: titleTemplate || null, body_template: bodyTemplate || null }) }),
 
   // ---- tasks ----

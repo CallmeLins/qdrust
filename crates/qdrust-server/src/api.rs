@@ -40,14 +40,14 @@ use crate::{
     model::{
         AdminUserUpdate, ApplyLibraryTemplate, AuthCredentials, AuthResponse, AuthenticatedSession,
         BatchCreateNotificationAction, BatchTaskOperation, BatchTaskResult, ChangePassword,
-        ClearLogs, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest,
-        CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription,
-        DecidePushRequest, ExternalIdentityClaim, ForgotPassword, ImportLibraryTemplates,
-        ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation, RegisterUser,
-        ResetPassword, SetNotepad, SetSiteSetting, TemplateSubscription, TemplateTestResult,
-        TemplateTestStep, TestTemplate, UpdateNotificationAction, UpdateNotificationChannel,
-        UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-        UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        ClearLogs, CreateApiToken, CreateNotificationAction, CreateNotificationChannel,
+        CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
+        CreateTemplateSubscription, DecidePushRequest, ExternalIdentityClaim, ForgotPassword,
+        ImportLibraryTemplates, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
+        RegisterUser, ResetPassword, SetNotepad, SetSiteSetting, TemplateSubscription,
+        TemplateTestResult, TemplateTestStep, TestTemplate, UpdateNotificationAction,
+        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
     },
     store::Store,
 };
@@ -382,7 +382,9 @@ pub fn router_with_auth(
         )
         .route(
             "/api/v1/tasks/{id}/notification-actions",
-            get(list_notification_actions).post(create_notification_action),
+            get(list_notification_actions)
+                .post(create_notification_action)
+                .delete(clear_task_notification_actions),
         )
         .route(
             "/api/v1/notification-actions",
@@ -409,6 +411,14 @@ pub fn router_with_auth(
         .route(
             "/api/v1/notepads/{notepad_id}",
             get(get_notepad).put(set_notepad).delete(delete_notepad),
+        )
+        .route(
+            "/api/v1/tokens",
+            get(list_api_tokens).post(create_api_token),
+        )
+        .route(
+            "/api/v1/tokens/{id}",
+            axum::routing::delete(revoke_api_token),
         )
         .route("/api/v1/public-templates", get(list_public_templates))
         .route(
@@ -1013,9 +1023,11 @@ async fn current_session(
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let (session_token, session) = require_session(&state, &headers).await?;
-    require_csrf(&headers, &session)?;
-    state.store.revoke_session(&session_token).await?;
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
+    // A bearer request has no session row to revoke; that is deliberate.
+    // Revoking a token is `DELETE /api/v1/tokens/{id}`, not this endpoint.
+    state.store.revoke_session(&origin.token).await?;
     state
         .store
         .record_audit(
@@ -1037,8 +1049,8 @@ async fn change_password(
     headers: HeaderMap,
     ApiJson(input): ApiJson<ChangePassword>,
 ) -> Result<Response, ApiError> {
-    let (_session_token, session) = require_session(&state, &headers).await?;
-    require_csrf(&headers, &session)?;
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
     let credentials = state
         .store
         .credentials_by_username(&session.user.username)
@@ -1106,26 +1118,74 @@ async fn issue_session_response(
     Ok(response)
 }
 
+/// Which credential authenticated a request. Carried next to the session so
+/// `require_csrf` can tell a cookie from a bearer token: a browser cannot attach
+/// a bearer token on its own, so there is no cross-site request to protect, and
+/// the token itself was already validated by the auth helper.
+#[derive(Clone, Debug)]
+struct AuthOrigin {
+    /// The session token (cookie) or the API token string (bearer).
+    token: String,
+    bearer: bool,
+}
+
+impl AuthOrigin {
+    fn cookie(token: String) -> Self {
+        Self {
+            token,
+            bearer: false,
+        }
+    }
+
+    fn bearer(token: String) -> Self {
+        Self {
+            token,
+            bearer: true,
+        }
+    }
+}
+
+fn unauthorized() -> ApiError {
+    ApiError::Unauthorized("authentication_required", "Authentication required")
+}
+
+/// `Authorization: Bearer qd_...` when present and non-empty.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))?
+        .trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
 async fn require_session(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(String, AuthenticatedSession), ApiError> {
-    let token = cookie(headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized(
-        "authentication_required",
-        "Authentication required",
-    ))?;
+) -> Result<(AuthOrigin, AuthenticatedSession), ApiError> {
+    // Bearer is preferred when present: it is unambiguous, and a client that
+    // sends one means it rather than a cookie.
+    if let Some(token) = bearer_token(headers) {
+        let session = state
+            .store
+            .authenticate_api_token(&token)
+            .await?
+            .ok_or_else(unauthorized)?;
+        return Ok((AuthOrigin::bearer(token), session));
+    }
+    let token = cookie(headers, SESSION_COOKIE).ok_or_else(unauthorized)?;
     let token_hash = crate::auth::token_hash(&token);
     if let Some(session) = state.session_cache.get(&token_hash).await {
-        return Ok((token, session));
+        return Ok((AuthOrigin::cookie(token), session));
     }
     let session = state
         .store
         .authenticate_session(&token)
         .await?
-        .ok_or(ApiError::Unauthorized(
-            "authentication_required",
-            "Authentication required",
-        ))?;
+        .ok_or_else(unauthorized)?;
     state
         .session_cache
         .set(
@@ -1134,28 +1194,39 @@ async fn require_session(
             i64::try_from(state.auth.session_ttl.as_secs().min(86_400 * 7)).unwrap_or(86_400 * 7),
         )
         .await;
-    Ok((token, session))
+    Ok((AuthOrigin::cookie(token), session))
 }
 
 async fn require_session_from_store(
     store: &Store,
     headers: &HeaderMap,
-) -> Result<(String, AuthenticatedSession), ApiError> {
-    let token = cookie(headers, SESSION_COOKIE).ok_or(ApiError::Unauthorized(
-        "authentication_required",
-        "Authentication required",
-    ))?;
+) -> Result<(AuthOrigin, AuthenticatedSession), ApiError> {
+    if let Some(token) = bearer_token(headers) {
+        let session = store
+            .authenticate_api_token(&token)
+            .await?
+            .ok_or_else(unauthorized)?;
+        return Ok((AuthOrigin::bearer(token), session));
+    }
+    let token = cookie(headers, SESSION_COOKIE).ok_or_else(unauthorized)?;
     let session = store
         .authenticate_session(&token)
         .await?
-        .ok_or(ApiError::Unauthorized(
-            "authentication_required",
-            "Authentication required",
-        ))?;
-    Ok((token, session))
+        .ok_or_else(unauthorized)?;
+    Ok((AuthOrigin::cookie(token), session))
 }
 
-fn require_csrf(headers: &HeaderMap, session: &AuthenticatedSession) -> Result<(), ApiError> {
+/// CSRF stands between a cookie and a state change. A bearer token is not a
+/// cookie — the browser never attaches it — so a bearer-authenticated request
+/// has nothing for this check to protect and is waved through.
+fn require_csrf(
+    headers: &HeaderMap,
+    origin: &AuthOrigin,
+    session: &AuthenticatedSession,
+) -> Result<(), ApiError> {
+    if origin.bearer {
+        return Ok(());
+    }
     let cookie_token = cookie(headers, CSRF_COOKIE).ok_or(ApiError::Forbidden(
         "csrf_validation_failed",
         "CSRF validation failed",
@@ -1318,7 +1389,7 @@ async fn header_auth_middleware(
                 return next.run(request).await;
             }
             // Establish (or refresh on identity drift) a session for the user.
-            let old_token = existing.as_ref().map(|(token, _)| token.clone());
+            let old_token = existing.as_ref().map(|(origin, _)| origin.token.clone());
             match establish_header_session(&state, &user, old_token.as_deref()).await {
                 Ok(issued) => {
                     inject_session_cookies(&mut request, &issued, &state.auth);
@@ -1856,6 +1927,24 @@ async fn create_notification_action(
     Ok((StatusCode::CREATED, Json(json!(action))))
 }
 
+/// Remove every notification binding of one task — what the task list's bell
+/// uses to turn a task's notifications off in one click. A task that is not the
+/// caller's reports `task_not_found`, not a silent empty delete.
+async fn clear_task_notification_actions(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    if store.get_for_owner(id, session.user.id).await?.is_none() {
+        return Err(ApiError::NotFound("task_not_found", "Task not found"));
+    }
+    let removed = store
+        .delete_notification_actions_for_task(id, session.user.id)
+        .await?;
+    Ok(Json(json!({"removed": removed})))
+}
+
 async fn batch_create_notification_actions(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -2172,6 +2261,64 @@ const NOTEPAD_PREVIEW_CHARS: usize = 120;
 /// The account comes from the session and never from the request. A slot holds
 /// whatever a template put there — a refreshed session cookie, most often — so
 /// letting the request name an account would be a way to read someone else's.
+/// Personal access tokens for programmatic API access. The list never contains
+/// a secret; creation returns the plaintext once.
+async fn list_api_tokens(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    Ok(Json(json!(store.list_api_tokens(session.user.id).await?)))
+}
+
+async fn create_api_token(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<CreateApiToken>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let issued = store
+        .create_api_token(session.user.id, input)
+        .await
+        .map_err(ApiError::unprocessable)?;
+    store
+        .record_audit(
+            Some(session.user.id),
+            "api_token.created",
+            Some("api_token"),
+            Some(issued.api_token.id),
+            None,
+            &json!({"name": issued.api_token.name}),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(json!(issued))))
+}
+
+async fn revoke_api_token(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    if !store.delete_api_token(id, session.user.id).await? {
+        return Err(ApiError::NotFound(
+            "api_token_not_found",
+            "API token not found",
+        ));
+    }
+    store
+        .record_audit(
+            Some(session.user.id),
+            "api_token.revoked",
+            Some("api_token"),
+            Some(id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_notepads(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -2929,15 +3076,15 @@ fn ensure_setting_key(key: &str) -> Result<(), ApiError> {
 async fn require_admin(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(String, AuthenticatedSession), ApiError> {
-    let (token, session) = require_session(state, headers).await?;
+) -> Result<(AuthOrigin, AuthenticatedSession), ApiError> {
+    let (origin, session) = require_session(state, headers).await?;
     if session.user.role != "admin" {
         return Err(ApiError::Forbidden(
             "admin_required",
             "Administrator role required",
         ));
     }
-    Ok((token, session))
+    Ok((origin, session))
 }
 
 // ==================== P1 features: email verification, CSRF rotation, subscriptions, push requests, backup ====================
@@ -3015,11 +3162,11 @@ async fn rotate_csrf_token(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (token, _session) = require_session(&state, &headers).await?;
+    let (origin, _session) = require_session(&state, &headers).await?;
     let new_csrf = crate::auth::new_token();
     state
         .store
-        .rotate_csrf(&token, &crate::auth::token_hash(&new_csrf))
+        .rotate_csrf(&origin.token, &crate::auth::token_hash(&new_csrf))
         .await?;
     let mut response = Json(json!({"csrf_token": new_csrf})).into_response();
     let max_age = state.auth.session_ttl.as_secs();
@@ -4787,6 +4934,106 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let tasks: Value = serde_json::from_slice(&body).unwrap();
         assert!(tasks.as_array().unwrap().is_empty());
+    }
+
+    /// A personal access token authenticates without a session cookie, and a
+    /// bearer request skips CSRF (it carries no cookie for CSRF to protect).
+    #[tokio::test]
+    async fn bearer_tokens_authenticate_and_skip_csrf() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+
+        // Mint a token over the cookie session.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tokens")
+                    .header("content-type", "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(json!({"name": "mcp"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let issued: Value = serde_json::from_slice(&body).unwrap();
+        let token = issued["token"].as_str().unwrap().to_owned();
+        assert!(token.starts_with("qd_"));
+
+        // A read with the bearer works...
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // ...and so does a write with no CSRF cookie or header.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tokens")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(json!({"name": "second"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // A garbage token is simply unauthenticated.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .header("authorization", "Bearer qd_nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Revoking it stops the bearer on the next request.
+        let id = issued["api_token"]["id"].as_i64().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/tokens/{id}"))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The test endpoint must read the same admin switch a scheduled run does.

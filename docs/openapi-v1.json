@@ -772,7 +772,49 @@
           }
         }
       }
+    },    "/api/v1/tokens": {
+      "get": {
+        "operationId": "listApiTokens",
+        "responses": {
+          "200": {
+            "description": "Personal access tokens (secrets omitted)",
+            "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ApiToken" } } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "operationId": "createApiToken",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateApiToken" } } } },
+        "responses": {
+          "201": {
+            "description": "Token created; the plaintext is returned once",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IssuedApiToken" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/ValidationError" }
+        }
+      }
     },
+    "/api/v1/tokens/{id}": {
+      "delete": {
+        "operationId": "revokeApiToken",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Token revoked" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+
     "/api/v1/public-templates": {
       "get": {
         "operationId": "listPublicTemplates",
@@ -1821,6 +1863,13 @@
     }
   },
   "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Personal access token (`qd_...`). Send `Authorization: Bearer <token>`. Bearer requests skip CSRF."
+      }
+    },
     "parameters": {
       "Id": {
         "name": "id",
@@ -2552,6 +2601,11 @@
                   "null"
                 ],
                 "description": "Group label (QD _groups equivalent)"
+              },
+              "notification_action_count": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Number of notification bindings this task has (0 = no notification)"
               }
             }
           }
@@ -3163,6 +3217,33 @@
             "type": "integer",
             "minimum": 0
           }
+        }
+      },
+      "ApiToken": {
+        "type": "object",
+        "required": ["id", "name", "created_at"],
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string" },
+          "created_at": { "type": "integer", "format": "int64" },
+          "last_used_at": { "type": ["integer", "null"], "format": "int64" },
+          "expires_at": { "type": ["integer", "null"], "format": "int64" }
+        }
+      },
+      "IssuedApiToken": {
+        "type": "object",
+        "required": ["token", "api_token"],
+        "properties": {
+          "token": { "type": "string", "description": "Plaintext token, shown once" },
+          "api_token": { "$ref": "#/components/schemas/ApiToken" }
+        }
+      },
+      "CreateApiToken": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "expires_in_days": { "type": ["integer", "null"], "description": "Omit or null for no expiry" }
         }
       },
       "TestTemplate": {

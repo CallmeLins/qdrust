@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -417,14 +417,20 @@ async function submitTask() {
     variables: taskForm.variables.length ? rowsToVariables(taskForm.variables) : null,
   };
   try {
+    let savedId = taskForm.id;
+    const previousActions = taskActions.value;
     if (taskForm.id != null) {
       await api.updateTask(taskForm.id, { ...payload });
       notify(t("taskUpdated"));
     } else {
-      await api.createTask(payload);
+      const created = await api.createTask(payload);
+      savedId = created.id;
       notify(t("taskCreated"));
     }
+    // Bind/unbind after the task exists: on create its id is only known here.
+    if (savedId != null) await syncTaskNotifications(savedId, previousActions);
     Object.assign(taskForm, blankTaskForm());
+    resetTaskNotifyForm();
     showCreate.value = false;
     await loadTasks();
   } catch (cause) {
@@ -435,14 +441,17 @@ async function submitTask() {
 function openCreateTask() {
   Object.assign(taskForm, blankTaskForm());
   testResult.value = null;
+  resetTaskNotifyForm();
   showCreate.value = true;
-  // Always re-read, not only when the list is empty: the dropdown's order and
-  // its "unused" suffix are computed from these rows, so a template bound since
-  // the last read would otherwise still be offered as unused.
+  // Channels drive the dialog's notification picker, and templates its dropdown;
+  // both are re-read rather than assumed, for the same reason: they may have
+  // changed since this dialog last opened.
+  void ensureChannelsLoaded();
   void refreshTemplates();
-}function openEditTask(task: Task) {
+}async function openEditTask(task: Task) {
   const visual = parseVisualCron(task.cron);
   testResult.value = null;
+  resetTaskNotifyForm();
   Object.assign(taskForm, {
     id: task.id,
     name: task.name,
@@ -462,6 +471,15 @@ function openCreateTask() {
     variables: variablesToRows(task.variables),
   });
   showCreate.value = true;
+  await ensureChannelsLoaded();
+  try {
+    const bound = await api.notificationActions(task.id);
+    taskActions.value = bound;
+    notifyEnabled.value = bound.length > 0;
+    notifyChannelIds.value = [...new Set(bound.map((action) => action.channel_id))];
+  } catch {
+    // Leave the switch off if the read fails; saving then only changes the task.
+  }
 }
 
 async function toggleTask(task: Task) {
@@ -1424,6 +1442,76 @@ async function saveActionEdit() {
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
+// ---------- task ↔ notification binding (issue #40) ----------
+/** Bindings of the task currently open in the dialog, as loaded when it was
+ *  opened. Saving edits them by difference. */
+const taskActions = ref<NotificationAction[]>([]);
+/** The dialog's master switch and channel selection. Fine-grained settings
+ *  (event, threshold, templates) stay on the notification page. */
+const notifyEnabled = ref(false);
+const notifyChannelIds = ref<number[]>([]);
+const enabledChannels = computed(() => channels.value.filter((channel) => channel.enabled));
+
+function resetTaskNotifyForm() {
+  taskActions.value = [];
+  notifyEnabled.value = false;
+  notifyChannelIds.value = [];
+}
+
+function toggleNotifyChannel(id: number) {
+  const at = notifyChannelIds.value.indexOf(id);
+  if (at >= 0) notifyChannelIds.value.splice(at, 1);
+  else notifyChannelIds.value.push(id);
+}
+
+/** Load the channel list so the dialog's picker is populated; a failure just
+ *  leaves it empty and the next page visit retries. */
+async function ensureChannelsLoaded() {
+  if (channels.value.length) return;
+  try { channels.value = await api.notificationChannels(); } catch { /* picker stays empty */ }
+}
+
+/** Push the dialog's switch/selection onto the server, touching only the
+ *  difference: checked channels get a default `failure` binding, unchecked ones
+ *  lose theirs. A binding that stays checked keeps its event/threshold/template. */
+async function syncTaskNotifications(taskId: number, existing: NotificationAction[]) {
+  const selected = new Set(notifyChannelIds.value);
+  for (const action of existing) {
+    if (!notifyEnabled.value || !selected.has(action.channel_id)) {
+      await api.deleteNotificationAction(action.id);
+    }
+  }
+  if (!notifyEnabled.value) return;
+  const present = new Set(existing.map((action) => action.channel_id));
+  for (const channelId of notifyChannelIds.value) {
+    if (!present.has(channelId)) await api.batchCreateNotificationActions([taskId], channelId, "failure");
+  }
+}
+
+/** The task list bell: bound -> remove every binding; unbound -> bind every
+ *  enabled channel with the default event. This is the issue's one-click
+ *  toggle; the dialog is where a specific channel can be chosen. */
+async function toggleTaskNotifications(task: Task) {
+  try {
+    if ((task.notification_action_count ?? 0) > 0) {
+      const removed = await api.clearTaskNotificationActions(task.id);
+      notify(fmt("notifyCleared", { n: removed.removed }));
+    } else {
+      await ensureChannelsLoaded();
+      const targets = enabledChannels.value;
+      if (!targets.length) { notify(t("notifyNoChannels"), "error"); return; }
+      for (const channel of targets) {
+        await api.batchCreateNotificationActions([task.id], channel.id, "failure");
+      }
+      notify(fmt("notifyBoundCount", { n: targets.length }));
+    }
+    await loadTasks();
+    if (view.value === "notifications") await loadActions();
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  }
+}
+
 // ---------- subscriptions (a section of the templates page, not a page of its own) ----------
 const subscriptions = ref<TemplateSubscription[]>([]);
 const {
@@ -1950,6 +2038,54 @@ async function rotateCsrf() {
   try { await api.rotateCsrf(); notify(t("csrfRotated")); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
+
+// ---------- personal access tokens (issue #41) ----------
+const apiTokens = ref<ApiToken[]>([]);
+const tokenForm = reactive({ name: "", expiresInDays: "" });
+/** Plaintext of the token just created. Shown once; the server stores only a
+ *  hash, so it cannot be recovered later. */
+const newToken = ref("");
+
+/** Tokens are only shown on the settings view, so they are read when it opens
+ *  rather than at boot. `createApiToken`/`revokeApiToken` reuse it to refresh. */
+async function openSettings() {
+  view.value = "settings";
+  try { apiTokens.value = await api.apiTokens(); }
+  catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function createApiToken() {
+  if (!tokenForm.name.trim()) return;
+  try {
+    const issued = await api.createApiToken({
+      name: tokenForm.name.trim(),
+      expires_in_days: tokenForm.expiresInDays ? Number(tokenForm.expiresInDays) : null,
+    });
+    newToken.value = issued.token;
+    Object.assign(tokenForm, { name: "", expiresInDays: "" });
+    notify(t("tokenIssued"));
+    await openSettings();
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  }
+}
+async function revokeApiToken(id: number) {
+  try {
+    await api.deleteApiToken(id);
+    notify(t("tokenRevoked"));
+    await openSettings();
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  }
+}
+async function copyNewToken() {
+  try {
+    await navigator.clipboard.writeText(newToken.value);
+    notify(t("copied"));
+  } catch {
+    // Clipboard may be unavailable outside a secure context; the code is
+    // selectable, so a failed convenience copy is not worth an error toast.
+  }
+}
 async function resendVerification() {
   try { await api.resendVerification(); notify(t("verifySent")); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
@@ -2248,7 +2384,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
         <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
-        <a :class="['nav-link', { active: view === 'settings' }]" href="#" @click.prevent="view='settings'"><Settings :size="18" />{{ t('settings') }}</a>
+        <a :class="['nav-link', { active: view === 'settings' }]" href="#" @click.prevent="openSettings"><Settings :size="18" />{{ t('settings') }}</a>
       </nav>
       <div class="sidebar-bottom">
         <a class="nav-link" href="#" @click.prevent="showHelp = true"><CircleHelp :size="18" />{{ t('help') }}</a>
@@ -2355,6 +2491,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                       <button class="icon-button row-act" :title="t('runNow')" @click="runNow(task)"><Play :size="17" /></button>
                       <button class="icon-button row-act" :title="t('runHistory')" @click="openRunHistory(task)"><Activity :size="17" /></button>
                       <button class="icon-button row-act" :title="t('editTask')" @click="openEditTask(task)"><Pencil :size="17" /></button>
+                      <button
+                        class="icon-button row-act"
+                        :class="{ 'notify-on': (task.notification_action_count ?? 0) > 0 }"
+                        :title="(task.notification_action_count ?? 0) > 0 ? t('notifyOn') : t('notifyOff')"
+                        @click="toggleTaskNotifications(task)"
+                      >
+                        <Bell v-if="(task.notification_action_count ?? 0) > 0" :size="17" />
+                        <BellOff v-else :size="17" />
+                      </button>
                       <button class="icon-button row-act" :title="t('deleteTask')" @click="removeTask(task)"><Trash2 :size="17" /></button>
                       <button class="icon-button row-more" :title="t('more')" :aria-expanded="openRowMenu === task.id" @click="toggleRowMenu(task.id)"><MoreVertical :size="17" /></button>
                       <div v-if="openRowMenu === task.id" class="row-menu">
@@ -3009,6 +3154,28 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <div><dt>{{ t('apiDocs') }}</dt><dd><a :href="apiPath('/api/v1/openapi.json')" target="_blank">{{ t('openapi') }}</a></dd></div>
             </dl>
           </div>
+          <div class="content-panel">
+            <h2>{{ t('apiTokens') }}</h2>
+            <p class="muted section-hint">{{ t('apiTokensHint') }}</p>
+            <form class="settings-form" @submit.prevent="createApiToken">
+              <label>{{ t('tokenName') }}<input v-model="tokenForm.name" required maxlength="128" placeholder="cursor / mcp" /></label>
+              <label>{{ t('tokenExpiry') }}<input v-model="tokenForm.expiresInDays" type="number" min="1" placeholder="30" /></label>
+              <div class="inline-actions"><button class="primary-button">{{ t('createToken') }}</button></div>
+            </form>
+            <div v-if="newToken" class="token-reveal">
+              <strong>{{ t('tokenOnce') }}</strong>
+              <code>{{ newToken }}</code>
+              <button class="secondary-button" type="button" @click="copyNewToken"><Copy :size="14" />{{ t('tokenCopy') }}</button>
+            </div>
+            <div v-if="apiTokens.length === 0" class="muted">{{ t('noTokens') }}</div>
+            <div v-for="token in apiTokens" :key="token.id" class="run-row">
+              <strong>{{ token.name }}</strong>
+              <span class="muted">{{ t('tokenCreated') }} {{ formatRunTime(token.created_at) }}</span>
+              <span v-if="token.last_used_at" class="muted">{{ t('tokenLastUsed') }} {{ formatRunTime(token.last_used_at) }}</span>
+              <span v-if="token.expires_at" class="chip">{{ t('tokenExpires') }} {{ formatRunTime(token.expires_at) }}</span>
+              <button class="icon-button danger" :title="t('revokeToken')" @click="revokeApiToken(token.id)"><Trash2 :size="16" /></button>
+            </div>
+          </div>
         </section>
       </div>
       </Transition>
@@ -3078,6 +3245,18 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </span>
           <small class="kv-hint">{{ taskForm.templateId ? t('templateVarsHint') : t('variablesHint') }}</small>
         </label>
+        <div class="notify-block field-wide">
+          <label class="checkbox"><input v-model="notifyEnabled" type="checkbox" />{{ t('taskNotifyEnable') }}</label>
+          <div v-if="notifyEnabled" class="check-list notify-channels">
+            <label v-for="channel in enabledChannels" :key="channel.id" class="check-row">
+              <input type="checkbox" :checked="notifyChannelIds.includes(channel.id)" @change="toggleNotifyChannel(channel.id)" />
+              <span class="check-row-name">{{ channel.name }}</span>
+              <span class="chip">{{ channelKindLabel(channel.kind) }}</span>
+            </label>
+            <div v-if="enabledChannels.length === 0" class="muted">{{ t('notifyNoChannels') }}</div>
+          </div>
+          <small v-if="notifyEnabled" class="kv-hint">{{ t('taskNotifyHint') }}</small>
+        </div>
         <label class="checkbox"><input v-model="taskForm.disabled" type="checkbox" />{{ t('createPaused') }}</label>
         <div v-if="testing || testResult" class="template-test">
           <div class="template-test-head">
