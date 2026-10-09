@@ -30,7 +30,8 @@ SERVER_NAME = "qdrust-mcp"
 INSTRUCTIONS = (
     "Create, run and inspect qdrust HTTP automation tasks. A task executes a "
     "template: use list_templates to find one, then create_task with template_id "
-    "and variables. update_task changes only the fields you pass."
+    "and variables. update_task changes only the fields you pass, and clear=[...] "
+    "erases one. Notepad slots hold small values that templates read and write."
 )
 
 
@@ -72,15 +73,26 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         timezone: str | None = None,
         disabled: bool | None = None,
         url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, Any] | None = None,
+        body: str | None = None,
         timeout_seconds: int | None = None,
+        retry_count: int | None = None,
+        retry_interval_seconds: int | None = None,
+        priority: int | None = None,
+        random_delay_max_seconds: int | None = None,
         variables: dict[str, Any] | None = None,
     ) -> str:
         """Create a scheduled task.
 
-        A task's requests come from its template, so bind `template_id`; `url` is
-        only for a task that is not bound to a template. `cron` is the 7-field
-        form `sec min hour day month weekday year`, e.g. `0 0 8 * * * *` is 08:00
-        daily. `variables` seeds the template, e.g. {"username": "..."}.
+        A task's requests come from its template, so bind `template_id`; `url`
+        (with `method`, `headers`, `body`) is only for a task that is not bound
+        to a template. `cron` is the 7-field form
+        `sec min hour day month weekday year`, e.g. `0 0 8 * * * *` is 08:00
+        daily. `timezone` is an IANA name (default UTC). `variables` seeds the
+        template, e.g. {"username": "..."}. `retry_count` is 0 = never,
+        -1 = always, N = up to N retries; `random_delay_max_seconds` jitters a
+        due run by 0..=N seconds.
         """
         return _json(
             api.create_task(
@@ -91,7 +103,14 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
                 timezone=timezone,
                 disabled=disabled,
                 url=url,
+                method=method,
+                headers=headers,
+                body=body,
                 timeout_seconds=timeout_seconds,
+                retry_count=retry_count,
+                retry_interval_seconds=retry_interval_seconds,
+                priority=priority,
+                random_delay_max_seconds=random_delay_max_seconds,
                 variables=variables,
             )
         )
@@ -105,8 +124,24 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         grp: str | None = None,
         timezone: str | None = None,
         variables: dict[str, Any] | None = None,
+        method: str | None = None,
+        url: str | None = None,
+        headers: dict[str, Any] | None = None,
+        body: str | None = None,
+        template_id: int | None = None,
+        timeout_seconds: int | None = None,
+        retry_count: int | None = None,
+        retry_interval_seconds: int | None = None,
+        priority: int | None = None,
+        random_delay_max_seconds: int | None = None,
+        clear: list[str] | None = None,
     ) -> str:
-        """Update a task. Fields left out keep their stored value."""
+        """Update a task. Fields left out keep their stored value.
+
+        To erase one instead — ungroup a task, drop its timezone, forget its
+        variables — name it in `clear`, e.g. clear=["grp"]. A field may not be
+        both set and cleared.
+        """
         return _json(
             api.update_task(
                 task_id,
@@ -116,6 +151,17 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
                 grp=grp,
                 timezone=timezone,
                 variables=variables,
+                method=method,
+                url=url,
+                headers=headers,
+                body=body,
+                template_id=template_id,
+                timeout_seconds=timeout_seconds,
+                retry_count=retry_count,
+                retry_interval_seconds=retry_interval_seconds,
+                priority=priority,
+                random_delay_max_seconds=random_delay_max_seconds,
+                clear=clear,
             )
         )
 
@@ -149,13 +195,17 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         status: str | None = None,
         task_id: int | None = None,
         limit: int | None = None,
+        before_id: int | None = None,
     ) -> str:
         """List runs across the caller's tasks, newest first.
 
         `status` filters to one of pending, leased, running, succeeded, failed,
-        cancelled; `limit` is 1..=500 (default 100).
+        cancelled; `limit` is 1..=500 (default 100). `before_id` pages back:
+        pass a run id and only older runs come back.
         """
-        return _json(api.list_runs(status=status, task_id=task_id, limit=limit))
+        return _json(
+            api.list_runs(status=status, task_id=task_id, limit=limit, before_id=before_id)
+        )
 
     @mcp.tool()
     def list_task_runs(task_id: int) -> str:
@@ -164,7 +214,7 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
 
     @mcp.tool()
     def get_run_steps(run_id: int) -> str:
-        """List the steps of one run: per-request status and body size."""
+        """List the steps of one run: per-request name, status and body size."""
         return _json(api.get_run_steps(run_id))
 
     @mcp.tool()
@@ -172,12 +222,26 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         """Cancel an active run."""
         return _json(api.cancel_run(run_id))
 
+    @mcp.tool()
+    def delete_run(run_id: int) -> str:
+        """Delete one run and its steps."""
+        return _json(api.delete_run(run_id))
+
     # -------------------------------------------------------------- templates
 
     @mcp.tool()
-    def list_templates(q: str | None = None, limit: int | None = None) -> str:
-        """List the caller's templates, newest first. `q` matches the name."""
-        return _json(api.list_templates(q=q, limit=limit))
+    def list_templates(
+        q: str | None = None,
+        grp: str | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """List the caller's templates, newest first.
+
+        `q` matches the name, `grp` the group. `cursor` pages back: pass the id
+        of the last template you saw.
+        """
+        return _json(api.list_templates(q=q, grp=grp, cursor=cursor, limit=limit))
 
     @mcp.tool()
     def get_template(template_id: int) -> str:
@@ -201,6 +265,37 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         or a QD request array.
         """
         return _json(api.import_template(name=name, har=har, description=description))
+
+    # --------------------------------------------------------------- notepads
+
+    @mcp.tool()
+    def list_notepads() -> str:
+        """List the caller's notepad slots: id, size, a short preview, updated_at.
+
+        These slots are the small store that `toolbox/notepad` template steps
+        read and write (cookies, tokens, cursors). Read one with get_notepad.
+        """
+        return _json(api.list_notepads())
+
+    @mcp.tool()
+    def get_notepad(notepad_id: int) -> str:
+        """Read one notepad slot's whole value."""
+        return _json(api.get_notepad(notepad_id))
+
+    @mcp.tool()
+    def set_notepad(notepad_id: int, content: str) -> str:
+        """Create or overwrite one notepad slot.
+
+        Slots are numbered from 1 and there are at most 20 of them, so a
+        template asks for a specific slot to read the value a previous run left.
+        `content` is capped at 256 KiB.
+        """
+        return _json(api.set_notepad(notepad_id, content))
+
+    @mcp.tool()
+    def delete_notepad(notepad_id: int) -> str:
+        """Remove one notepad slot. Answers not-found when the slot is absent."""
+        return _json(api.delete_notepad(notepad_id))
 
     # ---------------------------------------------------------- notifications
 

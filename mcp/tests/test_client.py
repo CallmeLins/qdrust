@@ -68,6 +68,20 @@ def test_a_blank_group_is_no_filter_at_all() -> None:
     assert seen["url"] == "http://qd.test/api/v1/tasks"
 
 
+def test_paging_and_template_filters_reach_the_query_string() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler)
+    client.list_runs(status="failed", task_id=3, before_id=99)
+    assert seen["url"] == "http://qd.test/api/v1/runs?status=failed&task_id=3&before_id=99"
+    client.list_templates(grp="daily", cursor=12)
+    assert seen["url"] == "http://qd.test/api/v1/templates?grp=daily&cursor=12"
+
+
 def test_update_task_sends_only_the_fields_the_caller_set() -> None:
     seen = {}
 
@@ -81,6 +95,25 @@ def test_update_task_sends_only_the_fields_the_caller_set() -> None:
     # `cron` was not passed: the server must keep the stored value, so it must
     # not appear as null.
     assert seen["body"] == {"disabled": True}
+
+
+def test_update_task_can_erase_a_field_with_an_explicit_null() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    make_client(handler).update_task(7, name="renamed", clear=["grp", "timezone"])
+    assert seen["body"] == {"name": "renamed", "grp": None, "timezone": None}
+
+
+def test_clearing_rejects_an_unknown_field_and_a_double_assignment() -> None:
+    client = make_client(lambda request: httpx.Response(200, json={}))
+    with pytest.raises(QdrustError, match="cannot clear 'cron'"):
+        client.update_task(7, clear=["cron"])
+    with pytest.raises(QdrustError, match="both given a value and listed in clear"):
+        client.update_task(7, grp="daily", clear=["grp"])
 
 
 def test_create_task_carries_a_template_and_variables() -> None:
@@ -154,6 +187,28 @@ def test_an_empty_success_body_is_not_parsed_as_json() -> None:
         return httpx.Response(204)
 
     assert make_client(handler).delete_task(5) is None
+
+
+def test_notepad_paths_and_the_slot_body() -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path, request.content))
+        return httpx.Response(200, json={})
+
+    client = make_client(handler)
+    client.list_notepads()
+    client.get_notepad(2)
+    client.set_notepad(2, "value")
+    client.delete_notepad(2)
+    client.delete_run(9)
+    assert calls == [
+        ("GET", "/api/v1/notepads", b""),
+        ("GET", "/api/v1/notepads/2", b""),
+        ("PUT", "/api/v1/notepads/2", b'{"content":"value"}'),
+        ("DELETE", "/api/v1/notepads/2", b""),
+        ("DELETE", "/api/v1/runs/9", b""),
+    ]
 
 
 def test_a_redirect_names_the_likely_cause() -> None:

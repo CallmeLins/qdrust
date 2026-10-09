@@ -15,6 +15,23 @@ import httpx
 DEFAULT_URL = "http://localhost:8923"
 DEFAULT_TIMEOUT = 120.0
 
+#: Fields `update_task(..., clear=[...])` may erase. Each one is an
+#: ``Option<Option<T>>`` on the server, where an explicit ``null`` clears the
+#: stored value — something a tool call cannot express by passing ``None``,
+#: because ``None`` is how "leave this field alone" travels.
+CLEARABLE_FIELDS = frozenset(
+    {
+        "grp",
+        "timezone",
+        "variables",
+        "timeout_seconds",
+        "retry_count",
+        "retry_interval_seconds",
+        "priority",
+        "random_delay_max_seconds",
+    }
+)
+
 
 class QdrustError(RuntimeError):
     """A refused or failed request, or an argument the API cannot express."""
@@ -176,7 +193,14 @@ class QdrustClient:
         timezone: str | None = None,
         disabled: bool | None = None,
         url: str | None = None,
+        method: str | None = None,
+        headers: dict[str, Any] | None = None,
+        body: str | None = None,
         timeout_seconds: int | None = None,
+        retry_count: int | None = None,
+        retry_interval_seconds: int | None = None,
+        priority: int | None = None,
+        random_delay_max_seconds: int | None = None,
         variables: Any | None = None,
     ) -> Any:
         return self.post(
@@ -189,7 +213,14 @@ class QdrustClient:
                 timezone=timezone,
                 disabled=disabled,
                 url=url,
+                method=method,
+                headers=headers,
+                body=body,
                 timeout_seconds=timeout_seconds,
+                retry_count=retry_count,
+                retry_interval_seconds=retry_interval_seconds,
+                priority=priority,
+                random_delay_max_seconds=random_delay_max_seconds,
                 variables=variables,
             ),
         )
@@ -204,18 +235,49 @@ class QdrustClient:
         grp: str | None = None,
         timezone: str | None = None,
         variables: Any | None = None,
+        method: str | None = None,
+        url: str | None = None,
+        headers: dict[str, Any] | None = None,
+        body: str | None = None,
+        template_id: int | None = None,
+        timeout_seconds: int | None = None,
+        retry_count: int | None = None,
+        retry_interval_seconds: int | None = None,
+        priority: int | None = None,
+        random_delay_max_seconds: int | None = None,
+        clear: list[str] | None = None,
     ) -> Any:
-        return self.put(
-            f"/api/v1/tasks/{task_id}",
-            present(
-                name=name,
-                cron=cron,
-                disabled=disabled,
-                grp=grp,
-                timezone=timezone,
-                variables=variables,
-            ),
+        payload = present(
+            name=name,
+            cron=cron,
+            disabled=disabled,
+            grp=grp,
+            timezone=timezone,
+            variables=variables,
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+            template_id=template_id,
+            timeout_seconds=timeout_seconds,
+            retry_count=retry_count,
+            retry_interval_seconds=retry_interval_seconds,
+            priority=priority,
+            random_delay_max_seconds=random_delay_max_seconds,
         )
+        for field in clear or ():
+            if field not in CLEARABLE_FIELDS:
+                raise QdrustError(
+                    f"cannot clear {field!r}: known fields are "
+                    f"{', '.join(sorted(CLEARABLE_FIELDS))}"
+                )
+            if field in payload:
+                raise QdrustError(
+                    f"{field!r} was both given a value and listed in clear: pass one or the other"
+                )
+            # An explicit null is the server's "erase this" — see CLEARABLE_FIELDS.
+            payload[field] = None
+        return self.put(f"/api/v1/tasks/{task_id}", payload)
 
     def delete_task(self, task_id: int) -> Any:
         return self.delete(f"/api/v1/tasks/{task_id}")
@@ -240,10 +302,16 @@ class QdrustClient:
         status: str | None = None,
         task_id: int | None = None,
         limit: int | None = None,
+        before_id: int | None = None,
     ) -> Any:
         return self.get(
             "/api/v1/runs",
-            params={"status": status, "task_id": task_id, "limit": limit},
+            params={
+                "status": status,
+                "task_id": task_id,
+                "limit": limit,
+                "before_id": before_id,
+            },
         )
 
     def get_run_steps(self, run_id: int) -> Any:
@@ -252,10 +320,23 @@ class QdrustClient:
     def cancel_run(self, run_id: int) -> Any:
         return self.post(f"/api/v1/runs/{run_id}/cancel")
 
+    def delete_run(self, run_id: int) -> Any:
+        return self.delete(f"/api/v1/runs/{run_id}")
+
     # ------------------------------------------------------------ templates
 
-    def list_templates(self, *, q: str | None = None, limit: int | None = None) -> Any:
-        return self.get("/api/v1/templates", params={"q": q, "limit": limit})
+    def list_templates(
+        self,
+        *,
+        q: str | None = None,
+        grp: str | None = None,
+        cursor: int | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        return self.get(
+            "/api/v1/templates",
+            params={"q": q, "grp": grp, "cursor": cursor, "limit": limit},
+        )
 
     def get_template(self, template_id: int) -> Any:
         return self.get(f"/api/v1/templates/{template_id}")
@@ -275,8 +356,22 @@ class QdrustClient:
     ) -> Any:
         return self.post(
             "/api/v1/templates/import-qd-har",
-            {"name": name, "har": har, "description": description},
+            present(name=name, har=har, description=description),
         )
+
+    # --------------------------------------------------------------- notepads
+
+    def list_notepads(self) -> Any:
+        return self.get("/api/v1/notepads")
+
+    def get_notepad(self, notepad_id: int) -> Any:
+        return self.get(f"/api/v1/notepads/{notepad_id}")
+
+    def set_notepad(self, notepad_id: int, content: str) -> Any:
+        return self.put(f"/api/v1/notepads/{notepad_id}", {"content": content})
+
+    def delete_notepad(self, notepad_id: int) -> Any:
+        return self.delete(f"/api/v1/notepads/{notepad_id}")
 
     # --------------------------------------------------------- notifications
 
