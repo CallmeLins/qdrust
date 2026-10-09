@@ -2064,7 +2064,10 @@ export interface operations {
     };
     listTasks: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Only the tasks in this group. Omit it for every task: an ungrouped task stores no value here, so an empty string is not the same as omitting. */
+                grp?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;

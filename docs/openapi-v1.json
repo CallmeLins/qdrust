@@ -135,6 +135,17 @@
     "/api/v1/tasks": {
       "get": {
         "operationId": "listTasks",
+        "parameters": [
+          {
+            "name": "grp",
+            "in": "query",
+            "description": "Only the tasks in this group. Omit it for every task: an ungrouped task stores no value here, so an empty string is not the same as omitting.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Task list"
