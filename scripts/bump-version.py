@@ -18,10 +18,13 @@ root Cargo.toml. Everything else is derived from it:
     webui/package.json       "version"
     webui/package-lock.json  root package "version" (two spots)
     docs/openapi-v1.json     info.version
+    mcp/pyproject.toml       [project] version
 
 The four workspace crates inherit the version through
 `version.workspace = true` in their [package] tables, so they carry no
-version literals of their own.
+version literals of their own. The Python MCP server is not a cargo crate, so
+its pyproject version is rewritten here instead (and mcp/uv.lock is not
+committed; see .gitignore).
 
 Bumps are transactional: every replacement is computed and verified in
 memory first; only when all of them succeed are the files written.
@@ -40,6 +43,7 @@ CARGO_TOML = ROOT / "Cargo.toml"
 PACKAGE_JSON = ROOT / "webui" / "package.json"
 PACKAGE_LOCK = ROOT / "webui" / "package-lock.json"
 OPENAPI_JSON = ROOT / "docs" / "openapi-v1.json"
+MCP_PYPROJECT = ROOT / "mcp" / "pyproject.toml"
 
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
@@ -164,6 +168,27 @@ def plan_openapi(old: str, new: str) -> str:
     return updated
 
 
+def mcp_version() -> str:
+    """The `version` under [project] in mcp/pyproject.toml."""
+    text = MCP_PYPROJECT.read_text(encoding="utf-8")
+    section = re.search(r"^\[project\]\s*$(.*?)(?=^\[|\Z)", text, re.S | re.M)
+    if not section:
+        sys.exit("error: [project] section not found in mcp/pyproject.toml")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', section.group(1), re.M)
+    if not match:
+        sys.exit("error: version key not found under [project] in mcp/pyproject.toml")
+    return match.group(1)
+
+
+def plan_mcp_pyproject(new: str) -> str:
+    text = MCP_PYPROJECT.read_text(encoding="utf-8")
+    pattern = re.compile(r'(^\[project\]\s*$.*?^version\s*=\s*")[^"]+(")', re.S | re.M)
+    updated, count = pattern.subn(rf"\g<1>{new}\g<2>", text, count=1)
+    if count != 1:
+        sys.exit("error: failed to plan the version rewrite in mcp/pyproject.toml")
+    return updated
+
+
 def sync_cargo_lock() -> None:
     result = subprocess.run(
         ["cargo", "update", "--workspace"],
@@ -184,6 +209,7 @@ def main() -> None:
             **{f"Cargo.toml [workspace.dependencies] {k}": v for k, v in workspace_dep_versions().items()},
             **{f"webui/{k}": v for k, v in webui_versions().items()},
             "docs/openapi-v1.json info": openapi_version(),
+            "mcp/pyproject.toml [project]": mcp_version(),
         }
         print("Release versions:")
         for label, value in versions.items():
@@ -210,11 +236,13 @@ def main() -> None:
     new_pkg = plan_package_json(current, target)
     new_lock = plan_package_lock(current, target)
     new_openapi = plan_openapi(openapi_version(), target)
+    new_mcp = plan_mcp_pyproject(target)
 
     CARGO_TOML.write_text(new_cargo, encoding="utf-8")
     PACKAGE_JSON.write_text(new_pkg, encoding="utf-8")
     PACKAGE_LOCK.write_text(new_lock, encoding="utf-8")
     OPENAPI_JSON.write_text(new_openapi, encoding="utf-8")
+    MCP_PYPROJECT.write_text(new_mcp, encoding="utf-8")
     sync_cargo_lock()
 
     print(f"Bumped {current} -> {target}:")
@@ -224,6 +252,7 @@ def main() -> None:
         "webui/package.json",
         "webui/package-lock.json (root + top)",
         "docs/openapi-v1.json info",
+        "mcp/pyproject.toml [project]",
     ):
         print(f"  {label:<32} {target}")
     print("  Cargo.lock                       synced (cargo update --workspace)")

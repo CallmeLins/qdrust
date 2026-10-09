@@ -28,7 +28,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 - **运行可观测**：QD 风格运行日志、按任务查看运行历史、WebSocket 实时步骤流。
 - **安全与多租户**：开放注册 / 忘记密码 / 邮箱验证 / CSRF 轮换；所有用户资源均做服务端归属校验。
 - **运维友好**：Docker 镜像（amd64 / arm64）、管理员备份恢复、运行时配置热更新、可选 Redis 会话缓存。
-- **程序化接入**：个人访问令牌（`Authorization: Bearer qd_…`）供脚本 / CI 使用，配套 stdio **MCP server**（`qdrust-mcp`），让 Claude Desktop / Cursor 等客户端直接建任务、跑任务、看结果（见 [MCP server](docs/mcp.md)）。
+- **程序化接入**：个人访问令牌（`Authorization: Bearer qd_…`）供脚本 / CI 使用，配套纯 Python 的 stdio **MCP server**（`mcp/`，`uvx` 直接跑、无需编译），让 Claude Desktop / Cursor 等客户端直接建任务、跑任务、看结果（见 [MCP server](docs/mcp.md)）。
 
 ### 与 QD 的刻意差异
 
@@ -42,7 +42,7 @@ qdrust 是按 [QD](https://github.com/qd-today/qd)（HTTP 请求定时任务自�
 - `crates/qdrust-core`：旧 QD HAR 解析、编译、变量求值和 HTTP 执行核心。
 - `crates/qdrust-cli`：无需启动服务即可校验和执行 HAR。
 - `crates/qdrust-server`：基于 Axum、SQLx 和 SQLite/MySQL 的 API、认证、调度与运行管理。
-- `crates/qdrust-mcp`：stdio MCP server，把 REST API 暴露给 MCP 客户端（独立二进制，由客户端拉起）。
+- `mcp/`：纯 Python 的 stdio MCP server（`qdrust-mcp`），把 REST API 暴露给 MCP 客户端；用 `uvx` 运行，无需编译。
 - `webui`：基于 Vue 3、TypeScript 和 Vite 的 WebUI。
 
 服务端覆盖：用户认证与会话（开放注册、忘记/重置密码、邮箱验证、CSRF 轮换）、管理员 API（用户管理、站点设置、日志清理、备份/恢复）、模板（搜索/分组/分页、可视化 HAR 编辑器、公共发布审批 PushRequest、订阅仓库自动导入）、任务（分组/批量操作、可视化调度器含随机延迟、模板变量预填）、运行记录与步骤（QD 风格运行日志、运行历史与清空）、WebSocket 实时步骤流（运行 + 订阅进度）、租约恢复、插件系统、通知、可选 Redis 会话缓存、GA 注入、模板跨运行状态与记事本页面（`api://util/toolbox/notepad`，以及 Web 侧查看/编辑/删除槽位）、运行时配置热更新以及 OpenAPI。所有用户资源均在服务端执行归属校验。
@@ -82,7 +82,7 @@ cargo run -p qdrust-server
 | [使用](docs/usage.md) | 导入 QD HAR、模板变量怎么算、原生模板 schema v1、创建与运行任务、HAR 编辑器、调度与时区、运行日志、订阅模板库、CLI |
 | [推送 / 通知](docs/notifications.md) | 11 种渠道的配置项、批量绑定、失败阈值、自定义标题/正文模板 |
 | [浏览器插件](docs/browser-plugin.md) | `api://browser/*` 的 action 一览、部署启用、一次性与会话用法、生命周期 |
-| [MCP server](docs/mcp.md) | `qdrust-mcp` 的构建、客户端配置、API 令牌与工具一览 |
+| [MCP server](docs/mcp.md) | 纯 Python 的 `qdrust-mcp`：客户端配置、API 令牌、工具一览，以及让 AI 代配环境的提示词 |
 | [模板表达式与内置工具](docs/expressions.md) | Jinja2 过滤器 / 函数清单与 `api://util/*` 工具表 |
 | [常见问题](docs/faq.md) | 部署、调度、通知、认证等高频问题 |
 | [运维与发版](docs/operations.md) | SQLite 备份 / 恢复、发布检查清单（本地门禁 / 浏览器验收 / 发布门禁） |

@@ -22,6 +22,15 @@ coverage/
 __pycache__/
 *.py[cod]
 
+# MCP server (Python, mcp/): the venv, caches and lock are local. The lock is
+# not committed because scripts/bump-version.py keeps mcp/pyproject.toml in
+# step with the release version, and a committed lock would then need a second
+# rewrite; `uvx` resolves and caches on first run instead.
+/mcp/.venv/
+/mcp/.ruff_cache/
+/mcp/.pytest_cache/
+/mcp/uv.lock
+
 # Local configuration and diagnostics
 .env
 .env.*

@@ -64,3 +64,17 @@ jobs:
       - run: npm audit --audit-level=high
       - name: Generated client is current
         run: git diff --exit-code -- src/generated/api.ts
+
+  # The Python MCP server (mcp/): nothing to compile, so CI only needs uv, ruff
+  # and the tests — one of which spawns the server over stdio and lists tools.
+  mcp:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run ruff check
+      - run: uv run pytest -q
