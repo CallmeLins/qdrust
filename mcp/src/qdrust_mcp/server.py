@@ -40,11 +40,15 @@ def _json(value: Any) -> str:
 
 def build_server(client: QdrustClient | None = None) -> FastMCP:
     api = client or QdrustClient()
-    try:
-        mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS, version=__version__)
-    except TypeError:
-        # `version` was added to FastMCP after 1.10; the name alone is enough.
-        mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
+    mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
+    # FastMCP takes no `version`: passing one raises TypeError, and the server
+    # then advertises the *SDK's* own version (1.30.0) to every client. The
+    # low-level Server underneath does carry it and uses it in the initialize
+    # response, so set it there. If a future SDK renames it this silently stops
+    # working — which is why tests/test_server.py asserts the reported version.
+    underlying = getattr(mcp, "_mcp_server", None)
+    if underlying is not None:
+        underlying.version = __version__
 
     # ------------------------------------------------------------------ tasks
 
