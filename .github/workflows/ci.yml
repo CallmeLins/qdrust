@@ -76,5 +76,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync
+      - run: uv run ruff format --check
       - run: uv run ruff check
       - run: uv run pytest -q
+
+      # `uv sync` above always resolves the newest SDK, so it can never tell an
+      # uninstallable floor from a good one. This is the half that keeps the
+      # promise in pyproject.toml honest — on the oldest Python we support, too.
+      - name: Oldest supported mcp SDK
+        run: |
+          uv venv --python 3.10 .venv-floor
+          # `--no-deps` applies to the whole command, so the project goes in
+          # alone: the next line is what decides the SDK version.
+          uv pip install --python .venv-floor/bin/python -e . --no-deps
+          uv pip install --python .venv-floor/bin/python 'mcp==1.22.*' pytest
+          .venv-floor/bin/python -m pytest -q

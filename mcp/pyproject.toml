@@ -9,7 +9,11 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "httpx>=0.27,<1",
-    "mcp>=1.10,<2",
+    # Not >=1.10: older SDKs import `pydantic._internal._typing_extra
+    # .eval_type_backport`, which modern pydantic no longer has, so they cannot
+    # even be imported in a fresh environment. 1.22 is the oldest release the
+    # tests pass against, and ci.yml re-checks that floor on every push.
+    "mcp>=1.22,<2",
 ]
 
 [project.scripts]

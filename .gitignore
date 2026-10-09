@@ -25,8 +25,11 @@ __pycache__/
 # MCP server (Python, mcp/): the venv, caches and lock are local. The lock is
 # not committed because scripts/bump-version.py keeps mcp/pyproject.toml in
 # step with the release version, and a committed lock would then need a second
-# rewrite; `uvx` resolves and caches on first run instead.
+# rewrite; `uvx` resolves and caches on first run instead. Drift that a lock
+# would have hidden is caught by CI instead: it runs the tests against the
+# newest SDK and against the floor declared in pyproject.toml.
 /mcp/.venv/
+/mcp/.venv-floor/
 /mcp/.ruff_cache/
 /mcp/.pytest_cache/
 /mcp/uv.lock
