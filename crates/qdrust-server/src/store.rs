@@ -2229,6 +2229,15 @@ macro_rules! define_store {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
+        // Written out table by table rather than left to the schema. SQLite
+        // would reach most of these through `ON DELETE CASCADE`, but MySQL
+        // carries no foreign keys at all -- the inline `REFERENCES` in its first
+        // migration is parsed and ignored, and the files after it declare none --
+        // so what cascades on one backend is left behind on the other.
+        //
+        // Children come before parents, so the order holds with keys enforced
+        // too: a row whose parent is deleted in the same transaction would
+        // otherwise be refused.
         sqlx::query(
             "DELETE FROM notification_actions WHERE channel_id IN (SELECT id FROM notification_channels WHERE owner_id=?) OR task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
         )
@@ -2240,15 +2249,29 @@ macro_rules! define_store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // An import hangs off a subscription and also points at a template the
+        // account may own, so it goes before either parent.
+        sqlx::query(
+            "DELETE FROM template_imports WHERE subscription_id IN (SELECT id FROM template_subscriptions WHERE owner_id=?) OR template_id IN (SELECT id FROM templates WHERE owner_id=?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM template_subscriptions WHERE owner_id=?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM push_requests WHERE owner_id=? OR reviewed_by=?")
-            .bind(id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // Owned by the requester, but also deleted when the template it asks
+        // about is -- which may be the account's, asked about by someone else.
+        sqlx::query(
+            "DELETE FROM push_requests WHERE owner_id=? OR reviewed_by=? OR template_id IN (SELECT id FROM templates WHERE owner_id=?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "DELETE FROM run_steps WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
         )
@@ -2268,6 +2291,30 @@ macro_rules! define_store {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM plugins WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // Held only by the account, with nothing pointing back at them.
+        sqlx::query("DELETE FROM notepads WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM api_tokens WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM external_identities WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM notification_default_templates WHERE owner_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        // The one row that outlives the account: the audit entry is kept and its
+        // actor forgotten, which is what the column's `ON DELETE SET NULL` asks
+        // for. SQLite does that by itself; MySQL would leave the id behind.
+        sqlx::query("UPDATE audit_logs SET actor_user_id=NULL WHERE actor_user_id=?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -6350,5 +6397,165 @@ mod tests {
             .unwrap();
         let purged = store.purge_expired_oidc_login_states().await.unwrap();
         assert_eq!(purged, 1);
+    }
+
+    /// Deleting an account has to leave nothing of it behind on either backend.
+    ///
+    /// MySQL enforces no foreign keys, so a row reaches its account only if
+    /// `delete_user` deletes it itself; SQLite's cascades would cover a missing
+    /// statement. This test turns the cascades off on its own connection, so it
+    /// asks the question MySQL answers, and checks in the same breath that a
+    /// second account keeps everything it owns.
+    #[tokio::test]
+    async fn deleting_a_user_leaves_none_of_its_rows_behind() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("purge_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("purge_bob", &password_hash, "user")
+            .await
+            .unwrap();
+
+        for user in [alice.id, bob.id] {
+            store.notepad_write(user, 1, Some("cookie")).await.unwrap();
+            store
+                .create_api_token(
+                    user,
+                    CreateApiToken {
+                        name: "ci".into(),
+                        expires_in_days: None,
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .set_notification_default(user, "failure", Some("t".into()), Some("b".into()))
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO external_identities(user_id, provider, issuer, subject, email, created_at, last_login_at)
+                 VALUES (?, 'github', 'issuer', ?, NULL, 0, 0)",
+            )
+            .bind(user)
+            .bind(format!("subject-{user}"))
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+            let name = format!("purge template {user}");
+            let template = store
+                .create_template_for_owner(
+                    user,
+                    CreateTemplate {
+                        name: name.clone(),
+                        description: None,
+                        definition: template_definition(&name),
+                        grp: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let subscription = store
+                .create_subscription(
+                    user,
+                    CreateTemplateSubscription {
+                        name: format!("feed {user}"),
+                        url: format!("https://example.invalid/{user}.json"),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .record_template_import(subscription.id, template.id, "entry", None, None)
+                .await
+                .unwrap();
+        }
+        store
+            .record_audit(
+                Some(alice.id),
+                "auth.password_changed",
+                Some("user"),
+                Some(alice.id),
+                Some("req-test"),
+                &serde_json::json!({"source":"test"}),
+            )
+            .await
+            .unwrap();
+
+        // Cascades off: whatever is not deleted here by name stays, which is the
+        // situation MySQL is always in.
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+
+        assert!(store.delete_user(alice.id).await.unwrap());
+        assert!(store.get_user(alice.id).await.unwrap().is_none());
+        assert!(store.get_user(bob.id).await.unwrap().is_some());
+
+        // Named by the account in a column of their own.
+        for (table, column) in [
+            ("notepads", "owner_id"),
+            ("api_tokens", "user_id"),
+            ("external_identities", "user_id"),
+            ("notification_default_templates", "owner_id"),
+        ] {
+            assert_eq!(
+                count_where(&store, table, column, alice.id).await,
+                0,
+                "{table} kept the deleted account's row"
+            );
+            assert_eq!(
+                count_where(&store, table, column, bob.id).await,
+                1,
+                "{table} lost the surviving account's row"
+            );
+        }
+
+        // Reached through a subscription the account owned.
+        let import_counts = |owner: i64| {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM template_imports WHERE subscription_id IN (SELECT id FROM template_subscriptions WHERE owner_id=?)",
+            )
+            .bind(owner)
+        };
+        let alice_imports = import_counts(alice.id)
+            .fetch_one(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert_eq!(alice_imports, 0, "the import outlived its account");
+        let bob_imports = import_counts(bob.id)
+            .fetch_one(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert_eq!(bob_imports, 1, "the surviving account lost its import");
+
+        // The audit entry outlives the account but stops naming it.
+        let attributed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE actor_user_id=?")
+                .bind(alice.id)
+                .fetch_one(store.sqlite_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            attributed, 0,
+            "the audit entry still names the deleted account"
+        );
+        let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert_eq!(entries, 1, "the audit entry itself should have survived");
+    }
+
+    /// `SELECT COUNT(*) WHERE <column>=?`, for a test that walks a fixed list.
+    async fn count_where(store: &Store, table: &str, column: &str, id: i64) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column}=?"))
+            .bind(id)
+            .fetch_one(store.sqlite_pool())
+            .await
+            .unwrap()
     }
 }
