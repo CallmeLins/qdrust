@@ -3612,10 +3612,16 @@ impl IntoResponse for ApiError {
             Self::TooManyRequests(code, message) => {
                 (StatusCode::TOO_MANY_REQUESTS, code, message.into())
             }
+            // `{:#}`, not `{}`: a validation failure that happened while a
+            // template was running is wrapped in a `step N (...)` label by the
+            // executor, and anyhow's plain Display prints only that outermost
+            // line — the actual reason is the next link in the chain, so the
+            // client would get a message that says where but not what. The
+            // alternate form prints the whole chain, outermost first.
             Self::Unprocessable(error) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation_error",
-                error.to_string(),
+                format!("{error:#}"),
             ),
             Self::Internal(error) => {
                 tracing::error!(%request_id, %error, "API request failed");

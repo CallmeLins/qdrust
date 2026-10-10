@@ -53,6 +53,22 @@ QD 模板是 Python，qdrust 在渲染前把下面这些写法改写成等价的
 
 改写只发生在 `{{ … }}` / `{% … %}` 内部，模板里的 HTML / JS 文本一字不动；不在支持列表里的方法名不做改写，照旧报 `has no method named …`，不会静默变成一次字典取值。
 
+## 带参数的过滤器：`urlencode` 与 `default`
+
+QD 把 `qdl.utils.urlencode_with_encoding` 作为过滤器暴露给模板，Jinja2 自己又内建了 `default`。两者的参数位在 qdrust 里同样保留，从 QD 抄来的写法不必删参数：
+
+| 写法 | 语义 |
+|---|---|
+| `{{ x \| urlencode }}` | 百分号编码，等价 `urlencode(x, 'utf-8', false)` |
+| `{{ x \| urlencode('gbk') }}` / `{{ x \| urlencode(encoding='gbk') }}` | 指定字符集。**只支持 `utf-8`**：QD 的 `url_quote` 能按任意 Python 编码逐字节编码，而这里没有那套编码表，与其悄悄按 UTF-8 编出发错的串，不如报 `urlencode only supports utf-8, got "gbk"` |
+| `{{ x \| urlencode(for_qs=True) }}` | 表单 / 查询串模式：空格编成 `+` 而不是 `%20`（Python `urllib.parse.quote_plus` 的开关） |
+| `{{ d \| urlencode }}`（`d` 是字典或键值对列表） | 拼成 `k=v&k=v`，两侧都编码、`/` 也编码（QD `urlencode_with_encoding` 对 dict / iterable 的分支） |
+| `{{ x \| default('兜底') }}` | 值为**未定义**时替换（Jinja2 语义，空串与 `0` 不替换） |
+| `{{ x \| default('兜底', true) }}` / `default('兜底', boolean=True)` | `boolean=True` 时**假值**也替换——空串、`0`、`[]`、`{}` 都会用兜底值 |
+| `{{ x \| d('兜底') }}` | `default` 的别名，参数同上 |
+
+多个参数一起写也可以（`{{ d | urlencode('utf-8', true) }}`）；传了不认识的关键字（例如对 `default` 写 `boolean` 之外的名字）会报出**可接受的名字列表**，而不是只说一句类型不对。
+
 ## 与 Python QD 的已知差异：列表的就地修改
 
 `minijinja` 的值默认**不可变**，而 Python QD 的 Jinja2 直接操作 Python 对象。不过 qdrust 对最常见的**模板自建累加器**写法做了兼容：只要列表是在模板里用 `{% set items = [] %}`（或种子字面量 `{% set items = ['a'] %}`）声明的，`.append` / `.extend` / `.insert` / `.pop` / `.remove` / `.clear` 都可以直接用，无需任何改写（[#27](https://github.com/CallmeLins/qdrust/issues/27)）：

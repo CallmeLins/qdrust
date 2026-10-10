@@ -321,71 +321,85 @@ impl QdExecutor {
         results: &'a mut Vec<StepResult>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            for step in steps {
-                match step {
-                    Step::Request(request) => {
-                        let entry = native_request_entry(request, context, &self.expressions)?;
-                        results.push(self.execute_request(&entry, context).await?);
-                    }
-                    Step::Extract(extract_step) => {
-                        let value = match extract_step.source {
-                            crate::template::ExtractSource::Status => context
-                                .last_status
-                                .map(|status| Value::Number(status.into())),
-                            crate::template::ExtractSource::Header => context
-                                .last_headers
-                                .iter()
-                                .find(|(name, _)| name.eq_ignore_ascii_case(&extract_step.selector))
-                                .map(|(_, value)| Value::String(value.clone())),
-                            crate::template::ExtractSource::Text => {
-                                extract(&extract_step.selector, &context.last_body)?
-                            }
-                            crate::template::ExtractSource::Json => {
-                                let json: Value = serde_json::from_str(&context.last_body)
-                                    .context("last response is not valid JSON")?;
-                                json.pointer(&extract_step.selector).cloned()
-                            }
-                        };
-                        if let Some(value) = value {
-                            context.variables.insert(extract_step.target.clone(), value);
-                        } else if extract_step.required {
-                            bail!("required extraction did not match: {}", extract_step.name);
+            for (index, step) in steps.iter().enumerate() {
+                self.execute_step(step, context, results)
+                    .await
+                    .with_context(|| step_label(index, step))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn execute_step<'a>(
+        &'a self,
+        step: &'a Step,
+        context: &'a mut ExecutionContext,
+        results: &'a mut Vec<StepResult>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match step {
+                Step::Request(request) => {
+                    let entry = native_request_entry(request, context, &self.expressions)?;
+                    results.push(self.execute_request(&entry, context).await?);
+                }
+                Step::Extract(extract_step) => {
+                    let value = match extract_step.source {
+                        crate::template::ExtractSource::Status => context
+                            .last_status
+                            .map(|status| Value::Number(status.into())),
+                        crate::template::ExtractSource::Header => context
+                            .last_headers
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(&extract_step.selector))
+                            .map(|(_, value)| Value::String(value.clone())),
+                        crate::template::ExtractSource::Text => {
+                            extract(&extract_step.selector, &context.last_body)?
                         }
-                    }
-                    Step::If {
-                        condition,
-                        then,
-                        otherwise,
-                    } => {
-                        let selected = if self
-                            .expressions
-                            .evaluate_bool(condition, &context.variables)?
-                        {
-                            then
-                        } else {
-                            otherwise
-                        };
-                        self.execute_template_steps(selected, context, results)
-                            .await?;
-                    }
-                    Step::ForEach { item, items, steps } => {
-                        let value = match context.variables.get(items).cloned() {
-                            Some(value) => value,
-                            None => self.expressions.evaluate(items, &context.variables)?,
-                        };
-                        let values = iterable_values(value)?;
-                        ensure!(
-                            values.len() <= context.loop_limit,
-                            "for_each iteration limit exceeded"
-                        );
-                        for value in values {
-                            context.variables.insert(item.clone(), value);
-                            self.execute_template_steps(steps, context, results).await?;
+                        crate::template::ExtractSource::Json => {
+                            let json: Value = serde_json::from_str(&context.last_body)
+                                .context("last response is not valid JSON")?;
+                            json.pointer(&extract_step.selector).cloned()
                         }
+                    };
+                    if let Some(value) = value {
+                        context.variables.insert(extract_step.target.clone(), value);
+                    } else if extract_step.required {
+                        bail!("required extraction did not match: {}", extract_step.name);
                     }
-                    Step::Delay { milliseconds } => {
-                        tokio::time::sleep(Duration::from_millis(*milliseconds)).await;
+                }
+                Step::If {
+                    condition,
+                    then,
+                    otherwise,
+                } => {
+                    let selected = if self
+                        .expressions
+                        .evaluate_bool(condition, &context.variables)?
+                    {
+                        then
+                    } else {
+                        otherwise
+                    };
+                    self.execute_template_steps(selected, context, results)
+                        .await?;
+                }
+                Step::ForEach { item, items, steps } => {
+                    let value = match context.variables.get(items).cloned() {
+                        Some(value) => value,
+                        None => self.expressions.evaluate(items, &context.variables)?,
+                    };
+                    let values = iterable_values(value)?;
+                    ensure!(
+                        values.len() <= context.loop_limit,
+                        "for_each iteration limit exceeded"
+                    );
+                    for value in values {
+                        context.variables.insert(item.clone(), value);
+                        self.execute_template_steps(steps, context, results).await?;
                     }
+                }
+                Step::Delay { milliseconds } => {
+                    tokio::time::sleep(Duration::from_millis(*milliseconds)).await;
                 }
             }
             Ok(())
@@ -399,66 +413,80 @@ impl QdExecutor {
         results: &'a mut Vec<StepResult>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            for block in blocks {
-                match block {
-                    QdBlock::Request(entry) => {
-                        results.push(self.execute_request(entry, context).await?);
+            for (index, block) in blocks.iter().enumerate() {
+                self.execute_block(block, context, results)
+                    .await
+                    .with_context(|| block_label(index, block))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn execute_block<'a>(
+        &'a self,
+        block: &'a QdBlock,
+        context: &'a mut ExecutionContext,
+        results: &'a mut Vec<StepResult>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match block {
+                QdBlock::Request(entry) => {
+                    results.push(self.execute_request(entry, context).await?);
+                }
+                QdBlock::If {
+                    condition,
+                    then_blocks,
+                    else_blocks,
+                } => {
+                    let selected = if self
+                        .expressions
+                        .evaluate_bool(condition, &context.variables)?
+                    {
+                        then_blocks
+                    } else {
+                        else_blocks
+                    };
+                    self.execute_blocks(selected, context, results).await?;
+                }
+                QdBlock::For {
+                    target,
+                    source,
+                    body,
+                } => {
+                    let value = match context.variables.get(source).cloned() {
+                        Some(value) => value,
+                        None => self.expressions.evaluate(source, &context.variables)?,
+                    };
+                    let values = iterable_values(value)?;
+                    ensure!(
+                        values.len() <= context.loop_limit,
+                        "for loop iteration limit exceeded"
+                    );
+                    enter_loop(&mut context.variables);
+                    let length = values.len();
+                    for (index, value) in values.into_iter().enumerate() {
+                        context.variables.insert(target.clone(), value);
+                        set_loop_variables(&mut context.variables, index, length);
+                        self.execute_blocks(body, context, results).await?;
                     }
-                    QdBlock::If {
-                        condition,
-                        then_blocks,
-                        else_blocks,
-                    } => {
-                        let selected = if self
+                    leave_loop(&mut context.variables);
+                }
+                QdBlock::While { condition, body } => {
+                    enter_loop(&mut context.variables);
+                    for index in 0..context.loop_limit {
+                        set_loop_variables(&mut context.variables, index, context.loop_limit);
+                        if !self
                             .expressions
                             .evaluate_bool(condition, &context.variables)?
                         {
-                            then_blocks
-                        } else {
-                            else_blocks
-                        };
-                        self.execute_blocks(selected, context, results).await?;
-                    }
-                    QdBlock::For {
-                        target,
-                        source,
-                        body,
-                    } => {
-                        let value = match context.variables.get(source).cloned() {
-                            Some(value) => value,
-                            None => self.expressions.evaluate(source, &context.variables)?,
-                        };
-                        let values = iterable_values(value)?;
-                        ensure!(
-                            values.len() <= context.loop_limit,
-                            "for loop iteration limit exceeded"
-                        );
-                        enter_loop(&mut context.variables);
-                        let length = values.len();
-                        for (index, value) in values.into_iter().enumerate() {
-                            context.variables.insert(target.clone(), value);
-                            set_loop_variables(&mut context.variables, index, length);
-                            self.execute_blocks(body, context, results).await?;
+                            break;
                         }
-                        leave_loop(&mut context.variables);
-                    }
-                    QdBlock::While { condition, body } => {
-                        enter_loop(&mut context.variables);
-                        for index in 0..context.loop_limit {
-                            set_loop_variables(&mut context.variables, index, context.loop_limit);
-                            if !self
-                                .expressions
-                                .evaluate_bool(condition, &context.variables)?
-                            {
-                                break;
-                            }
-                            self.execute_blocks(body, context, results).await?;
-                            if index + 1 == context.loop_limit {
-                                bail!("while loop iteration limit exceeded");
-                            }
+                        self.execute_blocks(body, context, results).await?;
+                        if index + 1 == context.loop_limit {
+                            bail!("while loop iteration limit exceeded");
                         }
-                        leave_loop(&mut context.variables);
                     }
+                    leave_loop(&mut context.variables);
                 }
             }
             Ok(())
@@ -984,6 +1012,60 @@ impl QdExecutor {
             .build()
             .context("cannot build pinned HTTP client")
     }
+}
+
+/// How many characters of a step's source a failure message may quote.
+const STEP_LABEL_CHARS: usize = 120;
+
+/// A one-line identity for the step that failed, taken from its **unrendered**
+/// source.
+///
+/// A step that fails before it produces anything — a template that will not
+/// render, so there is no URL to name it by — leaves the run with a single
+/// anonymous "execution" step. The message therefore has to carry the identity
+/// itself. Reading it off the source rather than the rendered values is what
+/// keeps request bodies and credentials out of the run log (issue #42: the
+/// reporter could only find the offending call by re-scanning every template).
+fn step_label(index: usize, step: &Step) -> String {
+    let detail = match step {
+        Step::Request(request) => request_label(&request.name, &request.method, &request.url),
+        Step::Extract(extract) => format!("extract {}", bounded_label(&extract.name)),
+        Step::If { condition, .. } => format!("if {}", bounded_label(condition)),
+        Step::ForEach { item, items, .. } => {
+            format!("for {item} in {}", bounded_label(items))
+        }
+        Step::Delay { milliseconds } => format!("delay {milliseconds}ms"),
+    };
+    format!("step {} ({detail})", index + 1)
+}
+
+/// The same, for the HAR-driven block list.
+fn block_label(index: usize, block: &QdBlock) -> String {
+    let detail = match block {
+        QdBlock::Request(entry) => request_label("", &entry.request.method, &entry.request.url),
+        QdBlock::For { target, source, .. } => format!("for {target} in {}", bounded_label(source)),
+        QdBlock::While { condition, .. } => format!("while {}", bounded_label(condition)),
+        QdBlock::If { condition, .. } => format!("if {}", bounded_label(condition)),
+    };
+    format!("step {} ({detail})", index + 1)
+}
+
+fn request_label(name: &str, method: &str, url: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        format!("{method} {}", bounded_label(url))
+    } else {
+        format!("{name} {method} {}", bounded_label(url))
+    }
+}
+
+fn bounded_label(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut bounded: String = trimmed.chars().take(STEP_LABEL_CHARS).collect();
+    if trimmed.chars().count() > STEP_LABEL_CHARS {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn native_request_entry(
@@ -2736,6 +2818,16 @@ mod tests {
         assert_eq!(context.variables.get("result"), Some(&json!("accepted")));
     }
 
+    /// The message a run actually records.
+    ///
+    /// `scheduler.rs` writes `{err:#}` into the run log, so that is what a test
+    /// has to assert on: the plain `Display` only shows the outermost context,
+    /// which is now the step label. A test that used `to_string()` would be
+    /// checking the wrong string.
+    fn failure_message(error: anyhow::Error) -> String {
+        format!("{error:#}")
+    }
+
     #[tokio::test]
     async fn limits_infinite_while_loop() {
         let program = QdProgram {
@@ -2747,13 +2839,12 @@ mod tests {
         let executor = QdExecutor::new(Duration::from_secs(1)).unwrap();
         let mut context = ExecutionContext::new(BTreeMap::new());
 
-        let error = executor
-            .execute(&program, &mut context)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = failure_message(executor.execute(&program, &mut context).await.unwrap_err());
 
-        assert!(error.contains("while loop iteration limit exceeded"));
+        assert!(
+            error.contains("while loop iteration limit exceeded"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2771,8 +2862,8 @@ mod tests {
         })
         .unwrap();
         let mut context = ExecutionContext::new(BTreeMap::new());
-        let error = executor.execute(&program, &mut context).await.unwrap_err();
-        assert!(error.to_string().contains("request limit exceeded"));
+        let error = failure_message(executor.execute(&program, &mut context).await.unwrap_err());
+        assert!(error.contains("request limit exceeded"), "{error}");
         assert_eq!(context.remaining_requests, 0);
     }
 
@@ -3272,11 +3363,12 @@ mod tests {
         }]}}))
         .unwrap();
         let mut context = ExecutionContext::new(BTreeMap::new());
-        let error = executor
-            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = failure_message(
+            executor
+                .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+                .await
+                .unwrap_err(),
+        );
 
         assert!(!error.contains("stored"), "{error}");
         assert!(
@@ -3293,11 +3385,12 @@ mod tests {
         }]}}))
         .unwrap();
         let mut context = ExecutionContext::new(BTreeMap::new());
-        let error = executor
-            .execute(&QdProgram::compile(&har).unwrap(), &mut context)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = failure_message(
+            executor
+                .execute(&QdProgram::compile(&har).unwrap(), &mut context)
+                .await
+                .unwrap_err(),
+        );
 
         assert!(error.contains("记事本不存在"), "{error}");
         assert!(!error.contains("omitted"), "{error}");
@@ -3327,11 +3420,7 @@ mod tests {
         let program = QdProgram::compile(&mock_echo_har()).unwrap();
         let mut context = ExecutionContext::new(BTreeMap::new());
 
-        let error = executor
-            .execute(&program, &mut context)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = failure_message(executor.execute(&program, &mut context).await.unwrap_err());
 
         assert!(error.contains("plugin unavailable: mock/echo"), "{error}");
         assert!(error.contains("registered: util"), "{error}");
@@ -4143,5 +4232,48 @@ mod tests {
         assert!(stored.contains("invalid QD regular expression"), "{stored}");
         // The rule after the broken one still ran.
         assert_eq!(context.variables.get("fine"), Some(&json!("hell")));
+    }
+
+    /// Issue #42: a step that fails before it produces anything leaves the run
+    /// with a single anonymous "execution" step, so the message has to name the
+    /// step itself. The reporter could otherwise not tell which of the
+    /// template's steps failed.
+    #[tokio::test]
+    async fn a_step_that_fails_before_running_names_itself() {
+        let definition = TemplateDefinition {
+            version: 1,
+            name: "probe".into(),
+            variables: BTreeMap::new(),
+            steps: vec![Step::Request(RequestStep {
+                name: "sign".into(),
+                method: "GET".into(),
+                // `urlencode` takes at most two arguments, so this cannot render
+                // — and no request is made, which is also what keeps this test
+                // off the network.
+                url: "https://example.com/sign?d={{ 'a'|urlencode('utf-8', true, 'x') }}".into(),
+                headers: BTreeMap::new(),
+                query: BTreeMap::new(),
+                body: None,
+            })],
+        };
+        let executor = QdExecutor::new(Duration::from_secs(1)).unwrap();
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let error = format!(
+            "{:#}",
+            executor
+                .execute_template(&definition, &mut context)
+                .await
+                .unwrap_err()
+        );
+
+        assert!(error.contains("too many arguments"), "{error}");
+        assert!(
+            error.contains("step 1 (sign GET https://example.com/sign?d="),
+            "{error}"
+        );
+        // The label is built from the unrendered source, so a variable's value
+        // can never reach the log through it.
+        assert!(error.contains("{{ 'a'|urlencode"), "{error}");
     }
 }

@@ -29,6 +29,190 @@ macro_rules! qd_fn {
     }};
 }
 
+/// The optional arguments of a QD helper, read the way Python would.
+///
+/// QD's helpers are Python functions, so a template may pass an optional
+/// argument **either** by position or by name — `urlencode(x, for_qs=True)` and
+/// `urlencode(x, 'utf-8', True)` both appear in the wild. MiniJinja collects the
+/// named ones into a single trailing kwargs value, which carries no information
+/// about which parameter they belong to, so the reading is positional with the
+/// kwargs map as the fallback — and a name the helper does not take is refused
+/// rather than silently ignored.
+struct QdCall<'a> {
+    positional: std::slice::Iter<'a, JinjaValue>,
+    kwargs: Option<&'a JinjaValue>,
+}
+
+impl<'a> QdCall<'a> {
+    fn new(rest: &'a [JinjaValue]) -> Self {
+        let split = rest.iter().position(JinjaValue::is_kwargs);
+        let (positional, kwargs) = match split {
+            Some(index) => (&rest[..index], rest.get(index)),
+            None => (rest, None),
+        };
+        Self {
+            positional: positional.iter(),
+            kwargs,
+        }
+    }
+
+    /// The next optional argument, by position or by name.
+    ///
+    /// An undefined value is reported as "not passed", which is what Python
+    /// does for a keyword whose value happens to be undefined.
+    fn next(&mut self, name: &str) -> Option<JinjaValue> {
+        if let Some(value) = self.positional.next() {
+            return Some(value.clone());
+        }
+        let value = self.kwargs?.get_attr(name).ok()?;
+        (!value.is_undefined()).then_some(value)
+    }
+
+    /// More positional arguments than the helper takes is the mistake that used
+    /// to reach the user as a bare "too many arguments" from inside MiniJinja,
+    /// with no mention of which call made it.
+    fn finish(self, accepted: &[&str]) -> Result<(), Error> {
+        if !self.positional.as_slice().is_empty() {
+            return Err(Error::new(
+                ErrorKind::TooManyArguments,
+                format!(
+                    "expected at most {} argument(s), got {} more",
+                    accepted.len(),
+                    self.positional.len()
+                ),
+            ));
+        }
+        let Some(kwargs) = self.kwargs else {
+            return Ok(());
+        };
+        for key in kwargs.try_iter()? {
+            let key = key.to_string();
+            if !accepted.contains(&key.as_str()) {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("unexpected keyword argument {key:?} (accepted: {accepted:?})"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `urllib.parse.quote` as QD calls it: the unreserved set stays literal, and
+/// "/" is the only extra character that stays literal — unless `for_qs` asks for
+/// it to be quoted as `%2F`.
+fn url_quote(value: &str, for_qs: bool) -> String {
+    const SAFE: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~')
+        .remove(b'/');
+    const SAFE_FOR_QS: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    if for_qs {
+        utf8_percent_encode(value, SAFE_FOR_QS).to_string()
+    } else {
+        utf8_percent_encode(value, SAFE).to_string()
+    }
+}
+
+/// QD's `urlencode`: quote a string, or build a query string.
+///
+/// Given a string (or anything non-iterable) it quotes that string. Given a
+/// mapping, or an iterable of `(key, value)` pairs, it joins them as
+/// `k=v&k=v` — quoting both sides, and with "/" quoted, exactly as QD's
+/// `urlencode_with_encoding` does.
+fn urlencode_value(value: &JinjaValue, for_qs: bool) -> Result<String, Error> {
+    let pairs: Vec<(JinjaValue, JinjaValue)> = match value.kind() {
+        ValueKind::Map => value
+            .try_iter()?
+            .map(|key| Ok((key.clone(), value.get_item(&key)?)))
+            .collect::<std::result::Result<_, Error>>()?,
+        ValueKind::Seq => value
+            .try_iter()?
+            .map(|pair| {
+                let mut parts = pair.try_iter()?;
+                match (parts.next(), parts.next()) {
+                    (Some(key), Some(item)) if parts.next().is_none() => Ok((key, item)),
+                    _ => Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "urlencode expects an iterable of (key, value) pairs",
+                    )),
+                }
+            })
+            .collect::<std::result::Result<_, Error>>()?,
+        _ => return Ok(url_quote(&value.to_string(), for_qs)),
+    };
+    Ok(pairs
+        .iter()
+        .map(|(key, item)| {
+            format!(
+                "{}={}",
+                url_quote(&key.to_string(), true),
+                url_quote(&item.to_string(), true)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&"))
+}
+
+/// QD's `urlencode` takes the charset as its second argument.
+///
+/// Only UTF-8 is implemented. Refusing the rest is deliberate: quoting a GBK
+/// string as UTF-8 produces a URL that decodes to mojibake, which is worse than
+/// an error the template author can see.
+fn check_urlencode_encoding(value: &JinjaValue) -> Result<(), Error> {
+    if value.is_none() || value.is_undefined() {
+        return Ok(());
+    }
+    let encoding = value.to_string();
+    let normalized = encoding.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "utf-8" || normalized == "utf8" {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::InvalidOperation,
+        format!("urlencode only supports utf-8, got {encoding:?}"),
+    ))
+}
+
+/// Jinja2's `default`: replace an undefined value, or — with `boolean=True` —
+/// any falsey one.
+///
+/// QD inherits this from Jinja2 rather than from its own `jinja_globals`, so the
+/// third parameter exists there and templates use it. `None` counts as undefined
+/// here, which is what this engine has always done; Jinja2 would keep it.
+fn default_filter(value: JinjaValue, rest: &[JinjaValue]) -> Result<JinjaValue, Error> {
+    let mut call = QdCall::new(rest);
+    let default_value = call
+        .next("default_value")
+        .unwrap_or_else(|| JinjaValue::from(""));
+    let boolean = call
+        .next("boolean")
+        .map(|value| value.is_true())
+        .unwrap_or(false);
+    call.finish(&["default_value", "boolean"])?;
+    if value.is_undefined() || value.is_none() || (boolean && !value.is_true()) {
+        Ok(default_value)
+    } else {
+        Ok(value)
+    }
+}
+
+/// MiniJinja's error, with the source line it points at folded in.
+///
+/// The debug information is only produced by the **alternate** formatter, and
+/// anyhow prints its sources with the plain one — so unless the text is captured
+/// here it never reaches the run log, which is the only place a failed run is
+/// ever read from.
+fn minijinja_error(err: Error) -> anyhow::Error {
+    anyhow::anyhow!("{err:#}")
+}
+
 pub struct QdExpressionEngine {
     environment: Environment<'static>,
 }
@@ -36,6 +220,12 @@ pub struct QdExpressionEngine {
 impl Default for QdExpressionEngine {
     fn default() -> Self {
         let mut environment = Environment::new();
+        // Keep the source of every template MiniJinja compiles, so a render
+        // error can point at the line that failed. Without it the run log only
+        // says "too many arguments" and the reader has to find the call by hand;
+        // with it the offending line travels with the error. `QdExpressionError`
+        // is what makes sure the text survives the trip.
+        environment.set_debug(true);
 
         // Type conversion functions
         qd_fn!(environment, "int", |value: JinjaValue| parse_i64(&value));
@@ -170,18 +360,27 @@ impl Default for QdExpressionEngine {
             }
         );
 
-        // URL encoding (QD urlencode = urllib.parse.quote with safe="/",
-        // so "/" stays literal and space becomes %20, not +).
-        qd_fn!(environment, "urlencode", |value: JinjaValue| {
-            let s = value.to_string();
-            const FRAGMENT: &AsciiSet = &NON_ALPHANUMERIC
-                .remove(b'-')
-                .remove(b'_')
-                .remove(b'.')
-                .remove(b'~')
-                .remove(b'/');
-            Ok::<_, Error>(utf8_percent_encode(&s, FRAGMENT).to_string())
-        });
+        // URL encoding (QD urlencode = urllib.parse.quote with safe="/", so "/"
+        // stays literal and space becomes %20, not +). QD's helper also takes
+        // the charset and `for_qs` — the latter quotes "/" as %2F — and builds a
+        // query string when handed a mapping instead of a string.
+        qd_fn!(
+            environment,
+            "urlencode",
+            |value: JinjaValue, rest: Rest<JinjaValue>| {
+                let mut call = QdCall::new(&rest);
+                let encoding = call.next("encoding");
+                let for_qs = call
+                    .next("for_qs")
+                    .map(|value| value.is_true())
+                    .unwrap_or(false);
+                call.finish(&["encoding", "for_qs"])?;
+                if let Some(encoding) = encoding.as_ref() {
+                    check_urlencode_encoding(encoding)?;
+                }
+                urlencode_value(&value, for_qs)
+            }
+        );
         environment.add_function("url_decode", |value: JinjaValue| {
             let s = value.to_string();
             percent_encoding::percent_decode_str(&s)
@@ -967,22 +1166,16 @@ impl Default for QdExpressionEngine {
                 })
         });
 
-        // Utility filters
-        environment.add_filter("default", |value: JinjaValue, default_value: JinjaValue| {
-            if value.is_undefined() || value.is_none() {
-                Ok::<_, Error>(default_value)
-            } else {
-                Ok(value)
-            }
-        });
-
-        environment.add_filter("d", |value: JinjaValue, default_value: JinjaValue| {
-            if value.is_undefined() || value.is_none() {
-                Ok::<_, Error>(default_value)
-            } else {
-                Ok(value)
-            }
-        });
+        // Utility filters. Jinja2 owns `default` (QD adds nothing of its own
+        // under this name), and Jinja2's third parameter is the difference that
+        // makes a migrated template render: `boolean=True` also replaces a
+        // falsey value, so `{{ x|default('y', boolean=True) }}` works. `d` is
+        // Jinja2's alias and takes the same arguments.
+        for name in ["default", "d"] {
+            environment.add_filter(name, |value: JinjaValue, rest: Rest<JinjaValue>| {
+                default_filter(value, &rest)
+            });
+        }
 
         environment.add_filter("abs", |value: JinjaValue| {
             let num = parse_f64(&value)?;
@@ -1203,6 +1396,7 @@ impl QdExpressionEngine {
             .context("invalid QD expression")?;
         let value = compiled
             .eval(variables)
+            .map_err(minijinja_error)
             .context("cannot evaluate QD expression")?;
         serde_json::to_value(value).context("cannot convert QD expression result")
     }
@@ -1213,6 +1407,7 @@ impl QdExpressionEngine {
     pub fn render(&self, template: &str, variables: &BTreeMap<String, Value>) -> Result<String> {
         self.environment
             .render_str(&compat_python_template(template), variables)
+            .map_err(minijinja_error)
             .context("cannot render QD template value")
     }
 
@@ -4746,5 +4941,159 @@ mod tests {
         // mandatory with custom error message on null
         let result = engine.evaluate("mandatory(null_var, 'Custom error')", &vars_with_null);
         assert!(result.is_err());
+    }
+
+    /// Issue #42: a template migrated from QD calls `urlencode(value, encoding,
+    /// for_qs)` — QD's `urlencode` *is* `urlencode_with_encoding`, which has all
+    /// three parameters — so the extra arguments have to be accepted or every
+    /// migrated template has to be edited by hand.
+    #[test]
+    fn urlencode_takes_the_charset_and_for_qs() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::from([("path".to_string(), json!("a/b c"))]);
+
+        // Without for_qs, "/" stays literal: that is QD's default and what the
+        // engine has always done.
+        assert_eq!(
+            engine.render("{{ path|urlencode }}", &variables).unwrap(),
+            "a/b%20c"
+        );
+        // for_qs quotes it — by keyword, which is how the reporter's templates
+        // write it, and by position, which Python also allows.
+        assert_eq!(
+            engine
+                .render("{{ path|urlencode(for_qs=True) }}", &variables)
+                .unwrap(),
+            "a%2Fb%20c"
+        );
+        assert_eq!(
+            engine
+                .render("{{ urlencode(path, 'utf-8', true) }}", &variables)
+                .unwrap(),
+            "a%2Fb%20c"
+        );
+        // The charset on its own is accepted in any case spelling.
+        assert_eq!(
+            engine
+                .render("{{ urlencode(path, 'UTF-8') }}", &variables)
+                .unwrap(),
+            "a/b%20c"
+        );
+    }
+
+    /// QD's `urlencode` also builds a query string when handed a mapping (or an
+    /// iterable of pairs), quoting both sides with "/" included.
+    #[test]
+    fn urlencode_builds_a_query_string_from_a_mapping() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::from([("params".to_string(), json!({"q": "a/b", "page": 2}))]);
+        assert_eq!(
+            engine.render("{{ params|urlencode }}", &variables).unwrap(),
+            "page=2&q=a%2Fb"
+        );
+    }
+
+    /// A wrong `encoding` and an extra argument are refused with a message that
+    /// says which call it was — the opposite of the bare "too many arguments"
+    /// that issue #42 was filed about.
+    #[test]
+    fn urlencode_refuses_what_it_cannot_encode_faithfully() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::new();
+
+        let err = format!(
+            "{:#}",
+            engine
+                .render("{{ 'x'|urlencode('gbk') }}", &variables)
+                .unwrap_err()
+        );
+        assert!(err.contains("only supports utf-8"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            engine
+                .render("{{ 'x'|urlencode('utf-8', true, 'extra') }}", &variables)
+                .unwrap_err()
+        );
+        assert!(err.contains("too many arguments"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            engine
+                .render("{{ 'x'|urlencode(safe='/') }}", &variables)
+                .unwrap_err()
+        );
+        assert!(err.contains("unexpected keyword argument"), "{err}");
+    }
+
+    /// Issue #42, second half: Jinja2's `default` takes a `boolean` argument, so
+    /// `{{ x|default('y', boolean=True) }}` renders in QD and must render here.
+    #[test]
+    fn default_takes_jinja2s_boolean_argument() {
+        let engine = QdExpressionEngine::default();
+        let variables = BTreeMap::from([
+            ("empty".to_string(), json!("")),
+            ("set".to_string(), json!("value")),
+        ]);
+
+        // Without boolean, only a missing value is replaced — an empty string is
+        // a value.
+        assert_eq!(
+            engine
+                .render("{{ empty|default('fallback') }}", &variables)
+                .unwrap(),
+            ""
+        );
+        // With it, an empty string is falsey and is replaced too, whether the
+        // flag arrives by keyword or by position.
+        assert_eq!(
+            engine
+                .render("{{ empty|default('fallback', boolean=True) }}", &variables)
+                .unwrap(),
+            "fallback"
+        );
+        assert_eq!(
+            engine
+                .render("{{ empty|default('fallback', true) }}", &variables)
+                .unwrap(),
+            "fallback"
+        );
+        // …and a value that is not falsey still wins.
+        assert_eq!(
+            engine
+                .render("{{ set|default('fallback', boolean=True) }}", &variables)
+                .unwrap(),
+            "value"
+        );
+        // `d` is Jinja2's alias and takes the same arguments.
+        assert_eq!(
+            engine
+                .render("{{ empty|d('fallback', boolean=True) }}", &variables)
+                .unwrap(),
+            "fallback"
+        );
+    }
+
+    /// Issue #42, third part: a render failure has to say *where*. MiniJinja
+    /// knows the line, but only the alternate formatter prints it, and the run
+    /// log is the only place this message is ever read from.
+    #[test]
+    fn a_failed_render_carries_the_line_that_failed() {
+        let engine = QdExpressionEngine::default();
+        let err = engine
+            .render(
+                "first line\n{{ 'x'|urlencode('a', 'b', 'c') }}\n",
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+        let rendered = format!("{err:#}");
+
+        assert!(rendered.contains("too many arguments"), "{rendered}");
+        // The offending line, and not just the anonymous "<string>".
+        assert!(
+            rendered.contains("{{ 'x'|urlencode('a', 'b', 'c') }}"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("first line"), "{rendered}");
     }
 }

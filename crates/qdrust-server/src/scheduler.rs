@@ -936,6 +936,17 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The failure as the *user* will read it.
+    ///
+    /// An executor failure arrives wrapped in a `step N (...)` label naming the
+    /// step that broke, and anyhow's plain `Display` prints only that outermost
+    /// line — the reason sits in the chain behind it. `{:#}` renders the whole
+    /// chain, outermost first, which is also what `ApiError::Unprocessable`
+    /// hands to an API client.
+    fn whole_chain(error: anyhow::Error) -> String {
+        format!("{error:#}")
+    }
+
     /// A run policy for tests: 30s timeout, private network off unless asked,
     /// certificates always verified. The certificate relaxation gets its own
     /// constructor so no existing call site silently gains it.
@@ -1189,8 +1200,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let blocked = whole_chain(blocked);
         assert!(
             blocked.contains("private or special-use network target is blocked"),
             "with the flag off a loopback target must be refused: {blocked}"
@@ -1234,9 +1245,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        // The whole chain: the guard's reason is the cause of the message this
-        // module wraps it in, so `{}` alone would show only the wrapper.
-        let blocked = format!("{blocked:#}");
+        let blocked = whole_chain(blocked);
         assert!(
             blocked.contains("private or special-use network target is blocked"),
             "a task URL pointing at loopback must be refused while the switch is off: {blocked}"
@@ -1519,8 +1528,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let error = whole_chain(error);
 
         assert!(error.contains("plugin unavailable: mock/echo"), "{error}");
         assert!(error.contains("registered: util"), "{error}");
