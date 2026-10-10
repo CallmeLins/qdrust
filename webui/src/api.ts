@@ -22,6 +22,12 @@ export type Template = components["schemas"]["Template"];
 export type Plugin = components["schemas"]["Plugin"];
 export type NotificationChannel = components["schemas"]["NotificationChannel"];
 export type NotificationAction = components["schemas"]["NotificationAction"];
+export type NotificationPreview = components["schemas"]["NotificationPreview"];
+export type NotificationDefaults = components["schemas"]["NotificationDefaults"];
+export type NotificationDefaultTemplate = components["schemas"]["NotificationDefaultTemplate"];
+/** The two events a default template can be written for. `always` belongs to a
+ *  binding, not to a default: a default is the wording for a known outcome. */
+export type NotificationDefaultEvent = NotificationDefaultTemplate["event"];
 export type TemplateSubscription = components["schemas"]["TemplateSubscription"];
 export type LibraryEntry = components["schemas"]["LibraryEntry"];
 export type TemplateLibrary = components["schemas"]["TemplateLibrary"];
@@ -328,6 +334,18 @@ export const api = {
   /** Drop every binding of one task — the task list bell's "off". */
   clearTaskNotificationActions: (taskId: number) => request<{ removed: number }>(`/api/v1/tasks/${taskId}/notification-actions`, { method: "DELETE" }),
   batchCreateNotificationActions: (taskIds: number[], channelId: number, event: string, failureThreshold = 1, automaticOnly = false, titleTemplate?: string, bodyTemplate?: string) => request<{ created: number }>("/api/v1/notification-actions/batch", { method: "POST", body: JSON.stringify({ task_ids: taskIds, channel_id: channelId, event, failure_threshold: failureThreshold, automatic_only: automaticOnly, title_template: titleTemplate || null, body_template: bodyTemplate || null }) }),
+  /** Render one binding's message without sending it, which is how a template
+   *  gets read before a scheduled run depends on it. `runId` renders against a
+   *  specific run; the newest one is used otherwise, and the answer says
+   *  `sample` when the task has never run at all. */
+  previewNotificationAction: (id: number, runId?: number) => request<NotificationPreview>(`/api/v1/notification-actions/${id}/preview${runId != null ? `?run_id=${runId}` : ""}`),
+  /** The account's default templates per event, plus the built-in pair the
+   *  editor shows as the fallback when neither the binding nor a default sets
+   *  a template. */
+  notificationDefaults: () => request<NotificationDefaults>("/api/v1/notification-defaults"),
+  /** Replace one event's defaults. A blank template clears it, so the built-in
+   *  pair is used again — an empty string means "unset", not "send nothing". */
+  setNotificationDefault: (event: NotificationDefaultEvent, input: { title_template: string; body_template: string }) => request<NotificationDefaultTemplate>(`/api/v1/notification-defaults/${event}`, { method: "PUT", body: JSON.stringify(input) }),
 
   // ---- tasks ----
   tasks: () => request<Task[]>("/api/v1/tasks"),

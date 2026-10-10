@@ -44,10 +44,11 @@ use crate::{
         CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate,
         CreateTemplateSubscription, DecidePushRequest, ExternalIdentityClaim, ForgotPassword,
         ImportLibraryTemplates, ImportQdHarTemplate, InvokePlugin, IssuedSession, QdHarValidation,
-        RegisterUser, ResetPassword, SetNotepad, SetSiteSetting, TemplateSubscription,
-        TemplateTestResult, TemplateTestStep, TestTemplate, UpdateNotificationAction,
-        UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-        UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar, VerifyEmail,
+        RegisterUser, ResetPassword, SetNotepad, SetNotificationDefaultTemplate, SetSiteSetting,
+        TemplateSubscription, TemplateTestResult, TemplateTestStep, TestTemplate,
+        UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest,
+        UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
+        VerifyEmail,
     },
     store::Store,
 };
@@ -397,6 +398,18 @@ pub fn router_with_auth(
         .route(
             "/api/v1/notification-actions/{id}",
             axum::routing::put(update_notification_action).delete(delete_notification_action),
+        )
+        .route(
+            "/api/v1/notification-actions/{id}/preview",
+            axum::routing::get(preview_notification_action),
+        )
+        .route(
+            "/api/v1/notification-defaults",
+            axum::routing::get(list_notification_defaults),
+        )
+        .route(
+            "/api/v1/notification-defaults/{event}",
+            axum::routing::put(set_notification_default),
         )
         .route("/api/v1/plugins", get(list_plugins).post(create_plugin))
         .route(
@@ -1995,6 +2008,137 @@ async fn update_notification_action(
             "notification_action_not_found",
             "Notification action not found",
         ))
+}
+
+#[derive(Deserialize, Default)]
+struct PreviewQuery {
+    /// Render against this run instead of the task's newest one. Useful for
+    /// reading back the failure that already happened.
+    run_id: Option<i64>,
+}
+
+/// Render one binding's message without sending it (issue #43).
+///
+/// The channel-level test proves the credentials with a message of its own — the
+/// documents said as much — so the only way to check a template used to be to
+/// wait for the next scheduled run, or to fire one and hope. This renders the
+/// text the binding would deliver: the binding's own template, else the owner's
+/// default, else the built-in, against the newest run of the binding's task
+/// (or `?run_id=`). Nothing is handed to a channel.
+async fn preview_notification_action(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Query(query): Query<PreviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let owner = session.user.id;
+    let action = store
+        .get_notification_action(id, owner)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "notification_action_not_found",
+            "Notification action not found",
+        ))?;
+    let task = store
+        .get_for_owner(action.task_id, owner)
+        .await?
+        .ok_or(ApiError::NotFound("task_not_found", "Task not found"))?;
+    let runs = store
+        .list_task_runs_for_owner(action.task_id, owner)
+        .await?
+        .unwrap_or_default();
+    let run = match query.run_id {
+        Some(run_id) => runs.iter().find(|run| run.id == run_id),
+        None => runs.first(),
+    };
+    let defaults = store.notification_defaults(owner).await?;
+    let owner_default = defaults.iter().find(|row| row.event == action.event);
+    let vars = crate::delivery::TemplateVars {
+        event: &action.event,
+        task_id: action.task_id,
+        task_name: &task.name,
+        run_id: run.map(|run| run.id).unwrap_or_default(),
+        status: run
+            .and_then(|run| run.http_status)
+            .map(|status| status.to_string())
+            .unwrap_or_default(),
+        error: run.and_then(|run| run.error.as_deref()).unwrap_or(""),
+        log: run.and_then(|run| run.log.as_deref()).unwrap_or(""),
+        time: crate::delivery::format_notification_time(
+            run.map(|run| run.finished_at.unwrap_or(run.created_at))
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+            task.timezone.as_deref(),
+        ),
+    };
+    let title = vars.render(crate::delivery::notification_template(
+        action.title_template.as_deref(),
+        owner_default.and_then(|row| row.title_template.as_deref()),
+        crate::delivery::BUILTIN_TITLE_TEMPLATE,
+    ));
+    let body = vars.render(crate::delivery::notification_template(
+        action.body_template.as_deref(),
+        owner_default.and_then(|row| row.body_template.as_deref()),
+        crate::delivery::BUILTIN_BODY_TEMPLATE,
+    ));
+    Ok(Json(json!({
+        "event": action.event,
+        "task_id": action.task_id,
+        "channel_id": action.channel_id,
+        // `sample` when the task has never run (or the named run is gone): the
+        // message still renders, but every run-scoped variable is empty, and
+        // saying so is better than letting an empty `{log}` look like a bug.
+        "source": if run.is_some() { "run" } else { "sample" },
+        "run_id": run.map(|run| run.id),
+        "title": title,
+        "body": body,
+    })))
+}
+
+/// The account's default notification templates, with the built-in pair so the
+/// editor can offer them as a placeholder (issue #45).
+async fn list_notification_defaults(
+    State(store): State<Store>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let defaults = store.notification_defaults(session.user.id).await?;
+    Ok(Json(json!({
+        "defaults": defaults,
+        "builtin": {
+            "title_template": crate::delivery::BUILTIN_TITLE_TEMPLATE,
+            "body_template": crate::delivery::BUILTIN_BODY_TEMPLATE,
+        },
+    })))
+}
+
+/// Set one event's defaults, replacing what was stored.
+///
+/// A blank template clears it and the built-in is used again — the same rule as
+/// `PUT /api/v1/notification-actions/{id}`, which also treats a blank string as
+/// "unset" rather than as an empty message.
+async fn set_notification_default(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(event): Path<String>,
+    ApiJson(input): ApiJson<SetNotificationDefaultTemplate>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    if !matches!(event.as_str(), "success" | "failure") {
+        return Err(ApiError::Unprocessable(anyhow::anyhow!(
+            "invalid notification event {event:?}: expected success or failure"
+        )));
+    }
+    let saved = store
+        .set_notification_default(
+            session.user.id,
+            &event,
+            input.title_template,
+            input.body_template,
+        )
+        .await
+        .map_err(ApiError::unprocessable)?;
+    Ok(Json(json!(saved)))
 }
 
 /// The template list's query string — typed for the same reason as
@@ -4661,6 +4805,334 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
+    }
+
+    /// The request `json_call` sends, split out so a test can read a bare
+    /// status: the auth guard answers 401 before a handler runs, without an
+    /// error body, so there is no `x-request-id` header to parse there.
+    fn json_request(
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header(COOKIE, cookie);
+        }
+        match body {
+            Some(body) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn json_status(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> StatusCode {
+        app.clone()
+            .oneshot(json_request(method, uri, cookie, body))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// One authenticated JSON call, so the tests below read as the sequence of
+    /// requests the notify page makes instead of a wall of builder chains.
+    ///
+    /// Reads the body directly rather than through [`response_json`]: only
+    /// `ApiError` response carry `x-request-id`, and most of what these tests
+    /// assert on is a 200 or a 201.
+    async fn json_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = json_request(method, uri, cookie, body);
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let payload = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| {
+            panic!(
+                "expected a JSON body, got {:?}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        (status, payload)
+    }
+
+    /// A channel, a task and the binding that joins them — everything the notify
+    /// page writes before there is anything to preview. The channel is never
+    /// contacted: rendering a message and delivering it are separate steps.
+    ///
+    /// `templates` sets the binding's own pair; `None` leaves them unset, which
+    /// is the case that has to fall through to a default.
+    async fn seed_binding(
+        app: &Router,
+        cookie: &str,
+        event: &str,
+        templates: Option<(&str, &str)>,
+    ) -> (i64, i64) {
+        let (status, channel) = json_call(
+            app,
+            "POST",
+            "/api/v1/notification-channels",
+            Some(cookie),
+            Some(json!({
+                "name": "preview-channel",
+                "kind": "webhook",
+                "config": {"url": "https://example.invalid/hook"},
+                "enabled": true
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{channel}");
+        let channel_id = channel["id"].as_i64().unwrap();
+
+        let (status, task) = json_call(
+            app,
+            "POST",
+            "/api/v1/tasks",
+            Some(cookie),
+            Some(json!({
+                "name": "preview-task",
+                "cron": "0 0 3 * * *",
+                "url": "https://example.invalid"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{task}");
+        let task_id = task["id"].as_i64().unwrap();
+
+        let mut body = json!({"channel_id": channel_id, "event": event});
+        if let Some((title, text)) = templates {
+            body["title_template"] = json!(title);
+            body["body_template"] = json!(text);
+        }
+        let (status, action) = json_call(
+            app,
+            "POST",
+            &format!("/api/v1/tasks/{task_id}/notification-actions"),
+            Some(cookie),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{action}");
+        (task_id, action["id"].as_i64().unwrap())
+    }
+
+    /// Issue #43, second complaint: the only way to find out what a template
+    /// actually renders used to be to wait for the next scheduled run and read
+    /// the notification. The preview route renders the same text without
+    /// touching the channel.
+    #[tokio::test]
+    async fn previewing_a_binding_renders_it_without_sending_it() {
+        let app = test_app().await;
+
+        // Session-gated, like the rest of the notify surface.
+        let status = json_status(
+            &app,
+            "GET",
+            "/api/v1/notification-actions/1/preview",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let cookie = test_auth_cookie(&app).await;
+        let (task_id, action_id) = seed_binding(
+            &app,
+            &cookie,
+            "failure",
+            Some(("preview {event}", "task={task} cn={status_cn} log=[{log}]")),
+        )
+        .await;
+
+        let (status, body) = json_call(
+            &app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["event"], "failure");
+        assert_eq!(body["task_id"].as_i64(), Some(task_id));
+        assert_eq!(body["title"], "preview failure");
+        // `{status_cn}` is the third of #43's asks: a template had no way to
+        // write 成功/失败. The run-scoped variables are empty because this task
+        // has never run — which the `sample` source says out loud rather than
+        // letting an empty `{log}` look like a bug.
+        assert_eq!(body["body"], "task=preview-task cn=失败 log=[]");
+        assert_eq!(body["source"], "sample");
+        assert_eq!(body["run_id"], Value::Null);
+
+        // Another account's binding is a 404, not somebody else's message.
+        let other = register_cookie(&app, "preview_other").await;
+        let (status, _) = json_call(
+            &app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview"),
+            Some(&other),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #45: one default pair per account per event, applied to any binding
+    /// that does not carry a template of its own — and the built-in pair behind
+    /// it, which is where `{log}` now lives (issue #43, first complaint).
+    #[tokio::test]
+    async fn default_templates_sit_between_the_binding_and_the_built_in_pair() {
+        let app = test_app().await;
+
+        let status = json_status(&app, "GET", "/api/v1/notification-defaults", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let status = json_status(
+            &app,
+            "PUT",
+            "/api/v1/notification-defaults/failure",
+            None,
+            Some(json!({"title_template": "", "body_template": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let cookie = test_auth_cookie(&app).await;
+
+        // Nothing saved yet: the answer still carries the built-in pair, which
+        // is what the editor shows as the fallback and what a delivered message
+        // uses until a default is written.
+        let (status, body) = json_call(
+            &app,
+            "GET",
+            "/api/v1/notification-defaults",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["defaults"], json!([]));
+        let builtin_body = body["builtin"]["body_template"].as_str().unwrap();
+        assert!(
+            builtin_body.contains("{log}"),
+            "the built-in body must carry the run log: {builtin_body}"
+        );
+
+        // A binding with no template of its own renders the built-in.
+        let (_, action_id) = seed_binding(&app, &cookie, "failure", None).await;
+        let (status, preview) = json_call(
+            &app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert!(
+            preview["body"].as_str().unwrap().contains("Log: "),
+            "an unset binding must render the built-in body: {preview}"
+        );
+
+        // Now write a default for that event; the same binding picks it up with
+        // no edit of its own — that is the whole point of the feature.
+        let (status, saved) = json_call(
+            &app,
+            "PUT",
+            "/api/v1/notification-defaults/failure",
+            Some(&cookie),
+            Some(json!({"title_template": "D {task}", "body_template": "DEF {task}"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["event"], "failure");
+
+        let (status, body) = json_call(
+            &app,
+            "GET",
+            "/api/v1/notification-defaults",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["defaults"][0]["event"], "failure");
+
+        let (status, preview) = json_call(
+            &app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert_eq!(preview["title"], "D preview-task");
+        assert_eq!(preview["body"], "DEF preview-task");
+
+        // Only the two events an action can have; anything else is a 422 rather
+        // than a row nothing would ever read.
+        let (status, body) = json_call(
+            &app,
+            "PUT",
+            "/api/v1/notification-defaults/sometimes",
+            Some(&cookie),
+            Some(json!({"title_template": "x", "body_template": "y"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "validation_error");
+
+        // A blank pair clears it back to the built-in, the same rule the action
+        // templates follow — an empty string is "unset", not "send nothing".
+        let (status, saved) = json_call(
+            &app,
+            "PUT",
+            "/api/v1/notification-defaults/failure",
+            Some(&cookie),
+            Some(json!({"title_template": "  ", "body_template": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["title_template"], Value::Null);
+        assert_eq!(saved["body_template"], Value::Null);
+        let (_, preview) = json_call(
+            &app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert!(
+            preview["body"].as_str().unwrap().contains("Log: "),
+            "a cleared default must fall back to the built-in again: {preview}"
+        );
+
+        // One account's default is not another's.
+        let other = register_cookie(&app, "default_other").await;
+        let (status, body) = json_call(
+            &app,
+            "GET",
+            "/api/v1/notification-defaults",
+            Some(&other),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["defaults"], json!([]));
     }
 
     #[tokio::test]

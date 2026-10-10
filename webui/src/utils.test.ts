@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, newestTemplatesFirst, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
+import { OIDC_LOGOUT_RETURN_KEY, OIDC_LOGOUT_RETURN_TTL_MS, consumeLogoutReturn, formatRunTime, groupBindingsByTask, harDocumentFrom, localLoginAvailable, markLogoutReturn, newestTemplatesFirst, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, unboundTemplatesFirst, type AuthPolicy, type StorageLike } from "./utils";
 
 describe("formatRunTime", () => {
   it("describes a task without runs", () => {
@@ -265,5 +265,66 @@ describe("taskOutcome", () => {
   // by a previous failure, because the server clears `last_error` on success.
   it("treats a non-empty error as authoritative over the status", () => {
     expect(taskOutcome({ disabled: false, last_status: 200, last_error: "stale" })).toBe("failed");
+  });
+});
+
+describe("groupBindingsByTask", () => {
+  const binding = (id: number, task_id: number, over: Partial<Parameters<typeof groupBindingsByTask>[0][number]> = {}) => ({
+    id,
+    task_id,
+    channel_id: 7,
+    event: "failure",
+    failure_threshold: 1,
+    automatic_only: false,
+    title_template: null,
+    body_template: null,
+    ...over,
+  });
+
+  // Issue #44: the page listed one row per binding, so a task with two channels
+  // was two rows. The grouping is what turns that back into one row per task.
+  it("collapses one task's bindings into a single group, order preserved", () => {
+    const groups = groupBindingsByTask([binding(1, 5), binding(2, 5), binding(3, 9)]);
+    expect(groups.map((group) => group.taskId)).toEqual([5, 9]);
+    expect(groups[0].rows.map((row) => row.id)).toEqual([1, 2]);
+    expect(groups[1].rows.map((row) => row.id)).toEqual([3]);
+  });
+
+  it("orders by task id, not by the order the bindings arrived", () => {
+    const groups = groupBindingsByTask([binding(1, 9), binding(2, 3)]);
+    expect(groups.map((group) => group.taskId)).toEqual([3, 9]);
+  });
+
+  it("keeps an empty list empty", () => {
+    expect(groupBindingsByTask([])).toEqual([]);
+  });
+
+  // The task row can only summarise a task whose bindings agree. A channel
+  // bound for success and for failure is two settings, not one.
+  it("counts the distinct settings of a task", () => {
+    const same = groupBindingsByTask([binding(1, 1, { channel_id: 7 }), binding(2, 1, { channel_id: 8 })]);
+    expect(same[0].variants).toBe(1);
+
+    const eventDiffers = groupBindingsByTask([binding(1, 1), binding(2, 1, { event: "success" })]);
+    expect(eventDiffers[0].variants).toBe(2);
+
+    const templateDiffers = groupBindingsByTask([binding(1, 1), binding(2, 1, { body_template: "{log}" })]);
+    expect(templateDiffers[0].variants).toBe(2);
+  });
+
+  // A threshold and a blank template are the two places a "same settings"
+  // comparison goes wrong if it is written as a loose truthiness check: 1 vs 2
+  // differs, and "" must read the same as an unset template.
+  it("tells apart a threshold change and an empty template", () => {
+    expect(groupBindingsByTask([binding(1, 1), binding(2, 1, { failure_threshold: 2 })])[0].variants).toBe(2);
+    expect(groupBindingsByTask([binding(1, 1), binding(2, 1, { body_template: "" })])[0].variants).toBe(1);
+  });
+
+  // The separator has to be something no template can contain, or two different
+  // settings could serialize to the same string and read as one.
+  it("keeps fields that would collide if the separator were loose", () => {
+    const left = binding(1, 1, { title_template: "a", body_template: "b" });
+    const right = binding(2, 1, { title_template: "a\u0000b", body_template: null });
+    expect(groupBindingsByTask([left, right])[0].variants).toBe(2);
   });
 });

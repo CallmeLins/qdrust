@@ -235,3 +235,69 @@ export function taskOutcome(task: { disabled: boolean; last_status: number | nul
   if (task.last_status == null) return "ok";
   return task.last_status < 400 ? "ok" : "failed";
 }
+
+// ---------- 通知页：按任务聚合绑定 ----------
+
+/** What the grouping below needs from a binding, structurally typed so this
+ *  module keeps importing nothing (the API's own type is a superset). */
+export interface NotificationBinding {
+  id: number;
+  task_id: number;
+  channel_id: number;
+  event: string;
+  failure_threshold: number;
+  automatic_only: boolean;
+  title_template?: string | null;
+  body_template?: string | null;
+}
+
+/** One task's bindings, as the notification page shows them (issue #44). */
+export interface NotificationBindingGroup<T extends NotificationBinding> {
+  taskId: number;
+  /** Every binding of the task, in the order they arrived. */
+  rows: T[];
+  /** How many distinct ways this task notifies. More than one means the task
+   *  row alone cannot describe what it does. */
+  variants: number;
+}
+
+/**
+ * Everything about a binding except the channel, as one comparable string.
+ *
+ * The channel is deliberately left out: a task bound to two channels the same
+ * way is one setting applied twice, while the same channel bound for success
+ * and for failure is two — and that is what `variants` counts.
+ */
+export function bindingSignature(binding: NotificationBinding): string {
+  return [
+    binding.event,
+    binding.failure_threshold,
+    binding.automatic_only,
+    binding.title_template ?? "",
+    binding.body_template ?? "",
+  ].join("\u0000");
+}
+
+/**
+ * Collapse a flat binding list into one entry per task, ordered by task id.
+ *
+ * The notification page listed bindings one per row, so 14 tasks across 2
+ * channels came out as 28 rows repeating the same few task names and the row
+ * being looked for was no easier to find than the rest. Grouping is the change
+ * (issue #44); this is the part of it that can be read without a browser, which
+ * this repo has none of in CI.
+ *
+ * Ordered by task id rather than by name so the list does not reshuffle when a
+ * task is renamed, and so it matches the order tasks were created in.
+ */
+export function groupBindingsByTask<T extends NotificationBinding>(bindings: T[]): NotificationBindingGroup<T>[] {
+  const byTask = new Map<number, T[]>();
+  for (const binding of bindings) {
+    const rows = byTask.get(binding.task_id);
+    if (rows) rows.push(binding);
+    else byTask.set(binding.task_id, [binding]);
+  }
+  return [...byTask.entries()]
+    .map(([taskId, rows]) => ({ taskId, rows, variants: new Set(rows.map(bindingSignature)).size }))
+    .sort((a, b) => a.taskId - b.taskId);
+}

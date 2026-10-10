@@ -53,6 +53,7 @@ impl TemplateVars<'_> {
     pub fn render(&self, value: &str) -> String {
         value
             .replace("{event}", self.event)
+            .replace("{status_cn}", event_label(self.event))
             .replace("{task_id}", &self.task_id.to_string())
             .replace("{task}", self.task_name)
             .replace("{run_id}", &self.run_id.to_string())
@@ -62,6 +63,34 @@ impl TemplateVars<'_> {
             .replace("{t}", &self.time)
     }
 }
+
+/// The event as a reader sees it (issue #43).
+///
+/// `{event}` is the machine value — `success` / `failure` — and `render` is plain
+/// string replacement, so a template could not turn it into 成功/失败 without
+/// building one binding per event. An account with 14 tasks and 2 channels went
+/// from 30 bindings to 60 that way.
+fn event_label(event: &str) -> &'static str {
+    match event {
+        "success" => "成功",
+        "failure" => "失败",
+        "test" => "测试",
+        _ => "通知",
+    }
+}
+
+/// The title a notification gets when neither the binding nor the owner's
+/// defaults set one.
+///
+/// It is a template, not a formatted string: #45 makes wording a per-account
+/// setting, so the built-in has to go through the same substitution as a user's
+/// own text — including `{log}`, which is the only part of a sign-in reminder
+/// worth reading and was missing here (#43).
+pub const BUILTIN_TITLE_TEMPLATE: &str = "[qdrust] Task \"{task}\" {event}";
+
+/// The body that goes with [`BUILTIN_TITLE_TEMPLATE`]. `{t}` and `{log}` are
+/// last, so a user who wants neither can delete the lines in their own default.
+pub const BUILTIN_BODY_TEMPLATE: &str = "Task: {task}\nEvent: {event}\nRun: #{run_id}\nHTTP status: {status}\nError: {error}\nTime: {t}\nLog: {log}";
 
 /// Placeholder values for a message that is not tied to a run, i.e. a channel
 /// test triggered from the UI. Rendering real templates against these proves the
@@ -86,6 +115,23 @@ pub struct Message<'a> {
     /// JSON body used by `webhook` / `custom_http` channels that have no body of
     /// their own configured.
     pub payload: &'a Value,
+}
+
+/// Which text a notification renders, in the order the candidates may win: the
+/// binding's own template, the owner's default for the event, the built-in.
+///
+/// A blank candidate is treated as unset, so clearing the text in the editor is
+/// the same as never having written one — the same rule the store applies when
+/// it writes a blank template as NULL.
+pub fn notification_template<'a>(
+    binding: Option<&'a str>,
+    owner_default: Option<&'a str>,
+    builtin: &'a str,
+) -> &'a str {
+    binding
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| owner_default.filter(|value| !value.trim().is_empty()))
+        .unwrap_or(builtin)
 }
 
 /// Deliver one already-rendered message through `kind` with `config`.

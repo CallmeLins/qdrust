@@ -20,7 +20,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     api::RunEventSender,
-    delivery::{Message, TemplateVars, format_notification_time},
+    delivery::{
+        BUILTIN_BODY_TEMPLATE, BUILTIN_TITLE_TEMPLATE, Message, TemplateVars,
+        format_notification_time, notification_template,
+    },
     email::EmailClient,
     model::{PluginManifest, RunStep, Task, Template},
     outbound::OutboundHttp,
@@ -502,22 +505,20 @@ async fn send_notifications(
         }
     };
     let payload = serde_json::json!({ "event": event, "task_id": task.id, "task_name": task.name, "run_id": run_id, "http_status": http_status, "error": error_message });
-    let status_word = if event == "success" {
-        "succeeded"
-    } else {
-        "failed"
+    // The account's own defaults for this event, if it has written any (#45).
+    // Loaded once for the whole notification rather than once per binding: an
+    // account has at most two rows, and the loop below can run many times.
+    let owner_defaults = match store.task_owner_id(task.id).await {
+        Ok(Some(owner)) => store
+            .notification_defaults(owner)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(task_id = task.id, %err, "cannot load default notification templates");
+                Vec::new()
+            }),
+        _ => Vec::new(),
     };
-    let title = format!("[qdrust] Task \"{}\" {status_word}", task.name);
-    let body = format!(
-        "Task: {}\nEvent: {}\nRun: #{}\nHTTP status: {}\nError: {}\n",
-        task.name,
-        event,
-        run_id,
-        http_status
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "-".into()),
-        error_message.unwrap_or("-"),
-    );
+    let owner_default = owner_defaults.iter().find(|row| row.event == event);
     let run = store.get_run(run_id).await.ok().flatten();
     let automatic = run.as_ref().is_some_and(|run| run.trigger != "manual");
     let failure_count = if event == "failure" {
@@ -554,16 +555,16 @@ async fn send_notifications(
             ),
         };
         let channel = delivery.channel;
-        let title = action
-            .title_template
-            .as_deref()
-            .map(|value| vars.render(value))
-            .unwrap_or_else(|| title.clone());
-        let body = action
-            .body_template
-            .as_deref()
-            .map(|value| vars.render(value))
-            .unwrap_or_else(|| body.clone());
+        let title = vars.render(notification_template(
+            action.title_template.as_deref(),
+            owner_default.and_then(|row| row.title_template.as_deref()),
+            BUILTIN_TITLE_TEMPLATE,
+        ));
+        let body = vars.render(notification_template(
+            action.body_template.as_deref(),
+            owner_default.and_then(|row| row.body_template.as_deref()),
+            BUILTIN_BODY_TEMPLATE,
+        ));
         let message = Message {
             title: &title,
             body: &body,

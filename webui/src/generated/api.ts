@@ -365,6 +365,61 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/notification-actions/{id}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /** @description Render the message one binding would deliver, without sending it. Uses the binding's own templates, else the caller's default for that event, else the built-in pair. Renders against the task's newest run, or the one named by `run_id`; `source` is `sample` when the task has never run, in which case every run-scoped variable is empty. */
+        get: operations["previewNotificationAction"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notification-defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The caller's default notification templates, one entry per event it has written, plus the built-in pair used when neither the binding nor a default sets one. */
+        get: operations["listNotificationDefaults"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/notification-defaults/{event}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                event: "success" | "failure";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** @description Replace the caller's default templates for one event. A blank or whitespace-only template clears it, so the built-in pair is used again — an empty string means "unset", not "send nothing". */
+        put: operations["setNotificationDefault"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plugins": {
         parameters: {
             query?: never;
@@ -1321,6 +1376,41 @@ export interface components {
             title_template?: string | null;
             body_template?: string | null;
         };
+        /** @description One event's default templates. A blank or whitespace-only value clears that template. */
+        SetNotificationDefaultTemplate: {
+            title_template?: string | null;
+            body_template?: string | null;
+        };
+        NotificationDefaultTemplate: {
+            /** @enum {string} */
+            event: "success" | "failure";
+            title_template?: string | null;
+            body_template?: string | null;
+        };
+        NotificationDefaults: {
+            defaults: components["schemas"]["NotificationDefaultTemplate"][];
+            /** @description The pair used when neither the binding nor a default sets one. */
+            builtin: {
+                title_template: string;
+                body_template: string;
+            };
+        };
+        NotificationPreview: {
+            event: string;
+            /** Format: int64 */
+            task_id: number;
+            /** Format: int64 */
+            channel_id: number;
+            /**
+             * @description `sample` when there is no run to render against, so every run-scoped variable is empty.
+             * @enum {string}
+             */
+            source: "run" | "sample";
+            /** Format: int64 */
+            run_id?: number | null;
+            title: string;
+            body: string;
+        };
         Plugin: {
             /** Format: int64 */
             id: number;
@@ -1806,6 +1896,11 @@ export interface components {
         UpdateNotificationAction: {
             content: {
                 "application/json": components["schemas"]["UpdateNotificationAction"];
+            };
+        };
+        SetNotificationDefaultTemplate: {
+            content: {
+                "application/json": components["schemas"]["SetNotificationDefaultTemplate"];
             };
         };
         CreatePlugin: {
@@ -2593,6 +2688,74 @@ export interface operations {
                 content?: never;
             };
             404: components["responses"]["NotFound"];
+        };
+    };
+    previewNotificationAction: {
+        parameters: {
+            query?: {
+                run_id?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rendered message */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationPreview"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    listNotificationDefaults: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Default templates and the built-in pair */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationDefaults"];
+                };
+            };
+        };
+    };
+    setNotificationDefault: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                event: "success" | "failure";
+            };
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["SetNotificationDefaultTemplate"];
+        responses: {
+            /** @description Default template saved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationDefaultTemplate"];
+                };
+            };
+            422: components["responses"]["ValidationError"];
         };
     };
     listPlugins: {

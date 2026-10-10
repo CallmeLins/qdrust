@@ -170,6 +170,62 @@ def test_bind_notification_defaults_to_the_failure_event() -> None:
     }
 
 
+def test_list_notification_actions_is_one_get() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[])
+
+    assert make_client(handler).list_notification_actions() == []
+    assert seen["url"] == "http://qd.test/api/v1/notification-actions"
+
+
+def test_preview_notification_omits_an_unset_run() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"source": "sample"})
+
+    client = make_client(handler)
+    client.preview_notification_action(7)
+    # `?run_id=` would be read by the server as "the run whose id is empty",
+    # which is the same mistake `_query` exists to avoid elsewhere.
+    assert seen["url"] == "http://qd.test/api/v1/notification-actions/7/preview"
+
+    client.preview_notification_action(7, 42)
+    assert seen["url"] == "http://qd.test/api/v1/notification-actions/7/preview?run_id=42"
+
+
+def test_set_notification_default_replaces_one_event() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"event": "success"})
+
+    make_client(handler).set_notification_default(
+        "success", title_template="OK {task}", body_template="{log}"
+    )
+    assert seen["method"] == "PUT"
+    assert seen["url"] == "http://qd.test/api/v1/notification-defaults/success"
+    assert seen["body"] == {"title_template": "OK {task}", "body_template": "{log}"}
+
+
+def test_set_notification_default_refuses_an_event_it_cannot_store() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no request should be sent")
+
+    client = make_client(handler)
+    with pytest.raises(QdrustError, match="success.*failure"):
+        client.set_notification_default("always")
+    with pytest.raises(QdrustError, match="success.*failure"):
+        client.set_notification_default("Failure")
+
+
 def test_a_refused_request_carries_qdrusts_own_message() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

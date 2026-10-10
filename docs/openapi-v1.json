@@ -634,6 +634,99 @@
         }
       }
     },
+    "/api/v1/notification-actions/{id}/preview": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "operationId": "previewNotificationAction",
+        "description": "Render the message one binding would deliver, without sending it. Uses the binding's own templates, else the caller's default for that event, else the built-in pair. Renders against the task's newest run, or the one named by `run_id`; `source` is `sample` when the task has never run, in which case every run-scoped variable is empty.",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Rendered message",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationPreview"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/notification-defaults": {
+      "get": {
+        "operationId": "listNotificationDefaults",
+        "description": "The caller's default notification templates, one entry per event it has written, plus the built-in pair used when neither the binding nor a default sets one.",
+        "responses": {
+          "200": {
+            "description": "Default templates and the built-in pair",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDefaults"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notification-defaults/{event}": {
+      "parameters": [
+        {
+          "name": "event",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure"
+            ]
+          }
+        }
+      ],
+      "put": {
+        "operationId": "setNotificationDefault",
+        "description": "Replace the caller's default templates for one event. A blank or whitespace-only template clears it, so the built-in pair is used again — an empty string means \"unset\", not \"send nothing\".",
+        "requestBody": {
+          "$ref": "#/components/requestBodies/SetNotificationDefaultTemplate"
+        },
+        "responses": {
+          "200": {
+            "description": "Default template saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDefaultTemplate"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
     "/api/v1/plugins": {
       "get": {
         "operationId": "listPlugins",
@@ -1989,6 +2082,16 @@
           }
         }
       },
+      "SetNotificationDefaultTemplate": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/SetNotificationDefaultTemplate"
+            }
+          }
+        }
+      },
       "CreatePlugin": {
         "required": true,
         "content": {
@@ -2988,6 +3091,127 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "SetNotificationDefaultTemplate": {
+        "type": "object",
+        "description": "One event's default templates. A blank or whitespace-only value clears that template.",
+        "properties": {
+          "title_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NotificationDefaultTemplate": {
+        "type": "object",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "event": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure"
+            ]
+          },
+          "title_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body_template": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NotificationDefaults": {
+        "type": "object",
+        "required": [
+          "defaults",
+          "builtin"
+        ],
+        "properties": {
+          "defaults": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationDefaultTemplate"
+            }
+          },
+          "builtin": {
+            "type": "object",
+            "description": "The pair used when neither the binding nor a default sets one.",
+            "required": [
+              "title_template",
+              "body_template"
+            ],
+            "properties": {
+              "title_template": {
+                "type": "string"
+              },
+              "body_template": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "NotificationPreview": {
+        "type": "object",
+        "required": [
+          "event",
+          "task_id",
+          "channel_id",
+          "source",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "event": {
+            "type": "string"
+          },
+          "task_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "channel_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "run",
+              "sample"
+            ],
+            "description": "`sample` when there is no run to render against, so every run-scoped variable is empty."
+          },
+          "run_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
           }
         }
       },

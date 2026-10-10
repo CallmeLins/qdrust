@@ -663,6 +663,30 @@ pub struct NotificationAction {
     pub created_at: i64,
 }
 
+/// One account's default notification templates for one event (issue #45).
+///
+/// A `None` template means "not set" — the binding's own template, or the
+/// built-in, is used instead. Never "send nothing".
+#[derive(Clone, Debug, Serialize)]
+pub struct NotificationDefaultTemplate {
+    pub event: String,
+    pub title_template: Option<String>,
+    pub body_template: Option<String>,
+}
+
+/// Body of `PUT /api/v1/notification-defaults/{event}`.
+///
+/// Both fields are optional and a blank value clears one, matching
+/// [`UpdateNotificationAction`]: the two places a notification template is
+/// written should not disagree about what "empty" means.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetNotificationDefaultTemplate {
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub body_template: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct CreateNotificationAction {
     pub channel_id: i64,

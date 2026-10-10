@@ -316,6 +316,62 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         """
         return _json(api.bind_notification(task_ids=task_ids, channel_id=channel_id, event=event))
 
+    @mcp.tool()
+    def list_notification_actions() -> str:
+        """List every notification binding (task ↔ channel) the account has.
+
+        Each row carries `id`, `task_id`, `channel_id`, `event`,
+        `failure_threshold`, `automatic_only` and the two templates. The `id` is
+        what `preview_notification` takes. `bind_notification` is the way to add
+        one of these; this tool is how you find one.
+        """
+        return _json(api.list_notification_actions())
+
+    @mcp.tool()
+    def preview_notification(action_id: int, run_id: int | None = None) -> str:
+        """Render one binding's message without sending it anywhere.
+
+        The text comes from the binding's own templates, else the account's
+        default for that event, else the built-in pair — against the task's
+        newest run, or the one named by `run_id`. `source` is `sample` when the
+        task has never run: the message still renders, but `{status}` `{error}`
+        `{log}` are empty, so an empty log is not a broken template. This is the
+        only way to read a template's output before a scheduled run does.
+        """
+        return _json(api.preview_notification_action(action_id, run_id))
+
+    @mcp.tool()
+    def get_notification_defaults() -> str:
+        """The account's default notification templates, per event.
+
+        `defaults` holds one entry per event the account has written (a cleared
+        one comes back with nulls); `builtin` is the pair used when neither the
+        binding nor a default sets a template.
+        """
+        return _json(api.notification_defaults())
+
+    @mcp.tool()
+    def set_notification_default(
+        event: str,
+        title_template: str = "",
+        body_template: str = "",
+    ) -> str:
+        """Set the account's default title/body template for one event.
+
+        `event` is `success` or `failure` — a default is the wording for an
+        outcome, so the binding-only `always` is not accepted. Any binding
+        without a template of its own uses these; a blank string clears it, so
+        the built-in pair is used again. Variables: `{event}` `{status_cn}`
+        `{task_id}` `{task}` `{run_id}` `{status}` `{error}` `{log}` `{t}`.
+        """
+        return _json(
+            api.set_notification_default(
+                event,
+                title_template=title_template,
+                body_template=body_template,
+            )
+        )
+
     return mcp
 
 

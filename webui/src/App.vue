@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, CircleHelp, Copy, Download, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp, Copy, Download, Eye, FileJson2, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
-import { consumeLogoutReturn, emptyHarDoc, formatRunTime, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome } from "./utils";
+import { consumeLogoutReturn, emptyHarDoc, formatRunTime, groupBindingsByTask, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, type NotificationBindingGroup } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
@@ -1295,6 +1295,10 @@ async function openNotifications() {
     const known = new Set(list.map((task) => task.id));
     actionForm.taskIds = actionForm.taskIds.filter((id) => known.has(id));
     await loadActions();
+    // The defaults editor is on this page, so its pair is loaded with the rest
+    // rather than on first interaction — the title/body it shows must be the
+    // stored ones, not a stale edit left over from the last visit.
+    await loadNotifyDefaults();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 /** Jump to the notification page with the given tasks already ticked. */
@@ -1439,6 +1443,125 @@ async function saveActionEdit() {
     notify(t("actionUpdated"));
     editingActionId.value = null;
     await loadActions();
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+
+/** One task's bindings, as the notify page shows them (issue #44).
+ *
+ * The list used to be flat: 14 tasks × 2 channels came out as 28 rows repeating
+ * the same task name, and the row you wanted was as hard to find as the rest.
+ * One row per task, its channels as chips, and the individual bindings behind a
+ * toggle. The grouping itself is [`groupBindingsByTask`], which is unit-tested;
+ * what is added here is only what needs the page's own lookups and words. */
+type ActionGroup = NotificationBindingGroup<NotificationAction> & {
+  name: string;
+  /** One chip per binding, reading "<channel> · <event>". */
+  chips: { id: number; label: string; title: string }[];
+};
+const actionGroups = computed<ActionGroup[]>(() =>
+  groupBindingsByTask(actions.value).map((group) => ({
+    ...group,
+    name: taskName(group.taskId),
+    chips: group.rows.map((action) => ({
+      id: action.id,
+      label: `${channelName(action.channel_id)} · ${eventLabel(action.event)}`,
+      title: actionSummary(action),
+    })),
+  })),
+);
+/** Which task rows are open. Collapsed by default — that is the point of the
+ *  grouping. A task with a single binding has nothing to hide, so it stays
+ *  open and its edit button one click away. */
+const expandedActionTasks = ref<number[]>([]);
+function toggleActionGroup(taskId: number) {
+  const at = expandedActionTasks.value.indexOf(taskId);
+  if (at >= 0) expandedActionTasks.value.splice(at, 1);
+  else expandedActionTasks.value.push(taskId);
+}
+function groupIsOpen(group: ActionGroup): boolean {
+  return group.rows.length === 1 || expandedActionTasks.value.includes(group.taskId);
+}
+function eventLabel(event: string): string {
+  if (event === "success") return t("eventSuccess");
+  if (event === "failure") return t("eventFailure");
+  return t("eventAlways");
+}
+/** A chip's tooltip: what this binding does beyond naming a channel. */
+function actionSummary(action: NotificationAction): string {
+  const parts = [eventLabel(action.event)];
+  if (action.failure_threshold > 1) parts.push(`${t("notifyFailureThreshold")} ≥ ${action.failure_threshold}`);
+  if (action.automatic_only) parts.push(t("notifyAutomaticOnly"));
+  if (action.title_template || action.body_template) parts.push(t("notifyCustomTemplate"));
+  return parts.join(" · ");
+}
+/** Drop every binding of one task straight from the list — the call the task
+ *  list's bell makes, without opening that task's dialog. */
+async function clearTaskBindings(group: ActionGroup) {
+  if (!window.confirm(fmt("notifyClearTaskConfirm", { name: group.name, n: group.rows.length }))) return;
+  try {
+    const removed = await api.clearTaskNotificationActions(group.taskId);
+    notify(fmt("notifyCleared", { n: removed.removed }));
+    await Promise.all([loadActions(), loadTasks()]);
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+
+// ---------- notification preview (issue #43) ----------
+/** The rendered message on screen, plus the names the dialog shows in its
+ *  heading — the endpoint answers with ids, which are not readable. */
+const preview = ref<(NotificationPreview & { task: string; channel: string }) | null>(null);
+const previewingActionId = ref<number | null>(null);
+/** Render one binding without sending anything. The channel-level "test" only
+ *  proves the credentials; this is the one way to read what a template will
+ *  actually say before the next scheduled run depends on it. */
+async function openActionPreview(action: NotificationAction) {
+  previewingActionId.value = action.id;
+  try {
+    const rendered = await api.previewNotificationAction(action.id);
+    preview.value = {
+      ...rendered,
+      task: taskName(action.task_id),
+      channel: channelName(action.channel_id),
+    };
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    previewingActionId.value = null;
+  }
+}
+
+// ---------- default notification templates (issue #45) ----------
+/** The account's defaults per event, plus the built-in pair behind them. */
+const notifyDefaults = ref<NotificationDefaults | null>(null);
+/** Which event the editor below is editing. A default is the wording for a
+ *  known outcome, so `always` — a property of a binding — is not on the list. */
+const defaultsEvent = ref<NotificationDefaultEvent>("failure");
+const defaultsForm = reactive({ title: "", body: "" });
+const defaultsEventOptions: { value: string; label: string }[] = [
+  { value: "success", label: t("eventSuccess") },
+  { value: "failure", label: t("eventFailure") },
+];
+/** Show the stored pair for the selected event; an unwritten event shows two
+ *  empty boxes, whose placeholders are the built-in template. */
+function syncDefaultsForm() {
+  const saved = notifyDefaults.value?.defaults.find((row) => row.event === defaultsEvent.value);
+  defaultsForm.title = saved?.title_template ?? "";
+  defaultsForm.body = saved?.body_template ?? "";
+}
+watch(defaultsEvent, syncDefaultsForm);
+async function loadNotifyDefaults() {
+  try {
+    notifyDefaults.value = await api.notificationDefaults();
+    syncDefaultsForm();
+  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+}
+async function saveNotifyDefaults() {
+  try {
+    await api.setNotificationDefault(defaultsEvent.value, {
+      title_template: defaultsForm.title,
+      body_template: defaultsForm.body,
+    });
+    notify(t("notifyDefaultSaved"));
+    await loadNotifyDefaults();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 
@@ -3005,40 +3128,77 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <label>{{ t('notifyTitleTemplate') }}<textarea v-model="actionForm.titleTemplate" rows="2" spellcheck="false" placeholder="{task} {event}" /></label>
             <label>{{ t('notifyBodyTemplate') }}<textarea v-model="actionForm.bodyTemplate" rows="2" spellcheck="false" placeholder="{log} {error}" /></label>
             <small class="kv-hint field-wide">{{ t('notifyVarsHint') }}</small>
+            <small class="kv-hint field-wide">{{ t('notifyPreviewAfterSave') }}</small>
             <button class="primary-button">{{ t('addAction') }}</button>
           </form>
           <div v-if="actions.length === 0" class="muted">{{ t('noActions') }}</div>
-          <div v-for="action in actions" :key="action.id" class="run-row">
-            <template v-if="editingActionId === action.id">
-              <!-- The row becomes its own editor: a binding is too small an
-                   object to justify a second form further up the page. -->
-              <form class="modal inline-modal action-edit" @submit.prevent="saveActionEdit">
-                <label>{{ t('channel') }}
-                  <Dropdown v-model="actionEdit.channelId" :options="actionChannelDropdownOptions" />
-                </label>
-                <label>{{ t('event') }}
-                  <Dropdown v-model="actionEdit.event" :options="eventDropdownOptions" />
-                </label>
-                <label>{{ t('notifyFailureThreshold') }}<input v-model="actionEdit.failureThreshold" type="number" min="1" /></label>
-                <label class="checkbox"><input v-model="actionEdit.automaticOnly" type="checkbox" />{{ t('notifyAutomaticOnly') }}</label>
-                <label class="field-wide">{{ t('notifyTitleTemplate') }}<textarea v-model="actionEdit.titleTemplate" rows="2" spellcheck="false" placeholder="{task} {event}" /></label>
-                <label class="field-wide">{{ t('notifyBodyTemplate') }}<textarea v-model="actionEdit.bodyTemplate" rows="2" spellcheck="false" placeholder="{log} {error}" /></label>
-                <div class="inline-actions">
-                  <button class="primary-button">{{ t('save') }}</button>
-                  <button type="button" class="secondary-button" @click="cancelEditAction">{{ t('cancel') }}</button>
-                </div>
-              </form>
-            </template>
-            <template v-else>
-              <strong>{{ action.event === 'success' ? t('eventSuccess') : action.event === 'failure' ? t('eventFailure') : t('eventAlways') }}</strong>
-              <span>{{ t('channel') }}: {{ channelName(action.channel_id) }}</span>
-              <span>{{ t('task') }}: {{ taskName(action.task_id) }}</span>
-              <span v-if="action.failure_threshold > 1" class="chip" :title="t('notifyFailureThreshold')">&ge;{{ action.failure_threshold }}</span>
-              <span v-if="action.automatic_only" class="chip">{{ t('notifyAutomaticOnlyShort') }}</span>
-              <button class="secondary-button" @click="startEditAction(action)"><Pencil :size="15" />{{ t('edit') }}</button>
-              <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
-            </template>
+          <!-- One row per task, its channels as chips, the bindings behind a
+               toggle (issue #44). The header is always drawn so a task with a
+               single binding reads the same way as one with six. -->
+          <div v-for="group in actionGroups" :key="group.taskId" class="action-group">
+            <div class="run-row action-group-row">
+              <button
+                v-if="group.rows.length > 1"
+                class="icon-button"
+                type="button"
+                :title="groupIsOpen(group) ? t('collapse') : t('expand')"
+                :aria-expanded="groupIsOpen(group)"
+                @click="toggleActionGroup(group.taskId)"
+              ><ChevronDown v-if="groupIsOpen(group)" :size="16" /><ChevronRight v-else :size="16" /></button>
+              <strong>{{ group.name }}</strong>
+              <!-- A task with a single binding has nothing to summarise: its row
+                   is open below and says the same thing in more detail. -->
+              <span v-for="chip in group.rows.length > 1 ? group.chips : []" :key="chip.id" class="chip" :title="chip.title">{{ chip.label }}</span>
+              <span v-if="group.rows.length > 1" class="muted action-group-count">{{ fmt('notifyBindingCount', { n: group.rows.length }) }}</span>
+              <span v-if="group.variants > 1" class="chip" :title="t('notifyVariantsHint')">{{ fmt('notifyVariants', { n: group.variants }) }}</span>
+              <button class="icon-button" :title="t('notifyClearTask')" @click="clearTaskBindings(group)"><Trash2 :size="16" /></button>
+            </div>
+            <div v-for="action in group.rows" v-show="groupIsOpen(group)" :key="action.id" class="run-row action-row">
+              <template v-if="editingActionId === action.id">
+                <!-- The row becomes its own editor: a binding is too small an
+                     object to justify a second form further up the page. -->
+                <form class="modal inline-modal action-edit" @submit.prevent="saveActionEdit">
+                  <label>{{ t('channel') }}
+                    <Dropdown v-model="actionEdit.channelId" :options="actionChannelDropdownOptions" />
+                  </label>
+                  <label>{{ t('event') }}
+                    <Dropdown v-model="actionEdit.event" :options="eventDropdownOptions" />
+                  </label>
+                  <label>{{ t('notifyFailureThreshold') }}<input v-model="actionEdit.failureThreshold" type="number" min="1" /></label>
+                  <label class="checkbox"><input v-model="actionEdit.automaticOnly" type="checkbox" />{{ t('notifyAutomaticOnly') }}</label>
+                  <label class="field-wide">{{ t('notifyTitleTemplate') }}<textarea v-model="actionEdit.titleTemplate" rows="2" spellcheck="false" placeholder="{task} {event}" /></label>
+                  <label class="field-wide">{{ t('notifyBodyTemplate') }}<textarea v-model="actionEdit.bodyTemplate" rows="2" spellcheck="false" placeholder="{log} {error}" /></label>
+                  <div class="inline-actions">
+                    <button class="primary-button">{{ t('save') }}</button>
+                    <button type="button" class="secondary-button" @click="cancelEditAction">{{ t('cancel') }}</button>
+                  </div>
+                </form>
+              </template>
+              <template v-else>
+                <!-- The task is named on the header above, so this row is about
+                     the channel and what that binding does with it. -->
+                <span>{{ channelName(action.channel_id) }}</span>
+                <span class="chip">{{ eventLabel(action.event) }}</span>
+                <span v-if="action.failure_threshold > 1" class="chip" :title="t('notifyFailureThreshold')">&ge;{{ action.failure_threshold }}</span>
+                <span v-if="action.automatic_only" class="chip">{{ t('notifyAutomaticOnlyShort') }}</span>
+                <span v-if="action.title_template || action.body_template" class="chip">{{ t('notifyCustomTemplate') }}</span>
+                <button class="secondary-button" :disabled="previewingActionId === action.id" @click="openActionPreview(action)"><Eye :size="15" />{{ t('notifyPreview') }}</button>
+                <button class="secondary-button" @click="startEditAction(action)"><Pencil :size="15" />{{ t('edit') }}</button>
+                <button class="icon-button" :title="t('deleteAction')" @click="removeAction(action.id)"><Trash2 :size="16" /></button>
+              </template>
+            </div>
           </div>
+          <h2>{{ t('notifyDefaults') }}</h2>
+          <p class="muted section-hint">{{ t('notifyDefaultsHint') }}</p>
+          <form class="modal inline-modal" @submit.prevent="saveNotifyDefaults">
+            <label>{{ t('event') }}
+              <Dropdown v-model="defaultsEvent" :options="defaultsEventOptions" />
+            </label>
+            <label class="field-wide">{{ t('notifyTitleTemplate') }}<textarea v-model="defaultsForm.title" rows="2" spellcheck="false" :placeholder="notifyDefaults?.builtin.title_template ?? ''" /></label>
+            <label class="field-wide">{{ t('notifyBodyTemplate') }}<textarea v-model="defaultsForm.body" rows="4" spellcheck="false" :placeholder="notifyDefaults?.builtin.body_template ?? ''" /></label>
+            <small class="kv-hint field-wide">{{ t('notifyDefaultsClearHint') }}</small>
+            <button class="primary-button">{{ t('save') }}</button>
+          </form>
         </section>
       </div>
 
@@ -3395,6 +3555,34 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           @next="nextRunLogPage"
           @update:page-size="setRunLogPageSize"
         />
+      </div>
+    </div>
+
+    <!-- ===== NOTIFICATION PREVIEW ===== -->
+    <!-- What one binding would deliver, rendered by the server and shown before
+         a scheduled run depends on it (issue #43). Nothing is sent: a channel's
+         own "test" proves the credentials, this reads the wording. -->
+    <div v-if="preview" class="modal-backdrop" @click.self="preview = null">
+      <div class="modal">
+        <div class="modal-header">
+          <div>
+            <h2>{{ t('notifyPreviewTitle') }}</h2>
+            <p class="muted preview-meta">
+              {{ fmt('notifyPreviewFor', { task: preview.task, channel: preview.channel }) }} · {{ eventLabel(preview.event) }}<template v-if="preview.run_id != null"> · {{ fmt('notifyPreviewRun', { n: preview.run_id }) }}</template>
+            </p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="preview = null"><X :size="20" /></button>
+        </div>
+        <p v-if="preview.source === 'sample'" class="muted preview-meta">{{ t('notifyPreviewSample') }}</p>
+        <div class="preview-block">
+          <span class="preview-label">{{ t('notifyPreviewTitleLabel') }}</span>
+          <pre class="preview-text">{{ preview.title }}</pre>
+        </div>
+        <div class="preview-block">
+          <span class="preview-label">{{ t('notifyPreviewBodyLabel') }}</span>
+          <pre class="preview-text">{{ preview.body }}</pre>
+        </div>
+        <div class="modal-actions"><button class="secondary-button" type="button" @click="preview = null">{{ t('close') }}</button></div>
       </div>
     </div>
 

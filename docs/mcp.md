@@ -142,6 +142,10 @@ uv tool install --from /absolute/path/to/qdrust/mcp qdrust-mcp
 | `get_notepad` / `set_notepad` / `delete_notepad` | `/api/v1/notepads/{notepad_id}` 的 `GET` / `PUT` / `DELETE` | 读 / 建或覆盖 / 删一个槽位；写入上限 256 KiB |
 | `list_notification_channels` | `GET /api/v1/notification-channels` | 通知渠道 |
 | `bind_notification` | `POST /api/v1/notification-actions/batch` | 把渠道绑到一个或多个任务（默认 `failure`） |
+| `list_notification_actions` | `GET /api/v1/notification-actions` | 你全部任务的绑定；`id` 就是下面预览要用的那个 |
+| `preview_notification` | `GET /api/v1/notification-actions/{id}/preview` | **渲染**某条绑定会发出的标题与正文，不投递；`run_id` 指定用哪次运行（默认最新），任务从未运行时 `source` 为 `sample`、`{status}`/`{error}`/`{log}` 为空 |
+| `get_notification_defaults` | `GET /api/v1/notification-defaults` | 你按事件设置的默认标题/正文模板，外加兜底的内置模板 |
+| `set_notification_default` | `PUT /api/v1/notification-defaults/{event}` | 改 `success` / `failure` 的默认模板；传空串即清除、回落到内置模板。模板变量见 [推送 / 通知](notifications.md) |
 
 ## 自检与排障
 

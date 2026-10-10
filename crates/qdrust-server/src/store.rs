@@ -14,11 +14,11 @@ use crate::model::{
     CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
     CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity,
     ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken,
-    IssuedSession, NotificationAction, NotificationChannel, NotificationDelivery, OidcLoginState,
-    PluginManifest, PushRequest, Run, RunStep, SetSiteSetting, SiteSetting, Task, Template,
-    TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel,
-    UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate,
-    UpdateTemplateSubscription, User, UserCredentials,
+    IssuedSession, NotificationAction, NotificationChannel, NotificationDefaultTemplate,
+    NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run, RunStep,
+    SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
+    UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
+    UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
 use qdrust_core::{
     plugin::NotepadSlot,
@@ -109,7 +109,7 @@ pub struct NotepadRow {
 macro_rules! define_store {
     ($module:ident, $db:ty, $pool:ty, $pool_options:ty, $options_builder:path, $migrator:expr,
      $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $notepad_upsert:expr,
-     $parent_check:path) => {
+     $notification_default_upsert:expr, $parent_check:path) => {
         #[allow(clippy::all)]
         pub mod $module {
             use super::*;
@@ -1773,7 +1773,12 @@ macro_rules! define_store {
             > 0)
     }
 
-    async fn get_notification_action(
+    /// One binding, scoped to its owner.
+    ///
+    /// The notify page edits by id and the preview endpoint renders by id, and
+    /// neither has the task in hand, so this joins `tasks` rather than trusting
+    /// the caller to have checked ownership first.
+    pub async fn get_notification_action(
         &self,
         id: i64,
         owner_id: i64,
@@ -2409,6 +2414,64 @@ macro_rules! define_store {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ---- Default notification templates (issue #45) ----
+
+    /// The owner's default templates, one row per event it has written.
+    ///
+    /// A row whose templates were both cleared comes back as such, with two
+    /// NULLs. It is deliberately not filtered out here: the row is what the
+    /// editor round-trips (so a cleared setting doesn't look like one that was
+    /// never touched), and every reader treats NULL as "unset" and falls
+    /// through to the next template in the chain anyway.
+    pub async fn notification_defaults(
+        &self,
+        owner_id: i64,
+    ) -> Result<Vec<NotificationDefaultTemplate>> {
+        let rows = sqlx::query("SELECT event,title_template,body_template FROM notification_default_templates WHERE owner_id=? ORDER BY event")
+            .bind(owner_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(notification_default_from_row)
+            .collect()
+    }
+
+    /// Write one event's defaults, replacing whatever was there.
+    ///
+    /// A blank template is stored as NULL: "cleared" and "never set" have to be
+    /// the same state, or the fallback would deliver a message with an empty
+    /// title instead of the built-in one.
+    pub async fn set_notification_default(
+        &self,
+        owner_id: i64,
+        event: &str,
+        title_template: Option<String>,
+        body_template: Option<String>,
+    ) -> Result<NotificationDefaultTemplate> {
+        ensure!(
+            matches!(event, "success" | "failure"),
+            "invalid notification event"
+        );
+        let title_template = title_template.and_then(blank_to_none);
+        let body_template = body_template.and_then(blank_to_none);
+        sqlx::query(&format!(
+            "INSERT INTO notification_default_templates(owner_id,event,title_template,body_template,updated_at) VALUES(?,?,?,?,?) {}",
+            $notification_default_upsert
+        ))
+        .bind(owner_id)
+        .bind(event)
+        .bind(title_template.as_deref())
+        .bind(body_template.as_deref())
+        .bind(Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(NotificationDefaultTemplate {
+            event: event.to_string(),
+            title_template,
+            body_template,
+        })
     }
 
     // ---- Password reset ----
@@ -3289,6 +3352,14 @@ fn notification_action_from_row(row: $row) -> Result<NotificationAction> {
     })
 }
 
+fn notification_default_from_row(row: $row) -> Result<NotificationDefaultTemplate> {
+    Ok(NotificationDefaultTemplate {
+        event: row.try_get("event")?,
+        title_template: row.try_get("title_template")?,
+        body_template: row.try_get("body_template")?,
+    })
+}
+
 fn notification_delivery_from_row(row: $row) -> Result<NotificationDelivery> {
     Ok(NotificationDelivery {
         channel: NotificationChannel {
@@ -3365,6 +3436,7 @@ define_store!(
     sqlite_username_cmp,
     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
     "ON CONFLICT(owner_id,notepad_id) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at",
+    "ON CONFLICT(owner_id,event) DO UPDATE SET title_template=excluded.title_template, body_template=excluded.body_template, updated_at=excluded.updated_at",
     sqlite_parent_check
 );
 
@@ -3380,6 +3452,7 @@ define_store!(
     mysql_username_cmp,
     "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
     "ON DUPLICATE KEY UPDATE content=VALUES(content), updated_at=VALUES(updated_at)",
+    "ON DUPLICATE KEY UPDATE title_template=VALUES(title_template), body_template=VALUES(body_template), updated_at=VALUES(updated_at)",
     no_parent_check
 );
 macro_rules! delegate {
@@ -3528,6 +3601,9 @@ impl Store {
         pub async fn delete_notification_action(id: i64, owner_id: i64) -> Result<bool> { id, owner_id };
         pub async fn delete_notification_actions_for_task(task_id: i64, owner_id: i64) -> Result<u64> { task_id, owner_id };
         pub async fn update_notification_action(id: i64, owner_id: i64, input: UpdateNotificationAction) -> Result<Option<NotificationAction>> { id, owner_id, input };
+        pub async fn get_notification_action(id: i64, owner_id: i64) -> Result<Option<NotificationAction>> { id, owner_id };
+        pub async fn notification_defaults(owner_id: i64) -> Result<Vec<NotificationDefaultTemplate>> { owner_id };
+        pub async fn set_notification_default(owner_id: i64, event: &str, title_template: Option<String>, body_template: Option<String>) -> Result<NotificationDefaultTemplate> { owner_id, event, title_template, body_template };
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };

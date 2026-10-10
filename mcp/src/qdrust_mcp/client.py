@@ -395,3 +395,46 @@ class QdrustClient:
                 "automatic_only": False,
             },
         )
+
+    def list_notification_actions(self) -> Any:
+        """Every binding the token's owner has, across all of their tasks."""
+        return self.get("/api/v1/notification-actions")
+
+    def preview_notification_action(self, action_id: int, run_id: int | None = None) -> Any:
+        """Render one binding's message without delivering it.
+
+        ``run_id`` renders against a specific run; the task's newest one is used
+        otherwise. A blank ``run_id`` is dropped rather than sent as an empty
+        query value — see ``_query``.
+        """
+        return self.get(
+            f"/api/v1/notification-actions/{action_id}/preview",
+            params={"run_id": run_id},
+        )
+
+    def notification_defaults(self) -> Any:
+        """The owner's default templates per event, plus the built-in pair."""
+        return self.get("/api/v1/notification-defaults")
+
+    def set_notification_default(
+        self,
+        event: str,
+        *,
+        title_template: str = "",
+        body_template: str = "",
+    ) -> Any:
+        """Replace the owner's default templates for one event.
+
+        Checked here as well as on the server so a typo comes back as a sentence
+        rather than a 422 whose `field_errors` are empty: an event is one of two
+        words, not a free-form label.
+        """
+        if event not in ("success", "failure"):
+            raise QdrustError(
+                f"event must be 'success' or 'failure', got {event!r}: a default is the "
+                "wording for an outcome, while 'always' belongs to a binding"
+            )
+        return self.put(
+            f"/api/v1/notification-defaults/{event}",
+            {"title_template": title_template, "body_template": body_template},
+        )
