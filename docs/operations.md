@@ -15,6 +15,8 @@ pwsh -File scripts/restore-db.ps1 -Backup backups/qdrust-20260818-120000.db -Dat
 
 After restore, start the server and verify `/ready`. The migration runner is forward-only, so rolling back only the image without restoring the database is not supported — take a backup before upgrading the image.
 
+For a portable copy that does not depend on the SQLite file, the admin page has **Backup / Restore** (`GET /api/v1/admin/backup`, `POST /api/v1/admin/restore`), which writes a JSON export of every table and reads it back into either backend. A restore clears **all** tables before loading, not only the ones this particular file contains, so a backup remains restorable after the schema gains a table: the new table simply comes back empty. It is a full-database replacement, not a merge.
+
 Release tags matching `v*` publish `linux/amd64` and `linux/arm64` images to GHCR with provenance and SBOM attestations. CI rejects images with known fixed HIGH or CRITICAL vulnerabilities.
 
 ## 数据库迁移

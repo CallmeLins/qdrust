@@ -38,6 +38,66 @@ static MYSQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migration
 const UNUSABLE_PASSWORD_HASH: &str =
     "$argon2id$v=19$m=0,t=0,p=0$unusable-sentinel$unusable-sentinel-external-user";
 
+/// Every table a backup carries, parents before children.
+///
+/// One list for both halves of a restore, because they used to be two and
+/// drifted: the exporter wrote twelve tables and the importer cleared exactly
+/// those twelve, so every table added since — notepads, api tokens, external
+/// identities, the notification defaults — was neither saved nor, on restore,
+/// cleared. A restore would then reinsert accounts over rows that still
+/// pointed at the previous ones, which nothing repairs on MySQL because the
+/// migrations there declare no foreign keys for it to cascade through.
+///
+/// The order is a topological sort of the foreign keys: `tasks.template_id` is
+/// the one `ON DELETE RESTRICT` in the schema, so tasks load after templates
+/// and are cleared before them. `import_data` walks this list forwards after
+/// clearing it backwards, which is a valid clear order for any arrangement of
+/// children. `backup_covers_every_table` in the tests fails when a migration
+/// adds a table and forgets this list.
+const BACKUP_TABLES: [&str; 21] = [
+    "users",
+    "sessions",
+    "plugins",
+    "api_tokens",
+    "external_identities",
+    "notepads",
+    "notification_default_templates",
+    "email_verification_tokens",
+    "password_reset_tokens",
+    "site_settings",
+    "oidc_login_states",
+    "templates",
+    "tasks",
+    "runs",
+    "run_steps",
+    "notification_channels",
+    "notification_actions",
+    "template_subscriptions",
+    "template_imports",
+    "push_requests",
+    "audit_logs",
+];
+
+/// `INSERT INTO \`table\`(\`a\`,\`b\`) VALUES(?,?)` for a restore.
+///
+/// Identifiers are quoted because they come from the schema rather than from
+/// this file, and two of them are MySQL reserved words: `runs.trigger` and
+/// `site_settings.key`. Unquoted they make a restore a syntax error on MySQL
+/// while SQLite parses them happily as column names, so no SQLite test can see
+/// the difference — which is exactly why the quoting is built and asserted here
+/// instead of being left to the integration path. Backticks are SQLite's
+/// MySQL-compatibility spelling, so one statement serves both backends, as
+/// `RUN_FIELDS` already does for `trigger`.
+fn insert_statement(table: &str, columns: &[String]) -> String {
+    let column_list = columns
+        .iter()
+        .map(|column| format!("`{column}`"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    format!("INSERT INTO `{table}`({column_list}) VALUES({placeholders})")
+}
+
 fn sqlite_options(url: &str) -> Result<SqliteConnectOptions> {
     Ok(SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
@@ -2986,22 +3046,8 @@ macro_rules! define_store {
             "exported_at".to_string(),
             JsonValue::from(Utc::now().timestamp()),
         );
-        let tables = [
-            "users",
-            "sessions",
-            "templates",
-            "tasks",
-            "runs",
-            "run_steps",
-            "notification_channels",
-            "notification_actions",
-            "plugins",
-            "site_settings",
-            "template_subscriptions",
-            "push_requests",
-        ];
-        for table in tables {
-            let rows: Vec<JsonValue> = sqlx::query(&format!("SELECT * FROM {table}"))
+        for table in BACKUP_TABLES {
+            let rows: Vec<JsonValue> = sqlx::query(&format!("SELECT * FROM `{table}`"))
                 .fetch_all(&self.pool)
                 .await?
                 .into_iter()
@@ -3048,41 +3094,20 @@ macro_rules! define_store {
             "unsupported backup schema_version {version} (expected 1)"
         );
         let mut tx = self.pool.begin().await?;
-        let tables = [
-            "push_requests",
-            "template_subscriptions",
-            "site_settings",
-            "plugins",
-            "notification_actions",
-            "notification_channels",
-            "run_steps",
-            "runs",
-            "tasks",
-            "templates",
-            "sessions",
-            "users",
-        ];
-        for table in tables {
-            sqlx::query(&format!("DELETE FROM {table}"))
+        // Backwards through the load order, so a child table is always cleared
+        // before the parent it points at. Every table is cleared, not only the
+        // ones this backup happens to carry: rows left in a table the file does
+        // not mention would keep pointing at accounts this import is about to
+        // replace.
+        for table in BACKUP_TABLES.iter().rev() {
+            sqlx::query(&format!("DELETE FROM `{table}`"))
                 .execute(&mut *tx)
                 .await?;
         }
-        // Import in dependency order regardless of the JSON key order.
-        let import_order = [
-            "users",
-            "sessions",
-            "templates",
-            "tasks",
-            "runs",
-            "run_steps",
-            "notification_channels",
-            "notification_actions",
-            "plugins",
-            "site_settings",
-            "template_subscriptions",
-            "push_requests",
-        ];
-        for table in import_order {
+        // Load in dependency order regardless of the JSON key order. A backup
+        // written before a table existed simply has no rows for it, so the
+        // format needs no version bump for the tables added since.
+        for table in BACKUP_TABLES {
             let Some(rows) = object.get(table).and_then(|v| v.as_array()) else {
                 continue;
             };
@@ -3096,15 +3121,11 @@ macro_rules! define_store {
             if columns.is_empty() {
                 continue;
             }
-            let column_list = columns.join(",");
-            let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = insert_statement(table, &columns);
             for row in rows {
                 let Some(row_map) = row.as_object() else {
                     continue;
                 };
-                let sql = format!(
-                    "INSERT INTO {table}({column_list}) VALUES({placeholders})"
-                );
                 let mut query = sqlx::query::<$db>(&sql);
                 for column in &columns {
                     let value = row_map.get(column).cloned().unwrap_or(JsonValue::Null);
@@ -6169,6 +6190,225 @@ mod tests {
         assert_eq!(restored.grp.as_deref(), Some("prod"));
         assert_eq!(target.list().await.unwrap().len(), 1);
         assert_eq!(target.list_users().await.unwrap().len(), 1);
+    }
+
+    /// The backup list has to name every table the migrations create.
+    ///
+    /// Checked against the live schema rather than against a second hand-kept
+    /// list, because the drift this guards against *is* "a migration added a
+    /// table and nobody updated the exporter". Six tables arrived after the
+    /// exporter was last edited and every one of them was silently missing from
+    /// every backup taken in between.
+    #[tokio::test]
+    async fn backup_covers_every_table() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let migrated: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(store.sqlite_pool())
+                .await
+                .unwrap();
+        // sqlx's own bookkeeping is not application data.
+        let mut actual: Vec<String> = migrated
+            .into_iter()
+            .filter(|name| !name.starts_with("sqlite_") && name != "_sqlx_migrations")
+            .collect();
+        actual.sort();
+
+        let mut covered: Vec<String> = BACKUP_TABLES.iter().map(|t| t.to_string()).collect();
+        covered.sort();
+        assert_eq!(
+            actual, covered,
+            "BACKUP_TABLES and the migrated schema disagree: a table the backup \
+             does not name is one a restore neither saves nor clears"
+        );
+
+        // The rows come from that same list, so a table named but never written
+        // would fail exactly as one that was missing.
+        let mut written: Vec<String> = store
+            .export_data()
+            .await
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "schema_version" | "exported_at"))
+            .cloned()
+            .collect();
+        written.sort();
+        assert_eq!(written, covered, "the export and BACKUP_TABLES disagree");
+    }
+
+    /// A restore statement quotes every identifier it takes from the schema.
+    ///
+    /// Two of those identifiers are MySQL reserved words, and SQLite accepts
+    /// both as bare column names — so the round-trip test below cannot tell a
+    /// quoted statement from an unquoted one. The statement itself is the only
+    /// place the difference is visible without a MySQL server.
+    #[test]
+    fn a_restore_statement_quotes_the_schema_identifiers() {
+        assert_eq!(
+            insert_statement("runs", &["id".to_string(), "trigger".to_string()]),
+            "INSERT INTO `runs`(`id`,`trigger`) VALUES(?,?)"
+        );
+        assert_eq!(
+            insert_statement("site_settings", &["key".to_string(), "value".to_string()]),
+            "INSERT INTO `site_settings`(`key`,`value`) VALUES(?,?)"
+        );
+    }
+
+    /// A restore carries the tables the exporter used to skip, and clears them.
+    ///
+    /// Cascades are off again, for the same reason as the delete test: SQLite
+    /// would clean a leaked row up by itself and hand the importer credit it
+    /// has not earned where MySQL, which declares no foreign keys at all, is
+    /// the only thing deciding what survives.
+    #[tokio::test]
+    async fn a_restore_carries_and_clears_every_table() {
+        /// One row in each of the tables the exporter used to skip, labelled so
+        /// that a surviving row names its author: both databases number their
+        /// first account 1, so the id cannot tell the two accounts apart.
+        async fn seed_owned_rows(store: &Store, user: i64, label: &str) {
+            store.notepad_write(user, 1, Some(label)).await.unwrap();
+            store
+                .create_api_token(
+                    user,
+                    CreateApiToken {
+                        name: label.into(),
+                        expires_in_days: None,
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .set_notification_default(user, "failure", Some(label.into()), Some(label.into()))
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO external_identities(user_id, provider, issuer, subject, email, created_at, last_login_at)
+                 VALUES (?, 'github', ?, ?, NULL, 0, 0)",
+            )
+            .bind(user)
+            .bind(label)
+            .bind(label)
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+            store
+                .record_audit(
+                    Some(user),
+                    "auth.password_changed",
+                    Some("user"),
+                    Some(user),
+                    None,
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            let template = store
+                .create_template_for_owner(
+                    user,
+                    CreateTemplate {
+                        name: format!("{label} template"),
+                        description: None,
+                        definition: template_definition(&format!("{label} template")),
+                        grp: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let subscription = store
+                .create_subscription(
+                    user,
+                    CreateTemplateSubscription {
+                        name: format!("{label} feed"),
+                        url: format!("https://example.invalid/{label}.json"),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .record_template_import(subscription.id, template.id, label, None, None)
+                .await
+                .unwrap();
+            // `runs.trigger` and `site_settings.key` are the two columns a
+            // restore has to quote, so both are written here to make the
+            // restore execute that statement rather than only build it.
+            let task = store
+                .create_for_owner(user, input(&format!("{label} task")))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .enqueue_run_with_trigger(task.id, label)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the run fixture did not enqueue"
+            );
+            store
+                .set_setting(
+                    label,
+                    &SetSiteSetting {
+                        value: serde_json::json!(label),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let owner = store
+            .create_user("backup_owner", &password_hash, "user")
+            .await
+            .unwrap();
+        seed_owned_rows(&store, owner.id, "restored").await;
+        let backup = store.export_data().await.unwrap();
+
+        // Into a database already holding a later account's rows in the very
+        // tables the exporter used to leave out.
+        let target = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(target.sqlite_pool())
+            .await
+            .unwrap();
+        let later = target
+            .create_user("later_owner", &password_hash, "user")
+            .await
+            .unwrap();
+        seed_owned_rows(&target, later.id, "stale").await;
+
+        target.import_data(&backup).await.unwrap();
+
+        assert_eq!(target.list_users().await.unwrap().len(), 1);
+        // Each table holds the backup's row and only the backup's row, so one
+        // label per table says both halves at once.
+        for (table, column, expected) in [
+            ("notepads", "content", "restored"),
+            ("api_tokens", "name", "restored"),
+            ("external_identities", "subject", "restored"),
+            (
+                "notification_default_templates",
+                "title_template",
+                "restored",
+            ),
+            ("template_imports", "entry_name", "restored"),
+            ("audit_logs", "action", "auth.password_changed"),
+            // The two MySQL reserved words, written and read back through the
+            // quoting.
+            ("runs", "trigger", "restored"),
+            ("site_settings", "key", "restored"),
+        ] {
+            let labels: Vec<String> = sqlx::query_scalar(&format!("SELECT {column} FROM {table}"))
+                .fetch_all(target.sqlite_pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                labels,
+                vec![expected.to_string()],
+                "{table} did not come back as exactly the backup's row"
+            );
+        }
     }
 
     fn oidc_claim(subject: &str, email: Option<&str>) -> ExternalIdentityClaim {
