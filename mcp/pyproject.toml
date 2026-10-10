@@ -2,7 +2,7 @@
 name = "qdrust-mcp"
 # Kept in sync by scripts/bump-version.py --check (same single source of truth
 # as the Cargo / webui / OpenAPI versions).
-version = "0.1.23"
+version = "0.1.24"
 description = "MCP server for a qdrust instance: create, run and inspect HTTP automation tasks from any MCP client"
 readme = "README.md"
 requires-python = ">=3.10"

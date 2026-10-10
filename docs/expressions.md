@@ -61,7 +61,7 @@ QD 把 `qdl.utils.urlencode_with_encoding` 作为过滤器暴露给模板，Jinj
 |---|---|
 | `{{ x \| urlencode }}` | 百分号编码，等价 `urlencode(x, 'utf-8', false)` |
 | `{{ x \| urlencode('gbk') }}` / `{{ x \| urlencode(encoding='gbk') }}` | 指定字符集。**只支持 `utf-8`**：QD 的 `url_quote` 能按任意 Python 编码逐字节编码，而这里没有那套编码表，与其悄悄按 UTF-8 编出发错的串，不如报 `urlencode only supports utf-8, got "gbk"` |
-| `{{ x \| urlencode(for_qs=True) }}` | 表单 / 查询串模式：空格编成 `+` 而不是 `%20`（Python `urllib.parse.quote_plus` 的开关） |
+| `{{ x \| urlencode(for_qs=True) }}` | 把这段值当作查询串用：`/` 也编成 `%2F`。默认 `false` 时 `/` 保持字面（`urllib.parse.quote` 的默认），与 QD 的 `url_quote(value, for_qs=…)` 一致。**两种模式下空格都是 `%20`** —— 这里不是 `quote_plus`，不产生 `+` |
 | `{{ d \| urlencode }}`（`d` 是字典或键值对列表） | 拼成 `k=v&k=v`，两侧都编码、`/` 也编码（QD `urlencode_with_encoding` 对 dict / iterable 的分支） |
 | `{{ x \| default('兜底') }}` | 值为**未定义**时替换（Jinja2 语义，空串与 `0` 不替换） |
 | `{{ x \| default('兜底', true) }}` / `default('兜底', boolean=True)` | `boolean=True` 时**假值**也替换——空串、`0`、`[]`、`{}` 都会用兜底值 |
