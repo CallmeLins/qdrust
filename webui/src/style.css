@@ -1482,6 +1482,10 @@ th.sortable .sort-idle { opacity: 0.3; }
 
 /* ---- notification preview (issue #43) ---- */
 .preview-meta { margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
+/* The success/failure switch, shown only for a binding that delivers on both
+   outcomes and therefore has no outcome of its own (issue #46). */
+.preview-event { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.preview-event .preview-meta { margin: 0; }
 .preview-block { display: grid; gap: 4px; margin-bottom: 12px; }
 .preview-label { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: 0.4px; text-transform: uppercase; }
 /* Rendered text keeps its own line breaks and can be long: it wraps and

@@ -337,8 +337,21 @@ export const api = {
   /** Render one binding's message without sending it, which is how a template
    *  gets read before a scheduled run depends on it. `runId` renders against a
    *  specific run; the newest one is used otherwise, and the answer says
-   *  `sample` when the task has never run at all. */
-  previewNotificationAction: (id: number, runId?: number) => request<NotificationPreview>(`/api/v1/notification-actions/${id}/preview${runId != null ? `?run_id=${runId}` : ""}`),
+   *  `sample` when the task has never run at all. `event` chooses which outcome
+   *  an `always` binding is rendered as — it delivers on both, so neither is its
+   *  own — and is ignored by a binding already pinned to one outcome. */
+  previewNotificationAction: (
+    id: number,
+    options: { runId?: number; event?: NotificationDefaultEvent } = {},
+  ) => {
+    const params = new URLSearchParams();
+    if (options.runId != null) params.set("run_id", String(options.runId));
+    if (options.event != null) params.set("event", options.event);
+    const suffix = params.toString();
+    return request<NotificationPreview>(
+      `/api/v1/notification-actions/${id}/preview${suffix ? `?${suffix}` : ""}`,
+    );
+  },
   /** The account's default templates per event, plus the built-in pair the
    *  editor shows as the fallback when neither the binding nor a default sets
    *  a template. */

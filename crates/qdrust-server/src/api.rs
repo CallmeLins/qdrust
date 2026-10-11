@@ -2015,6 +2015,11 @@ struct PreviewQuery {
     /// Render against this run instead of the task's newest one. Useful for
     /// reading back the failure that already happened.
     run_id: Option<i64>,
+    /// Which outcome to render an `always` binding as (issue #46). Both are real
+    /// for such a binding — it delivers on each — so the caller may pick one. A
+    /// binding already pinned to a single outcome ignores this. Left out, the
+    /// previewed run's own outcome is used.
+    event: Option<String>,
 }
 
 /// Render one binding's message without sending it (issue #43).
@@ -2032,6 +2037,17 @@ async fn preview_notification_action(
     Query(query): Query<PreviewQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
+    // A value the delivery path could never be made as is a malformed request
+    // rather than something to fall back from, so it fails before any lookup.
+    let requested_event = query.event.as_deref();
+    match requested_event {
+        None | Some(crate::delivery::EVENT_SUCCESS) | Some(crate::delivery::EVENT_FAILURE) => {}
+        Some(other) => {
+            return Err(ApiError::Unprocessable(anyhow::anyhow!(
+                "invalid notification event {other:?}: expected success or failure"
+            )));
+        }
+    }
     let owner = session.user.id;
     let action = store
         .get_notification_action(id, owner)
@@ -2053,9 +2069,19 @@ async fn preview_notification_action(
         None => runs.first(),
     };
     let defaults = store.notification_defaults(owner).await?;
-    let owner_default = defaults.iter().find(|row| row.event == action.event);
+    // `always` is not an outcome, so it is resolved to one before it is used for
+    // anything: the same string picks the default template and feeds `{event}` /
+    // `{status_cn}`, exactly as the scheduler does at delivery time (issue #46).
+    let previewed_event = crate::delivery::preview_event(
+        &action.event,
+        requested_event,
+        // Only `failed` is an outcome the scheduler notifies on; a cancelled run
+        // sends nothing at all, so there is no outcome to show for one.
+        run.map(|run| run.status == "failed"),
+    );
+    let owner_default = defaults.iter().find(|row| row.event == previewed_event);
     let vars = crate::delivery::TemplateVars {
-        event: &action.event,
+        event: previewed_event,
         task_id: action.task_id,
         task_name: &task.name,
         run_id: run.map(|run| run.id).unwrap_or_default(),
@@ -2082,7 +2108,7 @@ async fn preview_notification_action(
         crate::delivery::BUILTIN_BODY_TEMPLATE,
     ));
     Ok(Json(json!({
-        "event": action.event,
+        "event": previewed_event,
         "task_id": action.task_id,
         "channel_id": action.channel_id,
         // `sample` when the task has never run (or the named run is gone): the
@@ -4929,6 +4955,35 @@ mod tests {
         (task_id, action["id"].as_i64().unwrap())
     }
 
+    /// `GET` one binding's preview, with an optional query string already
+    /// formatted (including its own `?`).
+    async fn preview_action(app: &Router, cookie: &str, action_id: i64, query: &str) -> Value {
+        let (status, body) = json_call(
+            app,
+            "GET",
+            &format!("/api/v1/notification-actions/{action_id}/preview{query}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Write one event's default templates, so a preview has something to fall
+    /// back to.
+    async fn set_default(app: &Router, cookie: &str, event: &str, title: &str, body: &str) {
+        let (status, payload) = json_call(
+            app,
+            "PUT",
+            &format!("/api/v1/notification-defaults/{event}"),
+            Some(cookie),
+            Some(json!({"title_template": title, "body_template": body})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+    }
+
     /// Issue #43, second complaint: the only way to find out what a template
     /// actually renders used to be to wait for the next scheduled run and read
     /// the notification. The preview route renders the same text without
@@ -4988,6 +5043,102 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Issue #46, the reporter's own setup: a binding set to `always` with its
+    /// templates cleared. It delivers on both outcomes, so it has no single
+    /// `event` to render a default from — the preview read the literal `always`,
+    /// matched no default (that table holds only the two outcomes) and fell back
+    /// to the built-in, while the message that actually arrived used the default.
+    #[tokio::test]
+    async fn previewing_an_always_binding_uses_the_owners_default() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+        let (_task_id, action_id) = seed_binding(&app, &cookie, "always", None).await;
+        set_default(
+            &app,
+            &cookie,
+            "success",
+            "QD Rust定时任务 {task} {status_cn}",
+            "日志：{log}",
+        )
+        .await;
+
+        let body = preview_action(&app, &cookie, action_id, "").await;
+        // The default's wording, not the built-in `[qdrust] Task "preview-task"
+        // always`. `{status_cn}` rendering 成功 is the second half of the same
+        // bug: `always` used to reach the label lookup literally and paint 通知.
+        assert_eq!(body["title"], "QD Rust定时任务 preview-task 成功");
+        assert_eq!(body["body"], "日志：");
+        // The outcome it rendered as is reported, so the dialog can name what the
+        // reader is looking at instead of repeating the binding's `always`.
+        assert_eq!(body["event"], "success");
+    }
+
+    /// An `always` binding fires on whichever outcome the run reached, so the
+    /// preview follows the run it is showing — and the caller can ask for the
+    /// other one, because that message is real too.
+    #[tokio::test]
+    async fn previewing_an_always_binding_follows_the_run_it_shows() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let cookie = test_auth_cookie(&app).await;
+        let (task_id, action_id) = seed_binding(&app, &cookie, "always", None).await;
+        set_default(&app, &cookie, "success", "成功的措辞", "").await;
+        set_default(&app, &cookie, "failure", "失败的措辞", "").await;
+
+        // The task never ran: there is no outcome to read, so the common one.
+        let body = preview_action(&app, &cookie, action_id, "").await;
+        assert_eq!(body["title"], "成功的措辞");
+        assert_eq!(body["event"], "success");
+
+        // A failed run is exactly what this binding sent the failure wording for.
+        let run = store.start_run(task_id).await.unwrap();
+        store.finish_run(run.id, None, Some("boom")).await.unwrap();
+        let body = preview_action(&app, &cookie, action_id, "").await;
+        assert_eq!(body["title"], "失败的措辞");
+        assert_eq!(body["event"], "failure");
+
+        // Both outcomes are real for `always`, so the other is one query away.
+        let body = preview_action(&app, &cookie, action_id, "?event=success").await;
+        assert_eq!(body["title"], "成功的措辞");
+        assert_eq!(body["event"], "success");
+    }
+
+    /// A binding pinned to one outcome keeps it: a preview must not show wording
+    /// that binding will never send, whatever the request asks for.
+    #[tokio::test]
+    async fn a_pinned_binding_ignores_the_event_it_is_asked_for() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+        let (_task_id, action_id) = seed_binding(&app, &cookie, "success", None).await;
+        set_default(&app, &cookie, "success", "成功的措辞", "").await;
+        set_default(&app, &cookie, "failure", "失败的措辞", "").await;
+
+        let body = preview_action(&app, &cookie, action_id, "?event=failure").await;
+        assert_eq!(body["title"], "成功的措辞");
+        assert_eq!(body["event"], "success");
+    }
+
+    /// `always` is a property of a binding, not an outcome a delivery can be made
+    /// as, so it is a malformed request rather than something to fall back from.
+    #[tokio::test]
+    async fn a_preview_refuses_an_event_it_could_not_be_delivered_as() {
+        let app = test_app().await;
+        let cookie = test_auth_cookie(&app).await;
+        let (_task_id, action_id) = seed_binding(&app, &cookie, "always", None).await;
+
+        for event in ["always", "sometimes", ""] {
+            let (status, body) = json_call(
+                &app,
+                "GET",
+                &format!("/api/v1/notification-actions/{action_id}/preview?event={event}"),
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        }
     }
 
     /// Issue #45: one default pair per account per event, applied to any binding

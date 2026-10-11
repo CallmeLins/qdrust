@@ -64,6 +64,16 @@ impl TemplateVars<'_> {
     }
 }
 
+/// The three values `notification_actions.event` may hold.
+///
+/// `always` is not a third outcome: it means "deliver on both", so every
+/// delivery is made *as* one of the other two. Spelled once because three
+/// modules name these strings and #46 came out of two of them disagreeing about
+/// which one a binding was about to deliver.
+pub const EVENT_SUCCESS: &str = "success";
+pub const EVENT_FAILURE: &str = "failure";
+pub const EVENT_ALWAYS: &str = "always";
+
 /// The event as a reader sees it (issue #43).
 ///
 /// `{event}` is the machine value — `success` / `failure` — and `render` is plain
@@ -72,8 +82,8 @@ impl TemplateVars<'_> {
 /// from 30 bindings to 60 that way.
 fn event_label(event: &str) -> &'static str {
     match event {
-        "success" => "成功",
-        "failure" => "失败",
+        EVENT_SUCCESS => "成功",
+        EVENT_FAILURE => "失败",
         "test" => "测试",
         _ => "通知",
     }
@@ -132,6 +142,44 @@ pub fn notification_template<'a>(
         .filter(|value| !value.trim().is_empty())
         .or_else(|| owner_default.filter(|value| !value.trim().is_empty()))
         .unwrap_or(builtin)
+}
+
+/// Which outcome a preview renders an `always` binding as (issue #46).
+///
+/// A delivery always happens *as* `success` or `failure` — the scheduler
+/// resolves the default template and the `{event}` / `{status_cn}` variables
+/// against the outcome the run reached. A preview has no run of its own to have
+/// reached one, so it read the binding's literal `event` instead: `always`
+/// matched no default template (that table holds only the two outcomes), the
+/// message fell back to the built-in, and `{status_cn}` came out as 通知. The
+/// preview then disagreed with what the reader would actually receive, which is
+/// the one thing a preview exists to prevent.
+///
+/// So an `always` binding takes an outcome from one of two places — the caller's
+/// explicit choice, else the run being previewed. A binding pinned to a single
+/// outcome keeps it whatever the caller asks for: a request must not be able to
+/// show wording that binding will never send.
+pub fn preview_event(
+    binding_event: &str,
+    requested: Option<&str>,
+    previewed_run_failed: Option<bool>,
+) -> &'static str {
+    match binding_event {
+        EVENT_FAILURE => return EVENT_FAILURE,
+        EVENT_ALWAYS => {}
+        // The column's CHECK constraint leaves no fourth value, so this is a
+        // `success` binding.
+        _ => return EVENT_SUCCESS,
+    }
+    // Both outcomes are real for `always`, so an explicit choice is honoured.
+    match requested {
+        Some(value) if value == EVENT_FAILURE => EVENT_FAILURE,
+        Some(value) if value == EVENT_SUCCESS => EVENT_SUCCESS,
+        // Otherwise show the previewed run's own outcome. A task that never ran
+        // has nothing to read one from, and `success` is the common case.
+        _ if previewed_run_failed == Some(true) => EVENT_FAILURE,
+        _ => EVENT_SUCCESS,
+    }
 }
 
 /// Deliver one already-rendered message through `kind` with `config`.
@@ -277,6 +325,79 @@ mod tests {
             "1970-01-01 08:00:00"
         );
         assert!(!vars.time.is_empty());
+    }
+
+    /// Issue #46: a preview has to render the event a delivery would have been
+    /// made *as*, not the binding's literal `always`.
+    #[test]
+    fn preview_renders_an_always_binding_as_a_real_outcome() {
+        // `always` takes the previewed run's own outcome...
+        assert_eq!(preview_event(EVENT_ALWAYS, None, Some(true)), EVENT_FAILURE);
+        assert_eq!(
+            preview_event(EVENT_ALWAYS, None, Some(false)),
+            EVENT_SUCCESS
+        );
+        // ...and a task that never ran has no outcome to read, so it shows the
+        // common one rather than nothing.
+        assert_eq!(preview_event(EVENT_ALWAYS, None, None), EVENT_SUCCESS);
+        // An explicit choice wins, because `always` really does send both.
+        assert_eq!(
+            preview_event(EVENT_ALWAYS, Some(EVENT_FAILURE), Some(false)),
+            EVENT_FAILURE
+        );
+        assert_eq!(
+            preview_event(EVENT_ALWAYS, Some(EVENT_SUCCESS), Some(true)),
+            EVENT_SUCCESS
+        );
+        // The API rejects an unknown value before it gets here; the helper must
+        // not invent an outcome out of one either.
+        assert_eq!(
+            preview_event(EVENT_ALWAYS, Some("sometimes"), Some(true)),
+            EVENT_FAILURE
+        );
+    }
+
+    /// A binding that names one outcome keeps it, whatever the request says and
+    /// whatever the last run did — a preview must not show wording that binding
+    /// will never send.
+    #[test]
+    fn a_pinned_binding_ignores_the_request_and_the_run() {
+        assert_eq!(
+            preview_event(EVENT_SUCCESS, None, Some(true)),
+            EVENT_SUCCESS
+        );
+        assert_eq!(
+            preview_event(EVENT_SUCCESS, Some(EVENT_FAILURE), Some(true)),
+            EVENT_SUCCESS
+        );
+        assert_eq!(
+            preview_event(EVENT_FAILURE, None, Some(false)),
+            EVENT_FAILURE
+        );
+        assert_eq!(
+            preview_event(EVENT_FAILURE, Some(EVENT_SUCCESS), Some(false)),
+            EVENT_FAILURE
+        );
+    }
+
+    /// The symptom as the reporter saw it, asserted through the variable it
+    /// corrupted: `{status_cn}` used to come out as 通知 for an `always` binding
+    /// because `event_label` only knows the two outcomes.
+    #[test]
+    fn an_always_preview_paints_a_real_status_cn() {
+        let event = preview_event(EVENT_ALWAYS, None, Some(true));
+        let vars = TemplateVars {
+            event,
+            ..test_vars(None)
+        };
+        assert_eq!(vars.render("{event}/{status_cn}"), "failure/失败");
+
+        let event = preview_event(EVENT_ALWAYS, None, Some(false));
+        let vars = TemplateVars {
+            event,
+            ..test_vars(None)
+        };
+        assert_eq!(vars.render("{event}/{status_cn}"), "success/成功");
     }
 
     #[tokio::test]

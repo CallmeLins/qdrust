@@ -67,7 +67,7 @@ describe("notification defaults editor", () => {
 
 describe("notification preview", () => {
   it("renders a saved binding through the preview endpoint", () => {
-    expect(app).toContain("api.previewNotificationAction(action.id)");
+    expect(app).toContain("api.previewNotificationAction(action.id, { event })");
     expect(app).toContain("@click=\"openActionPreview(action)\"");
   });
 
@@ -82,6 +82,28 @@ describe("notification preview", () => {
   it("says so when there is no run behind the sample", () => {
     expect(app).toContain(`v-if="preview.source === 'sample'"`);
     expect(app).toContain("notifyPreviewSample");
+  });
+
+  /* Issue #46: a binding set to `always` delivers on both outcomes, so it has
+     none of its own. The preview used to render the literal `always`, which
+     matched no default template and fell back to the built-in pair — while the
+     message that actually arrived used the default. The dialog therefore has to
+     let the reader say which outcome to read, and has to show the one the server
+     answered with rather than a guess. */
+  it("offers both outcomes for a binding that delivers on both", () => {
+    expect(app).toContain(`v-if="previewAction?.event === 'always'"`);
+    expect(app).toContain('v-for="option in previewEventOptions"');
+    expect(app).toContain('@click="previewOutcome(option)"');
+    expect(app).toContain("previewEvent.value = rendered.event");
+  });
+
+  /* `always` is a property of the binding — what makes it fire on both — not an
+     outcome a message can be rendered as, so it is not one of the two options. */
+  it("only offers events a delivery can be made as", () => {
+    const options = app.slice(app.indexOf("const previewEventOptions"), app.indexOf("];", app.indexOf("const previewEventOptions")));
+    expect(options).toContain('"success"');
+    expect(options).toContain('"failure"');
+    expect(options).not.toContain('"always"');
   });
 });
 

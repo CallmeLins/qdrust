@@ -163,3 +163,52 @@ describe("errorCode (what a caller may branch on)", () => {
     expect(errorCode(null)).toBeNull();
   });
 });
+
+describe("previewNotificationAction (which outcome to render)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Point the globals `request()` reaches for at a canned render and return the
+   *  URLs it fetched. `document` is stubbed because `request()` reads the CSRF
+   *  cookie, and this suite runs without a DOM. */
+  function stubFetch() {
+    const calls: string[] = [];
+    vi.stubGlobal("document", { cookie: "" });
+    vi.stubGlobal("fetch", async (url: string) => {
+      calls.push(url);
+      return new Response(
+        JSON.stringify({
+          event: "success",
+          task_id: 1,
+          channel_id: 1,
+          source: "sample",
+          title: "t",
+          body: "b"
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+    return calls;
+  }
+
+  /* An `always` binding has no outcome of its own, so the server picks the one
+     the previewed run reached. Sending one unasked would override that. */
+  it("names no outcome unless the caller asks for one", async () => {
+    const calls = stubFetch();
+    await api.previewNotificationAction(7);
+    expect(calls).toEqual(["/api/v1/notification-actions/7/preview"]);
+  });
+
+  it("names the outcome the caller picked", async () => {
+    const calls = stubFetch();
+    await api.previewNotificationAction(7, { event: "failure" });
+    expect(calls).toEqual(["/api/v1/notification-actions/7/preview?event=failure"]);
+  });
+
+  it("still passes a specific run alongside the outcome", async () => {
+    const calls = stubFetch();
+    await api.previewNotificationAction(7, { runId: 42, event: "success" });
+    expect(calls).toEqual([
+      "/api/v1/notification-actions/7/preview?run_id=42&event=success"
+    ]);
+  });
+});

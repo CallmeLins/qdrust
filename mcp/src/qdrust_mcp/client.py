@@ -400,16 +400,20 @@ class QdrustClient:
         """Every binding the token's owner has, across all of their tasks."""
         return self.get("/api/v1/notification-actions")
 
-    def preview_notification_action(self, action_id: int, run_id: int | None = None) -> Any:
+    def preview_notification_action(
+        self, action_id: int, run_id: int | None = None, event: str | None = None
+    ) -> Any:
         """Render one binding's message without delivering it.
 
         ``run_id`` renders against a specific run; the task's newest one is used
-        otherwise. A blank ``run_id`` is dropped rather than sent as an empty
-        query value — see ``_query``.
+        otherwise. ``event`` picks the outcome an ``always`` binding is rendered
+        as — such a binding delivers on both, so it has no outcome of its own;
+        left out, the previewed run's own outcome is used. A blank value is
+        dropped rather than sent as an empty query value — see ``_query``.
         """
         return self.get(
             f"/api/v1/notification-actions/{action_id}/preview",
-            params={"run_id": run_id},
+            params={"run_id": run_id, "event": event},
         )
 
     def notification_defaults(self) -> Any:

@@ -328,7 +328,11 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         return _json(api.list_notification_actions())
 
     @mcp.tool()
-    def preview_notification(action_id: int, run_id: int | None = None) -> str:
+    def preview_notification(
+        action_id: int,
+        run_id: int | None = None,
+        event: str | None = None,
+    ) -> str:
         """Render one binding's message without sending it anywhere.
 
         The text comes from the binding's own templates, else the account's
@@ -337,8 +341,14 @@ def build_server(client: QdrustClient | None = None) -> FastMCP:
         task has never run: the message still renders, but `{status}` `{error}`
         `{log}` are empty, so an empty log is not a broken template. This is the
         only way to read a template's output before a scheduled run does.
+
+        `event` picks which outcome to render for a binding set to `always`.
+        Such a binding delivers on both and so has none of its own; it takes
+        "success" or "failure", and a binding already pinned to one outcome
+        ignores it. Left out, the previewed run's own outcome is used, and the
+        answer's `event` says which one that was.
         """
-        return _json(api.preview_notification_action(action_id, run_id))
+        return _json(api.preview_notification_action(action_id, run_id, event))
 
     @mcp.tool()
     def get_notification_defaults() -> str:

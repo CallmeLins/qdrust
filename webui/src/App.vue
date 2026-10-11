@@ -1509,14 +1509,29 @@ async function clearTaskBindings(group: ActionGroup) {
 /** The rendered message on screen, plus the names the dialog shows in its
  *  heading — the endpoint answers with ids, which are not readable. */
 const preview = ref<(NotificationPreview & { task: string; channel: string }) | null>(null);
+/** The binding behind the open preview, and which outcome is on screen. A
+ *  binding set to `always` delivers on both and so has no outcome of its own,
+ *  which is what the dialog's toggle switches between (issue #46). */
+const previewAction = ref<NotificationAction | null>(null);
+const previewEvent = ref<NotificationDefaultEvent>("success");
+/** The two outcomes a delivery can be made as. `always` is not one of them: it
+ *  is a property of the binding, not something a message can be rendered as. */
+const previewEventOptions: NotificationDefaultEvent[] = ["success", "failure"];
 const previewingActionId = ref<number | null>(null);
 /** Render one binding without sending anything. The channel-level "test" only
  *  proves the credentials; this is the one way to read what a template will
- *  actually say before the next scheduled run depends on it. */
-async function openActionPreview(action: NotificationAction) {
+ *  actually say before the next scheduled run depends on it.
+ *
+ *  `event` picks the outcome for a binding that delivers on both. Left out, the
+ *  server renders the one the previewed run reached and reports it back. */
+async function openActionPreview(action: NotificationAction, event?: NotificationDefaultEvent) {
   previewingActionId.value = action.id;
   try {
-    const rendered = await api.previewNotificationAction(action.id);
+    const rendered = await api.previewNotificationAction(action.id, { event });
+    previewAction.value = action;
+    // The server chooses when nothing was asked for, so the toggle shows the
+    // outcome it answered with rather than a guess at one.
+    previewEvent.value = rendered.event;
     preview.value = {
       ...rendered,
       task: taskName(action.task_id),
@@ -1527,6 +1542,17 @@ async function openActionPreview(action: NotificationAction) {
   } finally {
     previewingActionId.value = null;
   }
+}
+
+/** Re-render the open preview as the other outcome. */
+async function previewOutcome(event: NotificationDefaultEvent) {
+  const action = previewAction.value;
+  if (action) await openActionPreview(action, event);
+}
+
+function closePreview() {
+  preview.value = null;
+  previewAction.value = null;
 }
 
 // ---------- default notification templates (issue #45) ----------
@@ -3562,7 +3588,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <!-- What one binding would deliver, rendered by the server and shown before
          a scheduled run depends on it (issue #43). Nothing is sent: a channel's
          own "test" proves the credentials, this reads the wording. -->
-    <div v-if="preview" class="modal-backdrop" @click.self="preview = null">
+    <div v-if="preview" class="modal-backdrop" @click.self="closePreview">
       <div class="modal">
         <div class="modal-header">
           <div>
@@ -3571,7 +3597,17 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               {{ fmt('notifyPreviewFor', { task: preview.task, channel: preview.channel }) }} · {{ eventLabel(preview.event) }}<template v-if="preview.run_id != null"> · {{ fmt('notifyPreviewRun', { n: preview.run_id }) }}</template>
             </p>
           </div>
-          <button class="icon-button" type="button" :title="t('close')" @click="preview = null"><X :size="20" /></button>
+          <button class="icon-button" type="button" :title="t('close')" @click="closePreview"><X :size="20" /></button>
+        </div>
+        <!-- A binding set to `always` is delivered on both outcomes, so it is the
+             one case where the reader has to say which of them they want to read
+             (issue #46). The wording is the same message the scheduler would have
+             sent for that outcome, not a fallback to the built-in text. -->
+        <div v-if="previewAction?.event === 'always'" class="preview-event">
+          <div class="seg">
+            <button v-for="option in previewEventOptions" :key="option" type="button" :class="{ active: previewEvent === option }" :disabled="previewingActionId != null" @click="previewOutcome(option)">{{ eventLabel(option) }}</button>
+          </div>
+          <span class="muted preview-meta">{{ t('notifyPreviewEventHint') }}</span>
         </div>
         <p v-if="preview.source === 'sample'" class="muted preview-meta">{{ t('notifyPreviewSample') }}</p>
         <div class="preview-block">
@@ -3582,7 +3618,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <span class="preview-label">{{ t('notifyPreviewBodyLabel') }}</span>
           <pre class="preview-text">{{ preview.body }}</pre>
         </div>
-        <div class="modal-actions"><button class="secondary-button" type="button" @click="preview = null">{{ t('close') }}</button></div>
+        <div class="modal-actions"><button class="secondary-button" type="button" @click="closePreview">{{ t('close') }}</button></div>
       </div>
     </div>
 

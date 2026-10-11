@@ -374,7 +374,7 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** @description Render the message one binding would deliver, without sending it. Uses the binding's own templates, else the caller's default for that event, else the built-in pair. Renders against the task's newest run, or the one named by `run_id`; `source` is `sample` when the task has never run, in which case every run-scoped variable is empty. */
+        /** @description Render the message one binding would deliver, without sending it. Uses the binding's own templates, else the caller's default for that event, else the built-in pair. Renders against the task's newest run, or the one named by `run_id`; `source` is `sample` when the task has never run, in which case every run-scoped variable is empty. A binding set to `always` delivers on both outcomes but has no outcome of its own, so the preview renders it as the one that run reached, or as the one named by `event`. */
         get: operations["previewNotificationAction"];
         put?: never;
         post?: never;
@@ -1396,7 +1396,11 @@ export interface components {
             };
         };
         NotificationPreview: {
-            event: string;
+            /**
+             * @description The outcome the message was rendered as, which is what `{event}` and `{status_cn}` say. Not the binding's own `event`: a binding set to `always` delivers on both, so it never appears here.
+             * @enum {string}
+             */
+            event: "success" | "failure";
             /** Format: int64 */
             task_id: number;
             /** Format: int64 */
@@ -2694,6 +2698,8 @@ export interface operations {
         parameters: {
             query?: {
                 run_id?: number;
+                /** @description Which outcome to render an `always` binding as. Ignored by a binding already pinned to one outcome. Defaults to the previewed run's own outcome. */
+                event?: "success" | "failure";
             };
             header?: never;
             path: {
@@ -2713,6 +2719,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            422: components["responses"]["ValidationError"];
         };
     };
     listNotificationDefaults: {

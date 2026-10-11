@@ -197,6 +197,17 @@ def test_preview_notification_omits_an_unset_run() -> None:
     client.preview_notification_action(7, 42)
     assert seen["url"] == "http://qd.test/api/v1/notification-actions/7/preview?run_id=42"
 
+    # Issue #46: an `always` binding has no outcome of its own, so one can be
+    # named — and no `?event=` is sent when it is not.
+    client.preview_notification_action(7, event="failure")
+    assert seen["url"] == "http://qd.test/api/v1/notification-actions/7/preview?event=failure"
+
+    client.preview_notification_action(7, 42, "success")
+    assert (
+        seen["url"]
+        == "http://qd.test/api/v1/notification-actions/7/preview?run_id=42&event=success"
+    )
+
 
 def test_set_notification_default_replaces_one_event() -> None:
     seen = {}
