@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, path::Path, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
@@ -109,7 +115,19 @@ fn mysql_options(url: &str) -> Result<MySqlConnectOptions> {
     Ok(MySqlConnectOptions::from_str(url)?)
 }
 
-fn no_parent_check(_url: &str) -> Result<()> {
+/// The MySQL side of the two SQLite guards below: nothing to check, and nothing
+/// to probe.
+///
+/// What those guards exist for is specific to a file-backed database. A process
+/// that cannot write its own database file starts up, passes `/ready`, serves
+/// reads, and rejects the first INSERT — because SQLite is content to open a
+/// database read-only and only finds out at the write. MySQL says "Access
+/// denied" when the connection is made, so that mistake cannot arrive silently.
+fn no_preflight(_url: &str) -> Result<()> {
+    Ok(())
+}
+
+async fn no_write_probe(_pool: &MySqlPool) -> Result<()> {
     Ok(())
 }
 
@@ -169,7 +187,7 @@ pub struct NotepadRow {
 macro_rules! define_store {
     ($module:ident, $db:ty, $pool:ty, $pool_options:ty, $options_builder:path, $migrator:expr,
      $row:ty, $last_id_sql:expr, $username_cmp:path, $setting_upsert:expr, $notepad_upsert:expr,
-     $notification_default_upsert:expr, $parent_check:path) => {
+     $notification_default_upsert:expr, $preflight:path, $write_probe:path) => {
         #[allow(clippy::all)]
         pub mod $module {
             use super::*;
@@ -202,7 +220,7 @@ macro_rules! define_store {
                     acquire_timeout: Duration,
                     idle_timeout: Duration,
                 ) -> Result<Self> {
-                    $parent_check(url)?;
+                    $preflight(url)?;
                     let options = $options_builder(url)?;
                     let pool = <$pool_options>::new()
                         .min_connections(min_connections)
@@ -211,6 +229,11 @@ macro_rules! define_store {
                         .idle_timeout(idle_timeout)
                         .connect_with(options)
                         .await?;
+                    // Before the migrator, because a database that cannot be
+                    // written must not be reported as a migration problem: it
+                    // has to be named as what it is, at the point where the
+                    // operator can still fix the mount.
+                    $write_probe(&pool).await?;
                     let store = Self { pool };
                     $migrator.run(&store.pool).await?;
                     Ok(store)
@@ -3505,7 +3528,8 @@ define_store!(
     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
     "ON CONFLICT(owner_id,notepad_id) DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at",
     "ON CONFLICT(owner_id,event) DO UPDATE SET title_template=excluded.title_template, body_template=excluded.body_template, updated_at=excluded.updated_at",
-    sqlite_parent_check
+    sqlite_preflight,
+    sqlite_write_probe
 );
 
 define_store!(
@@ -3521,7 +3545,8 @@ define_store!(
     "ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=VALUES(updated_at)",
     "ON DUPLICATE KEY UPDATE content=VALUES(content), updated_at=VALUES(updated_at)",
     "ON DUPLICATE KEY UPDATE title_template=VALUES(title_template), body_template=VALUES(body_template), updated_at=VALUES(updated_at)",
-    no_parent_check
+    no_preflight,
+    no_write_probe
 );
 macro_rules! delegate {
     ($(pub async fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty { $($call:ident),* };)*) => {
@@ -3883,6 +3908,14 @@ fn validate_template_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The rules a username has to satisfy.
+///
+/// `create_user` applies these itself, so this is not the only guard — but the
+/// registration endpoint calls it *first*, on purpose. A name the rules refuse
+/// is the caller's mistake and belongs in a 4xx of its own; leaving it to
+/// `create_user` meant it arrived as whatever the caller mapped every database
+/// error to, which is how "already registered or invalid" came to mean
+/// "read-only database" as well.
 fn validate_username(username: &str) -> Result<()> {
     let username = username.trim();
     ensure!(username.chars().count() >= 3, "username is too short");
@@ -3896,18 +3929,135 @@ fn validate_username(username: &str) -> Result<()> {
     Ok(())
 }
 
-fn sqlite_parent_check(url: &str) -> Result<()> {
-    let Some(path) = url.strip_prefix("sqlite://") else {
+/// Where a `sqlite:` URL keeps its file, or `None` when there is no file — the
+/// in-memory database the tests use, or an unparseable URL that the pool will
+/// reject on its own terms.
+fn sqlite_file_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("sqlite://")?;
+    // A `?mode=ro` style parameter addresses the file, it is not part of its
+    // name. Nothing here understands the parameters themselves — the pool does.
+    let path = path.split('?').next().unwrap_or(path);
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Make the database's location ready, and refuse the one arrangement SQLite
+/// would otherwise let through.
+///
+/// The directory has to exist before `create_if_missing` can put a file in it.
+/// More importantly, an existing file has to be writable *by this process*:
+/// SQLite opens a read-only database without complaint and fails only at the
+/// first write. That is exactly how a `/data` copied between containers ends up
+/// looking like it restored fine — the server starts, `/ready` answers 200,
+/// every read works, and the first INSERT reports something unrelated to
+/// permissions. Better to stop here, where the message can still say why.
+fn sqlite_preflight(url: &str) -> Result<()> {
+    let Some(path) = sqlite_file_path(url) else {
         return Ok(());
     };
-    if path == ":memory:" {
-        return Ok(());
-    }
-    if let Some(parent) = Path::new(path)
+    if let Some(parent) = path
         .parent()
-        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        // `create_if_missing` will make it. An unwritable directory surfaces as
+        // an open error on the pool a moment later, which is message enough.
+        return Ok(());
+    }
+    // Opening for write rather than reading the mode bits: the kernel decides
+    // this, so group ownership, an ACL and a read-only mount are all reflected
+    // rather than guessed at.
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "database file {} is not writable by this process ({}): {error}. \
+             SQLite opens a database it cannot write without complaint and fails at the first \
+             write, so a server started on one looks healthy while every write is lost. \
+             The image runs as uid 10001 — fix with `chown 10001:10001 {}` plus its -wal/-shm \
+             files, or let the container entrypoint do it for you (see docs/deployment.md).",
+                path.display(),
+                describe_ownership(&path),
+                path.display(),
+            )
+        })?;
+    Ok(())
+}
+
+/// Ownership in the error above: "permission denied" alone sends people looking
+/// at the mode when the mismatch is usually *which* user, not *what* mode.
+fn describe_ownership(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(metadata) => ownership_of(&metadata),
+        Err(error) => format!("ownership unreadable: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn ownership_of(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "owned by {}:{}, mode {:o}",
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode() & 0o7777
+    )
+}
+
+#[cfg(not(unix))]
+fn ownership_of(_metadata: &std::fs::Metadata) -> String {
+    "ownership not inspectable on this platform".to_string()
+}
+
+/// Dropping a table that is not there writes nothing; creating one always does.
+/// Paired so the second statement cannot turn into a no-op and let a read-only
+/// database through.
+const SQLITE_WRITE_PROBE: [&str; 2] = [
+    "DROP TABLE IF EXISTS _qdrust_write_probe",
+    "CREATE TABLE _qdrust_write_probe(probe INTEGER)",
+];
+
+/// Ask the database whether it accepts writes, without leaving a mark.
+///
+/// The probe has to be an actual write. `BEGIN IMMEDIATE` looks like one and is
+/// not: a read-only database takes it without complaint, because what it cannot
+/// do is take the lock, and SQLite only finds that out when a statement writes.
+/// A test that stopped at the transaction would have passed against a read-only
+/// file forever.
+///
+/// So the write happens inside a transaction that is then rolled back — SQLite
+/// rolls DDL back with everything else, so the schema ends up exactly as it was
+/// even though the write really went through. A crash mid-probe rolls back too,
+/// which is why no table can be left behind.
+///
+/// `sqlite_preflight` above catches the ordinary case first, with a message that
+/// names the uids; this is the authority behind it, and it catches what a stat
+/// cannot see — an ACL, a network filesystem, a mount this process may read.
+async fn sqlite_write_probe(pool: &SqlitePool) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let mut failure = None;
+    for statement in SQLITE_WRITE_PROBE {
+        if let Err(error) = sqlx::query(statement).execute(&mut *conn).await {
+            failure = Some(error);
+            break;
+        }
+    }
+    // End the transaction whatever happened. A connection handed back to the
+    // pool mid-transaction would carry it into the next caller's statements.
+    sqlx::query("ROLLBACK").execute(&mut *conn).await?;
+    if let Some(error) = failure {
+        return Err(anyhow::anyhow!(
+            "database is read-only: {error}. qdrust writes on almost every request — sessions, \
+             runs, audit rows — so it stops here rather than serving reads and failing every \
+             write. If this database was copied in from elsewhere, check that the process can \
+             write the file and its -wal/-shm sidecars (see docs/deployment.md)."
+        ));
     }
     Ok(())
 }
@@ -3919,6 +4069,185 @@ mod tests {
 
     use crate::auth::{hash_password, token_hash};
     use qdrust_core::template::{RequestStep, Step, TemplateDefinition};
+
+    /// A private directory under the system temp dir, removed on drop.
+    ///
+    /// The guards below are about file permissions, so `sqlite::memory:` cannot
+    /// stand in for them — they need a real file. The name carries the process
+    /// id and a counter so two tests cannot land in the same directory and
+    /// delete each other's database.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "qdrust-store-{}-{label}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("create the temp dir");
+            Self(path)
+        }
+
+        /// The URL the store is pointed at. `sqlite://` takes everything up to
+        /// `?` as the filename verbatim, backslashes included, so the platform
+        /// separator needs no translation.
+        fn database_url(&self) -> String {
+            format!("sqlite://{}", self.0.join("qdrust.db").display())
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Best effort: on Windows a connection's file handle can outlive
+            // this drop, and a leftover temp directory is not worth a panic.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `expect_err` wants `Debug` on the store, which it has no reason to have.
+    /// The panic message names the URL so a failure points at the guard.
+    async fn connect_error(url: &str) -> anyhow::Error {
+        match Store::connect(url, 1, 1).await {
+            Ok(_) => panic!("connecting to {url} should have been refused"),
+            Err(error) => error,
+        }
+    }
+
+    /// Only a real file gets guarded. Getting this wrong is not cosmetic: if
+    /// `?mode=ro` were taken to be part of the filename, `exists()` would say
+    /// no and the preflight would quietly pass every read-only URL through.
+    #[test]
+    fn only_real_files_are_guarded() {
+        assert!(sqlite_file_path("sqlite::memory:").is_none());
+        assert!(sqlite_file_path("sqlite://:memory:").is_none());
+        assert_eq!(
+            sqlite_file_path("sqlite:///data/qdrust.db").unwrap(),
+            PathBuf::from("/data/qdrust.db")
+        );
+        assert_eq!(
+            sqlite_file_path("sqlite://data/qd.db").unwrap(),
+            PathBuf::from("data/qd.db")
+        );
+        assert_eq!(
+            sqlite_file_path("sqlite:///data/qdrust.db?mode=ro").unwrap(),
+            PathBuf::from("/data/qdrust.db")
+        );
+    }
+
+    /// The shape of the failure the reporter hit: a database that opens, reads
+    /// and answers `/ready`, then fails every write. `?mode=ro` reproduces it
+    /// without needing file modes, so this one runs on every platform.
+    #[tokio::test]
+    async fn a_read_only_database_is_refused_at_connect() {
+        let dir = TempDir::new("read-only");
+        let url = dir.database_url();
+        // The first open is what creates the file and runs the migrations; the
+        // second one has nothing left to migrate, which is the whole trick —
+        // the migrator would otherwise be the thing that failed.
+        Store::connect(&url, 1, 1)
+            .await
+            .expect("the first open writes the database");
+
+        let error = connect_error(&format!("{url}?mode=ro")).await;
+        let message = format!("{error:#}");
+        assert!(message.contains("database is read-only"), "{message}");
+    }
+
+    /// The same mistake wearing ordinary permissions: nothing is flagged
+    /// read-only inside the database, the file is simply not writable by this
+    /// process. That is what a `/data` copied out of a container running as uid
+    /// 10001 leaves behind.
+    ///
+    /// `set_readonly` rather than a Unix mode so this also runs on Windows,
+    /// where the attribute is what stops the write.
+    #[tokio::test]
+    async fn a_database_file_this_process_cannot_write_is_refused() {
+        let dir = TempDir::new("unwritable");
+        let url = dir.database_url();
+        let store = Store::connect(&url, 1, 1)
+            .await
+            .expect("the first open writes the database");
+        // Closed first: an open handle would keep the file writable on Windows
+        // and race the change on Unix.
+        store.sqlite_pool().clone().close().await;
+
+        let file = dir.0.join("qdrust.db");
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&file).is_ok() {
+            // Root, or a filesystem that ignores the attribute: there is no
+            // mismatch left to observe.
+            return;
+        }
+
+        let error = connect_error(&url).await;
+        let message = format!("{error:#}");
+        // The message has to name the owner — "permission denied" alone sends
+        // people looking at the mode when the problem is the uid.
+        assert!(
+            message.contains("not writable by this process"),
+            "{message}"
+        );
+        assert!(message.contains("chown 10001:10001"), "{message}");
+    }
+
+    /// The other half, and the reason the two tests above are not enough on
+    /// their own: every other test in this file uses `sqlite::memory:`, which
+    /// skips both guards. A preflight that rejected *every* file-backed
+    /// database would keep all of them green.
+    #[tokio::test]
+    async fn an_ordinary_file_database_still_connects() {
+        let dir = TempDir::new("writable");
+        let url = dir.database_url();
+
+        let store = Store::connect(&url, 1, 1)
+            .await
+            .expect("a writable file must connect");
+        // A write has to land, so this is not a pool that merely opened.
+        store
+            .create_user("probe-user", UNUSABLE_PASSWORD_HASH, "user")
+            .await
+            .expect("write through the probed pool");
+
+        // Reopened: no migrations left to run, so the guards are the only thing
+        // standing between the file and a working store.
+        let again = Store::connect(&url, 1, 1).await.expect("reopen");
+        assert!(
+            again
+                .credentials_by_username("probe-user")
+                .await
+                .unwrap()
+                .is_some(),
+            "the row written before the reopen is still there"
+        );
+    }
+
+    /// The probe really writes, so the rollback is the only thing keeping it
+    /// invisible. Without this test, deleting the `ROLLBACK` would leave a probe
+    /// table in every deployment and nothing would report it.
+    #[tokio::test]
+    async fn the_write_probe_leaves_no_trace() {
+        let dir = TempDir::new("no-trace");
+        let store = Store::connect(&dir.database_url(), 1, 1)
+            .await
+            .expect("connect");
+
+        let leftover: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_qdrust_write_probe'",
+        )
+        .fetch_optional(store.sqlite_pool())
+        .await
+        .unwrap();
+        assert!(
+            leftover.is_none(),
+            "the probe table outlived its transaction"
+        );
+    }
 
     fn input(name: &str) -> CreateTask {
         CreateTask {
