@@ -85,6 +85,27 @@ docker compose down             # 停止
 
 > 本地从源码构建（开发者）：仓库自带 `compose.yaml`，执行 `docker compose up --build -d` 会构建本地 `qdrust:local` 镜像，适合贡献代码时自测。
 
+### 数据目录的属主
+
+镜像以 uid **10001**（用户 `qdrust`）运行。SQLite 的 WAL 模式要同时写主库文件和 `-wal`、`-shm` 两个附属文件，所以这三个文件都得对 10001 可写。
+
+容器启动时先以 root 检查一次：`/data` 的属主不是 10001 就把整个目录改过来，然后立刻用 `setpriv` 降回 10001 再启动服务——**服务进程本身任何时候都不是 root**，root 只存在于启动脚本执行的那一小段里。因此把 `/data` 从一个容器拷出来、挂进另一个容器，可以直接用，不必在宿主上 `chown`。
+
+不想要 root 阶段的有两个出口：
+
+| 做法 | 效果 |
+|---|---|
+| compose 里加 `user: "10001:10001"` | 跳过整个 root 阶段（`id -u` 不是 0，脚本直接 exec） |
+| `QDRUST_CHOWN=0` | 仍以 root 启动，只跳过那次 chown |
+
+顶层属主已经正确、只有个别文件不对时脚本不会递归（它只在目录本身不对时才加 `-R`）。这种情形手动修：
+
+```bash
+chown 10001:10001 /data/qdrust.db /data/qdrust.db-wal /data/qdrust.db-shm
+```
+
+**数据库不可写时服务不会带病启动。** 启动时会先探一次写权限，失败就直接退出，错误里写明是哪个文件、属主是谁、以及该跑哪条 `chown`。没有这道检查的话，SQLite 会照常打开只读库：`/ready` 返回 200、读接口全部正常，只有写入静默失败——注册会回一句「用户名已被占用或非法」，而真相是磁盘上一个字节都没落。
+
 ## 反向代理到二级目录（sub-path）
 
 站点默认伺服在根路径（适合**二级域名** `https://qd.your.domain` 或裸域名）。若想反代到**二级目录**（如 `https://your.domain/qd`，少一条 DNS 记录、且路径对中间人不可见）：
@@ -153,6 +174,25 @@ QDRUST_BASE_PATH=/qd
 - **SQLite**：默认，零配置，文件位于 `DATABASE_URL` 指向的路径。
 - **MySQL**：设置 `DATABASE_URL=mysql://...` 即自动切换；迁移脚本位于 `migrations-mysql/`。
 - 迁移为**前向 only（forward-only）**，升级前务必备份数据库。
+
+### 直接复制数据库文件（热拷贝）
+
+停掉服务再拷最稳妥。运行中直接拷走 `qdrust.db` + `qdrust.db-wal` + `qdrust.db-shm` 也行，但有前提：
+
+- **三个文件必须同一时刻拷齐。** 只拷 `.db` 会丢掉还在 WAL 里、尚未 checkpoint 的数据。
+- 拷贝过程中若发生 checkpoint，`.db` 与 `-wal` 会互相不一致，库可能损坏——低峰期做风险最低。
+- `-shm` 拷不拷都行，它会自行重建。
+
+三个文件在同一个容器里、属主一致时，新容器起来即可用（属主问题见 [数据目录的属主](#数据目录的属主)）。
+
+若在意一致性，可以让 SQLite 自己产出一个自洽的单文件快照，只拷这一个文件：
+
+```bash
+# 需要 SQLite 3.27+，且镜像里没有 sqlite3 命令 —— 在装了它的机器上执行
+sqlite3 /data/qdrust.db "VACUUM INTO '/data/snapshot.db'"
+```
+
+跨后端、且完全不碰文件的做法是管理页的**备份 / 恢复**（`GET /api/v1/admin/backup`），导出的是全表 JSON，SQLite 与 MySQL 通用。两者是独立的两条路，取舍见 [运维与发版](operations.md)。
 
 ## 更新
 
