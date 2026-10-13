@@ -14,6 +14,12 @@ services:
       # at the browserless service below, or a self-hosted/cloud CDP endpoint.
       # QDRUST_BROWSER_URL: ws://browserless:3000
     volumes:
+      # The container starts as root only long enough to take /data for uid
+      # 10001, then drops the privilege before the server runs — see
+      # docker-entrypoint.sh. Data copied in from another container therefore
+      # works without a chown on the host. `user: "10001:10001"` here skips the
+      # root phase entirely, and `QDRUST_CHOWN: "0"` above skips only the
+      # repair. The server is never root in any of those cases.
       - qdrust-data:/data
     restart: unless-stopped
     healthcheck:

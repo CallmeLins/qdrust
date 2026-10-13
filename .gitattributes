@@ -12,3 +12,10 @@
 # What may not change is the content: see scripts/check-migrations.py, which
 # fails CI when a migration that already shipped was edited or deleted.
 *.sql text eol=lf
+
+# Same reason, different failure mode: a shell script whose shebang line ends in
+# CRLF makes the kernel look for an interpreter named `/bin/sh\r`, and the
+# container dies with "no such file or directory" before it has run a line.
+# Docker writes out exactly the bytes it is given, and core.autocrlf=true would
+# otherwise hand it CRLF on a Windows checkout.
+*.sh text eol=lf

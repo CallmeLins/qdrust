@@ -36,19 +36,33 @@ FROM debian:bookworm-slim AS runtime
 # serving the layer cached on the first build and the image would stay frozen
 # on whatever was current then — red gate, nothing a rebuild could fix.
 ARG DEBIAN_SECURITY_REFRESH=local
+# util-linux carries `setpriv`, which docker-entrypoint.sh uses to step down from
+# root to uid 10001 once it has repaired /data. It is a required-priority package
+# and is normally already in the base image, so this usually adds nothing to the
+# result — named anyway, so that a slimmer base cannot quietly take the
+# entrypoint's one dependency away.
 RUN echo "debian archive refresh: $DEBIAN_SECURITY_REFRESH" \
     && export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get -y upgrade \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 qdrust \
     && useradd --uid 10001 --gid qdrust --no-create-home --shell /usr/sbin/nologin qdrust
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/qdrust-server /usr/local/bin/qdrust-server
 COPY --from=web-builder /build/webui/dist webui/dist
-RUN mkdir -p /data && chown qdrust:qdrust /data
-USER qdrust:qdrust
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /data \
+    && chown qdrust:qdrust /data
+# Deliberately no `USER qdrust` here. The entrypoint starts as root, takes /data
+# for uid 10001 if a copy arrived owned by someone else, and drops the privilege
+# before exec — see docker-entrypoint.sh for the failure that makes it worth a
+# root phase. `--user 10001:10001` still skips all of it, and QDRUST_CHOWN=0
+# skips just the chown. The server process never has root either way, and the
+# .sh file has to be executable here rather than relying on the mode git records,
+# which a Windows checkout does not carry.
 ENV BIND=0.0.0.0 \
     PORT=8923 \
     DATABASE_URL=sqlite:///data/qdrust.db \
@@ -61,4 +75,5 @@ VOLUME ["/data"]
 EXPOSE 8923
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8923/health"]
-ENTRYPOINT ["qdrust-server"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["qdrust-server"]
