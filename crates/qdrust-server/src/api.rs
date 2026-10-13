@@ -50,7 +50,7 @@ use crate::{
         UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, ValidateQdHar,
         VerifyEmail,
     },
-    store::Store,
+    store::{Store, validate_username},
 };
 use openidconnect::{AuthorizationCode, Nonce, OAuth2TokenResponse, PkceCodeVerifier};
 
@@ -2857,11 +2857,40 @@ async fn update_qd_har(
         ))
 }
 
+/// Tell a taken name apart from a database that cannot be written.
+///
+/// Both used to arrive as the same 409 `username_taken`, so a `/data` mounted
+/// with the wrong owner answered a brand-new registration with "Username is
+/// already registered or invalid" — and said nothing about the fact that not a
+/// single row had been stored. Only a real uniqueness violation is a conflict;
+/// everything else is the server's own failure, and it gets logged as one
+/// instead of being described as something the caller did.
+fn classify_create_user_failure(error: anyhow::Error) -> ApiError {
+    let taken = error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(sqlx::error::DatabaseError::is_unique_violation);
+    if taken {
+        ApiError::Conflict("username_taken", "Username is already registered".into())
+    } else {
+        ApiError::Internal(error)
+    }
+}
+
 async fn register(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<RegisterUser>,
 ) -> Result<Response, ApiError> {
     ensure_local_login_allowed(&state)?;
+    // Before the hash, which is the expensive part, and before the insert, so
+    // that the two reasons a registration can fail stay apart: a name the rules
+    // refuse is the caller's error, a name already in the table is a conflict,
+    // and anything else — a database that cannot be written being the one that
+    // matters — is the server's own failure. All three used to arrive as one
+    // 409 saying "already registered or invalid", which is how a read-only
+    // `/data` came to look like a taken username.
+    validate_username(&input.username)
+        .map_err(|error| ApiError::unprocessable(error.context("invalid username")))?;
     let password = input.password;
     let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
@@ -2870,12 +2899,7 @@ async fn register(
         .store
         .create_user(input.username.trim(), &password_hash, "user")
         .await
-        .map_err(|_| {
-            ApiError::Conflict(
-                "username_taken",
-                "Username is already registered or invalid".into(),
-            )
-        })?;
+        .map_err(classify_create_user_failure)?;
     if let Some(email) = input.email.as_deref() {
         let _ = state.store.set_user_email(user.id, email).await;
         let (token, _expires) = state
@@ -4103,6 +4127,71 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["auth_mode"], "local");
         assert_eq!(value["local_login_enabled"], true);
+    }
+
+    /// A registration can fail for reasons that have nothing to do with each
+    /// other, and they used to reach the caller as one 409 reading "already
+    /// registered or invalid". What made that worth separating: a database the
+    /// server could read but not write answered a *fresh* name with that 409,
+    /// so a broken mount looked like a name collision rather than a database
+    /// that had stored nothing at all.
+    #[tokio::test]
+    async fn registration_tells_a_taken_name_apart_from_a_rejected_one() {
+        let app = test_app().await;
+        let registration = |username: &str| json!({"username": username, "password": "correct horse battery staple"});
+
+        let (status, _) = json_call(
+            &app,
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            Some(registration("taken_name")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the first registration succeeds");
+
+        let (status, body) = json_call(
+            &app,
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            Some(registration("taken_name")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "username_taken", "{body}");
+
+        // Too short for `validate_username`, so it is refused before the table
+        // is consulted: the caller's mistake, not a collision — and the one
+        // case that was previously indistinguishable from it.
+        let (status, body) = json_call(
+            &app,
+            "POST",
+            "/api/v1/auth/register",
+            None,
+            Some(registration("ab")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "validation_error", "{body}");
+    }
+
+    /// The other half of the classification, and the half a request cannot
+    /// reach any more: now that a read-only database refuses to start, no HTTP
+    /// test can produce one. Everything that is not a uniqueness violation has
+    /// to come out as the server's own failure.
+    #[test]
+    fn only_a_real_conflict_counts_as_a_taken_name() {
+        assert!(matches!(
+            classify_create_user_failure(anyhow::anyhow!("a database that cannot be written")),
+            ApiError::Internal(_)
+        ));
+        assert!(matches!(
+            classify_create_user_failure(anyhow::Error::from(sqlx::Error::Io(
+                std::io::Error::other("disk full")
+            ))),
+            ApiError::Internal(_)
+        ));
     }
 
     #[tokio::test]

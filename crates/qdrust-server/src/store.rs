@@ -3916,7 +3916,7 @@ fn validate_template_name(name: &str) -> Result<()> {
 /// `create_user` meant it arrived as whatever the caller mapped every database
 /// error to, which is how "already registered or invalid" came to mean
 /// "read-only database" as well.
-fn validate_username(username: &str) -> Result<()> {
+pub(crate) fn validate_username(username: &str) -> Result<()> {
     let username = username.trim();
     ensure!(username.chars().count() >= 3, "username is too short");
     ensure!(username.chars().count() <= 64, "username is too long");
