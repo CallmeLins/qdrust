@@ -12,6 +12,9 @@ pub struct User {
     pub username: String,
     pub role: String,
     pub disabled: bool,
+    /// One of the shipped avatar ids. The API never accepts a URL or image
+    /// bytes, so this stays a small choice rather than an upload surface.
+    pub avatar_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default)]
@@ -85,6 +88,11 @@ pub struct AuthResponse {
 pub struct ChangePassword {
     pub current_password: String,
     pub new_password: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChangeAvatar {
+    pub avatar_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

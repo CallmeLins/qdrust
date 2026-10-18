@@ -132,6 +132,40 @@
         }
       }
     },
+    "/api/v1/auth/avatar": {
+      "put": {
+        "operationId": "changeAvatar",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "$ref": "#/components/requestBodies/ChangeAvatar"
+        },
+        "responses": {
+          "200": {
+            "description": "The user with the selected built-in avatar",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
     "/api/v1/tasks": {
       "get": {
         "operationId": "listTasks",
@@ -2356,6 +2390,16 @@
           }
         }
       },
+      "ChangeAvatar": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ChangeAvatar"
+            }
+          }
+        }
+      },
       "RegisterUser": {
         "required": true,
         "content": {
@@ -2544,6 +2588,29 @@
           }
         }
       },
+      "ChangeAvatar": {
+        "type": "object",
+        "required": [
+          "avatar_id"
+        ],
+        "properties": {
+          "avatar_id": {
+            "type": "string",
+            "enum": [
+              "avatar-01",
+              "avatar-02",
+              "avatar-03",
+              "avatar-04",
+              "avatar-05",
+              "avatar-06",
+              "avatar-07",
+              "avatar-08",
+              "avatar-09",
+              "avatar-10"
+            ]
+          }
+        }
+      },
       "User": {
         "type": "object",
         "required": [
@@ -2551,6 +2618,7 @@
           "username",
           "role",
           "disabled",
+          "avatar_id",
           "created_at",
           "updated_at"
         ],
@@ -2571,6 +2639,21 @@
           },
           "disabled": {
             "type": "boolean"
+          },
+          "avatar_id": {
+            "type": "string",
+            "enum": [
+              "avatar-01",
+              "avatar-02",
+              "avatar-03",
+              "avatar-04",
+              "avatar-05",
+              "avatar-06",
+              "avatar-07",
+              "avatar-08",
+              "avatar-09",
+              "avatar-10"
+            ]
           },
           "created_at": {
             "type": "integer",

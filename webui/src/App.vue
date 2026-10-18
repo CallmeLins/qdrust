@@ -9,6 +9,8 @@ import { api, apiPath, errorCode, oidcStartUrl, websocketPath, type AuthConfig, 
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
+import Avatar from "./Avatar.vue";
+import { AVATARS, avatarName } from "./avatars";
 import { consumeLogoutReturn, emptyHarDoc, formatRunTime, groupBindingsByTask, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, type NotificationBindingGroup } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
 import { buildRunCalendar, type CalendarCell, type RunDay } from "./calendar";
@@ -2494,6 +2496,19 @@ function onRestoreFile(event: Event) {
 
 // ---------- settings / account ----------
 const pwdForm = reactive({ current: "", next: "" });
+const avatarSaving = ref(false);
+async function selectAvatar(avatarId: string) {
+  if (!currentUser.value || avatarSaving.value || currentUser.value.avatar_id === avatarId) return;
+  avatarSaving.value = true;
+  try {
+    currentUser.value = await api.changeAvatar(avatarId);
+    notify(t("avatarChanged"));
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    avatarSaving.value = false;
+  }
+}
 async function changePassword() {
   try {
     await api.changePassword(pwdForm.current, pwdForm.next);
@@ -2852,7 +2867,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <a class="nav-link" href="#" @click.prevent="showHelp = true"><CircleHelp :size="18" />{{ t('help') }}</a>
         <div class="system-state"><span :class="['state-dot', { online: ready }]" />{{ ready ? t('serviceOk') : t('connecting') }}</div>
         <div v-if="currentUser" class="sidebar-account">
-          <span class="account-avatar" aria-hidden="true">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
+          <Avatar :avatar-id="currentUser.avatar_id" :size="30" :label="t('avatar')" />
           <span class="account-copy"><strong>{{ currentUser.username }}</strong><small>{{ isAdmin ? t('roleAdmin') : t('roleUser') }}</small></span>
         </div>
       </div>
@@ -3690,6 +3705,29 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <section class="settings-grid">
           <div class="content-panel">
             <h2>{{ t('account') }}</h2>
+            <div class="avatar-picker-head">
+              <Avatar :avatar-id="currentUser?.avatar_id" :size="54" :label="t('avatar')" />
+              <div>
+                <strong>{{ t('avatar') }}</strong>
+                <p class="muted section-hint">{{ t('avatarPickHint') }}</p>
+              </div>
+            </div>
+            <div class="avatar-picker" role="listbox" :aria-label="t('avatar')">
+              <button
+                v-for="avatar in AVATARS"
+                :key="avatar.id"
+                type="button"
+                class="avatar-choice"
+                :class="{ selected: currentUser?.avatar_id === avatar.id }"
+                :aria-selected="currentUser?.avatar_id === avatar.id"
+                :title="avatarName(locale, avatar)"
+                :disabled="avatarSaving"
+                @click="selectAvatar(avatar.id)"
+              >
+                <Avatar :avatar-id="avatar.id" :size="42" />
+                <span>{{ avatarName(locale, avatar) }}</span>
+              </button>
+            </div>
             <dl class="settings-list">
               <div><dt>{{ t('username') }}</dt><dd>{{ currentUser?.username }}</dd></div>
               <div><dt>{{ t('role') }}</dt><dd>{{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</dd></div>

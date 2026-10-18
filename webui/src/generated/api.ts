@@ -116,6 +116,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/avatar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["changeAvatar"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tasks": {
         parameters: {
             query?: never;
@@ -163,6 +179,25 @@ export interface paths {
         put?: never;
         post?: never;
         delete: operations["deleteTaskRuns"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tasks/{id}/latest-failure-trace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        /** Latest retained full failure trace for a task */
+        get: operations["latestFailureTrace"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1179,6 +1214,10 @@ export interface components {
             current_password: string;
             new_password: string;
         };
+        ChangeAvatar: {
+            /** @enum {string} */
+            avatar_id: "avatar-01" | "avatar-02" | "avatar-03" | "avatar-04" | "avatar-05" | "avatar-06" | "avatar-07" | "avatar-08" | "avatar-09" | "avatar-10";
+        };
         User: {
             /** Format: int64 */
             id: number;
@@ -1186,6 +1225,8 @@ export interface components {
             /** @enum {string} */
             role: "admin" | "user";
             disabled: boolean;
+            /** @enum {string} */
+            avatar_id: "avatar-01" | "avatar-02" | "avatar-03" | "avatar-04" | "avatar-05" | "avatar-06" | "avatar-07" | "avatar-08" | "avatar-09" | "avatar-10";
             /** Format: int64 */
             created_at: number;
             /** Format: int64 */
@@ -1988,6 +2029,11 @@ export interface components {
                 "application/json": components["schemas"]["ChangePassword"];
             };
         };
+        ChangeAvatar: {
+            content: {
+                "application/json": components["schemas"]["ChangeAvatar"];
+            };
+        };
         RegisterUser: {
             content: {
                 "application/json": components["schemas"]["RegisterUser"];
@@ -2192,6 +2238,31 @@ export interface operations {
             422: components["responses"]["ValidationError"];
         };
     };
+    changeAvatar: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-CSRF-Token": components["parameters"]["CsrfToken"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: components["requestBodies"]["ChangeAvatar"];
+        responses: {
+            /** @description The user with the selected built-in avatar */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["ValidationError"];
+        };
+    };
     listTasks: {
         parameters: {
             query?: {
@@ -2338,6 +2409,44 @@ export interface operations {
                         deleted?: number;
                     };
                 };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    latestFailureTrace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["Id"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Trace and the run it belongs to */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** Format: int64 */
+                        run_id: number;
+                        /** Format: int64 */
+                        created_at: number;
+                        /** Format: int64 */
+                        finished_at?: number | null;
+                        trace: string;
+                    };
+                };
+            };
+            /** @description No retained failure trace */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             404: components["responses"]["NotFound"];
         };

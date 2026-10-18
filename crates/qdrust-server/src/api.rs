@@ -89,6 +89,17 @@ pub const ALLOW_PRIVATE_NETWORK_SETTING: &str = "security.allow_private_network"
 /// the key above — same reasoning, same single place to change the spelling.
 pub const ALLOW_INVALID_CERTIFICATES_SETTING: &str = "security.allow_invalid_certificates";
 
+/// The complete set of selectable avatars. Keeping the whitelist on the server
+/// means a modified client cannot store an arbitrary URL or user upload.
+pub const BUILTIN_AVATAR_IDS: [&str; 10] = [
+    "avatar-01", "avatar-02", "avatar-03", "avatar-04", "avatar-05", "avatar-06", "avatar-07",
+    "avatar-08", "avatar-09", "avatar-10",
+];
+
+fn valid_avatar_id(value: &str) -> bool {
+    BUILTIN_AVATAR_IDS.contains(&value)
+}
+
 /// Apply one stored `site_settings` row to the runtime snapshot.
 ///
 /// Kept as one table so a key cannot be persisted without also being applied:
@@ -278,6 +289,7 @@ pub fn router_with_auth(
             "/api/v1/auth/password",
             axum::routing::post(change_password),
         )
+        .route("/api/v1/auth/avatar", axum::routing::put(change_avatar))
         .route(
             "/api/v1/auth/forgot-password",
             axum::routing::post(forgot_password),
@@ -1120,6 +1132,40 @@ async fn change_password(
     let mut response = StatusCode::NO_CONTENT.into_response();
     append_clear_cookies(response.headers_mut(), state.auth.cookie_secure);
     Ok(response)
+}
+
+async fn change_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<crate::model::ChangeAvatar>,
+) -> Result<Json<Value>, ApiError> {
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
+    if !valid_avatar_id(&input.avatar_id) {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "unknown avatar id"
+        )));
+    }
+    let user = state
+        .store
+        .change_avatar(session.user.id, &input.avatar_id)
+        .await?
+        .ok_or(ApiError::Unauthorized(
+            "authentication_required",
+            "Authentication required",
+        ))?;
+    state
+        .store
+        .record_audit(
+            Some(session.user.id),
+            "auth.avatar_changed",
+            Some("user"),
+            Some(session.user.id),
+            None,
+            &json!({ "avatar_id": input.avatar_id }),
+        )
+        .await?;
+    Ok(Json(json!(user)))
 }
 
 async fn issue_session_response(
@@ -4518,6 +4564,14 @@ mod tests {
         response_cookies(&response).join("; ")
     }
 
+    fn cookie_named(cookie_header: &str, name: &str) -> String {
+        cookie_header
+            .split("; ")
+            .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")))
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// Register a second account. Register issues a session on success, so the
     /// cookies it returns are all a test needs to act as that account.
     async fn register_cookie(app: &Router, username: &str) -> String {
@@ -4739,6 +4793,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn avatar_selection_is_whitelisted_and_requires_csrf() {
+        let app = test_app().await;
+        let cookies = test_auth_cookie(&app).await;
+        let csrf = cookie_named(&cookies, "qd_csrf");
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/auth/avatar")
+                    .header(COOKIE, &cookies)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"avatar_id":"avatar-02"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/auth/avatar")
+                    .header(COOKIE, &cookies)
+                    .header("x-csrf-token", &csrf)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"avatar_id":"https://example.com/me.png"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = response_json(unknown).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "validation_error");
+
+        let selected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/auth/avatar")
+                    .header(COOKIE, &cookies)
+                    .header("x-csrf-token", &csrf)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"avatar_id":"avatar-07"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.status(), StatusCode::OK);
+        let body = ok_json(selected).await;
+        assert_eq!(body["avatar_id"], "avatar-07");
+
+        let session = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/session")
+                    .header(COOKIE, &cookies)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.status(), StatusCode::OK);
+        let body = ok_json(session).await;
+        assert_eq!(body["user"]["avatar_id"], "avatar-07");
+    }
+
+    #[tokio::test]
     async fn invalid_task_returns_validation_error() {
         let app = test_app().await;
         let cookie = test_auth_cookie(&app).await;
@@ -4831,6 +4957,7 @@ mod tests {
         assert!(
             document["paths"]["/api/v1/tasks/{id}/latest-failure-trace"]["get"].is_object()
         );
+        assert!(document["paths"]["/api/v1/auth/avatar"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());

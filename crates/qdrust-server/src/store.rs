@@ -334,7 +334,7 @@ macro_rules! define_store {
 
     pub async fn credentials_by_username(&self, username: &str) -> Result<Option<UserCredentials>> {
         let row = sqlx::query(&format!(
-            "SELECT id,username,password_hash,role,disabled,email,email_verified,session_version,created_at,updated_at FROM users WHERE {}",
+            "SELECT id,username,password_hash,role,disabled,avatar_id,email,email_verified,session_version,created_at,updated_at FROM users WHERE {}",
             $username_cmp()
         ))
         .bind(username.trim())
@@ -698,7 +698,7 @@ macro_rules! define_store {
         session_token: &str,
     ) -> Result<Option<AuthenticatedSession>> {
         let row = sqlx::query(
-            "SELECT u.id,u.username,u.role,u.disabled,u.email,u.email_verified,u.created_at,u.updated_at,
+            "SELECT u.id,u.username,u.role,u.disabled,u.avatar_id,u.email,u.email_verified,u.created_at,u.updated_at,
                     s.csrf_token_hash,s.expires_at
              FROM sessions s JOIN users u ON u.id=s.user_id
              WHERE s.token_hash=? AND s.expires_at>? AND s.session_version=u.session_version
@@ -784,7 +784,7 @@ macro_rules! define_store {
     ) -> Result<Option<AuthenticatedSession>> {
         let token_hash = crate::auth::token_hash(token);
         let row = sqlx::query(
-            "SELECT u.id,u.username,u.role,u.disabled,u.email,u.email_verified,u.created_at,u.updated_at,
+            "SELECT u.id,u.username,u.role,u.disabled,u.avatar_id,u.email,u.email_verified,u.created_at,u.updated_at,
                     t.expires_at
              FROM api_tokens t JOIN users u ON u.id=t.user_id
              WHERE t.token_hash=? AND u.disabled=0",
@@ -863,6 +863,24 @@ macro_rules! define_store {
         Ok(true)
     }
 
+    /// Change only the selected built-in avatar. Callers validate the id
+    /// against [`BUILTIN_AVATAR_IDS`] before reaching this method.
+    pub async fn change_avatar(&self, user_id: i64, avatar_id: &str) -> Result<Option<User>> {
+        let updated = sqlx::query(
+            "UPDATE users SET avatar_id=?,updated_at=? WHERE id=? AND disabled=0",
+        )
+        .bind(avatar_id)
+        .bind(Utc::now().timestamp())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_user(user_id).await
+    }
+
     pub async fn record_audit(
         &self,
         actor_user_id: Option<i64>,
@@ -898,7 +916,7 @@ macro_rules! define_store {
 
     async fn credentials_by_id(&self, id: i64) -> Result<Option<UserCredentials>> {
         let row = sqlx::query(
-            "SELECT id,username,password_hash,role,disabled,email,email_verified,session_version,created_at,updated_at
+            "SELECT id,username,password_hash,role,disabled,avatar_id,email,email_verified,session_version,created_at,updated_at
              FROM users WHERE id=?",
         )
         .bind(id)
@@ -3323,7 +3341,7 @@ const RUN_FIELDS_WITH_TRACE: &str = "SELECT id,task_id,status,http_status,error,
 /// `RUN_FIELDS` with every column qualified by the `r` alias, for the queries
 /// that join `tasks` (a bare `id` is ambiguous against `tasks.id`).
 const RUN_FIELDS_QUALIFIED: &str = "SELECT r.id,r.task_id,r.status,r.http_status,r.error,r.log,NULL AS failure_trace,r.started_at,r.finished_at,r.created_at,r.lease_owner,r.lease_expires_at,r.attempt,r.cancel_requested,r.run_after,r.retry_of,r.`trigger` FROM runs r JOIN tasks t ON t.id=r.task_id";
-const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
+const USER_FIELDS: &str = "SELECT id,username,role,disabled,avatar_id,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
     Ok(User {
@@ -3331,6 +3349,7 @@ fn user_from_row(row: &$row) -> Result<User> {
         username: row.try_get("username")?,
         role: row.try_get("role")?,
         disabled: row.try_get("disabled")?,
+        avatar_id: row.try_get("avatar_id")?,
         email: row.try_get("email")?,
         email_verified: row.try_get("email_verified")?,
         created_at: row.try_get("created_at")?,
@@ -3773,6 +3792,7 @@ impl Store {
         pub async fn revoke_session(session_token: &str) -> Result<bool> { session_token };
         pub async fn revoke_all_sessions(user_id: i64) -> Result<()> { user_id };
         pub async fn change_password(user_id: i64, password_hash: &str) -> Result<bool> { user_id, password_hash };
+        pub async fn change_avatar(user_id: i64, avatar_id: &str) -> Result<Option<User>> { user_id, avatar_id };
         pub async fn record_audit(actor_user_id: Option<i64>, action: &str, resource_type: Option<&str>, resource_id: Option<i64>, request_id: Option<&str>, details: &serde_json::Value) -> Result<()> { actor_user_id, action, resource_type, resource_id, request_id, details };
         pub async fn purge_expired_sessions() -> Result<u64> {  };
         pub async fn create(input: CreateTask) -> Result<Task> { input };
@@ -4961,6 +4981,34 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn users_start_with_and_can_change_a_builtin_avatar() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("avatar_user", &password_hash, "user")
+            .await
+            .unwrap();
+        assert_eq!(user.avatar_id, "avatar-01");
+
+        let changed = store
+            .change_avatar(user.id, "avatar-09")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.avatar_id, "avatar-09");
+        assert_eq!(
+            store
+                .credentials_by_username("avatar_user")
+                .await
+                .unwrap()
+                .unwrap()
+                .user
+                .avatar_id,
+            "avatar-09"
         );
     }
 

@@ -269,6 +269,7 @@ export const api = {
   login: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   changePassword: (currentPassword: string, newPassword: string) => request<{ ok: boolean }>("/api/v1/auth/password", { method: "POST", body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) }),
+  changeAvatar: (avatarId: string) => request<User>("/api/v1/auth/avatar", { method: "PUT", body: JSON.stringify({ avatar_id: avatarId }) }),
   forgotPassword: (username: string) => request<{ sent: boolean; reset_token?: string; reset_url?: string }>("/api/v1/auth/forgot-password", { method: "POST", body: JSON.stringify({ username }) }),
   resetPassword: (token: string, newPassword: string) => request<{ ok: boolean }>("/api/v1/auth/reset-password", { method: "POST", body: JSON.stringify({ token, new_password: newPassword }) }),
   verifyEmail: (token: string) => request<{ ok: boolean }>("/api/v1/auth/verify-email", { method: "POST", body: JSON.stringify({ token }) }),
