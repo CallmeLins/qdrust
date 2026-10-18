@@ -405,6 +405,7 @@ h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.1px; color
 }
 .icon-button:disabled { opacity: 0.35; cursor: not-allowed; }
 .icon-button.danger:hover { color: var(--bad); background-color: rgb(220 38 38 / 0.12); }
+.github-link { text-decoration: none; }
 
 /* ============================================================
    cards / panels / sections

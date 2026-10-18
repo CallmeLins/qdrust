@@ -37,6 +37,7 @@ const zh = {
   admin: "管理",
   settings: "设置",
   help: "帮助",
+  githubRepository: "在 GitHub 上查看项目",
   // common
   workspace: "工作区",
   refresh: "刷新",
@@ -641,6 +642,7 @@ const en: Record<MessageKey, string> = {
   admin: "Admin",
   settings: "Settings",
   help: "Help",
+  githubRepository: "View project on GitHub",
   // common
   workspace: "Workspace",
   refresh: "Refresh",

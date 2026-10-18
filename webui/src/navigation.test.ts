@@ -21,3 +21,12 @@ describe("breadcrumb sections", () => {
     );
   });
 });
+
+describe("topbar project link", () => {
+  it("opens the repository in a new, isolated tab", () => {
+    expect(app).toContain('const GITHUB_REPOSITORY_URL = "https://github.com/CallmeLins/qdrust"');
+    expect(app).toContain(':href="GITHUB_REPOSITORY_URL"');
+    expect(app).toContain('target="_blank"');
+    expect(app).toContain('rel="noopener noreferrer"');
+  });
+});
