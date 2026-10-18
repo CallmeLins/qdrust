@@ -238,7 +238,9 @@ fn format_trace_step(event: &ExecutionEvent, started_at: i64, finished_at: i64) 
     let outcome = match (&event.error, event.status, event.body_size) {
         (Some(error), status, _) => format!(
             "failed{}: {}",
-            status.map(|value| format!(" (HTTP {value})")).unwrap_or_default(),
+            status
+                .map(|value| format!(" (HTTP {value})"))
+                .unwrap_or_default(),
             error
         ),
         (None, Some(status), size) => format!("HTTP {status} · {size} bytes · succeeded"),
@@ -440,11 +442,7 @@ async fn execute_with_run(
             if let Some(record) = record
                 && observer_store.record_run_step(&record).await.is_ok()
             {
-                observer_observation
-                    .lock()
-                    .await
-                    .steps
-                    .push(record.clone());
+                observer_observation.lock().await.steps.push(record.clone());
                 let _ = observer_events.send(Value::from(crate::api::RunEvent {
                     run_id: observer_run_id,
                     kind: "step",

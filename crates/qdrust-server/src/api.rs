@@ -92,8 +92,16 @@ pub const ALLOW_INVALID_CERTIFICATES_SETTING: &str = "security.allow_invalid_cer
 /// The complete set of selectable avatars. Keeping the whitelist on the server
 /// means a modified client cannot store an arbitrary URL or user upload.
 pub const BUILTIN_AVATAR_IDS: [&str; 10] = [
-    "avatar-01", "avatar-02", "avatar-03", "avatar-04", "avatar-05", "avatar-06", "avatar-07",
-    "avatar-08", "avatar-09", "avatar-10",
+    "avatar-01",
+    "avatar-02",
+    "avatar-03",
+    "avatar-04",
+    "avatar-05",
+    "avatar-06",
+    "avatar-07",
+    "avatar-08",
+    "avatar-09",
+    "avatar-10",
 ];
 
 fn valid_avatar_id(value: &str) -> bool {
@@ -4954,9 +4962,7 @@ mod tests {
         assert!(document["paths"]["/api/v1/runs/calendar"]["get"].is_object());
         // The per-task run-history toolbar reads the one retained failure
         // trace through this route; the aggregate log deliberately does not.
-        assert!(
-            document["paths"]["/api/v1/tasks/{id}/latest-failure-trace"]["get"].is_object()
-        );
+        assert!(document["paths"]["/api/v1/tasks/{id}/latest-failure-trace"]["get"].is_object());
         assert!(document["paths"]["/api/v1/auth/avatar"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());

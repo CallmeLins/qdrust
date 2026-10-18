@@ -5256,7 +5256,10 @@ mod tests {
             .record_run(task.id, None, Some("first failed"))
             .await
             .unwrap();
-        store.finish_run(first.id, None, Some("first failed")).await.unwrap();
+        store
+            .finish_run(first.id, None, Some("first failed"))
+            .await
+            .unwrap();
         store
             .record_latest_failed_run_trace(task.id, first.id, "first trace")
             .await
@@ -5293,7 +5296,13 @@ mod tests {
             None
         );
         assert_eq!(
-            store.get_run(first.id).await.unwrap().unwrap().error.as_deref(),
+            store
+                .get_run(first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
             Some("first failed")
         );
         assert!(
