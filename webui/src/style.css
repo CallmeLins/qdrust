@@ -410,11 +410,14 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .stats small.positive { color: var(--ok); }
 
 /* ---------- check-in calendar ---------- */
-/* One square per day, 53 week columns. The width is fixed and the card scrolls
-   horizontally below ~840px rather than shrinking the cells: a 6px square is
-   not clickable and a heatmap nobody can read is not a heatmap. */
+/* One square per day, 53 week columns. The columns share whatever width the
+   card has (`1fr` each, `12px` the floor) and the squares stay square via
+   `aspect-ratio`, so the calendar fills the card instead of sitting in its left
+   two thirds. Below the floor the card scrolls rather than shrinking the cells:
+   a 6px square is not clickable and a heatmap nobody can read is not a
+   heatmap. */
 .run-calendar-card {
-  --calendar-cell: 12px;
+  --calendar-cell: 12px; /* the legend swatch, and the narrowest a day may get */
   margin: 32px 0; padding: 22px 26px;
   border-radius: var(--r-l);
   background-color: rgb(var(--card-surface));
@@ -422,22 +425,28 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   box-shadow: var(--card-shadow);
 }
 .run-calendar-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-.run-calendar-head .section-hint { margin: 6px 0 0; max-width: 62ch; }
-.run-calendar-legend { display: flex; align-items: center; gap: 16px; color: var(--ink-3); font-size: 12px; }
+/* No `max-width` on the hint: it is one sentence and should wrap only when the
+   card is genuinely too narrow for it, not at an arbitrary 62ch. */
+.run-calendar-intro { flex: 1 1 auto; min-width: 0; }
+.run-calendar-head .section-hint { margin: 6px 0 0; }
+.run-calendar-legend { display: flex; align-items: center; gap: 16px; color: var(--ink-3); font-size: 12px; flex: 0 0 auto; }
 .run-calendar-legend-failed, .run-calendar-scale { display: inline-flex; align-items: center; gap: 5px; }
 .run-calendar-scroll { margin-top: 18px; overflow-x: auto; padding-bottom: 4px; }
-.run-calendar-grid { display: flex; gap: 6px; width: max-content; }
+.run-calendar-grid { display: flex; gap: 6px; width: 100%; }
 .run-calendar-weekdays {
-  display: grid; grid-template-rows: repeat(7, var(--calendar-cell)); gap: 3px;
+  flex: 0 0 auto; align-items: center;
+  display: grid; grid-template-rows: repeat(7, 1fr); gap: 3px;
   margin-top: 18px; /* the month row above the columns */
-  color: var(--ink-3); font-size: 10px; line-height: var(--calendar-cell);
+  color: var(--ink-3); font-size: 10px; line-height: 1;
 }
 .run-calendar-weekdays span { white-space: nowrap; }
-.run-calendar-main { display: grid; gap: 5px; }
+/* `min-content` keeps the flex row from squeezing the grid past its floor: at
+   that point the card's overflow becomes a scrollbar, not a squashed map. */
+.run-calendar-main { display: grid; gap: 5px; flex: 1 1 auto; min-width: min-content; }
 .run-calendar-months { display: grid; gap: 3px; height: 13px; color: var(--ink-3); font-size: 10px; line-height: 1; }
 .run-calendar-months span { white-space: nowrap; }
-.run-calendar-weeks { display: flex; gap: 3px; }
-.run-calendar-week { display: grid; grid-template-rows: repeat(7, var(--calendar-cell)); gap: 3px; }
+.run-calendar-weeks { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(var(--calendar-cell), 1fr); gap: 3px; }
+.run-calendar-week { display: grid; gap: 3px; align-content: start; }
 /* `inline-block` because the legend reuses this class on an `<i>`: width and
    height do not apply to an inline element, so the swatches would vanish. */
 .run-calendar-cell {
@@ -446,6 +455,9 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   padding: 0; border: 0; border-radius: 2px;
   background-color: var(--calendar-empty);
 }
+/* Inside the grid a day fills its column and stays square; only the legend
+   swatch keeps the fixed 12px box above. */
+.run-calendar-weeks .run-calendar-cell { width: 100%; height: auto; aspect-ratio: 1; }
 .run-calendar-cell[data-level="1"] { background-color: var(--calendar-1); }
 .run-calendar-cell[data-level="2"] { background-color: var(--calendar-2); }
 .run-calendar-cell[data-level="3"] { background-color: var(--calendar-3); }
@@ -1243,7 +1255,7 @@ code {
   .stats { grid-template-columns: repeat(2, 1fr); }
   .stats > div { min-height: 92px; }
   .stats > div + div { border-top: 1px solid var(--line); border-left: 0; }
-  /* The calendar keeps its 12px squares and scrolls instead of shrinking: a
+  /* The calendar keeps its 12px floor and scrolls instead of shrinking: a
      year of weeks does not fit a phone, and 6px squares are not tappable. */
   .run-calendar-card { padding: 18px 16px; }
   .run-calendar-head { gap: 12px; }

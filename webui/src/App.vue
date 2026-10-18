@@ -2718,7 +2718,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
              which is the same list the run-log dialog shows, scoped to one day. -->
         <section class="run-calendar-card" :aria-label="t('calendarTitle')">
           <div class="run-calendar-head">
-            <div>
+            <div class="run-calendar-intro">
               <h2>{{ t('calendarTitle') }}</h2>
               <p class="muted section-hint">{{ t('calendarHint') }}</p>
             </div>
@@ -2744,7 +2744,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
               <div class="run-calendar-main">
                 <div
                   class="run-calendar-months"
-                  :style="{ gridTemplateColumns: `repeat(${calendarGrid.weeks.length}, var(--calendar-cell))` }"
+                  :style="{ gridTemplateColumns: `repeat(${calendarGrid.weeks.length}, minmax(var(--calendar-cell), 1fr))` }"
                 >
                   <span
                     v-for="month in calendarGrid.months"
