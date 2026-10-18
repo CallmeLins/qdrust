@@ -76,7 +76,7 @@ const { size: publicTemplatesPageSize, setSize: setPublicTemplatesPageSize } = u
 const { size: libraryPageSize, setSize: setLibraryPageSize } = usePageSize(localStorage, "library");
 const { size: runLogPageSize, setSize: setRunLogPageSize } = usePageSize(localStorage, "runLog");
 
-// ---------- theme (light / dark / system, mirrors collector) ----------
+// ---------- theme (light / dark / system) ----------
 type ThemeMode = "light" | "dark" | "system";
 const THEME_STORAGE_KEY = "qdrust-theme-mode";
 const THEME_MODES: ThemeMode[] = ["light", "dark", "system"];
@@ -94,7 +94,7 @@ function resolveTheme(mode: ThemeMode): "light" | "dark" {
 function applyTheme(mode: ThemeMode) {
   const resolved = resolveTheme(mode);
   document.documentElement.setAttribute("data-theme", resolved);
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#121212" : "#f7f7f7");
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", resolved === "dark" ? "#222a36" : "#f7f9fc");
 }
 
 function setTheme(mode: ThemeMode) {
@@ -2553,7 +2553,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
   <main v-if="!authenticated" class="auth-page">
     <!-- Pure-OIDC deployment (auth_mode === "oidc"): only the SSO affordance. -->
     <div v-if="ssoForced" class="auth-panel">
-      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
+      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span class="brand-copy">qdrust<small>{{ t('brandTagline') }}</small></span></div>
       <h1>{{ t('loginTitle') }}</h1>
       <p v-if="!ssoError" class="auth-hint">{{ t('ssoHint') }}</p>
       <div v-if="ssoError" class="auth-notice auth-error">{{ ssoErrorMessage(ssoError) }}</div>
@@ -2566,7 +2566,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
          deployment offers OIDC. Local fields are hidden when the server closes
          local login (local_login_enabled = false). -->
     <form v-else class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
-      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
+      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span class="brand-copy">qdrust<small>{{ t('brandTagline') }}</small></span></div>
       <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : t('resetTitle') }}</h1>
 
       <!-- SSO shortcut (shown above the local form when offered). -->
@@ -2650,20 +2650,27 @@ onUnmounted(() => window.clearInterval(refreshTimer));
   <!-- ============ APP ============ -->
   <div v-else class="app-shell">
     <aside :class="['sidebar', { open: menuOpen }]">
-      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span>qdrust</span></div>
-      <nav aria-label="主导航">
+      <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span class="brand-copy">qdrust<small>{{ t('brandTagline') }}</small></span></div>
+      <nav :aria-label="t('mainNavigation')">
+        <p class="nav-caption">{{ t('workspace') }}</p>
         <a :class="['nav-link', { active: view === 'tasks' }]" href="#" @click.prevent="view='tasks'"><LayoutDashboard :size="18" />{{ t('tasks') }}</a>
         <a :class="['nav-link', { active: view === 'templates' }]" href="#" @click.prevent="openTemplates"><FileJson2 :size="18" />{{ t('templates') }}</a>
         <a :class="['nav-link', { active: view === 'plugins' }]" href="#" @click.prevent="openPlugins"><Settings :size="18" />{{ t('plugins') }}</a>
         <a :class="['nav-link', { active: view === 'notepads' }]" href="#" @click.prevent="openNotepads"><NotebookPen :size="18" />{{ t('notepads') }}</a>
+        <p class="nav-caption">{{ t('navAutomation') }}</p>
         <a :class="['nav-link', { active: view === 'notifications' }]" href="#" @click.prevent="openNotifications"><Bell :size="18" />{{ t('notifications') }}</a>
         <a :class="['nav-link', { active: view === 'push' }]" href="#" @click.prevent="openPush"><Send :size="18" />{{ t('push') }}</a>
+        <p class="nav-caption">{{ t('navManagement') }}</p>
         <a v-if="isAdmin" :class="['nav-link', { active: view === 'admin' }]" href="#" @click.prevent="openAdmin"><Users :size="18" />{{ t('admin') }}</a>
         <a :class="['nav-link', { active: view === 'settings' }]" href="#" @click.prevent="openSettings"><Settings :size="18" />{{ t('settings') }}</a>
       </nav>
       <div class="sidebar-bottom">
         <a class="nav-link" href="#" @click.prevent="showHelp = true"><CircleHelp :size="18" />{{ t('help') }}</a>
         <div class="system-state"><span :class="['state-dot', { online: ready }]" />{{ ready ? t('serviceOk') : t('connecting') }}</div>
+        <div v-if="currentUser" class="sidebar-account">
+          <span class="account-avatar" aria-hidden="true">{{ currentUser.username.slice(0, 1).toUpperCase() }}</span>
+          <span class="account-copy"><strong>{{ currentUser.username }}</strong><small>{{ isAdmin ? t('roleAdmin') : t('roleUser') }}</small></span>
+        </div>
       </div>
     </aside>
 
@@ -2672,7 +2679,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <main class="app-main">
       <header class="topbar">
         <button class="icon-button mobile-menu" :title="t('menu')" @click="menuOpen = true"><Menu :size="20" /></button>
-        <div class="breadcrumb">{{ t('workspace') }} <span>/</span> {{ currentViewName }}</div>
+        <div class="breadcrumb">{{ t('workspace') }} <span>/</span> <strong>{{ currentViewName }}</strong></div>
         <div class="topbar-right">
           <span v-if="currentUser?.email && !currentUser.email_verified" class="verify-hint" :title="t('emailVerifyBanner')">
             <Mail :size="14" />{{ t('emailVerifyBanner') }}
@@ -2705,11 +2712,11 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
         </section>
 
-        <section class="stats" aria-label="任务概览">
-          <div><span>{{ t('totalTasks') }}</span><strong>{{ tasks.length }}</strong><small><CalendarClock :size="14" />{{ t('configured') }}</small></div>
-          <div><span>{{ t('enabledTasks') }}</span><strong>{{ activeCount }}</strong><small class="positive"><Activity :size="14" />{{ t('scheduledEnabled') }}</small></div>
-          <div><span>{{ t('lastSuccess') }}</span><strong>{{ successCount }}</strong><small><Check :size="14" />{{ t('hasResults') }}</small></div>
-          <div><span>{{ t('lastFailed') }}</span><strong :class="{ 'run-bad': failedCount > 0 }">{{ failedCount }}</strong><small :class="{ 'run-bad': failedCount > 0 }"><XCircle :size="14" />{{ t('lastRunFailed') }}</small></div>
+        <section class="stats" :aria-label="t('taskOverview')">
+          <div><span><CalendarClock :size="14" />{{ t('totalTasks') }}</span><strong>{{ tasks.length }}</strong><small>{{ t('configured') }}</small></div>
+          <div><span><Activity :size="14" />{{ t('enabledTasks') }}</span><strong>{{ activeCount }}</strong><small class="positive">{{ t('scheduledEnabled') }}</small></div>
+          <div><span><CheckCircle2 :size="14" />{{ t('lastSuccess') }}</span><strong>{{ successCount }}</strong><small>{{ t('hasResults') }}</small></div>
+          <div><span><XCircle :size="14" />{{ t('lastFailed') }}</span><strong :class="{ 'run-bad': failedCount > 0 }">{{ failedCount }}</strong><small :class="{ 'run-bad': failedCount > 0 }">{{ t('lastRunFailed') }}</small></div>
         </section>
 
         <!-- ===== CHECK-IN CALENDAR ===== -->

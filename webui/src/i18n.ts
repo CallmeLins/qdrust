@@ -23,6 +23,11 @@ export const locale = ref<Locale>(storedLocale() ?? "zh-CN");
 
 const zh = {
   // nav
+  brandTagline: "自动签到与任务调度",
+  mainNavigation: "主导航",
+  navAutomation: "自动化",
+  navManagement: "管理与设置",
+  taskOverview: "任务概览",
   tasks: "任务",
   templates: "模板",
   plugins: "插件",
@@ -608,6 +613,11 @@ const zh = {
 export type MessageKey = keyof typeof zh;
 
 const en: Record<MessageKey, string> = {
+  brandTagline: "Check-ins & scheduling",
+  mainNavigation: "Main navigation",
+  navAutomation: "Automation",
+  navManagement: "Management & settings",
+  taskOverview: "Task overview",
   // nav
   tasks: "Tasks",
   templates: "Templates",

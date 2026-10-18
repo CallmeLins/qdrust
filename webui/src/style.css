@@ -1,157 +1,160 @@
 /* ============================================================
-   qdrust webui — design system
-   Style language aligned with the `collector` project:
-   daisyUI `corporate` (light) / `business` (dark) semantics on a
-   flat page surface with card / panel / interactive tokens.
+   qdrust webui — quiet blue console
+   EMRank-inspired density, outlined surfaces and navigation.
    tokens -> base -> layout -> components -> motion
    ============================================================ */
 
 /* ============================================================
-   theme tokens — light (daisyUI corporate)
+   theme tokens — light
    ============================================================ */
 :root,
 [data-theme="light"] {
   color-scheme: light;
 
   /* semantic palette */
-  --primary: #4b6bfb;
-  --primary-hover: #3a57e0;
+  --primary: #5671b8;
+  --primary-hover: #4862a5;
   --primary-content: #ffffff;
-  --secondary: #7b92b2;
-  --neutral: #181a2a;
-  --neutral-content: #edf2f7;
+  --secondary: #8396b5;
+  --neutral: #303c50;
+  --neutral-content: #f1f4fa;
   --base-100: #ffffff;
-  --base-200: #f2f2f2;
-  --base-300: #e5e6e6;
-  --base-content: #181a2a;
+  --base-200: #f1f4fa;
+  --base-300: #dfe5ee;
+  --base-content: #303c50;
 
-  /* surfaces (collector parity) */
-  --page-surface: 247 247 247;
+  /* Blue-grey tint stays on the shell; content surfaces stay neutral. */
+  --page-surface: 247 249 252;
   --card-surface: 255 255 255;
-  --card-surface-hover: 255 255 255;
-  --card-border-rgb: 0 0 0;
-  --card-border-opacity: 0.06;
-  --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.05);
-  --card-shadow-hover: 0 2px 6px rgba(0, 0, 0, 0.05), 0 14px 36px rgba(0, 0, 0, 0.08);
+  --card-surface-hover: 250 252 255;
+  --card-border-rgb: 113 135 170;
+  --card-border-opacity: 0.2;
+  --card-shadow: 0 1px 2px rgb(38 59 94 / 0.015);
+  --card-shadow-hover: 0 3px 12px rgb(38 59 94 / 0.045);
   --panel-surface: 255 255 255;
-  --panel-surface-opacity: 0.78;
-  --panel-solid-surface: 252 252 252;
-  --panel-border-opacity: 0.08;
-  --panel-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
-  --interactive-surface: 0 0 0;
-  --interactive-hover-opacity: 0.04;
-  --interactive-active-opacity: 0.06;
+  --panel-surface-opacity: 0.96;
+  --panel-solid-surface: 240 244 250;
+  --panel-border-opacity: 0.18;
+  --panel-shadow: none;
+  --interactive-surface: 83 116 176;
+  --interactive-hover-opacity: 0.045;
+  --interactive-active-opacity: 0.09;
+  --nav-active: #e5ecfa;
+  --heading-surface: #f8fafd;
+  --ambient: rgb(118 151 210 / 0.08);
 
-  /* Check-in calendar: five greens for the shades, plus the failure red. Fixed
-     per theme rather than derived — a green that reads as "more" at 4% opacity
-     is invisible, and GitHub's palette is the one people already read. */
-  --calendar-empty: #ebedf0;
-  --calendar-1: #9be9a8;
-  --calendar-2: #40c463;
-  --calendar-3: #30a14e;
-  --calendar-4: #216e39;
-  --calendar-failed: #d1242f;
+  /* Keep the familiar green scale, with quieter, distinct sage shades. */
+  --calendar-empty: #edf1f5;
+  --calendar-1: #d3e8db;
+  --calendar-2: #a4cfb7;
+  --calendar-3: #74b08f;
+  --calendar-4: #4c8c6b;
+  --calendar-failed: #cc7782;
 
   /* aliases consumed by components and HarEditor scoped styles */
   --bg: rgb(var(--page-surface));
-  --bg-raise: #ffffff;
+  --bg-raise: #f1f4fa;
   --surface: rgb(var(--card-surface));
   --surface-strong: rgb(var(--card-surface-hover));
   --line: rgb(var(--card-border-rgb) / var(--card-border-opacity));
   --line-strong: rgb(var(--card-border-rgb) / calc(var(--card-border-opacity) + 0.06));
-  --ink: #181a2a;
-  --ink-2: rgba(24, 26, 42, 0.68);
-  --ink-3: rgba(24, 26, 42, 0.46);
+  --ink: #303c50;
+  --ink-2: #5e6d83;
+  --ink-3: #607087;
 
   /* accent = readable brand colour for text, links and focus */
-  --accent: #4b6bfb;
-  --accent-deep: #3a57e0;
+  --accent: #526caf;
+  --accent-deep: #435d9c;
   --accent-ink: #ffffff;
-  --accent-glow: rgba(75, 107, 251, 0.1);
+  --accent-glow: rgb(103 137 200 / 0.1);
 
   /* status */
-  --ok: #16a34a;
-  --warn: #b45309;
-  --bad: #dc2626;
-  --info: #0284c7;
-  --violet: #7c3aed;
+  --ok: #2d795d;
+  --warn: #956222;
+  --bad: #b14c5b;
+  --info: #3d7f9e;
+  --violet: #7a6aab;
 
   /* shape & depth */
-  --r-s: 8px;
-  --r-m: 12px;
-  --r-l: 16px;
-  --shadow-l: 0 14px 36px rgba(0, 0, 0, 0.1);
-  --shadow-m: 0 10px 30px rgba(0, 0, 0, 0.08);
+  --r-s: 6px;
+  --r-m: 8px;
+  --r-l: 10px;
+  --sidebar-width: 216px;
+  --topbar-height: 52px;
+  --shadow-l: 0 18px 56px rgb(38 59 94 / 0.12);
+  --shadow-m: 0 8px 28px rgb(38 59 94 / 0.08);
   --scrollbar-thumb: rgba(0, 0, 0, 0.16);
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.26);
 }
 
 /* ============================================================
-   theme tokens — dark (daisyUI business)
+   theme tokens — dark, softened slate instead of near-black
    ============================================================ */
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --primary: #1c4e80;
-  --primary-hover: #25649e;
-  --primary-content: #ffffff;
+  --primary: #a0b9e8;
+  --primary-hover: #b4caf0;
+  --primary-content: #202c43;
   --secondary: #7c909a;
-  --neutral: #23282e;
-  --neutral-content: #e5e7eb;
-  --base-100: #202020;
-  --base-200: #2a2a2a;
-  --base-300: #343434;
-  --base-content: #e8e8e8;
+  --neutral: #303b4b;
+  --neutral-content: #e3eaf4;
+  --base-100: #293341;
+  --base-200: #303c4d;
+  --base-300: #3c495d;
+  --base-content: #e0e8f3;
 
-  --page-surface: 18 18 18;
-  --card-surface: 24 24 24;
-  --card-surface-hover: 34 34 34;
-  --card-border-rgb: 255 255 255;
-  --card-border-opacity: 0.04;
-  --card-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  --card-shadow-hover: 0 14px 30px rgba(0, 0, 0, 0.24);
-  --panel-surface: 24 24 24;
-  --panel-surface-opacity: 0.88;
-  --panel-solid-surface: 24 24 24;
-  --panel-border-opacity: 0.05;
-  --panel-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
-  --interactive-surface: 255 255 255;
+  --page-surface: 34 42 54;
+  --card-surface: 41 51 65;
+  --card-surface-hover: 46 58 74;
+  --card-border-rgb: 163 185 217;
+  --card-border-opacity: 0.17;
+  --card-shadow: 0 1px 2px rgb(13 21 34 / 0.06);
+  --card-shadow-hover: 0 3px 12px rgb(13 21 34 / 0.12);
+  --panel-surface: 39 49 63;
+  --panel-surface-opacity: 0.96;
+  --panel-solid-surface: 38 48 63;
+  --panel-border-opacity: 0.15;
+  --panel-shadow: none;
+  --interactive-surface: 160 185 232;
   --interactive-hover-opacity: 0.06;
   --interactive-active-opacity: 0.1;
+  --nav-active: #344660;
+  --heading-surface: #2c3747;
+  --ambient: rgb(135 165 214 / 0.04);
 
-  /* GitHub's dark greens; the empty square sits just above the card surface so
-     a whole quiet year still reads as a grid rather than as nothing. */
-  --calendar-empty: #262626;
-  --calendar-1: #0e4429;
-  --calendar-2: #006d32;
-  --calendar-3: #26a641;
-  --calendar-4: #39d353;
-  --calendar-failed: #f85149;
+  /* The empty square remains visible against the slate card. */
+  --calendar-empty: #354154;
+  --calendar-1: #3c5c51;
+  --calendar-2: #4b7e65;
+  --calendar-3: #70a183;
+  --calendar-4: #a0c7ac;
+  --calendar-failed: #db919a;
 
   --bg: rgb(var(--page-surface));
-  --bg-raise: #202020;
+  --bg-raise: #303c4d;
   --surface: rgb(var(--card-surface));
   --surface-strong: rgb(var(--card-surface-hover));
-  --line: rgb(255 255 255 / 0.07);
-  --line-strong: rgb(255 255 255 / 0.13);
-  --ink: #e8e8e8;
-  --ink-2: rgba(232, 232, 232, 0.68);
-  --ink-3: rgba(232, 232, 232, 0.44);
+  --line: rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  --line-strong: rgb(var(--card-border-rgb) / 0.27);
+  --ink: #e0e8f3;
+  --ink-2: #b7c4d7;
+  --ink-3: #a4b3c8;
 
   /* lightened primary keeps accent text readable on the dark surface */
-  --accent: #7cb0f0;
-  --accent-deep: #9cc6f8;
-  --accent-ink: #ffffff;
-  --accent-glow: rgba(124, 176, 240, 0.14);
+  --accent: #adc5ef;
+  --accent-deep: #c6d8f6;
+  --accent-ink: #202c43;
+  --accent-glow: rgb(160 185 232 / 0.12);
 
   --ok: #6bb187;
   --warn: #dbae59;
-  --bad: #e57368;
+  --bad: #e98178;
   --info: #38bdf8;
   --violet: #a78bfa;
 
-  --shadow-l: 0 18px 44px rgba(0, 0, 0, 0.45);
-  --shadow-m: 0 12px 34px rgba(0, 0, 0, 0.34);
+  --shadow-l: 0 18px 56px rgb(13 21 34 / 0.3);
+  --shadow-m: 0 8px 28px rgb(13 21 34 / 0.22);
   --scrollbar-thumb: rgba(255, 255, 255, 0.12);
   --scrollbar-thumb-hover: rgba(255, 255, 255, 0.22);
 }
@@ -160,7 +163,7 @@
    base
    ============================================================ */
 :root {
-  --font-sans: Inter, "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  --font-sans: "Aptos", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
   --t-fast: 0.15s var(--ease);
@@ -178,6 +181,8 @@ body {
   min-width: 320px;
   min-height: 100vh;
   font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.55;
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
@@ -190,6 +195,11 @@ body {
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { cursor: pointer; }
 a { color: var(--accent); }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px;
+}
+button:disabled { cursor: not-allowed; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
 
 /* quiet scrollbars */
 * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
@@ -203,7 +213,7 @@ a { color: var(--accent); }
 *::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); }
 
 /* ============================================================
-   collector-parity surface helpers
+   surface helpers
    ============================================================ */
 .surface-panel,
 .surface-sidebar {
@@ -246,8 +256,9 @@ a { color: var(--accent); }
 
 /* ---------- sidebar ---------- */
 .sidebar {
-  position: fixed; inset: 0 auto 0 0; z-index: 30; width: 232px;
-  padding: 20px 14px;
+  position: fixed; inset: 0 auto 0 0; z-index: 30; width: var(--sidebar-width);
+  padding: 12px;
+  overflow-y: auto;
   color: var(--ink);
   background-color: rgb(var(--panel-solid-surface));
   border-right: 1px solid rgb(var(--card-border-rgb) / var(--panel-border-opacity));
@@ -256,33 +267,35 @@ a { color: var(--accent); }
 }
 
 .brand {
-  height: 44px; padding: 0 10px;
+  min-height: 44px; padding: 0 6px;
   display: flex; align-items: center; gap: 11px;
-  color: var(--ink); font-size: 18px; font-weight: 700; letter-spacing: 0.2px;
+  color: var(--ink); font-size: 17px; font-weight: 650; letter-spacing: -0.3px;
 }
+.brand-copy { display: grid; gap: 1px; line-height: 1.3; }
+.brand-copy small { color: var(--ink-3); font-size: 10.5px; font-weight: 400; letter-spacing: 0.3px; }
 
 .brand-mark {
-  width: 32px; height: 32px; display: grid; place-items: center;
+  width: 34px; height: 34px; flex: none; display: grid; place-items: center;
   color: var(--primary-content);
   background: var(--primary);
   border-radius: var(--r-s);
-  box-shadow: 0 4px 14px rgb(0 0 0 / 0.12);
+  box-shadow: none;
 }
 
-/* The hairline keeps the wordmark and the menu as two separate blocks instead
-   of one long column. The 14 + 14 split preserves the old 28px gap, so nothing
-   below it moves. */
-nav {
-  display: grid; gap: 3px;
-  margin: 14px 0 0; padding-top: 14px;
+/* A hairline separates the wordmark from the grouped navigation. */
+.sidebar nav {
+  display: grid; gap: 2px;
+  margin: 10px 0 0; padding-top: 10px;
   border-top: 1px solid var(--line);
 }
+.nav-caption { margin: 12px 8px 5px; color: var(--ink-3); font-size: 10.5px; font-weight: 500; letter-spacing: 0.4px; }
+.nav-caption:first-child { margin-top: 0; }
 
 .nav-link {
-  position: relative; height: 40px; padding: 0 12px;
+  position: relative; min-height: 36px; padding: 7px 10px;
   color: var(--ink-2); text-decoration: none;
   display: flex; align-items: center; gap: 11px;
-  border-radius: var(--r-s); font-size: 13.5px; font-weight: 500;
+  border-radius: var(--r-s); font-size: 13px; font-weight: 500;
   transition: color var(--t-fast), background-color var(--t-fast);
 }
 .nav-link:hover {
@@ -292,33 +305,32 @@ nav {
 .nav-link.active {
   color: var(--accent);
   font-weight: 600;
-  background-color: rgb(var(--interactive-surface) / var(--interactive-active-opacity));
+  background-color: var(--nav-active);
 }
 
 .sidebar-bottom { margin-top: auto; }
+.sidebar-account { display: flex; align-items: center; gap: 9px; margin-top: 12px; padding: 12px 6px 2px; border-top: 1px solid var(--line); }
+.account-avatar { width: 30px; height: 30px; flex: none; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 50%; color: var(--accent); background: var(--accent-glow); font-size: 12px; font-weight: 600; }
+.account-copy { display: grid; min-width: 0; gap: 1px; }
+.account-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
+.account-copy small { color: var(--ink-3); font-size: 10.5px; }
 
 .system-state {
-  margin: 14px 11px 0; padding-top: 16px;
-  border-top: 1px solid var(--line);
-  color: var(--ink-3); font-size: 12px;
+  margin: 10px 8px 0;
+  color: var(--ink-3); font-size: 11px;
   display: flex; align-items: center; gap: 8px;
 }
 .state-dot { width: 7px; height: 7px; background: var(--ink-3); border-radius: 50%; }
 .state-dot.online {
   background: var(--ok);
-  box-shadow: 0 0 0 3px rgb(22 163 74 / 0.14);
-  animation: breathe 2.4s ease-in-out infinite;
-}
-@keyframes breathe {
-  0%, 100% { box-shadow: 0 0 0 3px rgb(22 163 74 / 0.1); }
-  50% { box-shadow: 0 0 0 5px rgb(22 163 74 / 0.22); }
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 10%, transparent);
 }
 
 /* ---------- main / topbar ---------- */
-.app-main { min-height: 100vh; margin-left: 232px; }
+.app-main { min-height: 100vh; margin-left: var(--sidebar-width); }
 
 .topbar {
-  position: sticky; top: 0; z-index: 20; height: 64px; padding: 0 32px;
+  position: sticky; top: 0; z-index: 20; height: var(--topbar-height); padding: 0 24px;
   border-bottom: 1px solid rgb(var(--card-border-rgb) / var(--panel-border-opacity));
   background-color: rgb(var(--panel-surface) / var(--panel-surface-opacity));
   backdrop-filter: blur(18px);
@@ -327,16 +339,17 @@ nav {
   display: flex; align-items: center; justify-content: space-between; gap: 16px;
 }
 
-.breadcrumb { color: var(--ink-3); font-size: 13px; }
+.breadcrumb { color: var(--ink-2); font-size: 12px; }
+.breadcrumb strong { color: var(--ink); font-weight: 600; }
 .breadcrumb span { margin: 0 8px; color: var(--ink-3); opacity: 0.55; }
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 
 /* ---------- page scaffold ---------- */
-.page { position: relative; z-index: 1; width: min(1180px, calc(100% - 64px)); margin: 0 auto; padding: 40px 0 calc(72px + env(safe-area-inset-bottom)); }
+.page { position: relative; z-index: 1; width: min(1600px, calc(100% - 48px)); margin: 0 auto; padding: 26px 0 calc(48px + env(safe-area-inset-bottom)); }
 .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
-h1 { margin: 0; font-size: clamp(26px, 3.4vw, 34px); line-height: 1.12; letter-spacing: -0.5px; font-weight: 700; color: var(--ink); }
-h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
-.page-heading p { margin: 9px 0 0; color: var(--ink-2); font-size: 14px; }
+h1 { margin: 0; font-size: 22px; line-height: 1.4; letter-spacing: -0.4px; font-weight: 650; color: var(--ink); }
+h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.1px; color: var(--ink); }
+.page-heading p { margin: 5px 0 0; color: var(--ink-3); font-size: 12px; }
 /* Two import sources sit side by side in the templates heading. */
 .heading-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 /* Hint line under a section heading (e.g. the subscription panel). */
@@ -346,9 +359,9 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    buttons
    ============================================================ */
 .primary-button, .secondary-button {
-  min-height: 38px; padding: 0 16px; border-radius: var(--r-s);
+  min-height: 34px; padding: 6px 12px; border-radius: var(--r-s);
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  font-weight: 600; font-size: 13px; white-space: nowrap;
+  font-weight: 500; font-size: 12px; white-space: nowrap;
   transition: background-color var(--t-fast), border-color var(--t-fast), color var(--t-fast), box-shadow var(--t-fast), transform var(--t-fast), opacity var(--t-fast);
 }
 
@@ -358,7 +371,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   background: var(--primary);
   box-shadow: var(--card-shadow);
 }
-.primary-button:hover { background: var(--primary-hover); border-color: var(--primary-hover); box-shadow: var(--card-shadow-hover); transform: translateY(-1px); }
+.primary-button:hover { background: var(--primary-hover); border-color: var(--primary-hover); box-shadow: var(--card-shadow-hover); }
 .primary-button:active { transform: translateY(0); }
 .primary-button:disabled { opacity: 0.55; cursor: wait; transform: none; }
 
@@ -368,6 +381,8 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   background: rgb(var(--card-surface));
 }
 .secondary-button:hover { border-color: var(--primary); color: var(--primary); background: rgb(var(--card-surface-hover)); }
+.secondary-button:disabled { opacity: 0.45; }
+.secondary-button:disabled:hover { color: var(--ink); border-color: var(--line-strong); background: rgb(var(--card-surface)); }
 .secondary-button.is-active { border-color: var(--primary); color: var(--primary); background: var(--accent-glow); }
 .secondary-button.danger { color: var(--bad); border-color: rgb(220 38 38 / 0.35); }
 .secondary-button.danger:hover { border-color: rgb(220 38 38 / 0.6); background: rgb(220 38 38 / 0.08); }
@@ -379,7 +394,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    the odd one out. */
 .icon-button,
 .surface-theme-cycle {
-  width: 36px; height: 36px; padding: 0; border: 1px solid transparent; border-radius: 999px;
+  width: 32px; height: 32px; padding: 0; border: 1px solid transparent; border-radius: var(--r-s);
   color: var(--ink-2); background: transparent; display: inline-grid; place-items: center;
   transition: color var(--t-fast), background-color var(--t-fast), transform var(--t-fast);
 }
@@ -387,7 +402,6 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .surface-theme-cycle:hover {
   color: var(--ink);
   background-color: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
-  transform: translateY(-1px);
 }
 .icon-button:disabled { opacity: 0.35; cursor: not-allowed; }
 .icon-button.danger:hover { color: var(--bad); background-color: rgb(220 38 38 / 0.12); }
@@ -396,17 +410,13 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    cards / panels / sections
    ============================================================ */
 .stats {
-  margin: 32px 0; border-radius: var(--r-l);
-  background-color: rgb(var(--card-surface));
-  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
-  box-shadow: var(--card-shadow);
-  display: grid; grid-template-columns: repeat(4, 1fr); overflow: hidden;
+  margin: 22px 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px;
 }
-.stats > div { position: relative; min-height: 128px; padding: 24px 26px; display: flex; flex-direction: column; }
-.stats > div + div { border-left: 1px solid var(--line); }
-.stats span { color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: 1.4px; text-transform: uppercase; }
-.stats strong { margin: 10px 0 10px; color: var(--ink); font-size: 32px; font-weight: 700; letter-spacing: -1px; font-variant-numeric: tabular-nums; }
-.stats small { color: var(--ink-3); display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.stats > div { position: relative; min-width: 0; min-height: 136px; padding: 17px 18px; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-m); background: var(--surface); box-shadow: var(--card-shadow); }
+.stats span { display: flex; align-items: center; gap: 7px; color: var(--ink-3); font-size: 11px; font-weight: 400; }
+.stats strong { margin: 10px 0 8px; color: var(--ink); font-size: 29px; line-height: 1.2; font-weight: 600; letter-spacing: -0.7px; font-variant-numeric: tabular-nums; }
+.stats strong.run-bad { color: var(--bad); }
+.stats small { color: var(--ink-3); display: flex; align-items: center; gap: 6px; font-size: 11px; }
 .stats small.positive { color: var(--ok); }
 
 /* ---------- check-in calendar ---------- */
@@ -418,7 +428,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
    heatmap. */
 .run-calendar-card {
   --calendar-cell: 12px; /* the legend swatch, and the narrowest a day may get */
-  margin: 32px 0; padding: 22px 26px;
+  margin: 22px 0; padding: 18px 20px;
   border-radius: var(--r-l);
   background-color: rgb(var(--card-surface));
   border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
@@ -472,17 +482,17 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 
 .task-section { border-top: 1px solid var(--line); }
 .task-section > h2 { margin: 30px 0 14px; color: var(--ink); font-size: 15px; letter-spacing: 0.2px; }
-.content-grid, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-top: 26px; }
+.content-grid, .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 22px; }
 
 .content-panel {
-  min-width: 0; padding: 22px; border-radius: var(--r-l);
+  min-width: 0; padding: 18px; border-radius: var(--r-l);
   background-color: rgb(var(--card-surface));
   border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
   box-shadow: var(--card-shadow);
 }
 
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-.section-heading h2 { margin: 0; font-size: 17px; }
+.section-heading h2 { margin: 0; font-size: 15px; }
 .count-label { color: var(--ink-3); font-size: 12px; }
 
 /* card-style rows */
@@ -501,7 +511,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
   box-shadow: var(--card-shadow-hover);
 }
 .run-row.clickable { cursor: pointer; }
-.run-row.clickable:hover { transform: translateY(-2px); }
+.run-row.clickable:hover { border-color: var(--accent); }
 /* A notification action row that turned into its own editor. The row already
    draws the card, so the form only contributes the two-column field grid. */
 .run-row .action-edit {
@@ -561,7 +571,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 .error-banner button { border: 0; color: inherit; background: transparent; }
 
-.overlay-page { position: relative; z-index: 1; min-height: calc(100vh - 64px); }
+.overlay-page { position: relative; z-index: 1; min-height: calc(100vh - var(--topbar-height)); }
 .overlay-page > .task-section { margin-top: 30px; }
 .run-list { display: grid; gap: 8px; }
 .run-list .run-row { margin: 0; }
@@ -591,7 +601,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .run-active { color: var(--warn); }
 
 /* A run row holds three short cells and an excerpt, so it is only as tall as
-   what is in it. The shared `td` rule pads every row out to 68px because rows
+   what is in it. The shared `td` rule pads every row out to 58px because rows
    elsewhere carry buttons; on a list whose rows are one line of log it halved
    the number that fit on screen. `vertical-align: top` keeps the time and the
    status level with the first line of a multi-line excerpt rather than floating
@@ -636,7 +646,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 
 .batch-bar {
   display: flex; align-items: center; gap: 9px; padding: 11px 16px; margin: 10px 0;
-  border: 1px solid rgb(75 107 251 / 0.25); border-radius: var(--r-m);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); border-radius: var(--r-m);
   background: var(--accent-glow); font-size: 13px;
 }
 .batch-bar span { margin-right: auto; font-weight: 650; color: var(--accent); }
@@ -656,7 +666,7 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 /* The marker a paged table carries above it (issue #29): paging anchors back
    here, so give it a scroll margin that clears the sticky app header —
    otherwise the header covers the rows the view just jumped to. */
-.paged-anchor { scroll-margin-top: 72px; }
+.paged-anchor { scroll-margin-top: calc(var(--topbar-height) + 12px); }
 
 .pager {
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
@@ -709,8 +719,8 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 }
 table { width: 100%; border-collapse: collapse; min-width: 850px; }
 th {
-  height: 44px; padding: 0 18px; color: var(--ink-3); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
-  text-align: left; font-size: 10.5px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase;
+  height: 38px; padding: 0 16px; color: var(--ink-2); background: var(--heading-surface);
+  text-align: left; font-size: 11px; font-weight: 500; letter-spacing: 0.2px;
   /* The header is a column's floor: under the auto table layout a cell's
      specified width only wins when it clears every cell's min-content width,
      and CJK labels fold between any two characters, which let a narrow count
@@ -720,7 +730,7 @@ th {
   white-space: nowrap;
   border-bottom: 1px solid var(--line);
 }
-td { height: 68px; padding: 0 18px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 13px; }
+td { height: 58px; padding: 0 16px; border-top: 1px solid var(--line); color: var(--ink-2); font-size: 12px; }
 tbody tr:first-child td { border-top: 0; }
 tbody tr { transition: background-color var(--t-fast); }
 tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
@@ -824,9 +834,9 @@ code {
    ============================================================ */
 .modal-backdrop {
   position: fixed; inset: 0; z-index: 50; padding: 20px;
-  background: rgb(0 0 0 / 0.45);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: rgb(22 34 55 / 0.32);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   display: grid; place-items: center;
   animation: fade-in 0.2s var(--ease);
 }
@@ -905,7 +915,7 @@ code {
   max-height: 260px; padding: 5px;
   border: 1px solid var(--line-strong); border-radius: var(--r-m);
   background: var(--surface-strong); color: var(--ink);
-  box-shadow: 0 10px 30px rgb(0 0 0 / 0.16);
+  box-shadow: var(--shadow-m);
 }
 /* The scroll area is the <ul>, not the popup: the filter box stays visible
    while hundreds of rows move under it. */
@@ -954,10 +964,10 @@ code {
 /* Compact segmented control for the schedule mode. Anchored to the right of the
    "schedule mode" label so the switch sits with the fields it controls instead
    of floating under them as a lone link. */
-.seg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line-strong); border-radius: 999px; background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
-.seg button { border: 0; border-radius: 999px; padding: 4px 14px; background: transparent; color: var(--ink-2); font-size: 11.5px; font-weight: 600; line-height: 1.6; cursor: pointer; transition: background-color var(--t-fast), color var(--t-fast); }
+.seg { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line-strong); border-radius: var(--r-s); background: rgb(var(--interactive-surface) / var(--interactive-hover-opacity)); }
+.seg button { border: 0; border-radius: 4px; padding: 4px 14px; background: transparent; color: var(--ink-2); font-size: 11.5px; font-weight: 500; line-height: 1.6; cursor: pointer; transition: background-color var(--t-fast), color var(--t-fast); }
 .seg button:hover { color: var(--ink); }
-.seg button.active { background: var(--primary); color: var(--primary-content); }
+.seg button.active { background: var(--surface); color: var(--accent); box-shadow: var(--card-shadow); }
 /* The cron expression needs the whole row — half of a 560px modal is too narrow
    for "0 0 8 * * * *" plus its own label. */
 .field-full { grid-column: 1 / -1; }
@@ -1172,18 +1182,21 @@ code {
 /* ============================================================
    auth
    ============================================================ */
-.auth-page { position: relative; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.auth-page { position: relative; min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 40px 20px; background: radial-gradient(ellipse at 20% 10%, var(--ambient), transparent 55%), radial-gradient(ellipse at 90% 90%, var(--ambient), transparent 50%), var(--bg); }
 .auth-panel {
   position: relative; z-index: 1;
-  width: min(410px, 100%); display: grid; gap: 16px; padding: 32px 28px;
+  width: min(400px, 100%); display: grid; gap: 18px; padding: 32px;
   background: rgb(var(--card-surface));
   border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
   border-radius: var(--r-l);
-  box-shadow: var(--shadow-l);
+  box-shadow: var(--shadow-m);
   animation: modal-in 0.32s var(--ease);
 }
 .auth-panel .brand { padding: 0; height: auto; justify-self: start; }
-.auth-panel h1 { margin: 4px 0 0; font-size: 24px; }
+.auth-panel h1 { margin: 8px 0 2px; font-size: 22px; }
+.auth-panel > .primary-button, .auth-panel > .sso-button { min-height: 40px; }
+.auth-panel > .secondary-button:not(.sso-button) { min-height: 26px; padding: 2px; border-color: transparent; background: transparent; color: var(--ink-2); font-size: 11px; }
+.auth-panel > .secondary-button:not(.sso-button):hover { color: var(--accent); }
 .auth-theme { justify-self: center; margin-top: 2px; }
 .auth-panel label { display: grid; gap: 7px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
 .auth-panel input {
@@ -1200,7 +1213,7 @@ code {
 }
 .dev-token {
   display: grid; gap: 8px; padding: 12px;
-  border: 1px solid rgb(75 107 251 / 0.25); border-radius: var(--r-s);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); border-radius: var(--r-s);
   background: var(--accent-glow); font-size: 12px; color: var(--ink-2);
 }
 .dev-token code { overflow-wrap: anywhere; color: var(--accent); }
@@ -1253,8 +1266,7 @@ code {
   .breadcrumb { margin-right: auto; margin-left: 8px; }
   .page { width: calc(100% - 32px); padding-top: 26px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
-  .stats > div { min-height: 92px; }
-  .stats > div + div { border-top: 1px solid var(--line); border-left: 0; }
+  .stats > div { min-height: 116px; padding: 14px 16px; }
   /* The calendar keeps its 12px floor and scrolls instead of shrinking: a
      year of weeks does not fit a phone, and 6px squares are not tappable. */
   .run-calendar-card { padding: 18px 16px; }
@@ -1287,7 +1299,8 @@ code {
 @media (max-width: 520px) {
   .page-heading { display: grid; }
   .page-heading .primary-button { width: 100%; }
-  .heading-actions { flex-direction: column; align-items: stretch; }
+  .heading-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+  .heading-actions > button { white-space: normal; }
   .heading-actions > button { width: 100%; }
   .toolbar { align-items: center; }
   .modal { padding: 20px; }
@@ -1300,6 +1313,10 @@ code {
   .modal-actions > button { flex: 1 1 auto; }
   .form-row-4 { grid-template-columns: 1fr; }
   .stats { margin-top: 24px; }
+  .stats { gap: 10px; }
+  .stats > div { padding: 14px; }
+  .stats strong { font-size: 26px; }
+  .auth-panel { padding: 26px 22px; }
   .topbar-right { gap: 6px; }
   .toast-stack { right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: calc(100vw - 20px); }
 }
@@ -1361,13 +1378,13 @@ code {
 /* Wide screens: the tasks table stays a table and the four icon actions stay
    inline, but the actions cell is often squeezed by the columns before it, so
    they wrap onto a second line. The cell must then size to its content —
-   the shared `td { height: 68px }` is a fixed box, and two lines (34 + 6 + 34)
+   the shared `td { height: 58px }` is a fixed box, and two lines (34 + 6 + 34)
    overflow it and land on the row border. `height: auto` lets the row grow and
    the padding keeps the wrapped line off the border, while `min-height` keeps
-   single-line rows at the usual 68px rhythm. */
+   single-line rows at the usual 58px rhythm. */
 @media (min-width: 1025px) {
   .tasks-table .row-actions {
-    height: auto; min-height: 68px;
+    height: auto; min-height: 58px;
     padding-top: 10px; padding-bottom: 10px;
   }
 }

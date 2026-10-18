@@ -122,3 +122,70 @@ describe("scroll containment in style.css", () => {
     expect(boxes[0].body).toContain("overflow-y: auto");
   });
 });
+
+describe("quiet blue console theme", () => {
+  const themes = [
+    all.find((rule) => rule.selector.includes('[data-theme="light"]'))!,
+    selectorIs('[data-theme="dark"]')[0],
+  ];
+
+  function token(body: string, name: string): string {
+    const value = body.match(new RegExp(`--${name}:\\s*([^;]+);`))?.[1];
+    if (!value) throw new Error(`Missing theme token: ${name}`);
+    return value.trim();
+  }
+
+  function luminance(colour: string): number {
+    const channels = colour.startsWith("#")
+      ? colour.slice(1).match(/../g)!.map((part) => parseInt(part, 16))
+      : colour.split(/\s+/).map(Number);
+    return channels.map((channel) => {
+      const value = channel / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+  }
+
+  function contrast(a: string, b: string): number {
+    const first = luminance(a);
+    const second = luminance(b);
+    return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05);
+  }
+
+  it("keeps small text readable on cards, the page and the sidebar in both themes", () => {
+    for (const theme of themes) {
+      for (const surface of ["page-surface", "card-surface", "panel-solid-surface"]) {
+        for (const text of ["ink", "ink-2", "ink-3", "accent", "ok", "warn", "bad"]) {
+          expect(contrast(token(theme.body, text), token(theme.body, surface)),
+            `${theme.selector}: ${text} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    }
+  });
+
+  it("keeps primary button labels readable at rest and on hover", () => {
+    for (const theme of themes) {
+      for (const background of ["primary", "primary-hover"]) {
+        expect(contrast(token(theme.body, "primary-content"), token(theme.body, background)))
+          .toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("uses independent outlined statistic cards and shared shell dimensions", () => {
+    expect(selectorIs(".stats > div")[0].body).toContain("border: 1px solid var(--line)");
+    expect(selectorIs(".sidebar")[0].body).toContain("width: var(--sidebar-width)");
+    expect(selectorIs(".app-main")[0].body).toContain("margin-left: var(--sidebar-width)");
+    expect(selectorIs(".topbar")[0].body).toContain("height: var(--topbar-height)");
+  });
+
+  it("keeps the first-paint browser colour aligned with each page surface", () => {
+    const html = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+    const app = readFileSync(new URL("./App.vue", import.meta.url), "utf8");
+    for (const theme of themes) {
+      const hex = `#${token(theme.body, "page-surface").split(/\s+/)
+        .map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`;
+      expect(html).toContain(hex);
+      expect(app).toContain(hex);
+    }
+  });
+});

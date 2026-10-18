@@ -4,11 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
-    <meta name="theme-color" content="#f7f7f7" />
+    <meta name="theme-color" content="#f7f9fc" />
     <title>qdrust</title>
     <script>
       // Resolve the theme before first paint so the page never flashes the
-      // wrong palette. Mirrors the `collector` bootstrap: light / dark / system.
+      // wrong palette. Keep these colours aligned with the CSS theme tokens.
       (() => {
         const storageKey = 'qdrust-theme-mode';
         const storedMode = localStorage.getItem(storageKey);
@@ -23,7 +23,7 @@
         document.documentElement.setAttribute('data-theme', resolvedTheme);
 
         const meta = document.querySelector('meta[name="theme-color"]');
-        if (meta) meta.setAttribute('content', resolvedTheme === 'dark' ? '#121212' : '#f7f7f7');
+        if (meta) meta.setAttribute('content', resolvedTheme === 'dark' ? '#222a36' : '#f7f9fc');
       })();
     </script>
   </head>

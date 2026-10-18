@@ -912,10 +912,10 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 </template>
 
 <style scoped>
-.detail-tabs { display: flex; gap: 4px; padding: 0 0 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px; flex-wrap: wrap; }
-.detail-tabs button { min-height: 38px; border: 1px solid var(--accent); border-radius: 5px; padding: 0 14px; color: var(--ink-2); background: var(--bg-raise); font-weight: 600; cursor: pointer; }
+.detail-tabs { display: flex; gap: 4px; padding: 0; border-bottom: 1px solid var(--line); margin-bottom: 14px; flex-wrap: wrap; }
+.detail-tabs button { min-height: 34px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 0 12px; color: var(--ink-2); background: transparent; font-weight: 500; cursor: pointer; }
 .detail-tabs button:hover { background: var(--accent-glow); color: var(--ink); }
-.detail-tabs button.active { color: #000; background: var(--accent); border-color: var(--accent); }
+.detail-tabs button.active { color: var(--accent); background: transparent; border-bottom-color: var(--accent); }
 .tab-placeholder { min-height: 280px; padding: 22px; border: 1px solid var(--line); border-radius: var(--r-s); background: var(--bg-raise); }
 .tab-placeholder h3 { margin: 0 0 10px; color: var(--ink); font-size: 16px; }
 .tab-placeholder p { margin: 0; color: var(--ink-2); line-height: 1.6; }
@@ -1016,7 +1016,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   color: var(--ink);
 }
 .ctrl-custom input:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
 }
 
 /* ---------- 主体布局 ---------- */
@@ -1199,7 +1199,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   color: var(--ink);
 }
 .method-input:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .chk {
@@ -1253,7 +1253,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 .field input:focus,
 .field textarea:focus,
 .field select:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .field textarea::placeholder {
@@ -1353,7 +1353,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   color: var(--ink);
 }
 .kv-row input:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
 }
 .kv-row .chk-box {
   width: 16px;
@@ -1403,7 +1403,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
 }
 .assert-row input:focus,
 .extract-row input:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
 }
 
 /* ---------- postData ---------- */
@@ -1443,7 +1443,7 @@ onBeforeUnmount(() => document.removeEventListener("mousedown", onDocPointerDown
   resize: none;
 }
 .json-area:focus {
-  border-color: rgba(184, 239, 103, 0.55);
+  border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 .json-error {
