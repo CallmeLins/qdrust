@@ -173,6 +173,12 @@ const currentViewName = computed(() => ({
   notifications: t("notificationsTitle"),
   push: t("pushTitle"), admin: t("adminTitle"), settings: t("settingsTitle"),
 }[view.value]));
+/** The breadcrumb prefix follows the sidebar group the current page belongs to. */
+const currentViewSection = computed(() => {
+  if (view.value === "notifications" || view.value === "push") return t("navAutomation");
+  if (view.value === "admin" || view.value === "settings") return t("navManagement");
+  return t("workspace");
+});
 
 // ---------- tasks ----------
 const tasks = ref<Task[]>([]);
@@ -2679,7 +2685,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
     <main class="app-main">
       <header class="topbar">
         <button class="icon-button mobile-menu" :title="t('menu')" @click="menuOpen = true"><Menu :size="20" /></button>
-        <div class="breadcrumb">{{ t('workspace') }} <span>/</span> <strong>{{ currentViewName }}</strong></div>
+        <div class="breadcrumb">{{ currentViewSection }} <span>/</span> <strong>{{ currentViewName }}</strong></div>
         <div class="topbar-right">
           <span v-if="currentUser?.email && !currentUser.email_verified" class="verify-hint" :title="t('emailVerifyBanner')">
             <Mail :size="14" />{{ t('emailVerifyBanner') }}
