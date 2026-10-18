@@ -813,6 +813,7 @@ code {
 .row-description { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
 .error-text { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
 .ok-text { color: var(--ok); font-size: 12px; }
+.warn-text { color: var(--warn); font-size: 12px; }
 
 /* ============================================================
    empty / loading
@@ -1143,23 +1144,93 @@ code {
 /* ============================================================
    settings
    ============================================================ */
+.settings-sections > h2,
+.settings-anchor > h2 { margin-top: 28px; }
+.settings-anchor { scroll-margin-top: 20px; }
+.settings-band {
+  margin-top: 12px; padding: 16px;
+  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  border-radius: var(--r-m);
+  background: rgb(var(--card-surface));
+}
+.settings-profile {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 13px;
+  border: 1px solid var(--line); border-radius: var(--r-s);
+  background: rgb(var(--interactive-surface) / 0.035);
+}
+.settings-profile-copy { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.settings-profile-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.settings-profile-title strong { color: var(--ink); font-size: 14px; }
+.settings-profile-meta {
+  display: flex; align-items: center; gap: 4px 18px; flex-wrap: wrap;
+  color: var(--ink-3); font-size: 11.5px;
+}
+.settings-profile-meta > span { display: inline-flex; align-items: center; gap: 5px; }
+.settings-profile-meta strong { color: var(--ink-2); font-size: 11.5px; font-weight: 500; }
+.settings-profile-meta .ok-text,
+.settings-profile-meta .warn-text { font-size: 11.5px; }
+.settings-profile-meta .text-button { font-size: 11.5px; }
+.settings-service-grid > div {
+  min-width: 0; padding: 9px 12px; border-radius: var(--r-s);
+  background: rgb(var(--interactive-surface) / 0.04);
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.settings-service-grid span { color: var(--ink-3); font-size: 11.5px; }
+.settings-service-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
+}
+.settings-service-grid > div { justify-content: flex-start; flex-wrap: wrap; }
+.settings-service-grid a { color: var(--accent); font-size: 12.5px; }
 .settings-list { margin: 18px 0 0; }
 .settings-list div { padding: 12px 0; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 16px; align-items: center; }
 .settings-list dt { color: var(--ink-3); font-size: 12px; }
 .settings-list dd { margin: 0; color: var(--ink); font-size: 13px; display: flex; align-items: center; gap: 8px; }
 .settings-list a { color: var(--accent); }
 .settings-form { margin-top: 18px; display: grid; gap: 12px; }
-/* Settings: the one-time plaintext of a freshly created API token. */
+/* Access-token management: a quiet list where the name is the anchor and the
+   metadata stays on one scanning line. Creation lives in a dialog. */
+.settings-band-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px; margin-bottom: 12px;
+}
+.settings-band-head .section-hint { flex: 1; margin: 0; max-width: 760px; }
+.settings-band-head .secondary-button { flex: none; }
+.token-list { border-top: 1px solid var(--line); }
+.token-row {
+  display: flex; align-items: center; gap: 10px 22px;
+  min-height: 46px; padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+.token-row .muted { font-size: 11.5px; white-space: nowrap; }
+.token-name {
+  flex: 1 1 auto; display: inline-flex; align-items: center; gap: 7px;
+  min-width: 0; color: var(--ink-3);
+}
+.token-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: 12.5px; }
+.token-row > .muted:first-of-type { margin-left: auto; }
+.token-row .icon-button { flex: none; margin-left: auto; }
+.token-empty {
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px 2px 4px; color: var(--ink-3); font-size: 12px;
+}
+/* The one-time plaintext of a freshly created API token. */
 .token-reveal {
   display: grid; gap: 6px; margin: 12px 0; padding: 10px 12px;
   border: 1px solid var(--line-strong); border-radius: var(--r-s);
   background: rgb(var(--card-surface));
 }
 .token-reveal code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.token-reveal-actions { display: flex; align-items: center; gap: 12px; }
 .settings-form h3 { margin: 6px 0 0; color: var(--ink); font-size: 14px; }
 .settings-form label { display: grid; gap: 6px; color: var(--ink-2); font-size: 12px; font-weight: 600; }
 .settings-form input { height: 38px; padding: 0 11px; border: 1px solid var(--line-strong); border-radius: var(--r-s); outline: 0; background: rgb(var(--card-surface)); color: var(--ink); }
 .settings-form input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--accent-glow); }
+.settings-form-row {
+  grid-template-columns: repeat(2, minmax(160px, 1fr)) auto;
+  align-items: end;
+}
+.settings-form-row .inline-actions { align-self: end; }
 .role-select { height: 34px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: var(--r-s); background: rgb(var(--card-surface)); color: var(--ink); font-size: 12px; outline: 0; }
 
 /* Built-in avatar picker: a compact, keyboard-friendly palette rather than a
@@ -1351,6 +1422,12 @@ code {
   .form-row { grid-template-columns: 1fr; }
   .form-row-4 { grid-template-columns: 1fr 1fr; }
   .content-grid, .settings-grid { grid-template-columns: 1fr; }
+  .settings-service-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-form-row { grid-template-columns: minmax(0, 1fr); }
+  .settings-band-head { align-items: stretch; flex-direction: column; gap: 8px; }
+  .settings-band-head .secondary-button { align-self: flex-start; }
+  .token-row { flex-wrap: wrap; gap: 4px 12px; }
+  .token-name { flex-basis: calc(100% - 46px); }
   .inline-modal, .task-section > .modal { grid-template-columns: 1fr; }
   .inline-modal .primary-button, .inline-modal .inline-actions { grid-column: auto; }
   .har-meta { grid-template-columns: 1fr; }
@@ -1373,10 +1450,14 @@ code {
 
 @media (max-width: 520px) {
   .page-heading { display: grid; }
+  .page-heading .heading-actions { width: 100%; }
   .page-heading .primary-button { width: 100%; }
   .heading-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
   .heading-actions > button { white-space: normal; }
   .heading-actions > button { width: 100%; }
+  .settings-profile { align-items: flex-start; }
+  .settings-profile-meta { gap: 4px 12px; }
+  .settings-service-grid { grid-template-columns: minmax(0, 1fr); }
   .toolbar { align-items: center; }
   .modal { padding: 20px; }
   /* The run-log dialog draws its own band padding, and its bands have to reach
@@ -1567,37 +1648,48 @@ th.sortable .sort-idle { opacity: 0.3; }
 .library-table td.row-actions .icon-button { margin-left: 6px; }
 
 /* ---------- notepad ---------- */
-/* The slot list stays narrow — it shows a preview per slot, and the editor
-   takes the rest of the width. One column below 800px, matching the layout
-   breakpoint used elsewhere. */
-.notepad-layout {
+/* Slots form a responsive tile grid: 3 columns on a regular desktop, 4 on a
+   wide monitor, and two/one as the viewport narrows. `auto-fill` keeps the
+   cards at a readable size instead of stretching two of them across 1600px. */
+.notepad-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
-  gap: 22px;
-  align-items: start;
-  padding-top: 18px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 12px;
+  margin-top: 18px;
 }
-.notepad-list { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.notepad-blank { padding: 4px 0 10px; }
+.notepad-blank { padding: 14px 0 2px; }
 .notepad-blank p { margin: 0 0 6px; }
 .notepad-item {
-  display: flex; flex-direction: column; gap: 5px;
-  padding: 10px 12px;
-  border: 1px solid var(--line); border-radius: 10px;
-  background: var(--surface);
+  display: grid; align-content: start; gap: 10px;
+  min-width: 0; min-height: 148px; padding: 15px;
+  border: 1px solid var(--line); border-radius: var(--r-m);
+  background: rgb(var(--card-surface));
   color: var(--ink); font: inherit; text-align: left; cursor: pointer;
+  transition: border-color var(--t-fast), background-color var(--t-fast), transform var(--t-fast), box-shadow var(--t-fast);
 }
-.notepad-item:hover { border-color: var(--primary); background: var(--surface-strong); }
-.notepad-item.active { border-color: var(--primary); background: var(--accent-glow); }
-.notepad-item-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.notepad-item:hover {
+  border-color: var(--primary); background: rgb(var(--card-surface-hover));
+  box-shadow: var(--card-shadow); transform: translateY(-1px);
+}
+.notepad-item:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.notepad-item-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.notepad-item-head strong { font-size: 14px; }
 /* The stored value may be megabytes of cookie; the list shows its head only. */
 .notepad-item-preview {
   display: block; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--ink-3); font-size: 12px;
+  padding: 9px 10px; border-radius: var(--r-s);
+  background: rgb(var(--interactive-surface) / 0.04);
+  color: var(--ink-2); font-size: 12px;
 }
-.notepad-new { justify-content: center; }
-.notepad-editor { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.notepad-item-meta { align-self: end; color: var(--ink-3); font-size: 11.5px; }
+.notepad-new {
+  place-content: center; justify-items: center; gap: 7px;
+  border-style: dashed; color: var(--ink-2); text-align: center;
+}
+.notepad-new:hover { color: var(--primary); background: var(--accent-glow); }
+.notepad-new strong { font-size: 13px; }
+.notepad-new .muted { font-size: 11.5px; }
 .notepad-field { display: flex; flex-direction: column; gap: 6px; color: var(--ink-2); }
 .notepad-field textarea {
   width: 100%; padding: 12px;
@@ -1610,8 +1702,12 @@ th.sortable .sort-idle { opacity: 0.3; }
 .notepad-actions { display: flex; align-items: center; gap: 10px; }
 /* Delete is the one destructive action here, so it sits apart from save/cancel. */
 .notepad-actions .icon-button { margin-left: auto; }
-@media (max-width: 800px) {
-  .notepad-layout { grid-template-columns: minmax(0, 1fr); }
+.modal-notepad { width: min(820px, 100%); }
+.modal-password, .modal-token { width: min(440px, 100%); }
+.modal-password .section-hint,
+.modal-token .section-hint { margin: 4px 0 0; }
+@media (max-width: 640px) {
+  .notepad-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 

@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type 
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp, Copy, Download, Eye, FileJson2, FileText, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, LogOut, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
-  Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
+  Settings, ShieldCheck, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap, KeyRound,
 } from "@lucide/vue";
 import { api, apiPath, errorCode, oidcStartUrl, websocketPath, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken, type LiveRunEvent, type LatestFailureTrace } from "./api";
 import HarEditor from "./HarEditor.vue";
@@ -1436,9 +1436,10 @@ async function invokePlugin(plugin: Plugin) {
 // stored — usually a refreshed cookie — is only visible through the head of a
 // step name in the run log.
 const notepads = ref<NotepadSummary[]>([]);
-/** The slot the editor is showing, or null when none is open. A number that is
- *  not in `notepads` is the unsaved "new slot" the user just asked for. */
+/** The slot shown in the editor dialog, or null when the dialog is closed. A
+ *  number that is not in `notepads` is the unsaved "new slot" just asked for. */
 const notepadSelected = ref<number | null>(null);
+const notepadDialogOpen = ref(false);
 /** The editor's buffer, and the value it was loaded with, so "is there anything
  *  to save" is a comparison rather than a flag someone has to remember to clear. */
 const notepadContent = ref("");
@@ -1472,6 +1473,7 @@ async function selectNotepad(slot: number) {
     notepadSelected.value = slot;
     notepadContent.value = loaded.content;
     notepadLoaded.value = loaded.content;
+    notepadDialogOpen.value = true;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 function openNotepadSlot(slot: number) {
@@ -1484,6 +1486,14 @@ function newNotepad() {
   // Nothing is written yet: the server creates a slot on its first write, so a
   // new slot the user never saves leaves no row behind.
   notepadSelected.value = nextNotepadSlot.value;
+  notepadContent.value = "";
+  notepadLoaded.value = "";
+  notepadDialogOpen.value = true;
+}
+function closeNotepadDialog() {
+  if (notepadDirty.value && !window.confirm(t("notepadDiscard"))) return;
+  notepadDialogOpen.value = false;
+  notepadSelected.value = null;
   notepadContent.value = "";
   notepadLoaded.value = "";
 }
@@ -1506,6 +1516,7 @@ async function saveNotepad() {
     await api.setNotepad(slot, notepadContent.value);
     notepadLoaded.value = notepadContent.value;
     await openNotepads();
+    notepadDialogOpen.value = false;
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function removeNotepad(slot: number) {
@@ -1513,6 +1524,7 @@ async function removeNotepad(slot: number) {
   try {
     await api.deleteNotepad(slot);
     if (notepadSelected.value === slot) {
+      notepadDialogOpen.value = false;
       notepadSelected.value = null;
       notepadContent.value = "";
       notepadLoaded.value = "";
@@ -2499,6 +2511,8 @@ function onRestoreFile(event: Event) {
 // ---------- settings / account ----------
 const pwdForm = reactive({ current: "", next: "" });
 const avatarSaving = ref(false);
+const showPasswordDialog = ref(false);
+const passwordSaving = ref(false);
 async function selectAvatar(avatarId: string) {
   if (!currentUser.value || avatarSaving.value || currentUser.value.avatar_id === avatarId) return;
   avatarSaving.value = true;
@@ -2512,13 +2526,29 @@ async function selectAvatar(avatarId: string) {
   }
 }
 async function changePassword() {
+  if (passwordSaving.value) return;
+  passwordSaving.value = true;
   try {
     await api.changePassword(pwdForm.current, pwdForm.next);
-    notify(t("passwordChanged"));
+    showPasswordDialog.value = false;
     Object.assign(pwdForm, { current: "", next: "" });
+    notify(t("passwordChanged"));
     // backend revokes all sessions after password change
     await logout(true);
-  } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    passwordSaving.value = false;
+  }
+}
+function openPasswordDialog() {
+  Object.assign(pwdForm, { current: "", next: "" });
+  showPasswordDialog.value = true;
+}
+function closePasswordDialog() {
+  if (passwordSaving.value) return;
+  showPasswordDialog.value = false;
+  Object.assign(pwdForm, { current: "", next: "" });
 }
 async function rotateCsrf() {
   try { await api.rotateCsrf(); notify(t("csrfRotated")); }
@@ -2531,6 +2561,8 @@ const tokenForm = reactive({ name: "", expiresInDays: "" });
 /** Plaintext of the token just created. Shown once; the server stores only a
  *  hash, so it cannot be recovered later. */
 const newToken = ref("");
+const showTokenDialog = ref(false);
+const tokenSaving = ref(false);
 
 /** Tokens are only shown on the settings view, so they are read when it opens
  *  rather than at boot. `createApiToken`/`revokeApiToken` reuse it to refresh. */
@@ -2540,7 +2572,8 @@ async function openSettings() {
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 async function createApiToken() {
-  if (!tokenForm.name.trim()) return;
+  if (!tokenForm.name.trim() || tokenSaving.value) return;
+  tokenSaving.value = true;
   try {
     const issued = await api.createApiToken({
       name: tokenForm.name.trim(),
@@ -2548,11 +2581,23 @@ async function createApiToken() {
     });
     newToken.value = issued.token;
     Object.assign(tokenForm, { name: "", expiresInDays: "" });
+    showTokenDialog.value = false;
     notify(t("tokenIssued"));
     await openSettings();
   } catch (cause) {
     notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    tokenSaving.value = false;
   }
+}
+function openTokenDialog() {
+  Object.assign(tokenForm, { name: "", expiresInDays: "" });
+  showTokenDialog.value = true;
+}
+function closeTokenDialog() {
+  if (tokenSaving.value) return;
+  showTokenDialog.value = false;
+  Object.assign(tokenForm, { name: "", expiresInDays: "" });
 }
 async function revokeApiToken(id: number) {
   try {
@@ -2709,6 +2754,9 @@ onMounted(async () => {
       if (showCreate.value) showCreate.value = false;
       if (showImport.value) closeHarEditor();
       if (showHelp.value) showHelp.value = false;
+      if (notepadDialogOpen.value) closeNotepadDialog();
+      if (showPasswordDialog.value) closePasswordDialog();
+      if (showTokenDialog.value) closeTokenDialog();
       if (calendarDay.value) calendarDay.value = null;
       menuOpen.value = false;
     }
@@ -3415,43 +3463,31 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <button class="secondary-button" @click="openNotepads"><RefreshCw :size="16" />{{ t('refresh') }}</button>
           </div>
         </section>
-        <section class="task-section notepad-layout">
-          <aside class="notepad-list">
-            <div v-if="notepads.length === 0" class="notepad-blank">
-              <p>{{ t('notepadEmpty') }}</p>
-              <p class="muted">{{ t('notepadEmptyHint') }}</p>
-            </div>
+        <section class="task-section">
+          <div v-if="notepads.length === 0" class="notepad-blank">
+            <p>{{ t('notepadEmpty') }}</p>
+            <p class="muted">{{ t('notepadEmptyHint') }}</p>
+          </div>
+          <div class="notepad-grid">
             <button
               v-for="slot in notepads"
               :key="slot.notepad_id"
               type="button"
-              :class="['notepad-item', { active: notepadSelected === slot.notepad_id }]"
+              class="notepad-item"
               @click="openNotepadSlot(slot.notepad_id)"
             >
               <span class="notepad-item-head">
                 <strong>{{ fmt('notepadSlot', { n: slot.notepad_id }) }}</strong>
-                <span class="muted">{{ slot.content_size }} {{ t('notepadBytes') }} · {{ formatRunTime(slot.updated_at) }}</span>
+                <span class="chip">{{ slot.content_size }} {{ t('notepadBytes') }}</span>
               </span>
               <code class="notepad-item-preview">{{ slot.preview || t('none') }}</code>
+              <span class="notepad-item-meta">{{ t('notepadUpdated') }} {{ formatRunTime(slot.updated_at) }}</span>
             </button>
-            <button class="secondary-button notepad-new" type="button" @click="newNotepad">
-              <Plus :size="16" />{{ t('notepadNewSlot') }}
+            <button class="notepad-item notepad-new" type="button" @click="newNotepad">
+              <Plus :size="22" />
+              <strong>{{ t('notepadNewSlot') }}</strong>
+              <span class="muted">{{ t('notepadNewSlotHint') }}</span>
             </button>
-          </aside>
-
-          <div class="notepad-editor">
-            <p v-if="notepadSelected === null" class="muted">{{ t('notepadSelect') }}</p>
-            <template v-else>
-              <label class="notepad-field">
-                <span>{{ fmt('notepadSlot', { n: notepadSelected }) }}</span>
-                <textarea v-model="notepadContent" rows="14" spellcheck="false"></textarea>
-              </label>
-              <div class="notepad-actions">
-                <button class="primary-button" type="button" :disabled="!notepadDirty" @click="saveNotepad">{{ t('save') }}</button>
-                <button class="secondary-button" type="button" :disabled="!notepadDirty" @click="resetNotepad">{{ t('cancel') }}</button>
-                <button class="icon-button" type="button" :title="t('notepadDeleteSlot')" @click="removeNotepad(notepadSelected)"><Trash2 :size="16" /></button>
-              </div>
-            </template>
           </div>
         </section>
       </div>
@@ -3715,12 +3751,30 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- ===== SETTINGS ===== -->
       <div v-else class="page">
-        <section class="page-heading"><div><h1>{{ t('settingsTitle') }}</h1></div></section>
-        <section class="settings-grid">
-          <div class="content-panel">
-            <h2>{{ t('account') }}</h2>
+        <section class="page-heading">
+          <div><h1>{{ t('settingsTitle') }}</h1></div>
+          <div class="heading-actions">
+            <button class="secondary-button" type="button" @click="openPasswordDialog"><ShieldCheck :size="15" />{{ t('changePassword') }}</button>
+          </div>
+        </section>
+        <section class="task-section settings-sections">
+          <h2>{{ t('account') }}</h2>
+          <div class="settings-band">
+            <div class="settings-profile">
+              <Avatar :avatar-id="currentUser?.avatar_id" :size="46" :label="t('avatar')" />
+              <div class="settings-profile-copy">
+                <div class="settings-profile-title">
+                  <strong>{{ currentUser?.username }}</strong>
+                  <span class="chip">{{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</span>
+                </div>
+                <div class="settings-profile-meta">
+                  <span>{{ t('userId') }} <strong>#{{ currentUser?.id }}</strong></span>
+                  <span>{{ t('emailVerified') }} <strong :class="currentUser?.email_verified ? 'ok-text' : 'warn-text'">{{ currentUser?.email_verified ? t('verified') : t('unverified') }}</strong></span>
+                  <button v-if="currentUser?.email && !currentUser.email_verified" class="text-button" type="button" @click="resendVerification">{{ t('resendVerify') }}</button>
+                </div>
+              </div>
+            </div>
             <div class="avatar-picker-head">
-              <Avatar :avatar-id="currentUser?.avatar_id" :size="54" :label="t('avatar')" />
               <div>
                 <strong>{{ t('avatar') }}</strong>
                 <p class="muted section-hint">{{ t('avatarPickHint') }}</p>
@@ -3742,49 +3796,46 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <span>{{ avatarName(locale, avatar) }}</span>
               </button>
             </div>
-            <dl class="settings-list">
-              <div><dt>{{ t('username') }}</dt><dd>{{ currentUser?.username }}</dd></div>
-              <div><dt>{{ t('role') }}</dt><dd>{{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</dd></div>
-              <div><dt>{{ t('emailVerified') }}</dt><dd>{{ currentUser?.email_verified ? t('verified') : t('unverified') }}</dd></div>
-            </dl>
-            <form class="settings-form" @submit.prevent="changePassword">
-              <h3>{{ t('changePassword') }}</h3>
-              <label>{{ t('currentPassword') }}<input v-model="pwdForm.current" required type="password" /></label>
-              <label>{{ t('newPassword') }}<input v-model="pwdForm.next" required minlength="12" type="password" /></label>
-              <div class="inline-actions">
-                <button class="primary-button">{{ t('save') }}</button>
-                <button class="secondary-button" type="button" @click="rotateCsrf">{{ t('csrfRotate') }}</button>
-              </div>
-            </form>
           </div>
-          <div class="content-panel">
-            <h2>{{ t('service') }}</h2>
-            <dl class="settings-list">
-              <div><dt>{{ t('statusLabel') }}</dt><dd><span class="state-dot online" />{{ ready ? t('serviceOk') : t('connecting') }}</dd></div>
-              <div><dt>{{ t('localeLabel') }}</dt><dd><button class="secondary-button" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button></dd></div>
-              <div><dt>{{ t('apiDocs') }}</dt><dd><a :href="apiPath('/api/v1/openapi.json')" target="_blank">{{ t('openapi') }}</a></dd></div>
-            </dl>
-          </div>
-          <div class="content-panel">
-            <h2>{{ t('apiTokens') }}</h2>
-            <p class="muted section-hint">{{ t('apiTokensHint') }}</p>
-            <form class="settings-form" @submit.prevent="createApiToken">
-              <label>{{ t('tokenName') }}<input v-model="tokenForm.name" required maxlength="128" placeholder="cursor / mcp" /></label>
-              <label>{{ t('tokenExpiry') }}<input v-model="tokenForm.expiresInDays" type="number" min="1" placeholder="30" /></label>
-              <div class="inline-actions"><button class="primary-button">{{ t('createToken') }}</button></div>
-            </form>
-            <div v-if="newToken" class="token-reveal">
-              <strong>{{ t('tokenOnce') }}</strong>
-              <code>{{ newToken }}</code>
-              <button class="secondary-button" type="button" @click="copyNewToken"><Copy :size="14" />{{ t('tokenCopy') }}</button>
+
+          <h2>{{ t('service') }}</h2>
+          <div class="settings-band">
+            <div class="settings-service-grid">
+              <div><span>{{ t('statusLabel') }}</span><strong><span class="state-dot online" />{{ ready ? t('serviceOk') : t('connecting') }}</strong></div>
+              <div><span>{{ t('localeLabel') }}</span><button class="secondary-button" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button></div>
+              <div><span>{{ t('apiDocs') }}</span><a :href="apiPath('/api/v1/openapi.json')" target="_blank">{{ t('openapi') }}</a></div>
+              <div><span>{{ t('security') }}</span><button class="secondary-button" type="button" @click="rotateCsrf">{{ t('csrfRotate') }}</button></div>
             </div>
-            <div v-if="apiTokens.length === 0" class="muted">{{ t('noTokens') }}</div>
-            <div v-for="token in apiTokens" :key="token.id" class="run-row">
-              <strong>{{ token.name }}</strong>
-              <span class="muted">{{ t('tokenCreated') }} {{ formatRunTime(token.created_at) }}</span>
-              <span v-if="token.last_used_at" class="muted">{{ t('tokenLastUsed') }} {{ formatRunTime(token.last_used_at) }}</span>
-              <span v-if="token.expires_at" class="chip">{{ t('tokenExpires') }} {{ formatRunTime(token.expires_at) }}</span>
-              <button class="icon-button danger" :title="t('revokeToken')" @click="revokeApiToken(token.id)"><Trash2 :size="16" /></button>
+          </div>
+
+          <div id="system-access-tokens" class="settings-anchor">
+            <h2>{{ t('systemAccessTokens') }}</h2>
+            <div class="settings-band">
+              <div class="settings-band-head">
+                <p class="muted section-hint">{{ t('apiTokensHint') }}</p>
+                <button class="secondary-button" type="button" @click="openTokenDialog"><Plus :size="15" />{{ t('createToken') }}</button>
+              </div>
+              <div v-if="newToken" class="token-reveal">
+                <strong>{{ t('tokenOnce') }}</strong>
+                <code>{{ newToken }}</code>
+                <div class="token-reveal-actions">
+                  <button class="secondary-button" type="button" @click="copyNewToken"><Copy :size="14" />{{ t('tokenCopy') }}</button>
+                  <button class="text-button" type="button" @click="newToken = ''">{{ t('tokenDismiss') }}</button>
+                </div>
+              </div>
+              <div v-if="apiTokens.length === 0" class="token-empty">
+                <KeyRound :size="18" />
+                <span>{{ t('noTokens') }}</span>
+              </div>
+              <div v-else class="token-list">
+                <div v-for="token in apiTokens" :key="token.id" class="token-row">
+                  <span class="token-name"><KeyRound :size="14" /><strong>{{ token.name }}</strong></span>
+                  <span class="muted">{{ t('tokenCreated') }} {{ formatRunTime(token.created_at) }}</span>
+                  <span v-if="token.last_used_at" class="muted">{{ t('tokenLastUsed') }} {{ formatRunTime(token.last_used_at) }}</span>
+                  <span v-if="token.expires_at" class="chip">{{ t('tokenExpires') }} {{ formatRunTime(token.expires_at) }}</span>
+                  <button class="icon-button danger" :title="t('revokeToken')" @click="revokeApiToken(token.id)"><Trash2 :size="16" /></button>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -4142,6 +4193,72 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <p class="auth-hint">{{ t('helpBody') }}</p>
         <div class="modal-actions"><button class="secondary-button" type="button" @click="showHelp = false">{{ t('close') }}</button></div>
       </div>
+    </div>
+
+    <!-- ===== CHANGE PASSWORD MODAL ===== -->
+    <div v-if="showPasswordDialog" class="modal-backdrop" @click.self="closePasswordDialog">
+      <form class="modal modal-password" @submit.prevent="changePassword">
+        <div class="modal-header">
+          <div>
+            <h2>{{ t('changePassword') }}</h2>
+            <p class="muted section-hint">{{ t('changePasswordHint') }}</p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closePasswordDialog"><X :size="20" /></button>
+        </div>
+        <label>{{ t('currentPassword') }}<input v-model="pwdForm.current" required autocomplete="current-password" type="password" /></label>
+        <label>{{ t('newPassword') }}<input v-model="pwdForm.next" required minlength="12" autocomplete="new-password" type="password" /></label>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" :disabled="passwordSaving" @click="closePasswordDialog">{{ t('cancel') }}</button>
+          <button class="primary-button" :disabled="passwordSaving">{{ passwordSaving ? t('saving') : t('save') }}</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- ===== CREATE ACCESS TOKEN MODAL ===== -->
+    <div v-if="showTokenDialog" class="modal-backdrop" @click.self="closeTokenDialog">
+      <form class="modal modal-token" @submit.prevent="createApiToken">
+        <div class="modal-header">
+          <div>
+            <h2>{{ t('createToken') }}</h2>
+            <p class="muted section-hint">{{ t('tokenDialogHint') }}</p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeTokenDialog"><X :size="20" /></button>
+        </div>
+        <label>{{ t('tokenName') }}<input v-model="tokenForm.name" required maxlength="128" placeholder="cursor / mcp" /></label>
+        <label>{{ t('tokenExpiry') }}<input v-model="tokenForm.expiresInDays" type="number" min="1" placeholder="30" /></label>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" :disabled="tokenSaving" @click="closeTokenDialog">{{ t('cancel') }}</button>
+          <button class="primary-button" :disabled="tokenSaving">{{ tokenSaving ? t('saving') : t('createToken') }}</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- ===== NOTEPAD SLOT MODAL ===== -->
+    <div v-if="notepadDialogOpen" class="modal-backdrop" @click.self="closeNotepadDialog">
+      <form class="modal modal-notepad" @submit.prevent="saveNotepad">
+        <div class="modal-header">
+          <div>
+            <h2>{{ notepadSelected == null ? t('notepadNewSlot') : fmt('notepadSlot', { n: notepadSelected }) }}</h2>
+            <p class="muted section-hint">{{ t('notepadEditHint') }}</p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeNotepadDialog"><X :size="20" /></button>
+        </div>
+        <label class="notepad-field">
+          <span>{{ t('notepadContent') }}</span>
+          <textarea v-model="notepadContent" rows="16" spellcheck="false"></textarea>
+        </label>
+        <div class="notepad-actions">
+          <button class="primary-button" :disabled="!notepadDirty">{{ t('save') }}</button>
+          <button class="secondary-button" type="button" :disabled="!notepadDirty" @click="resetNotepad">{{ t('cancel') }}</button>
+          <button
+            v-if="notepadSelected != null && notepads.some((slot) => slot.notepad_id === notepadSelected)"
+            class="icon-button danger"
+            type="button"
+            :title="t('notepadDeleteSlot')"
+            @click="removeNotepad(notepadSelected)"
+          ><Trash2 :size="16" /></button>
+        </div>
+      </form>
     </div>
 
     <!-- ===== TOASTS ===== -->
