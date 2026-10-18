@@ -254,6 +254,60 @@
         }
       }
     },
+    "/api/v1/tasks/{id}/latest-failure-trace": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "operationId": "latestFailureTrace",
+        "summary": "Latest retained full failure trace for a task",
+        "responses": {
+          "200": {
+            "description": "Trace and the run it belongs to",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "run_id",
+                    "created_at",
+                    "trace"
+                  ],
+                  "properties": {
+                    "run_id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "created_at": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "finished_at": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "int64"
+                    },
+                    "trace": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "No retained failure trace"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{id}/run": {
       "parameters": [
         {

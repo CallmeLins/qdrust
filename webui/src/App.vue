@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
-  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp, Copy, Download, Eye, FileJson2, FileUp,
+  Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp, Copy, Download, Eye, FileJson2, FileText, FileUp,
   LayoutDashboard, Library as LibraryIcon, Loader2, LogOut, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
-import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, websocketPath, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken, type LiveRunEvent, type LatestFailureTrace } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -26,6 +26,8 @@ type Toast = {
   meta?: string;
   /** QD-style log line or error text, shown in a scrollable mono block */
   detail?: string;
+  /** Live request progress while a manual run is in flight */
+  liveSteps?: RunStep[];
   /** Enables the "view run history" action when set */
   taskId?: number;
   /** Pending toasts stay until they are updated or dismissed */
@@ -51,10 +53,16 @@ function notify(message: string, kind: ToastKind = "success", extra: Partial<Toa
 function updateToast(id: number, patch: Partial<Toast>) {
   const toast = toasts.value.find((x) => x.id === id);
   if (!toast) return;
+  if (patch.liveSteps) patch = { ...patch, liveSteps: [...patch.liveSteps] };
   Object.assign(toast, patch);
   if (patch.persistent === false || (patch.kind && patch.kind !== "pending")) {
     scheduleDismiss(id, toast.detail || toast.meta ? 9000 : 4000);
   }
+}
+function toastStepMeta(steps: RunStep[]): string {
+  const done = steps.filter((step) => step.status === "succeeded").length;
+  const running = steps.some((step) => step.status === "running");
+  return `${fmt("runStepsCount", { done, total: steps.length })}${running ? ` · ${t("runStepRunning")}` : ""}`;
 }
 /** Rows per page, one count per list (see `usePageSize`).
  *
@@ -192,6 +200,12 @@ const groupFilterDropdownOptions = computed(() => [
 ]);
 const selected = reactive(new Set<number>());
 const runsByTask = ref<Record<number, Run[]>>({});
+const failureTraceByTask = ref<Record<number, LatestFailureTrace | null>>({});
+const latestFailureTrace = computed(() =>
+  runHistoryTask.value ? failureTraceByTask.value[runHistoryTask.value.id] ?? null : null,
+);
+const showFailureTrace = ref(false);
+const failureTraceLoading = ref(false);
 const runHistoryTask = ref<Task | null>(null);
 /** Task whose overflow (kebab) menu is open on narrow screens; null = none. */
 const openRowMenu = ref<number | null>(null);
@@ -526,25 +540,127 @@ async function waitForRun(taskId: number, runId: number): Promise<Run | null> {
   return null;
 }
 
+/**
+ * Follow one run over the existing step WebSocket.
+ *
+ * The socket is an enhancement, not the source of truth: a closed browser tab,
+ * a proxy that strips upgrade requests, or a missed frame still falls through
+ * to `waitForRun`. Events update the toast in place so a long check-in reads as
+ * a sequence of requests instead of a spinner with no detail.
+ */
+function followRun(
+  runId: number,
+  toastId: number,
+  onDisconnect: () => void,
+): {
+  socket: WebSocket;
+  terminal: Promise<"succeeded" | "failed" | "cancelled" | "disconnected">;
+} {
+  const socket = new WebSocket(websocketPath(`/api/v1/runs/${runId}/steps/live`));
+  const liveSteps = new Map<number, RunStep>();
+  let resolveTerminal: (
+    status: "succeeded" | "failed" | "cancelled" | "disconnected",
+  ) => void = () => {};
+  let settled = false;
+  const terminal = new Promise<"succeeded" | "failed" | "cancelled" | "disconnected">(
+    (resolve) => {
+      resolveTerminal = resolve;
+    },
+  );
+  const finish = (status: "succeeded" | "failed" | "cancelled" | "disconnected") => {
+    if (settled) return;
+    settled = true;
+    resolveTerminal(status);
+    socket.close();
+  };
+  const publishSteps = () => {
+    const steps = [...liveSteps.values()].sort((a, b) => a.step_index - b.step_index);
+    updateToast(toastId, {
+      liveSteps: steps,
+      meta: steps.length ? toastStepMeta(steps) : t("runPreparing"),
+    });
+  };
+  socket.addEventListener("message", (message) => {
+    let event: LiveRunEvent;
+    try {
+      event = JSON.parse(String(message.data)) as LiveRunEvent;
+    } catch {
+      return;
+    }
+    if (event.type === "snapshot") {
+      for (const step of event.steps) {
+        const previous = liveSteps.get(step.step_index);
+        // Snapshots contain completed rows. Keep any live `running` placeholder
+        // already shown while replacing an older completed row as usual.
+        if (!previous || previous.status === "running") {
+          liveSteps.set(step.step_index, step);
+        }
+      }
+      publishSteps();
+      return;
+    }
+    if (event.type === "step") {
+      const previous = liveSteps.get(event.step.step_index);
+      // The `running` frame is not persisted and can arrive before the
+      // snapshot on a reconnect; never let it downgrade a terminal row.
+      if (!(event.step.status === "running" && previous && previous.status !== "running")) {
+        liveSteps.set(event.step.step_index, event.step);
+      }
+      publishSteps();
+      return;
+    }
+    if (event.type === "status" && TERMINAL_RUN_STATUSES.includes(event.status)) {
+      finish(event.status as "succeeded" | "failed" | "cancelled");
+    }
+  });
+  // A close is also how the server ends a stream after a terminal status, so
+  // it only releases the race; the error handler owns the visible warning.
+  socket.addEventListener("close", () => finish("disconnected"));
+  socket.addEventListener("error", () => {
+    if (settled) return;
+    onDisconnect();
+    finish("disconnected");
+  });
+  return { socket, terminal };
+}
+
 async function runNow(task: Task) {
   // Keep a pending toast open and fill it with the result once the run settles.
   const toastId = notify(t("runNowRunning"), "pending", {
     title: task.name,
+    meta: t("runPreparing"),
+    liveSteps: [],
     persistent: true,
   });
+  let live: ReturnType<typeof followRun> | null = null;
   try {
     const queued = await api.runTask(task.id);
-    const run = await waitForRun(task.id, queued.id);
+    live = followRun(queued.id, toastId, () => {
+      updateToast(toastId, { meta: t("runLiveUnavailable") });
+    });
+    // Wait for the first terminal signal. Then fetch the run list once: the row
+    // carries the status/HTTP summary and the socket's step frames carry the
+    // timeline. Starting a second polling loop here doubled every task-runs
+    // request on the normal websocket path.
+    const terminal = await Promise.race([
+      live.terminal,
+      waitForRun(task.id, queued.id).then((run) => run?.status ?? "disconnected"),
+    ]);
+    let run = (await api.taskRuns(task.id)).find((item) => item.id === queued.id) ?? null;
+    // The websocket terminal frame can beat the database row briefly. Poll only
+    // that narrow case; the normal path performs exactly one follow-up read.
+    if (terminal !== "disconnected" && (run == null || !TERMINAL_RUN_STATUSES.includes(run.status))) {
+      run = await waitForRun(task.id, queued.id);
+    }
     if (!run) {
       updateToast(toastId, { message: t("runNowTimeout"), taskId: task.id, persistent: false });
       return;
     }
     let steps: RunStep[] = [];
     try { steps = await api.runSteps(run.id); } catch { steps = []; }
-    const done = steps.filter((s) => s.status === "succeeded").length;
     const meta = [
       run.http_status != null ? `HTTP ${run.http_status}` : "",
-      steps.length ? fmt("runStepsCount", { done, total: steps.length }) : "",
+      steps.length ? toastStepMeta(steps) : "",
     ].filter(Boolean).join(" · ");
     const log = runLogText(run);
     updateToast(toastId, {
@@ -552,6 +668,7 @@ async function runNow(task: Task) {
       message: run.status === "succeeded" ? t("runNowSucceeded") : runStatusLabel(run.status),
       meta: meta || undefined,
       detail: log && log !== "–" ? log : undefined,
+      liveSteps: steps,
       taskId: task.id,
       persistent: false,
     });
@@ -563,6 +680,8 @@ async function runNow(task: Task) {
       message: cause instanceof Error ? cause.message : t("genericError"),
       persistent: false,
     });
+  } finally {
+    live?.socket.close();
   }
 }
 async function removeTask(task: Task) {
@@ -598,14 +717,63 @@ async function loadTaskRuns(taskId: number) {
   try { runsByTask.value[taskId] = await api.taskRuns(taskId); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
+async function loadLatestFailureTrace(
+  taskId: number,
+  notifyOnError = false,
+): Promise<boolean> {
+  try {
+    failureTraceByTask.value[taskId] = (await api.latestFailureTrace(taskId)) ?? null;
+    return true;
+  } catch (cause) {
+    // The trace is a diagnostic convenience. A transient read failure must not
+    // hide the run history itself; the button stays disabled until the next load.
+    failureTraceByTask.value[taskId] = null;
+    // A background refresh stays quiet, but an explicit click must not look
+    // like "no failure exists" when the request itself failed.
+    if (notifyOnError) {
+      notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+    }
+    return false;
+  }
+}
 async function openRunHistory(task: Task) {
   runHistoryTask.value = task;
   view.value = "taskRuns";
-  await loadTaskRuns(task.id);
+  await Promise.all([loadTaskRuns(task.id), loadLatestFailureTrace(task.id)]);
 }
 function backToTasks() {
+  showFailureTrace.value = false;
   runHistoryTask.value = null;
   view.value = "tasks";
+}
+
+async function openFailureTrace() {
+  if (!runHistoryTask.value) return;
+  if (!latestFailureTrace.value) {
+    // Do not disable this button: browsers suppress title tooltips on disabled
+    // controls, so a grey icon with no explanation is worse than an empty-state
+    // response. Clicking still explains that this task has no retained failure.
+    notify(t("latestFailureLogEmpty"), "error");
+    return;
+  }
+  failureTraceLoading.value = true;
+  const loaded = await loadLatestFailureTrace(runHistoryTask.value.id, true);
+  failureTraceLoading.value = false;
+  if (latestFailureTrace.value) {
+    showFailureTrace.value = true;
+  } else if (loaded && failureTraceByTask.value[runHistoryTask.value.id] === null) {
+    notify(t("latestFailureLogEmpty"), "error");
+  }
+}
+async function copyFailureTrace() {
+  const trace = latestFailureTrace.value?.trace;
+  if (!trace) return;
+  try {
+    await navigator.clipboard.writeText(trace);
+    notify(t("traceCopied"));
+  } catch {
+    // The pre block remains selectable when clipboard access is unavailable.
+  }
 }
 /** "View run history" action on a run-result toast. */
 function openRunHistoryFromToast(toast: Toast) {
@@ -633,13 +801,21 @@ async function removeRun(run: Run) {
   if (!window.confirm(t("confirmDeleteRun"))) return;
   try {
     await api.deleteRun(run.id);
+    if (latestFailureTrace.value?.run_id === run.id && runHistoryTask.value) {
+      await loadLatestFailureTrace(runHistoryTask.value.id);
+    }
     await refreshRunViews();
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 /** Reload whichever run list is on screen; both the task-run page and the
  *  run-log panel cancel and delete runs. */
 async function refreshRunViews() {
-  if (view.value === "taskRuns" && runHistoryTask.value != null) await loadTaskRuns(runHistoryTask.value.id);
+  if (view.value === "taskRuns" && runHistoryTask.value != null) {
+    await Promise.all([
+      loadTaskRuns(runHistoryTask.value.id),
+      loadLatestFailureTrace(runHistoryTask.value.id),
+    ]);
+  }
   else if (showRunLog.value) await loadRunLog();
 }
 async function clearTaskRuns() {
@@ -648,6 +824,8 @@ async function clearTaskRuns() {
   if (!window.confirm(fmt("confirmClearRuns", { name: task.name }))) return;
   try {
     await api.deleteTaskRuns(task.id);
+    failureTraceByTask.value[task.id] = null;
+    showFailureTrace.value = false;
     await loadTaskRuns(task.id);
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
@@ -2883,6 +3061,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div class="toolbar">
             <span class="run-toolbar">
               <button class="icon-button" :title="t('refresh')" @click="runHistoryTask && loadTaskRuns(runHistoryTask.id)"><RefreshCw :size="18" /></button>
+              <button class="icon-button" type="button" :title="t('latestFailureLogHint')" :disabled="failureTraceLoading" @click="openFailureTrace"><FileText :size="18" /></button>
               <button class="icon-button" :title="t('clearRuns')" @click="clearTaskRuns"><Trash2 :size="18" /></button>
             </span>
           </div>
@@ -3778,6 +3957,28 @@ onUnmounted(() => window.clearInterval(refreshTimer));
       </div>
     </div>
 
+    <!-- ===== LATEST FAILURE TRACE ===== -->
+    <div v-if="showFailureTrace && latestFailureTrace" class="modal-backdrop modal-backdrop-wide" @click.self="showFailureTrace = false">
+      <div class="modal modal-trace">
+        <div class="modal-header">
+          <div>
+            <h2>{{ t('failureTraceTitle') }}</h2>
+            <p class="muted trace-hint">{{ t('failureTraceHint') }}</p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="showFailureTrace = false"><X :size="20" /></button>
+        </div>
+        <div class="trace-meta">
+          <span>{{ t('runId') }} #{{ latestFailureTrace.run_id }}</span>
+          <span>{{ formatRunTime(latestFailureTrace.finished_at ?? latestFailureTrace.created_at) }}</span>
+        </div>
+        <pre class="trace-body">{{ latestFailureTrace.trace }}</pre>
+        <div class="modal-actions">
+          <button class="secondary-button" type="button" @click="copyFailureTrace"><Copy :size="14" />{{ t('copyTrace') }}</button>
+          <button class="secondary-button" type="button" @click="showFailureTrace = false">{{ t('close') }}</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ===== CHECK-IN DAY MODAL ===== -->
     <!-- The calendar square the reader clicked, opened as the run log scoped to
          that one day. Same columns, same wording: a day of check-ins is a list
@@ -3901,6 +4102,15 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <strong v-if="toast.title" class="toast-title">{{ toast.title }}</strong>
           <span>{{ toast.message }}</span>
           <span v-if="toast.meta" class="toast-meta">{{ toast.meta }}</span>
+          <ol v-if="toast.liveSteps?.length" class="toast-steps">
+            <li v-for="step in toast.liveSteps" :key="step.step_index" :class="step.status">
+              <Loader2 v-if="step.status === 'running'" :size="13" class="toast-spin" />
+              <CheckCircle2 v-else-if="step.status === 'succeeded'" :size="13" />
+              <XCircle v-else :size="13" />
+              <span class="toast-step-name">{{ step.name }}</span>
+              <span v-if="step.http_status != null" class="toast-step-code">HTTP {{ step.http_status }}</span>
+            </li>
+          </ol>
           <pre v-if="toast.detail" class="toast-detail">{{ toast.detail }}</pre>
           <button v-if="toast.taskId != null" class="text-button toast-action" @click="openRunHistoryFromToast(toast)">{{ t('viewRunHistory') }}</button>
         </div>

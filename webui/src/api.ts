@@ -17,6 +17,12 @@ export type RunStep = {
   started_at: number;
   finished_at: number;
 };
+export interface LatestFailureTrace {
+  run_id: number;
+  created_at: number;
+  finished_at: number | null;
+  trace: string;
+}
 export type User = components["schemas"]["User"];
 export type Template = components["schemas"]["Template"];
 export type Plugin = components["schemas"]["Plugin"];
@@ -117,14 +123,19 @@ export interface AppMeta {
   default_locale: string;
 }
 
-/** Live run-step WebSocket event */
-export interface LiveRunEvent {
-  run_id: number;
-  type: string;
-  status?: string | null;
-  step?: RunStep | null;
-  error?: string | null;
-}
+/** One frame from the live run-step WebSocket. The opening `snapshot` frame
+ *  carries the already-persisted steps; later `step` and `status` frames
+ *  describe what is happening now. */
+export type LiveRunEvent =
+  | { type: "snapshot"; run_id: number; steps: RunStep[] }
+  | { type: "step"; run_id: number; status?: string | null; step: RunStep }
+  | {
+      type: "status";
+      run_id: number;
+      status: string;
+      step?: null;
+      error?: string | null;
+    };
 
 function csrfToken(): string | undefined {
   return document.cookie.split("; ").find((value) => value.startsWith("qd_csrf="))?.split("=")[1];
@@ -172,6 +183,13 @@ export function apiPath(path: string, prefix: string = detectUrlPrefix()): strin
     return path;
   }
   return prefix + path;
+}
+
+/** Absolute WebSocket URL for an API path under the current reverse-proxy
+ *  prefix. The browser's http(s) origin supplies the matching ws(s) scheme. */
+export function websocketPath(path: string): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${apiPath(path)}`;
 }
 
 /** Full (already reverse-proxy-prefixed) URL the browser should be sent to in
@@ -384,6 +402,8 @@ export const api = {
   runTask: (id: number) => request<Run>(`/api/v1/tasks/${id}/run`, { method: "POST" }),
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
+  latestFailureTrace: (id: number) =>
+    request<LatestFailureTrace | undefined>(`/api/v1/tasks/${id}/latest-failure-trace`),
   /** Aggregated log: runs across every task the caller owns, newest first. */
   runs: async (filter: { status?: string; taskId?: number; from?: number; to?: number; beforeId?: number; limit?: number } = {}) => {
     const params = new URLSearchParams();

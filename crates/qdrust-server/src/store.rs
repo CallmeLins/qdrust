@@ -1416,6 +1416,34 @@ macro_rules! define_store {
         Ok(())
     }
 
+    /// Store the full failure trace only on this task's newest failed run.
+    /// Older full traces are cleared in the same transaction; their short
+    /// `error` text remains, so the aggregate log keeps one row per failure
+    /// without accumulating large diagnostic blobs.
+    pub async fn record_latest_failed_run_trace(
+        &self,
+        task_id: i64,
+        run_id: i64,
+        trace: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE runs SET failure_trace=NULL WHERE task_id=? AND id<>?",
+        )
+        .bind(task_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE runs SET failure_trace=? WHERE id=? AND task_id=?")
+            .bind(trace)
+            .bind(run_id)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Delete a single run (run_steps cascade via FK).
     pub async fn delete_run(&self, run_id: i64) -> Result<bool> {
         Ok(sqlx::query("DELETE FROM runs WHERE id=?")
@@ -1532,6 +1560,28 @@ macro_rules! define_store {
             return Ok(None);
         }
         Ok(Some(self.list_task_runs(task_id).await?))
+    }
+
+    /// The newest failed run of a task that still carries a full trace.
+    /// Returns `None` both when the task has no owner match and when every
+    /// failure trace has aged out or been cleared.
+    pub async fn latest_failed_run_trace_for_owner(
+        &self,
+        task_id: i64,
+        owner_id: i64,
+    ) -> Result<Option<Run>> {
+        if self.get_for_owner(task_id, owner_id).await?.is_none() {
+            return Ok(None);
+        }
+        let row = sqlx::query(&format!(
+            "{RUN_FIELDS_WITH_TRACE} WHERE task_id=? AND status='failed' \
+             AND failure_trace IS NOT NULL \
+             ORDER BY id DESC LIMIT 1"
+        ))
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(run_from_row).transpose()
     }
 
     /// Runs across every task the owner has, newest first, for the aggregated
@@ -3265,10 +3315,14 @@ const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_a
 // `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
 // them as well). Every other reference to this column in the file must be
 // quoted the same way or MySQL deployments fail with a 1064 syntax error.
-const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
+const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,NULL AS failure_trace,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
+/// The same shape as [`RUN_FIELDS`], plus the diagnostic blob. Only the
+/// dedicated failure-trace query selects it; list and aggregate reads keep it
+/// out of memory and off the wire.
+const RUN_FIELDS_WITH_TRACE: &str = "SELECT id,task_id,status,http_status,error,log,failure_trace,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
 /// `RUN_FIELDS` with every column qualified by the `r` alias, for the queries
 /// that join `tasks` (a bare `id` is ambiguous against `tasks.id`).
-const RUN_FIELDS_QUALIFIED: &str = "SELECT r.id,r.task_id,r.status,r.http_status,r.error,r.log,r.started_at,r.finished_at,r.created_at,r.lease_owner,r.lease_expires_at,r.attempt,r.cancel_requested,r.run_after,r.retry_of,r.`trigger` FROM runs r JOIN tasks t ON t.id=r.task_id";
+const RUN_FIELDS_QUALIFIED: &str = "SELECT r.id,r.task_id,r.status,r.http_status,r.error,r.log,NULL AS failure_trace,r.started_at,r.finished_at,r.created_at,r.lease_owner,r.lease_expires_at,r.attempt,r.cancel_requested,r.run_after,r.retry_of,r.`trigger` FROM runs r JOIN tasks t ON t.id=r.task_id";
 const USER_FIELDS: &str = "SELECT id,username,role,disabled,email,email_verified,created_at,updated_at FROM users";
 
 fn user_from_row(row: &$row) -> Result<User> {
@@ -3470,6 +3524,7 @@ fn run_from_row(row: $row) -> Result<Run> {
         http_status: row.try_get("http_status")?,
         error: row.try_get("error")?,
         log: row.try_get("log")?,
+        failure_trace: row.try_get("failure_trace")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         created_at: row.try_get("created_at")?,
@@ -3746,6 +3801,7 @@ impl Store {
         pub async fn recover_expired_runs() -> Result<u64> {  };
         pub async fn finish_run(run_id: i64, http_status: Option<u16>, error: Option<&str>) -> Result<()> { run_id, http_status, error };
         pub async fn record_run_log(run_id: i64, log: &str) -> Result<()> { run_id, log };
+        pub async fn record_latest_failed_run_trace(task_id: i64, run_id: i64, trace: &str) -> Result<()> { task_id, run_id, trace };
         pub async fn delete_run(run_id: i64) -> Result<bool> { run_id };
         pub async fn delete_runs_for_owner(owner_id: i64) -> Result<u64> { owner_id };
         pub async fn delete_all_runs() -> Result<u64> {  };
@@ -3756,6 +3812,7 @@ impl Store {
         pub async fn get_run(id: i64) -> Result<Option<Run>> { id };
         pub async fn list_task_runs(task_id: i64) -> Result<Vec<Run>> { task_id };
         pub async fn list_task_runs_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Vec<Run>>> { task_id, owner_id };
+        pub async fn latest_failed_run_trace_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Run>> { task_id, owner_id };
         pub async fn search_runs_for_owner(owner_id: i64, filter: &RunFilter) -> Result<Vec<Run>> { owner_id, filter };
         pub async fn run_calendar_for_owner(owner_id: i64, from: i64, to: i64, tz: chrono_tz::Tz) -> Result<Vec<RunCalendarDay>> { owner_id, from, to, tz };
         pub async fn create_notification_channel(owner_id: i64, input: CreateNotificationChannel) -> Result<NotificationChannel> { owner_id, input };
@@ -5128,6 +5185,76 @@ mod tests {
             .unwrap();
         assert_eq!(steps[0].http_status, Some(200));
         assert_eq!(steps[0].body_size, 12);
+    }
+
+    #[tokio::test]
+    async fn keeps_only_the_latest_failure_trace_per_task() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("trace_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("trace_bob", &password_hash, "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("trace task"))
+            .await
+            .unwrap();
+        let first = store.start_run(task.id).await.unwrap();
+        store
+            .record_run(task.id, None, Some("first failed"))
+            .await
+            .unwrap();
+        store.finish_run(first.id, None, Some("first failed")).await.unwrap();
+        store
+            .record_latest_failed_run_trace(task.id, first.id, "first trace")
+            .await
+            .unwrap();
+        let second = store.start_run(task.id).await.unwrap();
+        store
+            .record_run(task.id, None, Some("second failed"))
+            .await
+            .unwrap();
+        store
+            .finish_run(second.id, None, Some("second failed"))
+            .await
+            .unwrap();
+        store
+            .record_latest_failed_run_trace(task.id, second.id, "second trace")
+            .await
+            .unwrap();
+
+        let latest = store
+            .latest_failed_run_trace_for_owner(task.id, alice.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.id, second.id);
+        assert_eq!(latest.failure_trace.as_deref(), Some("second trace"));
+        assert_eq!(latest.log, None);
+        assert_eq!(
+            store
+                .get_run(first.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .failure_trace,
+            None
+        );
+        assert_eq!(
+            store.get_run(first.id).await.unwrap().unwrap().error.as_deref(),
+            Some("first failed")
+        );
+        assert!(
+            store
+                .latest_failed_run_trace_for_owner(task.id, bob.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

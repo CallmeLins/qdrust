@@ -3,19 +3,21 @@ use std::{collections::BTreeMap, str::FromStr, sync::Arc, time::Duration};
 use chrono::{TimeZone, Utc};
 use cron::Schedule;
 use qdrust_core::{
-    executor::{CancellationToken, ExecutionContext, ExecutorOptions, QdExecutor, StepResult},
+    executor::{
+        CancellationToken, ExecutionContext, ExecutionEvent, ExecutionObserver, ExecutionPhase,
+        ExecutorOptions, QdExecutor, StepResult,
+    },
     plugin::{
         NotepadSlot, NotepadStore, PLUGIN_API_VERSION, Plugin,
         PluginManifest as CorePluginManifest, SubprocessPlugin,
     },
     qd_har::{QdHar, QdProgram},
-    template::Step,
 };
 use qdrust_plugin_browser::{BrowserSessionManager, BrowserSessionPlugin};
 use rand::Rng;
 use reqwest::Method;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -225,6 +227,62 @@ pub(crate) struct RunPolicy {
     allow_invalid_certificates: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct RunObservation {
+    steps: Vec<RunStep>,
+    current: Option<(usize, i64)>,
+    trace: Vec<String>,
+}
+
+fn format_trace_step(event: &ExecutionEvent, started_at: i64, finished_at: i64) -> String {
+    let outcome = match (&event.error, event.status, event.body_size) {
+        (Some(error), status, _) => format!(
+            "failed{}: {}",
+            status.map(|value| format!(" (HTTP {value})")).unwrap_or_default(),
+            error
+        ),
+        (None, Some(status), size) => format!("HTTP {status} · {size} bytes · succeeded"),
+        (None, None, size) => format!("{size} bytes · succeeded"),
+    };
+    format!(
+        "step {}  {} {}\n        started:  {}\n        finished: {}\n        {}",
+        event.step_index + 1,
+        event.method,
+        event.url,
+        format_trace_time(started_at),
+        format_trace_time(finished_at),
+        outcome
+    )
+}
+
+fn format_trace_time(timestamp: i64) -> String {
+    Utc.timestamp_opt(timestamp, 0)
+        .single()
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+/// The failure trace is kept as plain text so it can be copied out of the
+/// dialog as-is. Cap it at 256 KiB; a run cannot generate more than 100 request
+/// steps by default, but the error context itself may quote a response.
+fn format_trace(steps: &[String], error: &str) -> String {
+    const MAX_TRACE_BYTES: usize = 256 * 1024;
+    let mut trace = if steps.is_empty() {
+        format!("No request step completed before the failure.\n\n{error}")
+    } else {
+        format!("{}\n\nerror:\n{error}", steps.join("\n\n"))
+    };
+    if trace.len() > MAX_TRACE_BYTES {
+        let mut boundary = MAX_TRACE_BYTES;
+        while !trace.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        trace.truncate(boundary);
+        trace.push_str("\n\n[trace truncated]");
+    }
+    trace
+}
+
 /// The policy a run executes under, assembled from the task and the shared
 /// runtime settings.
 ///
@@ -297,6 +355,107 @@ async fn execute_with_run(
     policy: RunPolicy,
     browser: Option<Arc<BrowserSessionManager>>,
 ) {
+    let (observer_tx, observer_rx) = mpsc::unbounded_channel::<ExecutionEvent>();
+    let observer: ExecutionObserver = {
+        let sender = observer_tx.clone();
+        Arc::new(move |event| {
+            let _ = sender.send(event);
+        })
+    };
+    let observer_store = store.clone();
+    let observer_events = run_events.clone();
+    let observer_run_id = run.id;
+    let observation = Arc::new(tokio::sync::Mutex::new(RunObservation::default()));
+    let observer_observation = observation.clone();
+    let observer_task = tokio::spawn(async move {
+        let mut rx = observer_rx;
+        while let Some(event) = rx.recv().await {
+            let mut transmission = None;
+            let record = match event.phase {
+                ExecutionPhase::Started => {
+                    let mut state = observer_observation.lock().await;
+                    state.current = Some((event.step_index, Utc::now().timestamp()));
+                    transmission = Some(Value::from(crate::api::RunEvent {
+                        run_id: observer_run_id,
+                        kind: "step",
+                        status: Some("running".into()),
+                        step: Some(serde_json::json!({
+                            "run_id": observer_run_id,
+                            "step_index": event.step_index,
+                            "name": truncate_name(
+                                &format!("{} {}", event.method, event.url),
+                                200,
+                            ),
+                            "status": "running",
+                            "http_status": Value::Null,
+                            "body_size": 0,
+                            "error": Value::Null,
+                            "started_at": Utc::now().timestamp(),
+                            "finished_at": Value::Null,
+                        })),
+                        error: None,
+                    }));
+                    None
+                }
+                ExecutionPhase::Finished => {
+                    let mut state = observer_observation.lock().await;
+                    let started_at = state
+                        .current
+                        .take()
+                        .filter(|(index, _)| *index == event.step_index)
+                        .map(|(_, at)| at)
+                        .unwrap_or_else(|| Utc::now().timestamp());
+                    let finished_at = Utc::now().timestamp();
+                    let Ok(step_index) = i64::try_from(event.step_index) else {
+                        continue;
+                    };
+                    let Ok(body_size) = i64::try_from(event.body_size) else {
+                        continue;
+                    };
+                    let record = RunStep {
+                        id: 0,
+                        run_id: observer_run_id,
+                        step_index,
+                        name: truncate_name(&format!("{} {}", event.method, event.url), 200),
+                        status: if event.error.is_some() {
+                            "failed".into()
+                        } else {
+                            "succeeded".into()
+                        },
+                        http_status: event.status.map(i64::from),
+                        body_size,
+                        error: event.error.clone(),
+                        started_at,
+                        finished_at,
+                    };
+                    state
+                        .trace
+                        .push(format_trace_step(&event, started_at, finished_at));
+                    Some(record)
+                }
+            };
+            if let Some(event) = transmission {
+                let _ = observer_events.send(event);
+            }
+            if let Some(record) = record
+                && observer_store.record_run_step(&record).await.is_ok()
+            {
+                observer_observation
+                    .lock()
+                    .await
+                    .steps
+                    .push(record.clone());
+                let _ = observer_events.send(Value::from(crate::api::RunEvent {
+                    run_id: observer_run_id,
+                    kind: "step",
+                    status: None,
+                    step: Some(serde_json::to_value(&record).unwrap_or_default()),
+                    error: None,
+                }));
+            }
+        }
+    });
+    let observation_for_outcome = observation.clone();
     let result = async {
         let variables = task_variables(&task);
         if let Some(template_id) = task.template_id {
@@ -314,45 +473,19 @@ async fn execute_with_run(
             // on the next execution without a restart.
             let plugins = load_plugins(&store, task.id, browser).await;
             let notepad = load_notepad(&store, task.id).await;
-            let outcome = execute_template(
+            let outcome = execute_template_with_observer(
                 template.clone(),
                 &cancellation,
                 &variables,
                 policy,
                 &plugins,
                 notepad,
+                Some(observer),
             )
             .await;
             supervisor.abort();
             let (steps, final_variables) = outcome?;
-            let now = Utc::now().timestamp();
-            let methods = template_request_methods(&template);
-            for (index, step) in steps.iter().enumerate() {
-                let name = match methods.get(index) {
-                    Some(method) => truncate_name(&format!("{method} {}", step.url), 200),
-                    None => format!("step-{}", index + 1),
-                };
-                let step_record = RunStep {
-                    id: 0,
-                    run_id: run.id,
-                    step_index: i64::try_from(index)?,
-                    name,
-                    status: "succeeded".into(),
-                    http_status: Some(i64::from(step.status)),
-                    body_size: i64::try_from(step.body_size)?,
-                    error: None,
-                    started_at: now,
-                    finished_at: now,
-                };
-                store.record_run_step(&step_record).await?;
-                let _ = run_events.send(Value::from(crate::api::RunEvent {
-                    run_id: run.id,
-                    kind: "step",
-                    status: None,
-                    step: Some(serde_json::to_value(&step_record).unwrap_or_default()),
-                    error: None,
-                }));
-            }
+            let _ = steps;
             // QD-style log line: the last extraction usually binds __log__ with
             // the human-readable summary ("...签到：获得N积分...").
             let log_message = final_variables
@@ -371,6 +504,17 @@ async fn execute_with_run(
         ))
     }
     .await;
+    drop(observer_tx);
+    if let Err(err) = observer_task.await {
+        warn!(run_id = run.id, %err, "run observer stopped unexpectedly");
+    }
+    let observation = {
+        let state = observation_for_outcome.lock().await;
+        state.clone()
+    };
+    // The observer has already drained by this point, so the persisted steps
+    // are available to the success branch as well. They are kept as `run_steps`
+    // (the run-history timeline), while the full trace is failure-only.
     match result {
         Ok((status, log_message)) => {
             info!(task_id = task.id, status, "task completed");
@@ -423,21 +567,30 @@ async fn execute_with_run(
             // is what they paste back to the issue.
             error!(task_id = task.id, err = format!("{err:#}"), "task failed");
             let now = Utc::now().timestamp();
-            let _ = store
-                .record_run_step(&RunStep {
-                    id: 0,
-                    run_id: run.id,
-                    step_index: 0,
-                    name: "execution".into(),
-                    status: "failed".into(),
-                    http_status: None,
-                    body_size: 0,
-                    error: Some(message.clone()),
-                    started_at: now,
-                    finished_at: now,
-                })
-                .await;
+            if observation.steps.is_empty() {
+                let _ = store
+                    .record_run_step(&RunStep {
+                        id: 0,
+                        run_id: run.id,
+                        step_index: 0,
+                        name: "execution".into(),
+                        status: "failed".into(),
+                        http_status: None,
+                        body_size: 0,
+                        error: Some(message.clone()),
+                        started_at: now,
+                        finished_at: now,
+                    })
+                    .await;
+            }
             let _ = store.record_run(task.id, None, Some(&message)).await;
+            let trace = format_trace(&observation.trace, &message);
+            // Commit the diagnostic payload before exposing `failed` to the
+            // WebSocket/UI. A reader who sees the terminal status can then open
+            // the trace without racing this write.
+            let _ = store
+                .record_latest_failed_run_trace(task.id, run.id, &trace)
+                .await;
             let _ = store.finish_run(run.id, None, Some(&message)).await;
             let _ = run_events.send(Value::from(crate::api::RunEvent {
                 run_id: run.id,
@@ -638,44 +791,6 @@ fn spawn_run_supervisor(
     })
 }
 
-/// Best-effort per-step HTTP method hints derived from the template source.
-/// QD HAR / native steps execute in source order for straight-line programs;
-/// loop bodies execute more times than they appear, so the caller falls back to
-/// `step-N` when the hint list is exhausted. Display metadata only.
-fn template_request_methods(template: &Template) -> Vec<String> {
-    let mut methods = Vec::new();
-    if template.source_format == "qd_har" {
-        if let Some(har) = template.qd_har.as_ref()
-            && let Ok(har) = QdHar::parse(har.clone())
-        {
-            for entry in har.entries() {
-                if entry.checked && entry.control().is_none() {
-                    methods.push(entry.request.method.clone());
-                }
-            }
-        }
-    } else if let Some(definition) = template.definition.as_ref() {
-        collect_native_methods(&definition.steps, &mut methods);
-    }
-    methods
-}
-
-fn collect_native_methods(steps: &[Step], methods: &mut Vec<String>) {
-    for step in steps {
-        match step {
-            Step::Request(request) => methods.push(request.method.clone()),
-            Step::If {
-                then, otherwise, ..
-            } => {
-                collect_native_methods(then, methods);
-                collect_native_methods(otherwise, methods);
-            }
-            Step::ForEach { steps, .. } => collect_native_methods(steps, methods),
-            Step::Extract(_) | Step::Delay { .. } => {}
-        }
-    }
-}
-
 fn truncate_name(name: &str, max: usize) -> String {
     let mut bounded: String = name.chars().take(max).collect();
     if name.chars().count() > max {
@@ -867,6 +982,28 @@ pub(crate) async fn execute_template(
     plugins: &[Arc<dyn Plugin>],
     notepad: Option<Arc<dyn NotepadStore>>,
 ) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
+    execute_template_with_observer(
+        template,
+        cancellation,
+        variables,
+        policy,
+        plugins,
+        notepad,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_template_with_observer(
+    template: Template,
+    cancellation: &CancellationToken,
+    variables: &BTreeMap<String, Value>,
+    policy: RunPolicy,
+    plugins: &[Arc<dyn Plugin>],
+    notepad: Option<Arc<dyn NotepadStore>>,
+    observer: Option<ExecutionObserver>,
+) -> anyhow::Result<(Vec<StepResult>, BTreeMap<String, Value>)> {
     // The one place a run's executor is built, so a policy knob cannot be
     // honoured on one path (a QD template) and quietly ignored on the other
     // (a plain request). Everything except the timeout and ADR-0008's two
@@ -878,6 +1015,9 @@ pub(crate) async fn execute_template(
         notepad,
         ..ExecutorOptions::default()
     })?;
+    if let Some(observer) = observer {
+        executor.set_observer(observer);
+    }
     for plugin in plugins {
         let plugin_id = plugin.manifest().id.clone();
         if let Err(err) = executor.register_plugin(plugin.clone()) {

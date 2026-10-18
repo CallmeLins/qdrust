@@ -579,6 +579,12 @@ pub struct Run {
     /// execution (empty for plain tasks and failed runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Full diagnostic trace retained for this task's newest failed run.
+    ///
+    /// Deliberately absent from list responses: the run table has a short
+    /// error/log column, and the trace is fetched only when its dialog opens.
+    #[serde(skip_serializing)]
+    pub failure_trace: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub created_at: i64,

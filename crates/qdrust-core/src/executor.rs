@@ -185,6 +185,31 @@ pub struct StepResult {
     pub body_size: usize,
 }
 
+/// A live view of one request during a template run.
+///
+/// Request steps are the only steps with network latency, and the only ones a
+/// user waiting on a toast can watch progress against. `Finished` is emitted
+/// for both success and failure so a failed run still carries the steps that
+/// completed before it stopped.
+#[derive(Clone, Debug)]
+pub struct ExecutionEvent {
+    pub step_index: usize,
+    pub method: String,
+    pub url: String,
+    pub phase: ExecutionPhase,
+    pub status: Option<u16>,
+    pub body_size: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionPhase {
+    Started,
+    Finished,
+}
+
+pub type ExecutionObserver = Arc<dyn Fn(ExecutionEvent) + Send + Sync>;
+
 pub struct QdExecutor {
     cookies: Arc<Jar>,
     /// Everything the SSRF guard reads, in one place. Held as the policy rather
@@ -199,6 +224,8 @@ pub struct QdExecutor {
     plugin_timeout: Duration,
     request_limit: usize,
     loop_limit: usize,
+    observer: Option<ExecutionObserver>,
+    next_step_index: std::sync::atomic::AtomicUsize,
 }
 
 impl QdExecutor {
@@ -231,7 +258,19 @@ impl QdExecutor {
             plugin_timeout: options.plugin_timeout,
             request_limit: options.request_limit,
             loop_limit: options.loop_limit,
+            observer: None,
+            next_step_index: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Report request progress to a caller-owned sink.
+    ///
+    /// The callback is deliberately synchronous: the executor must not acquire
+    /// a database handle, and a run's observer (the scheduler) only forwards to
+    /// an unbounded channel. Keeping it on the executor means both QD HAR and
+    /// native templates emit the same events.
+    pub fn set_observer(&mut self, observer: ExecutionObserver) {
+        self.observer = Some(observer);
     }
 
     /// Wire a plugin into this executor. Templates reach it through
@@ -498,8 +537,65 @@ impl QdExecutor {
         entry: &QdHarEntry,
         context: &mut ExecutionContext,
     ) -> Result<StepResult> {
+        let step_index = self
+            .next_step_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let observed_method = entry.request.method.clone();
+        let observed_url = self
+            .render(&entry.request.url, context)
+            .unwrap_or_else(|_| entry.request.url.clone());
+        self.emit(ExecutionEvent {
+            step_index,
+            method: observed_method.clone(),
+            url: observed_url.clone(),
+            phase: ExecutionPhase::Started,
+            status: None,
+            body_size: 0,
+            error: None,
+        });
+        let result = self
+            .execute_request_inner(entry, context)
+            .await
+            .map_err(|err| {
+                self.emit(ExecutionEvent {
+                    step_index,
+                    method: observed_method.clone(),
+                    url: observed_url.clone(),
+                    phase: ExecutionPhase::Finished,
+                    status: context.last_status,
+                    body_size: 0,
+                    error: Some(format!("{err:#}")),
+                });
+                err
+            })?;
+        self.emit(ExecutionEvent {
+            step_index,
+            method: observed_method,
+            url: result.url.clone(),
+            phase: ExecutionPhase::Finished,
+            status: Some(result.status),
+            body_size: result.body_size,
+            error: None,
+        });
+        Ok(result)
+    }
+
+    fn emit(&self, event: ExecutionEvent) {
+        if let Some(observer) = self.observer.as_ref() {
+            observer(event);
+        }
+    }
+
+    async fn execute_request_inner(
+        &self,
+        entry: &QdHarEntry,
+        context: &mut ExecutionContext,
+    ) -> Result<StepResult> {
         ensure!(context.remaining_requests > 0, "request limit exceeded");
         context.remaining_requests -= 1;
+        // A request that never receives a response must not inherit the prior
+        // step's status in mutation observers or failure traces.
+        context.last_status = None;
 
         let method = self.render(&entry.request.method, context)?;
         let url = self.render(&entry.request.url, context)?;
@@ -2673,6 +2769,40 @@ mod tests {
         assert!(results[1].url.ends_with("token=abc123"));
         assert_eq!(context.variables.get("token"), Some(&json!("abc123")));
         assert_eq!(context.remaining_requests, DEFAULT_REQUEST_LIMIT - 2);
+    }
+
+    #[tokio::test]
+    async fn reports_start_and_finish_events_for_requests() {
+        let app = Router::new().route("/ok", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/ok")}
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let mut executor = local_executor();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        executor.set_observer(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        }));
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        executor.execute(&program, &mut context).await.unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].phase, ExecutionPhase::Started);
+        assert_eq!(events[0].step_index, 0);
+        assert_eq!(events[0].method, "GET");
+        assert_eq!(events[1].phase, ExecutionPhase::Finished);
+        assert_eq!(events[1].status, Some(200));
+        assert_eq!(events[1].body_size, 2);
+        assert!(events[1].error.is_none());
     }
 
     #[tokio::test]

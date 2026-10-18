@@ -297,6 +297,10 @@ pub fn router_with_auth(
             "/api/v1/tasks/{id}/runs",
             get(list_task_runs).delete(delete_task_runs),
         )
+        .route(
+            "/api/v1/tasks/{id}/latest-failure-trace",
+            get(latest_failure_trace),
+        )
         .route("/api/v1/tasks/{id}/run", axum::routing::post(run_task))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
@@ -1588,6 +1592,32 @@ async fn list_task_runs(
         return Err(ApiError::NotFound("task_not_found", "Task not found"));
     };
     Ok(Json(json!(runs)))
+}
+
+async fn latest_failure_trace(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    let Some(run) = store
+        .latest_failed_run_trace_for_owner(id, session.user.id)
+        .await?
+    else {
+        // Distinguish an absent task from a task that merely has no retained
+        // trace: the first is a 404, the second is a normal empty state.
+        if store.get_for_owner(id, session.user.id).await?.is_none() {
+            return Err(ApiError::NotFound("task_not_found", "Task not found"));
+        }
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    Ok(Json(json!({
+        "run_id": run.id,
+        "created_at": run.created_at,
+        "finished_at": run.finished_at,
+        "trace": run.failure_trace.as_deref().unwrap_or_default(),
+    }))
+    .into_response())
 }
 
 /// The aggregated run log's query string.
@@ -4796,6 +4826,11 @@ mod tests {
         assert!(document["paths"]["/api/v1/runs"]["get"].is_object());
         // The tasks page draws its check-in calendar from here.
         assert!(document["paths"]["/api/v1/runs/calendar"]["get"].is_object());
+        // The per-task run-history toolbar reads the one retained failure
+        // trace through this route; the aggregate log deliberately does not.
+        assert!(
+            document["paths"]["/api/v1/tasks/{id}/latest-failure-trace"]["get"].is_object()
+        );
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());
@@ -6622,6 +6657,78 @@ mod tests {
         assert_eq!(run_ids(&all).len(), 6, "{all}");
         assert_eq!(all["has_more"], json!(false), "{all}");
         assert_eq!(all["next_cursor"], Value::Null, "{all}");
+    }
+
+    #[tokio::test]
+    async fn latest_failure_trace_is_owner_scoped_and_absent_after_success_only() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let owner_cookie = test_auth_cookie(&app).await;
+        let stranger_cookie = register_cookie(&app, "trace_stranger").await;
+        let owner = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "route_admin")
+            .expect("bootstrap created the owner");
+        let task = store
+            .create_for_owner(owner.id, seeded_task("trace-logs"))
+            .await
+            .unwrap();
+
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/tasks/{}/latest-failure-trace", task.id))
+                    .header(COOKIE, &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::NO_CONTENT);
+
+        let run = store.start_run(task.id).await.unwrap();
+        store
+            .record_latest_failed_run_trace(task.id, run.id, "step 1 failed")
+            .await
+            .unwrap();
+        store
+            .finish_run(run.id, None, Some("failed"))
+            .await
+            .unwrap();
+
+        let trace = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/tasks/{}/latest-failure-trace", task.id))
+                    .header(COOKIE, &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trace.status(), StatusCode::OK);
+        let body = to_bytes(trace.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["run_id"], run.id);
+        assert_eq!(body["trace"], "step 1 failed");
+
+        let hidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/tasks/{}/latest-failure-trace", task.id))
+                    .header(COOKIE, stranger_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
     }
 
     /// The calendar endpoint buckets the same rows by day and reports failures,
