@@ -42,6 +42,16 @@
   --interactive-hover-opacity: 0.04;
   --interactive-active-opacity: 0.06;
 
+  /* Check-in calendar: five greens for the shades, plus the failure red. Fixed
+     per theme rather than derived — a green that reads as "more" at 4% opacity
+     is invisible, and GitHub's palette is the one people already read. */
+  --calendar-empty: #ebedf0;
+  --calendar-1: #9be9a8;
+  --calendar-2: #40c463;
+  --calendar-3: #30a14e;
+  --calendar-4: #216e39;
+  --calendar-failed: #d1242f;
+
   /* aliases consumed by components and HarEditor scoped styles */
   --bg: rgb(var(--page-surface));
   --bg-raise: #ffffff;
@@ -108,6 +118,15 @@
   --interactive-surface: 255 255 255;
   --interactive-hover-opacity: 0.06;
   --interactive-active-opacity: 0.1;
+
+  /* GitHub's dark greens; the empty square sits just above the card surface so
+     a whole quiet year still reads as a grid rather than as nothing. */
+  --calendar-empty: #262626;
+  --calendar-1: #0e4429;
+  --calendar-2: #006d32;
+  --calendar-3: #26a641;
+  --calendar-4: #39d353;
+  --calendar-failed: #f85149;
 
   --bg: rgb(var(--page-surface));
   --bg-raise: #202020;
@@ -389,6 +408,55 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -0.2px; color: var(--ink); }
 .stats strong { margin: 10px 0 10px; color: var(--ink); font-size: 32px; font-weight: 700; letter-spacing: -1px; font-variant-numeric: tabular-nums; }
 .stats small { color: var(--ink-3); display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .stats small.positive { color: var(--ok); }
+
+/* ---------- check-in calendar ---------- */
+/* One square per day, 53 week columns. The width is fixed and the card scrolls
+   horizontally below ~840px rather than shrinking the cells: a 6px square is
+   not clickable and a heatmap nobody can read is not a heatmap. */
+.run-calendar-card {
+  --calendar-cell: 12px;
+  margin: 32px 0; padding: 22px 26px;
+  border-radius: var(--r-l);
+  background-color: rgb(var(--card-surface));
+  border: 1px solid rgb(var(--card-border-rgb) / var(--card-border-opacity));
+  box-shadow: var(--card-shadow);
+}
+.run-calendar-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+.run-calendar-head .section-hint { margin: 6px 0 0; max-width: 62ch; }
+.run-calendar-legend { display: flex; align-items: center; gap: 16px; color: var(--ink-3); font-size: 12px; }
+.run-calendar-legend-failed, .run-calendar-scale { display: inline-flex; align-items: center; gap: 5px; }
+.run-calendar-scroll { margin-top: 18px; overflow-x: auto; padding-bottom: 4px; }
+.run-calendar-grid { display: flex; gap: 6px; width: max-content; }
+.run-calendar-weekdays {
+  display: grid; grid-template-rows: repeat(7, var(--calendar-cell)); gap: 3px;
+  margin-top: 18px; /* the month row above the columns */
+  color: var(--ink-3); font-size: 10px; line-height: var(--calendar-cell);
+}
+.run-calendar-weekdays span { white-space: nowrap; }
+.run-calendar-main { display: grid; gap: 5px; }
+.run-calendar-months { display: grid; gap: 3px; height: 13px; color: var(--ink-3); font-size: 10px; line-height: 1; }
+.run-calendar-months span { white-space: nowrap; }
+.run-calendar-weeks { display: flex; gap: 3px; }
+.run-calendar-week { display: grid; grid-template-rows: repeat(7, var(--calendar-cell)); gap: 3px; }
+/* `inline-block` because the legend reuses this class on an `<i>`: width and
+   height do not apply to an inline element, so the swatches would vanish. */
+.run-calendar-cell {
+  display: inline-block; vertical-align: middle;
+  width: var(--calendar-cell); height: var(--calendar-cell);
+  padding: 0; border: 0; border-radius: 2px;
+  background-color: var(--calendar-empty);
+}
+.run-calendar-cell[data-level="1"] { background-color: var(--calendar-1); }
+.run-calendar-cell[data-level="2"] { background-color: var(--calendar-2); }
+.run-calendar-cell[data-level="3"] { background-color: var(--calendar-3); }
+.run-calendar-cell[data-level="4"] { background-color: var(--calendar-4); }
+.run-calendar-cell.is-failed { background-color: var(--calendar-failed); }
+.run-calendar-cell.is-empty { background-color: transparent; }
+.run-calendar-cell:not(.is-empty):hover { outline: 1px solid var(--ink-2); outline-offset: 1px; }
+.run-calendar-cell:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+/* The "first 200" note closes the day dialog below the table, so it needs the
+   dialog's own gutter — `.run-log-hint` only carries the top margin. */
+.calendar-day-note { padding: 8px 18px 12px; }
 
 .task-section { border-top: 1px solid var(--line); }
 .task-section > h2 { margin: 30px 0 14px; color: var(--ink); font-size: 15px; letter-spacing: 0.2px; }
@@ -1175,6 +1243,11 @@ code {
   .stats { grid-template-columns: repeat(2, 1fr); }
   .stats > div { min-height: 92px; }
   .stats > div + div { border-top: 1px solid var(--line); border-left: 0; }
+  /* The calendar keeps its 12px squares and scrolls instead of shrinking: a
+     year of weeks does not fit a phone, and 6px squares are not tappable. */
+  .run-calendar-card { padding: 18px 16px; }
+  .run-calendar-head { gap: 12px; }
+  .run-calendar-legend { gap: 12px; }
   .page-heading { align-items: flex-start; }
   .form-row { grid-template-columns: 1fr; }
   .form-row-4 { grid-template-columns: 1fr 1fr; }

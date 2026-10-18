@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use sqlx::{
     Column, MySql, MySqlPool, Row, Sqlite, SqlitePool,
     mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow},
@@ -21,8 +21,8 @@ use crate::model::{
     CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity,
     ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken,
     IssuedSession, NotificationAction, NotificationChannel, NotificationDefaultTemplate,
-    NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run, RunStep,
-    SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
+    NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run, RunCalendarDay,
+    RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
     UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
     UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
 };
@@ -149,6 +149,11 @@ pub struct RunFilter {
     pub status: Option<String>,
     /// Restrict to one task.
     pub task_id: Option<i64>,
+    /// Lower bound on `created_at`, inclusive. Used by the WebUI's calendar:
+    /// clicking a day asks for that day's runs only.
+    pub from: Option<i64>,
+    /// Upper bound on `created_at`, exclusive.
+    pub to: Option<i64>,
     /// Keyset pagination: return only runs older than this run id.
     pub before_id: Option<i64>,
     /// Upper bound on returned rows, clamped to `1..=500`.
@@ -162,6 +167,8 @@ impl Default for RunFilter {
         Self {
             status: None,
             task_id: None,
+            from: None,
+            to: None,
             before_id: None,
             limit: 100,
         }
@@ -1543,6 +1550,12 @@ macro_rules! define_store {
         if filter.task_id.is_some() {
             sql.push_str(" AND r.task_id=?");
         }
+        if filter.from.is_some() {
+            sql.push_str(" AND r.created_at>=?");
+        }
+        if filter.to.is_some() {
+            sql.push_str(" AND r.created_at<?");
+        }
         if filter.before_id.is_some() {
             sql.push_str(" AND r.id<?");
         }
@@ -1555,12 +1568,74 @@ macro_rules! define_store {
         if let Some(task_id) = filter.task_id {
             query = query.bind(task_id);
         }
+        if let Some(from) = filter.from {
+            query = query.bind(from);
+        }
+        if let Some(to) = filter.to {
+            query = query.bind(to);
+        }
         if let Some(before_id) = filter.before_id {
             query = query.bind(before_id);
         }
         let limit = filter.limit.clamp(1, 500);
         let rows = query.bind(limit + 1).fetch_all(&self.pool).await?;
         rows.into_iter().map(run_from_row).collect()
+    }
+
+    /// Per-day run counts for the contribution-style calendar.
+    ///
+    /// The bucketing happens here rather than in SQL: `date(...,'unixepoch')`
+    /// is SQLite-only and `FROM_UNIXTIME` is MySQL-only, and one statement has
+    /// to serve both backends. A year of runs is two narrow columns over an
+    /// indexed range, so the round trip dominates anyway.
+    ///
+    /// `tz` is the reader's zone, not the task's: a check-in at 00:30 in UTC+8
+    /// belongs to their Tuesday, not to UTC's Monday. Tasks may each carry their
+    /// own zone, but this calendar is a single grid and has to pick one.
+    ///
+    /// Every run counts towards `total`, including queued ones — the number is
+    /// "how many attempts were recorded that day". Only `failed` is called out
+    /// separately, because that is what the grid paints red.
+    pub async fn run_calendar_for_owner(
+        &self,
+        owner_id: i64,
+        from: i64,
+        to: i64,
+        tz: chrono_tz::Tz,
+    ) -> Result<Vec<RunCalendarDay>> {
+        let rows = sqlx::query(
+            "SELECT r.created_at AS created_at, r.status AS status
+             FROM runs r JOIN tasks t ON t.id=r.task_id
+             WHERE t.owner_id=? AND r.created_at>=? AND r.created_at<?",
+        )
+        .bind(owner_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut days: BTreeMap<chrono::NaiveDate, (i64, i64)> = BTreeMap::new();
+        for row in rows {
+            let created_at: i64 = row.try_get("created_at")?;
+            let status: String = row.try_get("status")?;
+            let Some(local) = tz.timestamp_opt(created_at, 0).single() else {
+                continue;
+            };
+            let entry = days.entry(local.date_naive()).or_insert((0, 0));
+            entry.0 += 1;
+            if status == "failed" {
+                entry.1 += 1;
+            }
+        }
+
+        Ok(days
+            .into_iter()
+            .map(|(date, (total, failed))| RunCalendarDay {
+                date: date.format("%Y-%m-%d").to_string(),
+                total,
+                failed,
+            })
+            .collect())
     }
 
     pub async fn create_notification_channel(
@@ -3682,6 +3757,7 @@ impl Store {
         pub async fn list_task_runs(task_id: i64) -> Result<Vec<Run>> { task_id };
         pub async fn list_task_runs_for_owner(task_id: i64, owner_id: i64) -> Result<Option<Vec<Run>>> { task_id, owner_id };
         pub async fn search_runs_for_owner(owner_id: i64, filter: &RunFilter) -> Result<Vec<Run>> { owner_id, filter };
+        pub async fn run_calendar_for_owner(owner_id: i64, from: i64, to: i64, tz: chrono_tz::Tz) -> Result<Vec<RunCalendarDay>> { owner_id, from, to, tz };
         pub async fn create_notification_channel(owner_id: i64, input: CreateNotificationChannel) -> Result<NotificationChannel> { owner_id, input };
         pub async fn list_notification_channels(owner_id: i64) -> Result<Vec<NotificationChannel>> { owner_id };
         pub async fn get_notification_channel(id: i64, owner_id: i64) -> Result<Option<NotificationChannel>> { id, owner_id };
@@ -5183,6 +5259,93 @@ mod tests {
         // limit+1 rows are fetched so the caller can detect "has_more".
         assert_eq!(page.len(), 2);
         assert!(page.iter().all(|run| run.id < all[0].id));
+    }
+
+    /// The calendar groups by the *reader's* day, not by UTC: 00:30 in UTC+8 is
+    /// the 6th to them and still the 5th to a UTC reader, and the same rows have
+    /// to answer both questions.
+    #[tokio::test]
+    async fn run_calendar_buckets_by_the_readers_timezone() {
+        use chrono::TimeZone;
+
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("calendar_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("calendar_bob", &password_hash, "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("morning check-in"))
+            .await
+            .unwrap();
+        let other = store
+            .create_for_owner(bob.id, input("not alice's"))
+            .await
+            .unwrap();
+
+        // Three of alice's runs on one local day, one of bob's on the same
+        // instant: bob's must not count towards alice's squares.
+        let after_midnight = chrono_tz::Asia::Shanghai
+            .with_ymd_and_hms(2026, 1, 6, 0, 30, 0)
+            .unwrap()
+            .timestamp();
+        for (task_id, at, error) in [
+            (task.id, after_midnight, None),
+            (task.id, after_midnight + 6 * 3600, None),
+            (task.id, after_midnight + 8 * 3600, Some("boom")),
+            (other.id, after_midnight, Some("boom")),
+        ] {
+            let run = store.start_run(task_id).await.unwrap();
+            // `start_run` stamps "now"; the point of the test is the day a run
+            // was recorded on, so move the row to the instant under test.
+            sqlx::query("UPDATE runs SET created_at=? WHERE id=?")
+                .bind(at)
+                .bind(run.id)
+                .execute(store.sqlite_pool())
+                .await
+                .unwrap();
+            // Every run is closed: `idx_runs_active_task` allows only one active
+            // run per task, so leaving the successful ones open would make the
+            // next `start_run` a UNIQUE violation.
+            store
+                .finish_run(run.id, Some(200), error)
+                .await
+                .unwrap();
+        }
+
+        let from = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+        let to = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 8, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+
+        let shanghai = store
+            .run_calendar_for_owner(alice.id, from, to, chrono_tz::Asia::Shanghai)
+            .await
+            .unwrap();
+        assert_eq!(shanghai.len(), 1, "all three runs land on one local day");
+        assert_eq!(shanghai[0].date, "2026-01-06");
+        assert_eq!(shanghai[0].total, 3);
+        assert_eq!(shanghai[0].failed, 1);
+
+        let utc = store
+            .run_calendar_for_owner(alice.id, from, to, chrono_tz::UTC)
+            .await
+            .unwrap();
+        assert_eq!(utc.len(), 2);
+        assert_eq!(utc[0].date, "2026-01-05");
+        assert_eq!(utc[0].total, 2);
+        assert_eq!(utc[0].failed, 0);
+        assert_eq!(utc[1].date, "2026-01-06");
+        assert_eq!(utc[1].total, 1);
+        assert_eq!(utc[1].failed, 1);
     }
 
     #[tokio::test]

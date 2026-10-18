@@ -609,6 +609,21 @@ pub struct RunStep {
     pub finished_at: i64,
 }
 
+/// One cell of the run calendar: a local calendar day and how many runs landed
+/// in it.
+///
+/// The day is already shifted into the caller's timezone — a run at 00:30 in
+/// UTC+8 belongs to that local day, not to the UTC one before it — so the date
+/// string is what the WebUI draws, with no further conversion.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunCalendarDay {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub total: i64,
+    /// Runs that ended in `failed`. The WebUI paints the cell red for these.
+    pub failed: i64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NotificationChannel {
     pub id: i64,

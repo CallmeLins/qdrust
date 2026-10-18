@@ -303,6 +303,10 @@ pub fn router_with_auth(
         .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
         .route("/api/v1/runs/{id}", delete(delete_run))
         .route("/api/v1/runs", get(list_runs).delete(delete_all_runs))
+        // Ahead of the `{id}` routes in spirit: a static segment wins over the
+        // parameter in matchit, so `/runs/calendar` never reaches `delete_run`
+        // with "calendar" as an id.
+        .route("/api/v1/runs/calendar", get(run_calendar))
         .route(
             "/api/v1/auth/verify-email",
             axum::routing::post(verify_email),
@@ -1603,6 +1607,13 @@ struct RunsQuery {
     status: Option<String>,
     #[serde(default)]
     task_id: Option<i64>,
+    /// Inclusive lower bound on `created_at`. The calendar's day dialog asks for
+    /// one local day at a time.
+    #[serde(default)]
+    from: Option<i64>,
+    /// Exclusive upper bound on `created_at`.
+    #[serde(default)]
+    to: Option<i64>,
     #[serde(default)]
     before_id: Option<i64>,
     #[serde(default)]
@@ -1611,9 +1622,10 @@ struct RunsQuery {
 
 /// Every run the caller owns, newest first — the aggregated log view.
 ///
-/// Query parameters: `status` (exact match), `task_id`, `limit` (default 100,
-/// max 500) and `before_id` (keyset cursor: the `next_cursor` of the previous
-/// page). Returns `{items, has_more, next_cursor}` like the template list.
+/// Query parameters: `status` (exact match), `task_id`, `from` / `to` (unix
+/// seconds, half-open range on `created_at`), `limit` (default 100, max 500) and
+/// `before_id` (keyset cursor: the `next_cursor` of the previous page). Returns
+/// `{items, has_more, next_cursor}` like the template list.
 async fn list_runs(
     State(store): State<Store>,
     headers: HeaderMap,
@@ -1629,6 +1641,8 @@ async fn list_runs(
             .filter(|value| !value.is_empty())
             .map(str::to_string),
         task_id: query.task_id,
+        from: query.from,
+        to: query.to,
         before_id: query.before_id,
         limit,
     };
@@ -1648,6 +1662,66 @@ async fn list_runs(
         "items": runs,
         "has_more": has_more,
         "next_cursor": next_cursor,
+    })))
+}
+
+/// The run calendar's query string: the window and the reader's zone.
+#[derive(Deserialize, Default)]
+struct CalendarQuery {
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
+    #[serde(default)]
+    tz: Option<String>,
+}
+
+/// `GET /api/v1/runs/calendar`
+///
+/// One entry per day that has runs: `{date, total, failed}`, where `date` is a
+/// `YYYY-MM-DD` string already shifted into `tz`. That shift is the whole point
+/// of the endpoint: a check-in at 00:30 in UTC+8 must land on the reader's
+/// Thursday, not on the UTC Wednesday the row's timestamp falls in, and doing
+/// it here keeps the WebUI from converting a year of timestamps.
+///
+/// `from` / `to` are unix seconds (half-open on `created_at`) and default to the
+/// last 365 days. The span is clamped to 400 days so the endpoint stays a year
+/// view rather than "read my whole history". `tz` is an IANA name; a bad one is
+/// a 422 rather than a silent UTC fallback, because a wrong bucket is
+/// indistinguishable from missing data.
+async fn run_calendar(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Query(query): Query<CalendarQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    const MAX_SPAN: i64 = 400 * 86_400;
+    let to = query
+        .to
+        .unwrap_or_else(|| chrono::Utc::now().timestamp() + 86_400);
+    let from = query.from.unwrap_or(to - 365 * 86_400).max(to - MAX_SPAN);
+    if to <= from {
+        return Err(ApiError::unprocessable(anyhow::anyhow!(
+            "`to` must be after `from`"
+        )));
+    }
+    let tz_name = query
+        .tz
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("UTC");
+    let tz = tz_name.parse::<chrono_tz::Tz>().map_err(|_| {
+        ApiError::unprocessable(anyhow::anyhow!("unknown timezone `{tz_name}`"))
+    })?;
+    let days = store
+        .run_calendar_for_owner(session.user.id, from, to, tz)
+        .await?;
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "timezone": tz.to_string(),
+        "days": days,
     })))
 }
 
@@ -4720,6 +4794,8 @@ mod tests {
         // button and the notification editors must stay in the published
         // contract.
         assert!(document["paths"]["/api/v1/runs"]["get"].is_object());
+        // The tasks page draws its check-in calendar from here.
+        assert!(document["paths"]["/api/v1/runs/calendar"]["get"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}/test"]["post"].is_object());
         assert!(document["paths"]["/api/v1/notification-channels/{id}"]["put"].is_object());
         assert!(document["paths"]["/api/v1/notification-actions/{id}"]["put"].is_object());
@@ -6546,6 +6622,87 @@ mod tests {
         assert_eq!(run_ids(&all).len(), 6, "{all}");
         assert_eq!(all["has_more"], json!(false), "{all}");
         assert_eq!(all["next_cursor"], Value::Null, "{all}");
+    }
+
+    /// The calendar endpoint buckets the same rows by day and reports failures,
+    /// which is what the WebUI paints. `from` / `to` on the plain run log are
+    /// the other half: the day dialog asks for one local day of rows.
+    #[tokio::test]
+    async fn run_calendar_aggregates_days_and_honours_the_window() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let app = router(store.clone());
+        let cookie = test_auth_cookie(&app).await;
+        let owner = store
+            .list_users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "route_admin")
+            .expect("bootstrap created the owner");
+        let task = store
+            .create_for_owner(owner.id, seeded_task("calendar-checkin"))
+            .await
+            .unwrap();
+        for error in [None, None, Some("upstream refused")] {
+            let run = store.start_run(task.id).await.unwrap();
+            store.finish_run(run.id, Some(200), error).await.unwrap();
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/runs/calendar?tz=UTC&from={}&to={}",
+                        now - 86_400,
+                        now + 86_400
+                    ))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Success responses carry no `x-request-id` (only `ApiError` does), so
+        // the body is read directly rather than through `response_json`.
+        let body = ok_json(response).await;
+        assert_eq!(body["timezone"], json!("UTC"));
+        let days = body["days"].as_array().expect("a day list");
+        // The date itself is not asserted: these runs are stamped "now", so a
+        // test crossing midnight UTC would move the bucket without anything
+        // being wrong.
+        assert_eq!(days.len(), 1, "all three runs share one day: {body}");
+        assert_eq!(days[0]["total"], json!(3));
+        assert_eq!(days[0]["failed"], json!(1));
+
+        // Outside the window the run log has nothing to show, which is what the
+        // day dialog relies on.
+        let future = get_runs(&app, &cookie, &format!("from={}", now + 3600)).await;
+        assert!(run_ids(&future).is_empty(), "{future}");
+        let today = get_runs(
+            &app,
+            &cookie,
+            &format!("from={}&to={}", now - 86_400, now + 86_400),
+        )
+        .await;
+        assert_eq!(run_ids(&today).len(), 3, "{today}");
+
+        // A zone the server cannot resolve is a rejection, not a silent UTC
+        // bucket that would look like missing data.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runs/calendar?tz=Mars/Olympus")
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// A slot holds whatever a template stored — a session cookie, in the case

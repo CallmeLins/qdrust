@@ -11,6 +11,7 @@ import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
 import { consumeLogoutReturn, emptyHarDoc, formatRunTime, groupBindingsByTask, harDocumentFrom, localLoginAvailable, markLogoutReturn, oidcLogoutUrl, orderTemplatesForNewTask, ssoAvailable, ssoOnly, taskOutcome, type NotificationBindingGroup } from "./utils";
 import { useCursorPager, usePager, usePageSize } from "./pagination";
+import { buildRunCalendar, type CalendarCell, type RunDay } from "./calendar";
 import { fmt, locale, t, toggleLocale } from "./i18n";
 
 // ---------- toast ----------
@@ -768,6 +769,124 @@ watch([runLogStatus, runLogTaskId, runLogPageSize], () => {
 // filters intentionally do not — they change which runs match, not where the
 // reader was in the list.
 watch(runLogPageSize, () => scrollToPaged(runLogAnchor));
+
+// ---------- check-in calendar ----------
+// One square per day for the past year. The grid itself is arithmetic and lives
+// in calendar.ts; this block decides which window to ask for, and what a square
+// says when it is hovered or clicked.
+const CALENDAR_WEEKS = 53;
+const calendarDays = ref<RunDay[]>([]);
+const calendarLoading = ref(false);
+/** "Today" as the grid sees it. Held in a ref rather than read on every render:
+ *  a midnight rollover should move the last column when the page refreshes, not
+ *  while the reader is looking at it. */
+const calendarToday = ref(new Date());
+const calendarGrid = computed(() =>
+  buildRunCalendar(calendarDays.value, {
+    end: calendarToday.value,
+    weeks: CALENDAR_WEEKS,
+    locale: locale.value,
+  }),
+);
+/** Mon/Wed/Fri only. Seven labels in a 12px row are unreadable, and the rest of
+ *  the pattern is obvious from three. */
+const calendarWeekdays = computed(() => {
+  const format = new Intl.DateTimeFormat(locale.value, { weekday: "short" });
+  return Array.from({ length: 7 }, (_, row) =>
+    row % 2 === 0 ? format.format(new Date(2024, 0, 1 + row)) : "",
+  );
+});
+
+/** The browser's IANA zone. The server buckets days in it, so a check-in at
+ *  00:30 counts towards the day the reader is actually living in. */
+function readerTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+async function loadRunCalendar() {
+  if (!authenticated.value) return;
+  calendarLoading.value = true;
+  calendarToday.value = new Date();
+  try {
+    const { start, end } = calendarGrid.value;
+    // Half-open window: the first day drawn, up to (not including) tomorrow.
+    const to = new Date(end.getFullYear(), end.getMonth(), end.getDate() + 1);
+    const result = await api.runCalendar({
+      from: Math.floor(start.getTime() / 1000),
+      to: Math.floor(to.getTime() / 1000),
+      tz: readerTimezone(),
+    });
+    calendarDays.value = result.days;
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    calendarLoading.value = false;
+  }
+}
+
+/** The day whose runs the dialog lists (`YYYY-MM-DD`), or null when it is shut. */
+const calendarDay = ref<string | null>(null);
+const calendarRuns = ref<Run[]>([]);
+const calendarRunsLoading = ref(false);
+const calendarRunsHasMore = ref(false);
+
+async function openCalendarDay(date: string) {
+  calendarDay.value = date;
+  calendarRuns.value = [];
+  calendarRunsHasMore.value = false;
+  calendarRunsLoading.value = true;
+  try {
+    const [year, month, day] = date.split("-").map(Number);
+    // Local midnight to local midnight. Built through the Date constructor, not
+    // `Date.parse("2026-01-06")`, which reads the string as UTC and would shift
+    // the window for everyone east of Greenwich.
+    const from = new Date(year, month - 1, day).getTime() / 1000;
+    const to = new Date(year, month - 1, day + 1).getTime() / 1000;
+    const page = await api.runs({
+      from: Math.floor(from),
+      to: Math.floor(to),
+      limit: 200,
+    });
+    calendarRuns.value = page.items;
+    calendarRunsHasMore.value = page.has_more;
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    calendarRunsLoading.value = false;
+  }
+}
+
+function closeCalendarDay() {
+  calendarDay.value = null;
+}
+
+/** The day dialog's task name leaves it for the task's history, like the row in
+ *  the run log does. */
+function openCalendarRunHistory(taskId: number) {
+  calendarDay.value = null;
+  openRunLogHistory(taskId);
+}
+
+function calendarCellTitle(cell: CalendarCell): string {
+  if (cell.total === 0) return fmt("calendarDayNone", { date: cell.date });
+  if (cell.failed > 0) {
+    return fmt("calendarDayFailed", { date: cell.date, n: cell.total, failed: cell.failed });
+  }
+  return fmt("calendarDayCount", { date: cell.date, n: cell.total });
+}
+
+// The grid is a year of history, so it is worth one request per visit to the
+// tasks page — not one per render, and not on pages that cannot show it.
+watch(authenticated, (isIn) => {
+  if (isIn) void loadRunCalendar();
+});
+watch(view, (next) => {
+  if (next === "tasks" && authenticated.value) void loadRunCalendar();
+});
 
 // ---------- templates ----------
 const templates = ref<Template[]>([]);
@@ -2389,6 +2508,7 @@ onMounted(async () => {
       if (showCreate.value) showCreate.value = false;
       if (showImport.value) closeHarEditor();
       if (showHelp.value) showHelp.value = false;
+      if (calendarDay.value) calendarDay.value = null;
       menuOpen.value = false;
     }
   });
@@ -2590,6 +2710,68 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div><span>{{ t('enabledTasks') }}</span><strong>{{ activeCount }}</strong><small class="positive"><Activity :size="14" />{{ t('scheduledEnabled') }}</small></div>
           <div><span>{{ t('lastSuccess') }}</span><strong>{{ successCount }}</strong><small><Check :size="14" />{{ t('hasResults') }}</small></div>
           <div><span>{{ t('lastFailed') }}</span><strong :class="{ 'run-bad': failedCount > 0 }">{{ failedCount }}</strong><small :class="{ 'run-bad': failedCount > 0 }"><XCircle :size="14" />{{ t('lastRunFailed') }}</small></div>
+        </section>
+
+        <!-- ===== CHECK-IN CALENDAR ===== -->
+        <!-- A year of squares, one per day: darker green for more check-ins, red
+             for a day with a failed run. Clicking a day opens the runs it holds,
+             which is the same list the run-log dialog shows, scoped to one day. -->
+        <section class="run-calendar-card" :aria-label="t('calendarTitle')">
+          <div class="run-calendar-head">
+            <div>
+              <h2>{{ t('calendarTitle') }}</h2>
+              <p class="muted section-hint">{{ t('calendarHint') }}</p>
+            </div>
+            <div class="run-calendar-legend">
+              <span class="run-calendar-legend-failed">
+                <i class="run-calendar-cell is-failed" aria-hidden="true" />{{ t('calendarFailedLegend') }}
+              </span>
+              <span class="run-calendar-scale">
+                {{ t('calendarLess') }}
+                <i v-for="level in [0, 1, 2, 3, 4]" :key="level" class="run-calendar-cell" :data-level="level" aria-hidden="true" />
+                {{ t('calendarMore') }}
+              </span>
+            </div>
+          </div>
+          <div v-if="calendarLoading && calendarDays.length === 0" class="loading-state">
+            <RefreshCw class="spin" :size="20" />{{ t('loading') }}
+          </div>
+          <div v-else class="run-calendar-scroll">
+            <div class="run-calendar-grid">
+              <div class="run-calendar-weekdays" aria-hidden="true">
+                <span v-for="(label, row) in calendarWeekdays" :key="row">{{ label }}</span>
+              </div>
+              <div class="run-calendar-main">
+                <div
+                  class="run-calendar-months"
+                  :style="{ gridTemplateColumns: `repeat(${calendarGrid.weeks.length}, var(--calendar-cell))` }"
+                >
+                  <span
+                    v-for="month in calendarGrid.months"
+                    :key="month.column"
+                    :style="{ gridColumnStart: month.column + 1 }"
+                  >{{ month.label }}</span>
+                </div>
+                <div class="run-calendar-weeks">
+                  <div v-for="(week, column) in calendarGrid.weeks" :key="column" class="run-calendar-week">
+                    <template v-for="(cell, row) in week" :key="row">
+                      <button
+                        v-if="cell"
+                        type="button"
+                        class="run-calendar-cell"
+                        :class="{ 'is-failed': cell.failed > 0 }"
+                        :data-level="cell.level"
+                        :title="calendarCellTitle(cell)"
+                        :aria-label="calendarCellTitle(cell)"
+                        @click="openCalendarDay(cell.date)"
+                      />
+                      <span v-else class="run-calendar-cell is-empty" aria-hidden="true" />
+                    </template>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="task-section">
@@ -3580,6 +3762,46 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           @next="nextRunLogPage"
           @update:page-size="setRunLogPageSize"
         />
+      </div>
+    </div>
+
+    <!-- ===== CHECK-IN DAY MODAL ===== -->
+    <!-- The calendar square the reader clicked, opened as the run log scoped to
+         that one day. Same columns, same wording: a day of check-ins is a list
+         of runs, and a second vocabulary for it would only be a second thing to
+         learn. The date comes from the square, so the header and the query
+         window cannot disagree. -->
+    <div v-if="calendarDay" class="modal-backdrop modal-backdrop-wide" @click.self="closeCalendarDay">
+      <div class="modal modal-runlog">
+        <div class="modal-header">
+          <div>
+            <h2>{{ fmt('calendarDayTitle', { date: calendarDay }) }}</h2>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeCalendarDay"><X :size="20" /></button>
+        </div>
+        <div v-if="calendarRunsLoading" class="loading-state"><RefreshCw class="spin" :size="22" />{{ t('loading') }}</div>
+        <div v-else-if="calendarRuns.length === 0" class="empty-state">
+          <span><Activity :size="25" /></span>
+          <h2>{{ t('calendarDayEmpty') }}</h2>
+        </div>
+        <template v-else>
+          <div class="table-wrap">
+            <table class="runs-table">
+              <thead><tr>
+                <th>{{ t('time') }}</th><th>{{ t('task') }}</th><th>{{ t('status') }}</th><th class="run-log-col">{{ t('log') }}</th>
+              </tr></thead>
+              <tbody>
+                <tr v-for="run in calendarRuns" :key="run.id">
+                  <td class="col-time run-time">{{ formatRunTime(run.started_at ?? run.created_at) }}</td>
+                  <td><button class="text-button" @click="openCalendarRunHistory(run.task_id)">{{ runTaskName(run.task_id) }}</button></td>
+                  <td class="col-status"><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
+                  <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-if="calendarRunsHasMore" class="muted run-log-hint calendar-day-note">{{ fmt('calendarDayTruncated', { n: calendarRuns.length }) }}</p>
+        </template>
       </div>
     </div>
 

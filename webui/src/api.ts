@@ -77,6 +77,22 @@ export interface RunPage {
   next_cursor: number | null;
 }
 
+/** One square of the check-in calendar, already bucketed in the caller's zone. */
+export interface RunCalendarDay {
+  /** `YYYY-MM-DD`. */
+  date: string;
+  total: number;
+  failed: number;
+}
+
+/** GET /api/v1/runs/calendar — only days that have runs, oldest first. */
+export interface RunCalendar {
+  from: number;
+  to: number;
+  timezone: string;
+  days: RunCalendarDay[];
+}
+
 /** Public authentication policy exposed by GET /api/v1/auth/config.
  *  Never contains secrets; mirrors the server `PublicAuthConfig`. */
 export interface AuthConfig {
@@ -369,13 +385,26 @@ export const api = {
   cancelRun: (id: number) => request<void>(`/api/v1/runs/${id}/cancel`, { method: "POST" }),
   taskRuns: (id: number) => request<Run[]>(`/api/v1/tasks/${id}/runs`),
   /** Aggregated log: runs across every task the caller owns, newest first. */
-  runs: async (filter: { status?: string; taskId?: number; beforeId?: number; limit?: number } = {}) => {
+  runs: async (filter: { status?: string; taskId?: number; from?: number; to?: number; beforeId?: number; limit?: number } = {}) => {
     const params = new URLSearchParams();
     if (filter.status) params.set("status", filter.status);
     if (filter.taskId) params.set("task_id", String(filter.taskId));
+    if (filter.from != null) params.set("from", String(filter.from));
+    if (filter.to != null) params.set("to", String(filter.to));
     if (filter.beforeId) params.set("before_id", String(filter.beforeId));
     params.set("limit", String(filter.limit ?? 100));
     return request<RunPage>(`/api/v1/runs?${params.toString()}`);
+  },
+  /** Per-day check-in counts for the calendar. `tz` is the reader's IANA zone:
+   *  the server buckets the days in it, so a 00:30 run is on that day and not
+   *  on the UTC one before it. */
+  runCalendar: async (window: { from: number; to: number; tz?: string }) => {
+    const params = new URLSearchParams({
+      from: String(window.from),
+      to: String(window.to),
+    });
+    if (window.tz) params.set("tz", window.tz);
+    return request<RunCalendar>(`/api/v1/runs/calendar?${params.toString()}`);
   },
   deleteTaskRuns: (id: number) => request<{ deleted?: number }>(`/api/v1/tasks/${id}/runs`, { method: "DELETE" }),
   deleteRun: (id: number) => request<void>(`/api/v1/runs/${id}`, { method: "DELETE" }),

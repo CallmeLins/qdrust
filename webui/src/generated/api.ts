@@ -240,6 +240,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/runs/calendar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Per-day run counts for the contribution-style calendar, bucketed in the caller's timezone */
+        get: operations["getRunCalendar"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/runs": {
         parameters: {
             query?: never;
@@ -1295,6 +1312,20 @@ export interface components {
              * @description For retry runs: id of the first (original) run of the retry chain
              */
             retry_of?: number | null;
+        };
+        RunCalendarDay: {
+            /** @description Calendar day in the requested timezone, YYYY-MM-DD */
+            date: string;
+            /**
+             * Format: int64
+             * @description Runs recorded that day
+             */
+            total: number;
+            /**
+             * Format: int64
+             * @description Runs of those that ended failed; the WebUI paints these days red
+             */
+            failed: number;
         };
         NotificationChannel: {
             /** Format: int64 */
@@ -2398,6 +2429,40 @@ export interface operations {
             404: components["responses"]["NotFound"];
         };
     };
+    getRunCalendar: {
+        parameters: {
+            query?: {
+                /** @description Inclusive lower bound on created_at, unix seconds (default: 365 days before `to`) */
+                from?: number;
+                /** @description Exclusive upper bound on created_at, unix seconds (default: end of today) */
+                to?: number;
+                /** @description IANA timezone the days are bucketed in, e.g. Asia/Shanghai (default UTC) */
+                tz?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Days that have runs, oldest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        from: number;
+                        to: number;
+                        timezone: string;
+                        days: components["schemas"]["RunCalendarDay"][];
+                    };
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            422: components["responses"]["ValidationError"];
+        };
+    };
     listRuns: {
         parameters: {
             query?: {
@@ -2405,6 +2470,10 @@ export interface operations {
                 status?: string;
                 /** @description Only runs of this task */
                 task_id?: number;
+                /** @description Inclusive lower bound on created_at, unix seconds */
+                from?: number;
+                /** @description Exclusive upper bound on created_at, unix seconds */
+                to?: number;
                 /** @description Page size, clamped to 1..=500 (default 100) */
                 limit?: number;
                 /** @description Keyset cursor: the next_cursor of the previous page */
