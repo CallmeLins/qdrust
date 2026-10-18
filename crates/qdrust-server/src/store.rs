@@ -5311,10 +5311,7 @@ mod tests {
             // Every run is closed: `idx_runs_active_task` allows only one active
             // run per task, so leaving the successful ones open would make the
             // next `start_run` a UNIQUE violation.
-            store
-                .finish_run(run.id, Some(200), error)
-                .await
-                .unwrap();
+            store.finish_run(run.id, Some(200), error).await.unwrap();
         }
 
         let from = chrono::Utc

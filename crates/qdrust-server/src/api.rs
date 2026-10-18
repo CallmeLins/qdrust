@@ -1711,9 +1711,9 @@ async fn run_calendar(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("UTC");
-    let tz = tz_name.parse::<chrono_tz::Tz>().map_err(|_| {
-        ApiError::unprocessable(anyhow::anyhow!("unknown timezone `{tz_name}`"))
-    })?;
+    let tz = tz_name
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| ApiError::unprocessable(anyhow::anyhow!("unknown timezone `{tz_name}`")))?;
     let days = store
         .run_calendar_for_owner(session.user.id, from, to, tz)
         .await?;
