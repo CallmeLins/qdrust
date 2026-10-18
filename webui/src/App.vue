@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, type Ref } from "vue";
 import {
   Activity, ArrowLeft, ArrowRight, ArrowUpDown, Bell, BellOff, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CircleHelp, Copy, Download, Eye, FileJson2, FileUp,
-  LayoutDashboard, Library as LibraryIcon, Loader2, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
+  LayoutDashboard, Library as LibraryIcon, Loader2, LogOut, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap,
 } from "@lucide/vue";
 import { api, apiPath, errorCode, oidcStartUrl, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken } from "./api";
@@ -101,6 +101,23 @@ function setTheme(mode: ThemeMode) {
   localStorage.setItem(THEME_STORAGE_KEY, mode);
   applyTheme(mode);
 }
+
+/** One button instead of three: each click advances light → dark → system and
+ *  wraps around. `setTheme` still persists the choice, so a reload keeps the
+ *  mode the user ended on. */
+function cycleTheme() {
+  const next = THEME_MODES[(THEME_MODES.indexOf(themeMode.value) + 1) % THEME_MODES.length];
+  setTheme(next);
+}
+
+const themeModeLabel = computed(() => {
+  if (themeMode.value === "light") return t("themeLight");
+  if (themeMode.value === "dark") return t("themeDark");
+  return t("themeSystem");
+});
+
+/** Tooltip names the mode that is active and says that a click moves on. */
+const themeButtonTitle = computed(() => `${t("theme")}: ${themeModeLabel.value} · ${t("themeCycleHint")}`);
 
 function handleSystemThemeChange() {
   if (themeMode.value === "system") applyTheme("system");
@@ -2482,43 +2499,32 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         {{ authMode === 'login' ? t('initAdmin') : authMode === 'bootstrap' ? t('needAccount') : t('haveAccount') }}
       </button>
 
-      <div class="surface-theme-switch auth-theme" role="group" :aria-label="t('theme')">
-        <button
-          v-for="mode in THEME_MODES"
-          :key="mode"
-          type="button"
-          class="surface-theme-option"
-          :class="{ 'is-active': themeMode === mode }"
-          :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-          :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-          :aria-pressed="themeMode === mode"
-          @click="setTheme(mode)"
-        >
-          <Sun v-if="mode === 'light'" :size="15" />
-          <Moon v-else-if="mode === 'dark'" :size="15" />
-          <Monitor v-else :size="15" />
-        </button>
-      </div>
+      <button
+        type="button"
+        class="surface-theme-cycle auth-theme"
+        :title="themeButtonTitle"
+        :aria-label="`${t('theme')}: ${themeModeLabel}`"
+        @click="cycleTheme"
+      >
+        <Sun v-if="themeMode === 'light'" :size="16" />
+        <Moon v-else-if="themeMode === 'dark'" :size="16" />
+        <Monitor v-else :size="16" />
+      </button>
     </form>
 
     <!-- Theme switch for the pure-SSO landing panel. -->
-    <div v-if="ssoForced" class="surface-theme-switch auth-theme" role="group" :aria-label="t('theme')">
-      <button
-        v-for="mode in THEME_MODES"
-        :key="mode"
-        type="button"
-        class="surface-theme-option"
-        :class="{ 'is-active': themeMode === mode }"
-        :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-        :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-        :aria-pressed="themeMode === mode"
-        @click="setTheme(mode)"
-      >
-        <Sun v-if="mode === 'light'" :size="15" />
-        <Moon v-else-if="mode === 'dark'" :size="15" />
-        <Monitor v-else :size="15" />
-      </button>
-    </div>
+    <button
+      v-if="ssoForced"
+      type="button"
+      class="surface-theme-cycle auth-theme"
+      :title="themeButtonTitle"
+      :aria-label="`${t('theme')}: ${themeModeLabel}`"
+      @click="cycleTheme"
+    >
+      <Sun v-if="themeMode === 'light'" :size="16" />
+      <Moon v-else-if="themeMode === 'dark'" :size="16" />
+      <Monitor v-else :size="16" />
+    </button>
   </main>
 
   <!-- ============ APP ============ -->
@@ -2552,26 +2558,19 @@ onUnmounted(() => window.clearInterval(refreshTimer));
             <Mail :size="14" />{{ t('emailVerifyBanner') }}
             <button class="text-button" @click="resendVerification">{{ t('resendVerify') }}</button>
           </span>
-          <div class="surface-theme-switch" role="group" :aria-label="t('theme')">
-            <button
-              v-for="mode in THEME_MODES"
-              :key="mode"
-              type="button"
-              class="surface-theme-option"
-              :class="{ 'is-active': themeMode === mode }"
-              :title="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-              :aria-label="mode === 'light' ? t('themeLight') : mode === 'dark' ? t('themeDark') : t('themeSystem')"
-              :aria-pressed="themeMode === mode"
-              @click="setTheme(mode)"
-            >
-              <Sun v-if="mode === 'light'" :size="15" />
-              <Moon v-else-if="mode === 'dark'" :size="15" />
-              <Monitor v-else :size="15" />
-            </button>
-          </div>
+          <button
+            type="button"
+            class="surface-theme-cycle"
+            :title="themeButtonTitle"
+            :aria-label="`${t('theme')}: ${themeModeLabel}`"
+            @click="cycleTheme"
+          >
+            <Sun v-if="themeMode === 'light'" :size="16" />
+            <Moon v-else-if="themeMode === 'dark'" :size="16" />
+            <Monitor v-else :size="16" />
+          </button>
           <button class="icon-button" :title="locale" @click="toggleLocale">{{ locale === 'zh-CN' ? 'EN' : '中' }}</button>
-          <span class="account-name">{{ currentUser?.username }} · {{ currentUser?.role === 'admin' ? t('roleAdmin') : t('roleUser') }}</span>
-          <button class="avatar" :title="t('logout')" @click="logout()">{{ currentUser?.username.slice(0, 2).toUpperCase() }}</button>
+          <button class="icon-button" :title="t('logout')" :aria-label="t('logout')" @click="logout()"><LogOut :size="18" /></button>
         </div>
       </header>
 

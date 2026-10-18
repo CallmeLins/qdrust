@@ -220,34 +220,25 @@ a { color: var(--accent); }
   background-color: rgb(var(--interactive-surface) / var(--interactive-active-opacity));
 }
 
-.surface-theme-switch {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border-radius: 999px;
-  background-color: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
-}
-
-.surface-theme-option {
-  display: inline-grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
+/* Theme control: one button that cycles light → dark → system. The three-way
+   segmented switch this replaces needed a row of three targets to say the same
+   thing, and the icon already tells you which mode you are in. */
+.surface-theme-cycle {
+  width: 34px;
+  height: 34px;
+  padding: 0;
   border: 0;
   border-radius: 999px;
-  color: var(--ink-3);
-  background: transparent;
-  transition: background-color var(--t-med), color var(--t-med);
-}
-.surface-theme-option:hover {
+  color: var(--ink-2);
   background-color: rgb(var(--interactive-surface) / var(--interactive-hover-opacity));
-  color: var(--ink);
+  display: inline-grid;
+  place-items: center;
+  transition: color var(--t-med), background-color var(--t-med), transform var(--t-fast);
 }
-.surface-theme-option.is-active {
-  background-color: rgb(var(--card-surface));
+.surface-theme-cycle:hover {
   color: var(--accent);
-  box-shadow: var(--card-shadow);
+  background-color: rgb(var(--interactive-surface) / var(--interactive-active-opacity));
+  transform: translateY(-1px);
 }
 
 /* ============================================================
@@ -334,15 +325,6 @@ nav { display: grid; gap: 3px; margin-top: 28px; }
 .breadcrumb { color: var(--ink-3); font-size: 13px; }
 .breadcrumb span { margin: 0 8px; color: var(--ink-3); opacity: 0.55; }
 .topbar-right { display: flex; align-items: center; gap: 10px; }
-.account-name { color: var(--ink-2); font-size: 13px; }
-
-.avatar {
-  width: 34px; height: 34px; border: 1px solid var(--line-strong); border-radius: 999px;
-  color: var(--accent); background: var(--accent-glow);
-  font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
-  transition: box-shadow var(--t-fast), transform var(--t-fast);
-}
-.avatar:hover { box-shadow: 0 0 0 4px var(--accent-glow); transform: translateY(-1px); }
 
 /* ---------- page scaffold ---------- */
 .page { position: relative; z-index: 1; width: min(1180px, calc(100% - 64px)); margin: 0 auto; padding: 40px 0 calc(72px + env(safe-area-inset-bottom)); }
@@ -1198,7 +1180,6 @@ code {
   .mobile-menu { display: inline-grid; }
   .topbar { padding: 0 18px; }
   .breadcrumb { margin-right: auto; margin-left: 8px; }
-  .account-name { display: none; }
   .page { width: calc(100% - 32px); padding-top: 26px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .stats > div { min-height: 92px; }
