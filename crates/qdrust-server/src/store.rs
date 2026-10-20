@@ -1181,23 +1181,62 @@ macro_rules! define_store {
         self.get(id).await
     }
 
-    pub async fn delete(&self, id: i64) -> Result<bool> {
-        Ok(sqlx::query("DELETE FROM tasks WHERE id=?")
+    /// Delete a task and everything hanging off it.
+    ///
+    /// SQLite would reach `runs`, `run_steps` and `notification_actions`
+    /// through `ON DELETE CASCADE`; MySQL carries no foreign keys at all, so the
+    /// same rows are named here, children first. `owner_id` narrows the lookup,
+    /// which means a mismatched owner removes nothing rather than orphans the
+    /// children of a task it then fails to delete.
+    async fn delete_task_rows(&self, id: i64, owner_id: Option<i64>) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        let existing: Option<i64> = match owner_id {
+            Some(owner_id) => {
+                sqlx::query_scalar("SELECT id FROM tasks WHERE id=? AND owner_id=?")
+                    .bind(id)
+                    .bind(owner_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+            }
+            None => {
+                sqlx::query_scalar("SELECT id FROM tasks WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+            }
+        };
+        let Some(id) = existing else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query("DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM runs WHERE task_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM notification_actions WHERE task_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM tasks WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
             .await?
             .rows_affected()
-            > 0)
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
+    }
+
+    pub async fn delete(&self, id: i64) -> Result<bool> {
+        self.delete_task_rows(id, None).await
     }
 
     pub async fn delete_for_owner(&self, id: i64, owner_id: i64) -> Result<bool> {
-        Ok(sqlx::query("DELETE FROM tasks WHERE id=? AND owner_id=?")
-            .bind(id)
-            .bind(owner_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            > 0)
+        self.delete_task_rows(id, Some(owner_id)).await
     }
 
     pub async fn record_run(
@@ -1462,44 +1501,76 @@ macro_rules! define_store {
         Ok(())
     }
 
-    /// Delete a single run (run_steps cascade via FK).
+    /// Delete a single run and its steps.
+    ///
+    /// `run_steps.run_id` is `ON DELETE CASCADE` in SQLite but there are no
+    /// foreign keys on MySQL, so the steps are deleted first by hand.
     pub async fn delete_run(&self, run_id: i64) -> Result<bool> {
-        Ok(sqlx::query("DELETE FROM runs WHERE id=?")
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM run_steps WHERE run_id=?")
             .bind(run_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM runs WHERE id=?")
+            .bind(run_id)
+            .execute(&mut *transaction)
             .await?
             .rows_affected()
-            > 0)
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     /// Clear the run history of every task owned by `owner_id`; returns the
-    /// number of deleted runs.
+    /// number of deleted runs. Steps go first: MySQL has no cascade to rely on.
     pub async fn delete_runs_for_owner(&self, owner_id: i64) -> Result<u64> {
-        Ok(sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM run_steps WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
+        )
+        .bind(owner_id)
+        .execute(&mut *transaction)
+        .await?;
+        let deleted = sqlx::query(
             "DELETE FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
         )
         .bind(owner_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?
-        .rows_affected())
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     /// Clear the whole run history (admin).
     pub async fn delete_all_runs(&self) -> Result<u64> {
-        Ok(sqlx::query("DELETE FROM runs")
-            .execute(&self.pool)
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM run_steps")
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM runs")
+            .execute(&mut *transaction)
             .await?
-            .rows_affected())
+            .rows_affected();
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     /// Clear the run history of a single task (ownership is checked at the
     /// API layer); returns the number of deleted runs.
     pub async fn delete_runs_for_task(&self, task_id: i64) -> Result<u64> {
-        Ok(sqlx::query("DELETE FROM runs WHERE task_id=?")
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)")
             .bind(task_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM runs WHERE task_id=?")
+            .bind(task_id)
+            .execute(&mut *transaction)
             .await?
-            .rows_affected())
+            .rows_affected();
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn record_run_step(&self, step: &RunStep) -> Result<()> {
@@ -1760,15 +1831,32 @@ macro_rules! define_store {
     }
 
     pub async fn delete_notification_channel(&self, id: i64, owner_id: i64) -> Result<bool> {
-        Ok(
-            sqlx::query("DELETE FROM notification_channels WHERE id=? AND owner_id=?")
+        let mut transaction = self.pool.begin().await?;
+        let owned: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM notification_channels WHERE id=? AND owner_id=?")
                 .bind(id)
                 .bind(owner_id)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-                > 0,
-        )
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if owned.is_none() {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        // `notification_actions.channel_id` cascades on SQLite only; MySQL has
+        // no foreign keys, so the bindings are removed before the channel.
+        sqlx::query("DELETE FROM notification_actions WHERE channel_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM notification_channels WHERE id=? AND owner_id=?")
+            .bind(id)
+            .bind(owner_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn create_notification_action(
@@ -2217,24 +2305,56 @@ macro_rules! define_store {
     }
 
     pub async fn delete_template(&self, id: i64) -> Result<bool> {
-        Ok(sqlx::query("DELETE FROM templates WHERE id=?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            > 0)
+        self.delete_template_rows(id, None).await
     }
 
     pub async fn delete_template_for_owner(&self, id: i64, owner_id: i64) -> Result<bool> {
-        Ok(
-            sqlx::query("DELETE FROM templates WHERE id=? AND owner_id=?")
-                .bind(id)
-                .bind(owner_id)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-                > 0,
-        )
+        self.delete_template_rows(id, Some(owner_id)).await
+    }
+
+    /// Delete a template and the rows that point at it.
+    ///
+    /// `tasks.template_id` is `ON DELETE RESTRICT` and is checked by the API
+    /// layer before we get here; the remaining dependants (`template_imports`,
+    /// `push_requests`) cascade on SQLite only, so they are removed explicitly
+    /// for MySQL.
+    async fn delete_template_rows(&self, id: i64, owner_id: Option<i64>) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        let existing: Option<i64> = match owner_id {
+            Some(owner_id) => {
+                sqlx::query_scalar("SELECT id FROM templates WHERE id=? AND owner_id=?")
+                    .bind(id)
+                    .bind(owner_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+            }
+            None => {
+                sqlx::query_scalar("SELECT id FROM templates WHERE id=?")
+                    .bind(id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+            }
+        };
+        let Some(id) = existing else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query("DELETE FROM template_imports WHERE template_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM push_requests WHERE template_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM templates WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     /// How many tasks are bound to a template.
@@ -2342,13 +2462,38 @@ macro_rules! define_store {
             .execute(&self.pool)
             .await?
             .rows_affected(),
-            "delete" => sqlx::query(&format!(
-                "DELETE FROM tasks WHERE owner_id=? AND id IN ({ids})"
-            ))
-            .bind(owner_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected(),
+            // Same child-first sweep as `delete_task_rows`, in one statement per
+            // table: MySQL has no foreign keys to cascade for us.
+            "delete" => {
+                let mut transaction = self.pool.begin().await?;
+                sqlx::query(&format!(
+                    "DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=? AND id IN ({ids})))"
+                ))
+                .bind(owner_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(&format!(
+                    "DELETE FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=? AND id IN ({ids}))"
+                ))
+                .bind(owner_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(&format!(
+                    "DELETE FROM notification_actions WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=? AND id IN ({ids}))"
+                ))
+                .bind(owner_id)
+                .execute(&mut *transaction)
+                .await?;
+                let deleted = sqlx::query(&format!(
+                    "DELETE FROM tasks WHERE owner_id=? AND id IN ({ids})"
+                ))
+                .bind(owner_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                transaction.commit().await?;
+                deleted
+            }
             "run" => {
                 // Enqueue a run for each task; count the ones that were enqueued.
                 let mut count = 0_usize;
@@ -2805,15 +2950,24 @@ macro_rules! define_store {
 
     // ---- Log retention ----
 
-    /// Delete runs (and their steps via cascade) finished before the given timestamp.
+    /// Delete runs (and their steps) finished before the given timestamp.
     pub async fn prune_run_logs(&self, before: i64) -> Result<u64> {
-        Ok(
-            sqlx::query("DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at<?")
-                .bind(before)
-                .execute(&self.pool)
-                .await?
-                .rows_affected(),
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at<?)",
         )
+        .bind(before)
+        .execute(&mut *transaction)
+        .await?;
+        let deleted = sqlx::query(
+            "DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at<?",
+        )
+        .bind(before)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     pub async fn count_old_runs(&self, before: i64) -> Result<i64> {
@@ -3001,15 +3155,31 @@ macro_rules! define_store {
     }
 
     pub async fn delete_subscription(&self, id: i64, owner_id: i64) -> Result<bool> {
-        Ok(
-            sqlx::query("DELETE FROM template_subscriptions WHERE id=? AND owner_id=?")
+        let mut transaction = self.pool.begin().await?;
+        let owned: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM template_subscriptions WHERE id=? AND owner_id=?")
                 .bind(id)
                 .bind(owner_id)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-                > 0,
-        )
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if owned.is_none() {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        // `template_imports.subscription_id` cascades on SQLite only.
+        sqlx::query("DELETE FROM template_imports WHERE subscription_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM template_subscriptions WHERE id=? AND owner_id=?")
+            .bind(id)
+            .bind(owner_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+            > 0;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 
     // ---- Template library imports (provenance for subscription sources) ----
@@ -7470,5 +7640,375 @@ mod tests {
             .fetch_one(store.sqlite_pool())
             .await
             .unwrap()
+    }
+
+    /// Turn the cascades off, which is the situation MySQL is permanently in:
+    /// no foreign keys at all. Whatever the explicit deletes miss stays behind,
+    /// so a test that still passes here proves the deletes are the reason.
+    async fn disable_cascades(store: &Store) {
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+    }
+
+    /// A finished run with one persisted step; returns the run id.
+    ///
+    /// It is finished on the way out because `idx_runs_active_task` allows one
+    /// live run per task, and these fixtures are not about liveness.
+    async fn seed_run(store: &Store, task_id: i64) -> i64 {
+        let run = store.start_run(task_id).await.unwrap();
+        store
+            .record_run_step(&RunStep {
+                id: 0,
+                run_id: run.id,
+                step_index: 0,
+                name: "request".into(),
+                status: "succeeded".into(),
+                http_status: Some(200),
+                body_size: 2,
+                error: None,
+                started_at: 1,
+                finished_at: 2,
+            })
+            .await
+            .unwrap();
+        store.finish_run(run.id, Some(200), None).await.unwrap();
+        run.id
+    }
+
+    #[tokio::test]
+    async fn deleting_a_task_takes_its_runs_steps_and_bindings_with_it() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("graph_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("graph_bob", &password_hash, "user")
+            .await
+            .unwrap();
+        let alice_task = store
+            .create_for_owner(alice.id, input("graph alice"))
+            .await
+            .unwrap();
+        let bob_task = store
+            .create_for_owner(bob.id, input("graph bob"))
+            .await
+            .unwrap();
+        let alice_run = seed_run(&store, alice_task.id).await;
+        let bob_run = seed_run(&store, bob_task.id).await;
+
+        let channel = store
+            .create_notification_channel(
+                alice.id,
+                CreateNotificationChannel {
+                    name: "hook".into(),
+                    kind: "webhook".into(),
+                    config: serde_json::json!({"url": "https://example.invalid/hook"}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .create_notification_action(
+                    alice_task.id,
+                    alice.id,
+                    CreateNotificationAction {
+                        channel_id: channel.id,
+                        event: "failure".into(),
+                        failure_threshold: 1,
+                        automatic_only: false,
+                        title_template: None,
+                        body_template: None,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        disable_cascades(&store).await;
+        assert!(
+            store
+                .delete_for_owner(alice_task.id, alice.id)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            count_where(&store, "runs", "task_id", alice_task.id).await,
+            0,
+            "the run outlived its task"
+        );
+        assert_eq!(
+            count_where(&store, "run_steps", "run_id", alice_run).await,
+            0,
+            "the step outlived its run"
+        );
+        assert_eq!(
+            count_where(&store, "notification_actions", "task_id", alice_task.id).await,
+            0,
+            "the binding outlived its task"
+        );
+        // Nothing scoped to one owner reaches the other account's graph.
+        assert_eq!(count_where(&store, "runs", "task_id", bob_task.id).await, 1);
+        assert_eq!(count_where(&store, "run_steps", "run_id", bob_run).await, 1);
+        assert!(
+            store
+                .get_for_owner(bob_task.id, bob.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_removes_the_same_rows_as_a_single_delete() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("batch_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let first = store
+            .create_for_owner(alice.id, input("batch one"))
+            .await
+            .unwrap();
+        let second = store
+            .create_for_owner(alice.id, input("batch two"))
+            .await
+            .unwrap();
+        let mut runs = Vec::new();
+        for task in [&first, &second] {
+            runs.push(seed_run(&store, task.id).await);
+        }
+        let channel = store
+            .create_notification_channel(
+                alice.id,
+                CreateNotificationChannel {
+                    name: "hook".into(),
+                    kind: "webhook".into(),
+                    config: serde_json::json!({"url": "https://example.invalid/hook"}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create_notification_action(
+                first.id,
+                alice.id,
+                CreateNotificationAction {
+                    channel_id: channel.id,
+                    event: "failure".into(),
+                    failure_threshold: 1,
+                    automatic_only: false,
+                    title_template: None,
+                    body_template: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        disable_cascades(&store).await;
+        let deleted = store
+            .batch_operations_for_owner(
+                alice.id,
+                &BatchTaskOperation {
+                    ids: vec![first.id, second.id],
+                    action: "delete".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        for (task, run) in [(&first, runs[0]), (&second, runs[1])] {
+            assert_eq!(count_where(&store, "runs", "task_id", task.id).await, 0);
+            assert_eq!(count_where(&store, "run_steps", "run_id", run).await, 0);
+        }
+        assert_eq!(
+            count_where(&store, "notification_actions", "task_id", first.id).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn run_deletes_and_pruning_remove_steps_without_cascades() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("prune_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("prune task"))
+            .await
+            .unwrap();
+        let single = seed_run(&store, task.id).await;
+        let owned = seed_run(&store, task.id).await;
+        let later = seed_run(&store, task.id).await;
+
+        disable_cascades(&store).await;
+        assert!(store.delete_run(single).await.unwrap());
+        assert_eq!(count_where(&store, "run_steps", "run_id", single).await, 0);
+        assert_eq!(count_where(&store, "runs", "id", single).await, 0);
+
+        assert_eq!(store.delete_runs_for_owner(alice.id).await.unwrap(), 2);
+        for run_id in [owned, later] {
+            assert_eq!(count_where(&store, "run_steps", "run_id", run_id).await, 0);
+        }
+
+        let prunable = seed_run(&store, task.id).await;
+        assert_eq!(store.prune_run_logs(i64::MAX).await.unwrap(), 1);
+        assert_eq!(
+            count_where(&store, "run_steps", "run_id", prunable).await,
+            0,
+            "pruning left the steps of the pruned run"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_subscription_and_template_deletes_remove_their_children() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let alice = store
+            .create_user("child_alice", &password_hash, "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(alice.id, input("child task"))
+            .await
+            .unwrap();
+        let channel = store
+            .create_notification_channel(
+                alice.id,
+                CreateNotificationChannel {
+                    name: "hook".into(),
+                    kind: "webhook".into(),
+                    config: serde_json::json!({"url": "https://example.invalid/hook"}),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create_notification_action(
+                task.id,
+                alice.id,
+                CreateNotificationAction {
+                    channel_id: channel.id,
+                    event: "failure".into(),
+                    failure_threshold: 1,
+                    automatic_only: false,
+                    title_template: None,
+                    body_template: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let subscription = store
+            .create_subscription(
+                alice.id,
+                CreateTemplateSubscription {
+                    name: "feed".into(),
+                    url: "https://example.invalid/feed.json".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let imported = store
+            .create_template_for_owner(
+                alice.id,
+                CreateTemplate {
+                    name: "imported".into(),
+                    description: None,
+                    definition: template_definition("imported"),
+                    grp: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_template_import(subscription.id, imported.id, "entry", None, None)
+            .await
+            .unwrap();
+        let pushed = store
+            .create_template_for_owner(
+                alice.id,
+                CreateTemplate {
+                    name: "pushed".into(),
+                    description: None,
+                    definition: template_definition("pushed"),
+                    grp: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create_push_request(
+                alice.id,
+                CreatePushRequest {
+                    template_id: pushed.id,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the push request fixture was not created");
+
+        disable_cascades(&store).await;
+        assert!(
+            store
+                .delete_notification_channel(channel.id, alice.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count_where(&store, "notification_actions", "channel_id", channel.id).await,
+            0
+        );
+
+        assert!(
+            store
+                .delete_subscription(subscription.id, alice.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count_where(
+                &store,
+                "template_imports",
+                "subscription_id",
+                subscription.id
+            )
+            .await,
+            0
+        );
+
+        assert!(
+            store
+                .delete_template_for_owner(pushed.id, alice.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count_where(&store, "push_requests", "template_id", pushed.id).await,
+            0
+        );
+        assert!(
+            store
+                .delete_template_for_owner(imported.id, alice.id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count_where(&store, "template_imports", "template_id", imported.id).await,
+            0
+        );
     }
 }
