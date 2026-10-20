@@ -229,6 +229,105 @@ impl FromRef<AppState> for Store {
     }
 }
 
+/// Session revocation lives here rather than at every call site.
+///
+/// [`require_session`] answers cookie requests from the Redis cache *before* it
+/// consults the store, and that cached copy is never re-checked against the row
+/// it came from. Deleting the `sessions` row therefore only takes effect once
+/// the cache entry expires -- up to the seven-day cap applied on insert -- which
+/// is exactly what "log out" and "change your password" must not do. Each path
+/// that ends or rewrites a session goes through these wrappers so the store and
+/// the cache are always changed together.
+impl AppState {
+    /// End one session, in the store and in the cache.
+    async fn revoke_session(&self, session_token: &str) -> Result<bool, ApiError> {
+        let existed = self.store.revoke_session(session_token).await?;
+        self.session_cache
+            .invalidate(&token_hash(session_token))
+            .await;
+        Ok(existed)
+    }
+
+    /// Change a password; the store revokes all sessions in the same
+    /// transaction, so the cache sweep runs only after it reported success.
+    async fn change_password(&self, user_id: i64, password_hash: &str) -> Result<bool, ApiError> {
+        let changed = self.store.change_password(user_id, password_hash).await?;
+        if changed {
+            self.session_cache.invalidate_user(user_id, &[]).await;
+        }
+        Ok(changed)
+    }
+
+    /// Delete a user along with everything they own, then drop their cached
+    /// sessions.
+    async fn delete_user(&self, id: i64) -> Result<bool, ApiError> {
+        let deleted = self.store.delete_user(id).await?;
+        if deleted {
+            self.session_cache.invalidate_user(id, &[]).await;
+        }
+        Ok(deleted)
+    }
+
+    /// Update role / disabled. The cached session copy carries the user row, so
+    /// both a demotion and a disable have to evict it to take effect immediately.
+    async fn update_user(
+        &self,
+        id: i64,
+        input: &AdminUserUpdate,
+    ) -> Result<Option<crate::model::User>, ApiError> {
+        let user = self
+            .store
+            .update_user(id, input)
+            .await
+            .map_err(ApiError::unprocessable)?;
+        if user.is_some() {
+            self.session_cache.invalidate_user(id, &[]).await;
+        }
+        Ok(user)
+    }
+
+    /// Swap the built-in avatar, then evict the cached user row that still holds
+    /// the old one.
+    async fn set_avatar(
+        &self,
+        user_id: i64,
+        avatar_id: &str,
+    ) -> Result<Option<crate::model::User>, ApiError> {
+        let user = self.store.change_avatar(user_id, avatar_id).await?;
+        if user.is_some() {
+            self.session_cache.invalidate_user(user_id, &[]).await;
+        }
+        Ok(user)
+    }
+
+    /// Confirm an email address. `email_verified` lives in the cached user row,
+    /// so the eviction is what makes the badge appear on the very next request.
+    async fn consume_email_verification(&self, token: &str) -> Result<Option<i64>, ApiError> {
+        let user_id = self.store.consume_email_verification_token(token).await?;
+        if let Some(id) = user_id {
+            self.session_cache.invalidate_user(id, &[]).await;
+        }
+        Ok(user_id)
+    }
+
+    /// Redeem a password-reset token: the store rewrites the password and
+    /// revokes every session in one transaction, then the cache is swept.
+    async fn consume_password_reset(
+        &self,
+        token: &str,
+        password_hash: &str,
+    ) -> Result<Option<i64>, ApiError> {
+        let user_id = self
+            .store
+            .consume_password_reset_token(token, password_hash)
+            .await?;
+        if let Some(id) = user_id {
+            self.session_cache.invalidate_user(id, &[]).await;
+        }
+        Ok(user_id)
+    }
+}
+
 /**
  * A run lifecycle event published to all connected WebSocket clients.
  */
@@ -1068,7 +1167,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     require_csrf(&headers, &origin, &session)?;
     // A bearer request has no session row to revoke; that is deliberate.
     // Revoking a token is `DELETE /api/v1/tokens/{id}`, not this endpoint.
-    state.store.revoke_session(&origin.token).await?;
+    state.revoke_session(&origin.token).await?;
     state
         .store
         .record_audit(
@@ -1117,7 +1216,6 @@ async fn change_password(
         .await
         .map_err(anyhow::Error::from)??;
     if !state
-        .store
         .change_password(session.user.id, &password_hash)
         .await?
     {
@@ -1155,8 +1253,7 @@ async fn change_avatar(
         )));
     }
     let user = state
-        .store
-        .change_avatar(session.user.id, &input.avatar_id)
+        .set_avatar(session.user.id, &input.avatar_id)
         .await?
         .ok_or(ApiError::Unauthorized(
             "authentication_required",
@@ -1516,7 +1613,7 @@ async fn establish_header_session(
     old_token: Option<&str>,
 ) -> anyhow::Result<crate::model::IssuedSession> {
     if let Some(old) = old_token {
-        let _ = state.store.revoke_session(old).await;
+        let _ = state.revoke_session(old).await;
     }
     let issued = state
         .store
@@ -3172,8 +3269,7 @@ async fn reset_password(
         .await
         .map_err(anyhow::Error::from)??;
     let Some(user_id) = state
-        .store
-        .consume_password_reset_token(&input.token, &password_hash)
+        .consume_password_reset(&input.token, &password_hash)
         .await?
     else {
         return Err(ApiError::Unauthorized(
@@ -3306,10 +3402,8 @@ async fn admin_update_user(
         ));
     }
     state
-        .store
         .update_user(id, &input)
-        .await
-        .map_err(ApiError::unprocessable)?
+        .await?
         .map(|user| Json(json!(user)))
         .ok_or(ApiError::NotFound("user_not_found", "User not found"))
 }
@@ -3326,7 +3420,7 @@ async fn admin_delete_user(
             "Cannot delete your own account",
         ));
     }
-    if !state.store.delete_user(id).await? {
+    if !state.delete_user(id).await? {
         return Err(ApiError::NotFound("user_not_found", "User not found"));
     }
     state
@@ -3445,11 +3539,7 @@ async fn verify_email(
     State(state): State<AppState>,
     ApiJson(input): ApiJson<VerifyEmail>,
 ) -> Result<Json<Value>, ApiError> {
-    let Some(user_id) = state
-        .store
-        .consume_email_verification_token(&input.token)
-        .await?
-    else {
+    let Some(user_id) = state.consume_email_verification(&input.token).await? else {
         return Err(ApiError::Unauthorized(
             "invalid_or_expired_verification_token",
             "The verification token is invalid or has expired",
