@@ -3335,6 +3335,63 @@ async fn run_steps_websocket(
     Ok(ws.on_upgrade(move |socket| stream_run_steps(socket, store, id, events)))
 }
 
+/// How often an idle run stream pings its client.
+///
+/// A reverse proxy in front of the server drops a silent upgrade -- nginx's
+/// `proxy_read_timeout` is 60s by default -- and a run waiting on a slow target
+/// can be quiet for longer than that. The ping is what keeps the socket alive
+/// between steps.
+const RUN_STREAM_PING_INTERVAL: Duration = Duration::from_secs(20);
+
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled")
+}
+
+/// Send a full snapshot of the run's steps.
+///
+/// Returns whether the stream should keep going. `false` means either the
+/// socket is gone or the run is already finished -- a finished run will never
+/// publish another frame, so the snapshot's status replay is the last thing the
+/// client needs to hear.
+async fn send_run_snapshot(
+    socket: &mut axum::extract::ws::WebSocket,
+    store: &Store,
+    run_id: i64,
+) -> bool {
+    let steps = match store.list_run_steps(run_id).await {
+        Ok(steps) => steps,
+        // A failed read is not a reason to drop a live stream: the next frame,
+        // or the client's own polling, still has a chance.
+        Err(_) => return true,
+    };
+    let snapshot = json!({"type": "snapshot", "run_id": run_id, "steps": steps});
+    if socket
+        .send(Message::Text(snapshot.to_string().into()))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    // The broadcast only carries a status frame to subscribers that were
+    // already listening. A run that finished before the socket opened -- or
+    // between a `Lagged` gap and this snapshot -- therefore has no terminal
+    // frame left to deliver, and the client would wait for one that never
+    // comes. Replaying the current status closes that gap.
+    match store.get_run(run_id).await {
+        Ok(Some(run)) if is_terminal_run_status(&run.status) => {
+            let frame = json!({
+                "type": "status",
+                "run_id": run_id,
+                "status": run.status,
+                "error": run.error,
+            });
+            let _ = socket.send(Message::Text(frame.to_string().into())).await;
+            false
+        }
+        _ => true,
+    }
+}
+
 async fn stream_run_steps(
     mut socket: axum::extract::ws::WebSocket,
     store: Store,
@@ -3342,38 +3399,74 @@ async fn stream_run_steps(
     mut events: tokio::sync::broadcast::Receiver<Value>,
 ) {
     use futures_util::SinkExt;
-    // Send the initial snapshot of known steps.
-    if let Ok(steps) = store.list_run_steps(run_id).await {
-        let _ = socket
-            .send(Message::Text(
-                json!({"type": "snapshot", "run_id": run_id, "steps": steps})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
+    if !send_run_snapshot(&mut socket, &store, run_id).await {
+        return;
     }
-    // Stream subsequent live events for this run.
+    let mut ping = tokio::time::interval(RUN_STREAM_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately; consume it so the first ping lands a
+    // full interval from now rather than right after the snapshot.
+    ping.tick().await;
     loop {
         let event = tokio::select! {
-            _ = socket.recv() => {
-                // Client ping/close handling.
-                break;
+            incoming = socket.recv() => match incoming {
+                // `None` and `Close` are the client leaving.
+                None | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // A text frame from the client, or the pong answering our own
+                // ping, says nothing about the run. Treating any frame as a
+                // disconnect (as this did) tore the stream down as soon as the
+                // keepalive it was sent came back.
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => break,
+            },
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+                continue;
             },
             event = events.recv() => match event {
                 Ok(value) => value,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // The receiver fell behind and frames were dropped. A snapshot
+                // is the repair: it carries every persisted step, so the client
+                // rebuilds instead of running with a hole in the timeline.
+                // Dropping them silently left the toast missing steps with no
+                // way to notice.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if !send_run_snapshot(&mut socket, &store, run_id).await {
+                        break;
+                    }
+                    continue;
+                }
             },
         };
         let ev_run_id = event.get("run_id").and_then(|v| v.as_i64());
         if ev_run_id != Some(run_id) {
             continue;
         }
+        let terminal = event
+            .get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|status| {
+                event.get("type").and_then(|v| v.as_str()) == Some("status")
+                    && is_terminal_run_status(status)
+            });
         if socket
             .send(Message::Text(event.to_string().into()))
             .await
             .is_err()
         {
+            break;
+        }
+        // Nothing else will ever be published for this run.
+        if terminal {
             break;
         }
     }

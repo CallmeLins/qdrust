@@ -531,12 +531,18 @@ async function toggleTask(task: Task) {
   } catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
 }
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled"];
+/** How long a single `runNow` may wait before it gives up and points at the log. */
+const RUN_WAIT_LIMIT_MS = 5 * 60 * 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** Poll the task's runs until the given one reaches a terminal status. */
 async function waitForRun(taskId: number, runId: number): Promise<Run | null> {
-  const deadline = Date.now() + 5 * 60 * 1000;
+  const deadline = Date.now() + RUN_WAIT_LIMIT_MS;
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await sleep(1000);
     const runs = await api.taskRuns(taskId);
     const run = runs.find((x) => x.id === runId);
     if (run && TERMINAL_RUN_STATUSES.includes(run.status)) return run;
@@ -642,21 +648,28 @@ async function runNow(task: Task) {
     live = followRun(queued.id, toastId, () => {
       updateToast(toastId, { meta: t("runLiveUnavailable") });
     });
-    // Wait for the first terminal signal. Then fetch the run list once: the row
-    // carries the status/HTTP summary and the socket's step frames carry the
-    // timeline. Starting a second polling loop here doubled every task-runs
-    // request on the normal websocket path.
-    const terminal = await Promise.race([
-      live.terminal,
-      waitForRun(task.id, queued.id).then((run) => run?.status ?? "disconnected"),
-    ]);
+    // The socket is the primary path: it reports the terminal status as soon as
+    // the run finishes. The hard stop is only for a socket that connects and
+    // then goes quiet, so the toast can never spin forever.
+    let hardStop: number | undefined;
+    const timedOut = new Promise<"timedOut">((resolve) => {
+      hardStop = window.setTimeout(() => resolve("timedOut"), RUN_WAIT_LIMIT_MS);
+    });
+    const terminal = await Promise.race([live.terminal, timedOut]);
+    window.clearTimeout(hardStop);
+    // Read the row once for the status/HTTP summary. When the socket dropped
+    // before the run settled, this row is still `running` -- so polling, not
+    // this read, decides the outcome. Treating a non-terminal row as final here
+    // is what used to report a live run as failed.
     let run = (await api.taskRuns(task.id)).find((item) => item.id === queued.id) ?? null;
-    // The websocket terminal frame can beat the database row briefly. Poll only
-    // that narrow case; the normal path performs exactly one follow-up read.
-    if (terminal !== "disconnected" && (run == null || !TERMINAL_RUN_STATUSES.includes(run.status))) {
+    const settled = run != null && TERMINAL_RUN_STATUSES.includes(run.status);
+    if (!settled && terminal !== "timedOut") {
+      if (terminal === "disconnected") {
+        updateToast(toastId, { meta: t("runLiveUnavailable") });
+      }
       run = await waitForRun(task.id, queued.id);
     }
-    if (!run) {
+    if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) {
       updateToast(toastId, { message: t("runNowTimeout"), taskId: task.id, persistent: false });
       return;
     }
