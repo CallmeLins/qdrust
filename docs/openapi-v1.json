@@ -1074,27 +1074,58 @@
           }
         }
       }
-    },    "/api/v1/tokens": {
+    },
+    "/api/v1/tokens": {
       "get": {
         "operationId": "listApiTokens",
         "responses": {
           "200": {
             "description": "Personal access tokens (secrets omitted)",
-            "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ApiToken" } } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiToken"
+                  }
+                }
+              }
+            }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       },
       "post": {
         "operationId": "createApiToken",
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateApiToken" } } } },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateApiToken"
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "Token created; the plaintext is returned once",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IssuedApiToken" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedApiToken"
+                }
+              }
+            }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "422": { "$ref": "#/components/responses/ValidationError" }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
         }
       }
     },
@@ -1106,17 +1137,25 @@
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
-          "204": { "description": "Token revoked" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "204": {
+            "description": "Token revoked"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
-
     "/api/v1/public-templates": {
       "get": {
         "operationId": "listPublicTemplates",
@@ -1317,14 +1356,19 @@
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "requestBody": {
           "required": false,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/TestTemplate" }
+              "schema": {
+                "$ref": "#/components/schemas/TestTemplate"
+              }
             }
           }
         },
@@ -1333,13 +1377,21 @@
             "description": "Test run outcome",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/TemplateTestResult" }
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateTestResult"
+                }
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/NotFound" },
-          "422": { "$ref": "#/components/responses/ValidationError" }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
         }
       }
     },
@@ -3732,29 +3784,71 @@
       },
       "ApiToken": {
         "type": "object",
-        "required": ["id", "name", "created_at"],
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "name": { "type": "string" },
-          "created_at": { "type": "integer", "format": "int64" },
-          "last_used_at": { "type": ["integer", "null"], "format": "int64" },
-          "expires_at": { "type": ["integer", "null"], "format": "int64" }
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_used_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
         }
       },
       "IssuedApiToken": {
         "type": "object",
-        "required": ["token", "api_token"],
+        "required": [
+          "token",
+          "api_token"
+        ],
         "properties": {
-          "token": { "type": "string", "description": "Plaintext token, shown once" },
-          "api_token": { "$ref": "#/components/schemas/ApiToken" }
+          "token": {
+            "type": "string",
+            "description": "Plaintext token, shown once"
+          },
+          "api_token": {
+            "$ref": "#/components/schemas/ApiToken"
+          }
         }
       },
       "CreateApiToken": {
         "type": "object",
-        "required": ["name"],
+        "required": [
+          "name"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "expires_in_days": { "type": ["integer", "null"], "description": "Omit or null for no expiry" }
+          "name": {
+            "type": "string"
+          },
+          "expires_in_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Omit or null for no expiry"
+          }
         }
       },
       "TestTemplate": {
@@ -3768,27 +3862,50 @@
       },
       "TemplateTestStep": {
         "type": "object",
-        "required": ["index", "url", "status", "body_size"],
+        "required": [
+          "index",
+          "url",
+          "status",
+          "body_size"
+        ],
         "properties": {
-          "index": { "type": "integer" },
-          "url": { "type": "string" },
-          "status": { "type": "integer" },
-          "body_size": { "type": "integer" }
+          "index": {
+            "type": "integer"
+          },
+          "url": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "body_size": {
+            "type": "integer"
+          }
         }
       },
       "TemplateTestResult": {
         "type": "object",
-        "required": ["steps", "variables"],
+        "required": [
+          "steps",
+          "variables"
+        ],
         "properties": {
           "steps": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/TemplateTestStep" }
+            "items": {
+              "$ref": "#/components/schemas/TemplateTestStep"
+            }
           },
           "variables": {
             "type": "object",
             "additionalProperties": true
           },
-          "log": { "type": ["string", "null"] }
+          "log": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       },
       "Template": {
