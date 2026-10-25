@@ -44,6 +44,95 @@ jobs:
           fetch-depth: 0
       - run: python3 scripts/check-migrations.py
 
+  # MySQL is the backend the unit tests cannot reach: they all run on SQLite, so
+  # every MySQL-only trap is invisible to `cargo test` -- the second migration
+  # tree drifting from the first, a reserved word that needs backticks, and the
+  # absence of foreign keys, which makes every "it cascades" assumption wrong.
+  #
+  # Three things are checked: the two migration trees describe the same schema,
+  # the binary boots against MySQL, and a task deleted through the API really
+  # takes its runs and steps with it (no cascade would have done that for us).
+  mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: qdrust-ci
+          MYSQL_DATABASE: qdrust_ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pqdrust-ci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      MYSQL_PASSWORD: qdrust-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: The two migration trees describe one schema
+        run: python3 scripts/check-schema-parity.py --mysql-host 127.0.0.1 --mysql-user root
+
+      - name: Boot, run and delete against MySQL
+        run: |
+          set -euo pipefail
+          cargo build --bin qdrust-server
+          DATABASE_URL='mysql://root:qdrust-ci@127.0.0.1:3306/qdrust_ci' \
+            PORT=18923 \
+            QDRUST_LOCAL_LOGIN_ENABLED=true \
+            RUST_LOG=warn \
+            ./target/debug/qdrust-server &
+          server=$!
+          trap 'kill $server || true' EXIT
+
+          BASE=http://127.0.0.1:18923
+          for _ in $(seq 1 60); do
+            if curl -fsS "$BASE/ready" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS "$BASE/ready" >/dev/null
+
+          # Register + login exercises LAST_INSERT_ID and the session writes.
+          curl -fsS -X POST "$BASE/api/v1/auth/register" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"cismoke","password":"ci-smoke-password"}' >/dev/null
+          curl -fsS -c jar.txt -X POST "$BASE/api/v1/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"cismoke","password":"ci-smoke-password"}' >/dev/null
+          csrf=$(awk '$6=="qd_csrf"{print $7}' jar.txt)
+
+          # Reading a run selects `trigger`, which is a reserved word on MySQL and
+          # needs backticks: this call is what fails without them.
+          curl -fsS -b jar.txt -X POST "$BASE/api/v1/tasks" \
+            -H 'Content-Type: application/json' -H "x-csrf-token: $csrf" \
+            -d '{"name":"ci","cron":"0 */5 * * * * *","method":"GET","url":"http://127.0.0.1:18923/health"}' >/dev/null
+          curl -fsS -b jar.txt -X POST "$BASE/api/v1/tasks/1/run" -H "x-csrf-token: $csrf" >/dev/null
+
+          for _ in $(seq 1 60); do
+            status=$(curl -fsS -b jar.txt "$BASE/api/v1/tasks/1/runs" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["status"])')
+            case "$status" in succeeded|failed|cancelled) break ;; esac
+            sleep 1
+          done
+          test "$status" = succeeded
+
+          curl -fsS -b jar.txt -X DELETE "$BASE/api/v1/tasks/1" -H "x-csrf-token: $csrf" >/dev/null
+
+          # The point of the exercise: MySQL has no foreign keys here, so if the
+          # delete path forgot a child table the rows are simply still there.
+          for table in runs run_steps notification_deliveries notification_actions; do
+            left=$(mysql --host=127.0.0.1 --user=root --password=qdrust-ci --protocol=TCP \
+              --batch --skip-column-names --execute="SELECT COUNT(*) FROM qdrust_ci.$table")
+            if [ "$left" != "0" ]; then
+              echo "::error::$table still holds $left row(s) after the task was deleted"
+              exit 1
+            fi
+          done
+
   webui:
     runs-on: ubuntu-latest
     defaults:
