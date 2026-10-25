@@ -162,12 +162,49 @@ QDRUST_BASE_PATH=/qd
 | `REQUIRE_EMAIL_VERIFICATION` | `false` | 新用户登录前必须验证邮箱 |
 | `GA_KEY` | 空 | 注入 WebUI 的 Google Analytics 密钥 |
 | `REDIS_URL` | 空 | 可选 Redis 会话缓存 |
+| `QDRUST_METRICS` | 空 | 设为 `1` / `true` 时开放 `GET /metrics`（Prometheus 文本格式）且**不校验凭据**，适合只在内网或 sidecar 抓取的场景 |
+| `QDRUST_METRICS_TOKEN` | 空 | 设置后自动启用 `/metrics`，并要求 `Authorization: Bearer <token>`。两者都不设时 `/metrics` 返回 404（等同于不存在），因为运行计数本身就是部署信息 |
 | `QDRUST_CONFIG_FILE` | 空 | 运行时可调配置的 JSON 文件路径（热更新站点设置） |
 | `QDRUST_BROWSER_URL` | 空 | 浏览器插件端点，配置后启用 `api://browser/*`（进程内 chromiumoxide，CDP：`http://localhost:9222` / `ws://localhost:3000` / `wss://chrome.browserless.io?token=...`） |
 | `QDRUST_ALLOW_PRIVATE_NETWORK` | `false` | **高风险**：允许**全部出站请求**（模板运行、直接填 URL 的任务、通知渠道、订阅抓取、模板里的 `api://util/dddd` 转发）访问内网 / 回环 / 链路本地地址。仅在确实依赖内网服务（如自建 flaresolverr、内网 ntfy、内网 DdddOCR）时开启，理由、风控与升级影响见[出站请求访问内网地址](usage.md#出站请求访问内网地址高风险开关)。也可在管理页「站点设置」里运行时开关，优先级高于本变量 |
 | `QDRUST_ALLOW_INVALID_CERTIFICATES` | `false` | **高风险**：不再校验证书（自签名 / 过期 / 域名不匹配都接受）。与上一个开关互相独立，理由见[接受无效证书](usage.md#接受无效证书高风险开关)。同样可在管理页运行时开关，优先级高于本变量 |
 
 第三方登录（OIDC / 反向代理 Header）另有一组变量，见 [账号与第三方登录](authentication.md)。
+
+## 监控指标
+
+`GET /metrics` 输出 Prometheus 文本格式，数据每次抓取时用几条聚合查询现算，不驻留内存，因此进程重启不会丢计数、也不会和表里的数据对不上。默认关闭：
+
+```bash
+# 受凭据保护（推荐）
+QDRUST_METRICS_TOKEN=change-me
+
+# 或者只在内网信任、由 sidecar 抓取
+QDRUST_METRICS=1
+```
+
+```yaml
+scrape_configs:
+  - job_name: qdrust
+    authorization:
+      credentials: change-me
+    static_configs:
+      - targets: ["qdrust:8923"]
+```
+
+指标含义：
+
+| 指标 | 类型 | 用途 |
+|---|---|---|
+| `qdrust_runs_total{status=...}` | gauge | 各终态的累计运行数。六种状态**都**会输出，为 0 也输出，否则 `rate()` 与告警规则会在第一次失败时才发现序列不存在 |
+| `qdrust_runs_active` | gauge | 排队 + 执行中的运行数 |
+| `qdrust_runs_oldest_pending_age_seconds` | gauge | 最久等待的那个运行已经等了多久；队列空时为 0。调度器卡住时这个数会一直涨 |
+| `qdrust_tasks_total{disabled=...}` | gauge | 已启用 / 已停用的任务数 |
+| `qdrust_notification_deliveries_total{status=...}` | gauge | 通知投递成功 / 失败数，配合运行详情页的「投递记录」定位「签到成功但没收到消息」 |
+| `qdrust_users_total` | gauge | 账号总数 |
+| `qdrust_build_info{version=...}` | gauge | 恒为 1，只用来把版本带进标签 |
+
+数据库读不到时返回 `503` 并附一行 `# scrape failed:` 说明，而不是输出一排 0 —— 一排 0 在面板上看起来等于「一切正常」。
 
 ## 数据库
 

@@ -15,7 +15,18 @@ use sqlx::{
 };
 
 use crate::auth::{new_token, token_hash};
-use crate::model::{AdminUserUpdate, ApiToken, AuthenticatedSession, BatchTaskOperation, CreateApiToken, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken, IssuedSession, NotificationAction, NotificationChannel, NotificationDefaultTemplate, NotificationDelivery, NotificationDeliveryRecord, OidcLoginState, PluginManifest, PushRequest, Run, RunCalendarDay, RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials};
+use crate::model::{
+    AdminUserUpdate, ApiToken, AuthenticatedSession, BatchTaskOperation, CreateApiToken,
+    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
+    CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity,
+    ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken,
+    IssuedSession, MetricsSnapshot, NotificationAction, NotificationChannel,
+    NotificationDefaultTemplate, NotificationDelivery, NotificationDeliveryRecord, OidcLoginState,
+    PluginManifest, PushRequest, Run, RunCalendarDay, RunStep, SetSiteSetting, SiteSetting, Task,
+    Template, TemplateImport, TemplateSubscription, UpdateNotificationAction,
+    UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
+    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
+};
 use qdrust_core::{
     plugin::NotepadSlot,
     qd_har::QdHar,
@@ -3151,6 +3162,88 @@ macro_rules! define_store {
         .await?)
     }
 
+    /// One read of everything `/metrics` reports.
+    ///
+    /// Aggregate queries rather than counters held in memory: a counter is lost
+    /// on restart and drifts from the table it is supposed to describe, and
+    /// these tables are small enough that grouping them costs about as much as
+    /// scraping them.
+    pub async fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
+        // Every status the schema allows. Listed here rather than derived from
+        // the rows, so a status that currently has no runs still gets a series
+        // at zero -- a disappearing series breaks rate() and alerting rules.
+        const RUN_STATUSES: [&str; 6] = [
+            "pending", "leased", "running", "succeeded", "failed", "cancelled",
+        ];
+        let mut runs_by_status = RUN_STATUSES
+            .iter()
+            .map(|status| ((*status).to_string(), 0i64))
+            .collect::<Vec<_>>();
+        let counted: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM runs GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        for (status, count) in counted {
+            match runs_by_status.iter_mut().find(|(name, _)| *name == status) {
+                Some(slot) => slot.1 = count,
+                // A status this build does not know about (an older schema
+                // restored from a backup) is still reported, not dropped.
+                None => runs_by_status.push((status, count)),
+            }
+        }
+
+        let (active_runs, oldest_pending): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(created_at) FROM runs WHERE status IN ('pending','leased','running')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let now = Utc::now().timestamp();
+        let oldest_pending_age_seconds = oldest_pending.map_or(0, |started| (now - started).max(0));
+
+        let mut tasks_enabled = 0i64;
+        let mut tasks_disabled = 0i64;
+        let counted: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT disabled, COUNT(*) FROM tasks GROUP BY disabled")
+                .fetch_all(&self.pool)
+                .await?;
+        for (disabled, count) in counted {
+            if disabled == 0 {
+                tasks_enabled += count;
+            } else {
+                tasks_disabled += count;
+            }
+        }
+
+        let mut deliveries_by_status = vec![("succeeded".to_string(), 0i64), ("failed".to_string(), 0)];
+        let counted: Vec<(String, i64)> =
+            sqlx::query_as("SELECT status, COUNT(*) FROM notification_deliveries GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        for (status, count) in counted {
+            match deliveries_by_status
+                .iter_mut()
+                .find(|(name, _)| *name == status)
+            {
+                Some(slot) => slot.1 = count,
+                None => deliveries_by_status.push((status, count)),
+            }
+        }
+
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+
+        Ok(MetricsSnapshot {
+            runs_by_status,
+            active_runs,
+            oldest_pending_age_seconds,
+            tasks_enabled,
+            tasks_disabled,
+            deliveries_by_status,
+            users,
+        })
+    }
+
     // ---- Email verification (MustVerifyEmail) ----
 
     pub async fn set_user_email(&self, user_id: i64, email: &str) -> Result<bool> {
@@ -4263,6 +4356,7 @@ impl Store {
         pub async fn purge_expired_reset_tokens() -> Result<u64> {  };
         pub async fn prune_run_logs(before: i64) -> Result<u64> { before };
         pub async fn count_old_runs(before: i64) -> Result<i64> { before };
+        pub async fn metrics_snapshot() -> Result<MetricsSnapshot> {  };
         pub async fn set_user_email(user_id: i64, email: &str) -> Result<bool> { user_id, email };
         pub async fn create_email_verification_token(user_id: i64, ttl_seconds: i64) -> Result<(String, i64)> { user_id, ttl_seconds };
         pub async fn consume_email_verification_token(token: &str) -> Result<Option<i64>> { token };

@@ -6,6 +6,7 @@ pub mod email;
 pub mod ga;
 pub mod header_auth;
 pub mod library;
+pub mod metrics;
 pub mod model;
 pub mod oidc;
 pub mod outbound;

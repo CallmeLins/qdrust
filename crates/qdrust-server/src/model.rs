@@ -785,6 +785,25 @@ pub struct NotificationDeliveryRecord {
     pub created_at: i64,
 }
 
+/// Everything `/metrics` reports, read in one go.
+///
+/// A plain value rather than a set of accessors: the endpoint formats it, the
+/// tests assert on it, and a struct makes it obvious that a scrape is a
+/// consistent-enough read of the deployment rather than a dozen separate ones.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MetricsSnapshot {
+    /// Every run status, including the ones at zero.
+    pub runs_by_status: Vec<(String, i64)>,
+    /// Runs queued or in flight.
+    pub active_runs: i64,
+    /// How long the oldest waiting run has been waiting; 0 when idle.
+    pub oldest_pending_age_seconds: i64,
+    pub tasks_enabled: i64,
+    pub tasks_disabled: i64,
+    pub deliveries_by_status: Vec<(String, i64)>,
+    pub users: i64,
+}
+
 fn default_failure_threshold() -> i64 {
     1
 }

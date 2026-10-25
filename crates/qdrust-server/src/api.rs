@@ -200,8 +200,10 @@ impl AuthConfig {
     }
 }
 
+/// `pub(crate)` so the Prometheus handler can live in its own module without
+/// the router having to re-export state.
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     store: Store,
     auth: AuthConfig,
     login_limiter: LoginRateLimiter,
@@ -221,6 +223,9 @@ struct AppState {
     /// Trusted reverse-proxy header auth config. `None` (the default) means
     /// header auth is disabled and the middleware is a no-op pass-through.
     header_auth: Option<std::sync::Arc<crate::config::HeaderAuthConfig>>,
+    /// How `GET /metrics` may be scraped. Read from the environment once, at
+    /// router construction, so a request cannot change it.
+    metrics: crate::metrics::MetricsConfig,
 }
 
 impl FromRef<AppState> for Store {
@@ -384,6 +389,10 @@ pub fn router_with_auth(
     let inner = Router::new()
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/meta", get(app_meta))
+        // Outside `/api/v1` on purpose: this is a Prometheus scrape target, not
+        // part of the versioned API a client codes against, and scraper
+        // configuration is easier to write when the path does not move.
+        .route("/metrics", get(metrics))
         .route("/api/v1/auth/config", get(auth_config))
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
         .route("/api/v1/auth/register", axum::routing::post(register))
@@ -622,6 +631,7 @@ pub fn router_with_auth(
         catalogue_cache: crate::library::CatalogueCache::new(),
         base_path: base_path.to_string(),
         header_auth,
+        metrics: crate::metrics::MetricsConfig::from_env(),
     };
 
     // Header authentication middleware (Phase 4). It runs for every API request
@@ -670,6 +680,48 @@ async fn ready(State(store): State<Store>) -> Result<Json<Value>, ApiError> {
 }
 async fn api_not_found() -> ApiError {
     ApiError::NotFound("api_endpoint_not_found", "API endpoint not found")
+}
+
+/// `GET /metrics` -- Prometheus text exposition.
+///
+/// Lives here rather than in `metrics.rs` because it is a route handler, and
+/// every other route handler in this crate is in this file. `metrics.rs` holds
+/// the part worth testing on its own: which scrapes are authorised, and how the
+/// snapshot is rendered.
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // A disabled endpoint is indistinguishable from a missing one: telling a
+    // stranger "this deployment has metrics turned off" is itself a hint.
+    if !state.metrics.is_enabled() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !state.metrics.authorised(&headers) {
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response.headers_mut().insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer"),
+        );
+        return response;
+    }
+    let snapshot = match state.store.metrics_snapshot().await {
+        Ok(snapshot) => snapshot,
+        // A scrape that cannot read the database must say so instead of
+        // reporting zeros, which a dashboard would plot as "all quiet".
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("# scrape failed: {err}\n"),
+            )
+                .into_response();
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(axum::body::Body::from(crate::metrics::render(&snapshot)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Public login-policy endpoint consumed by the WebUI to decide what to render
