@@ -2950,24 +2950,53 @@ macro_rules! define_store {
 
     // ---- Log retention ----
 
-    /// Delete runs (and their steps) finished before the given timestamp.
+    /// Delete runs (and their steps) finished before the given
+    /// timestamp; returns how many runs were removed.
+    ///
+    /// Deleted in bounded batches rather than one statement. Retention exists
+    /// precisely because there is a backlog, and a single unbounded DELETE over
+    /// a year of history holds one write transaction — and, on MySQL, a row lock
+    /// on everything it touches — for as long as the sweep takes. Short commits
+    /// keep the hourly maintenance from stalling the scheduler and the
+    /// dispatcher behind it.
     pub async fn prune_run_logs(&self, before: i64) -> Result<u64> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at<?)",
-        )
-        .bind(before)
-        .execute(&mut *transaction)
-        .await?;
-        let deleted = sqlx::query(
-            "DELETE FROM runs WHERE finished_at IS NOT NULL AND finished_at<?",
-        )
-        .bind(before)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        transaction.commit().await?;
-        Ok(deleted)
+        // Small enough that one batch is a blink even on a slow disk, large
+        // enough that a year of history is a handful of round trips.
+        const BATCH: usize = 500;
+        let mut total = 0u64;
+        loop {
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at<? ORDER BY id LIMIT ?",
+            )
+            .bind(before)
+            .bind(BATCH as i64)
+            .fetch_all(&self.pool)
+            .await?;
+            let batch_len = ids.len();
+            if batch_len == 0 {
+                break;
+            }
+            let placeholders = vec!["?"; batch_len].join(",");
+            let mut transaction = self.pool.begin().await?;
+            // Children first: MySQL carries no foreign keys here (see the
+            // module-level note on the migrations), so nothing cascades.
+            for statement in [
+                format!("DELETE FROM run_steps WHERE run_id IN ({placeholders})"),
+                format!("DELETE FROM runs WHERE id IN ({placeholders})"),
+            ] {
+                let mut query = sqlx::query(&statement);
+                for id in &ids {
+                    query = query.bind(id);
+                }
+                query.execute(&mut *transaction).await?;
+            }
+            transaction.commit().await?;
+            total += batch_len as u64;
+            if batch_len < BATCH {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     pub async fn count_old_runs(&self, before: i64) -> Result<i64> {
