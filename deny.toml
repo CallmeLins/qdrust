@@ -5,7 +5,19 @@ yanked = "deny"
 # transitively by sqlx-mysql for caching_sha2_password auth; no patched rsa
 # release is pinned by sqlx yet. Local deployments are unaffected (the server
 # initiates TLS to MySQL and the auth exchange is not attacker-controlled).
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0387 (crypto-bigint 0.5.5): several operations documented as
+# constant-time can branch on secret data. The fix is 0.7.6, a major bump, and
+# 0.5.5 is not avoidable from here: it arrives through
+# openidconnect -> p256/p384 -> elliptic-curve 0.13 -> crypto-bigint 0.5, and
+# 4.0.1 declares p256/p384 as unconditional dependencies with no feature gate.
+# Everything that reaches it is ES256/ES384 *verification*
+# (`openidconnect::core::crypto` builds an `ecdsa::VerifyingKey` and calls
+# `verify`), so the values flowing through these branches are the signature and
+# the provider's public JWKS -- both public. This tree never loads an EC private
+# scalar: the only signing keys openidconnect implements are RSA, HMAC and
+# Ed25519, and none of them are used here. Revisit when openidconnect moves to
+# elliptic-curve 0.14 (which pulls crypto-bigint 0.7).
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
 
 [licenses]
 version = 2
