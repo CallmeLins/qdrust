@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Library as LibraryIcon, Loader2, LogOut, Mail, Menu, Monitor, Moon, MoreVertical, NotebookPen, Pencil, Play, Plus, Power, PowerOff, RefreshCw, Search, Send,
   Settings, ShieldCheck, Sun, Trash2, Undo2, Upload, Users, X, XCircle, Zap, KeyRound,
 } from "@lucide/vue";
-import { api, apiPath, errorCode, oidcStartUrl, websocketPath, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken, type LiveRunEvent, type LatestFailureTrace } from "./api";
+import { api, apiPath, errorCode, oidcStartUrl, websocketPath, type AuthConfig, type CreateTask, type Task, type Run, type RunStep, type User, type Template, type Plugin, type NotificationChannel, type NotificationAction, type NotificationDefaultEvent, type NotificationDefaults, type NotificationPreview, type TemplateSubscription, type PushRequest, type SiteSetting, type LibraryEntry, type LibrarySourceStatus, type TemplateTestResult, type NotepadSummary, type ApiToken, type LiveRunEvent, type LatestFailureTrace, type NotificationDeliveryRecord } from "./api";
 import HarEditor from "./HarEditor.vue";
 import Dropdown from "./Dropdown.vue";
 import Pager from "./Pager.vue";
@@ -211,6 +211,46 @@ const latestFailureTrace = computed(() =>
 const showFailureTrace = ref(false);
 const failureTraceLoading = ref(false);
 const runHistoryTask = ref<Task | null>(null);
+/** Run whose notification ledger is open, or null when the panel is closed.
+ *  A separate panel rather than a column: the ledger is the thing you open
+ *  *because* a run succeeded silently, so it should not compete for width with
+ *  the log column on the very table you scanned to get here. */
+const deliveryRun = ref<Run | null>(null);
+const deliveries = ref<NotificationDeliveryRecord[]>([]);
+const deliveriesLoading = ref(false);
+const retryingDeliveryId = ref<number | null>(null);
+async function openDeliveries(run: Run) {
+  deliveryRun.value = run;
+  deliveries.value = [];
+  deliveriesLoading.value = true;
+  try {
+    deliveries.value = await api.runDeliveries(run.id);
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    deliveriesLoading.value = false;
+  }
+}
+function closeDeliveries() {
+  deliveryRun.value = null;
+  deliveries.value = [];
+}
+/** Re-send one attempt. The endpoint answers with the run's whole ledger, so the
+ *  refreshed list is the server's view of it -- including the attempt number
+ *  that was just appended -- rather than something patched together here. */
+async function retryDelivery(record: NotificationDeliveryRecord) {
+  retryingDeliveryId.value = record.id;
+  try {
+    deliveries.value = await api.retryDelivery(record.id);
+    const latest = deliveries.value[deliveries.value.length - 1];
+    if (latest?.status === "succeeded") notify(t("deliveryRetried"));
+    else notify(latest?.error || t("deliveryRetryFailed"), "error");
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    retryingDeliveryId.value = null;
+  }
+}
 /** Task whose overflow (kebab) menu is open on narrow screens; null = none. */
 const openRowMenu = ref<number | null>(null);
 function toggleRowMenu(id: number) {
@@ -3167,6 +3207,7 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   <td><strong :class="runStatusClass(run.status)">{{ runStatusLabel(run.status) }}</strong></td>
                   <td class="run-log-col"><span class="run-log">{{ runLogText(run) }}</span></td>
                   <td class="row-actions">
+                    <button class="icon-button" :title="t('deliveryLedger')" @click="openDeliveries(run)"><Bell :size="15" /></button>
                     <button v-if="['pending','leased','running'].includes(run.status)" class="icon-button" :title="t('cancelRun')" @click="cancelRun(run)"><X :size="15" /></button>
                     <button class="icon-button" :title="t('deleteRun')" @click="removeRun(run)"><Trash2 :size="15" /></button>
                   </td>
@@ -4132,6 +4173,51 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           </div>
           <p v-if="calendarRunsHasMore" class="muted run-log-hint calendar-day-note">{{ fmt('calendarDayTruncated', { n: calendarRuns.length }) }}</p>
         </template>
+      </div>
+    </div>
+
+    <!-- ===== NOTIFICATION DELIVERY LEDGER ===== -->
+    <!-- Every attempt recorded for one run. This is the panel you open because a
+         run succeeded but no message arrived; before it existed the only trace
+         was a log line that the next restart rotated away. -->
+    <div v-if="deliveryRun" class="modal-backdrop" @click.self="closeDeliveries">
+      <div class="modal">
+        <div class="modal-header">
+          <div>
+            <h2>{{ t('deliveryLedger') }}</h2>
+            <p class="muted preview-meta">{{ formatRunTime(deliveryRun.started_at ?? deliveryRun.created_at, undefined, runHistoryTask?.timezone || undefined) }} · {{ runStatusLabel(deliveryRun.status) }}</p>
+          </div>
+          <button class="icon-button" type="button" :title="t('close')" @click="closeDeliveries"><X :size="20" /></button>
+        </div>
+        <p v-if="deliveriesLoading" class="muted">{{ t('loading') }}</p>
+        <p v-else-if="deliveries.length === 0" class="muted">{{ t('deliveryEmpty') }}</p>
+        <div v-else class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>{{ t('time') }}</th><th>{{ t('notifyChannel') }}</th><th>{{ t('notifyEvent') }}</th><th>{{ t('status') }}</th><th><span class="sr-only">{{ t('manage') }}</span></th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="row in deliveries" :key="row.id">
+                <td class="run-time">{{ formatRunTime(row.created_at) }}<span class="muted delivery-attempt">{{ fmt('deliveryAttempt', { n: row.attempt }) }}</span></td>
+                <td><strong>{{ row.channel_kind }}</strong></td>
+                <td>{{ eventLabel(row.event) }}</td>
+                <td>
+                  <strong :class="row.status === 'succeeded' ? 'run-ok' : 'run-bad'">{{ row.status === 'succeeded' ? t('deliverySucceeded') : t('deliveryFailed') }}</strong>
+                  <span v-if="row.http_status != null" class="muted delivery-attempt">HTTP {{ row.http_status }}</span>
+                  <!-- The channel's own error text is the whole point of the row:
+                       a 401 from a stale token reads differently from a timeout. -->
+                  <div v-if="row.error" class="delivery-error">{{ row.error }}</div>
+                </td>
+                <td class="row-actions">
+                  <button class="secondary-button" type="button" :disabled="retryingDeliveryId != null" @click="retryDelivery(row)">
+                    <Send :size="14" />{{ retryingDeliveryId === row.id ? t('sending') : t('deliveryRetry') }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-actions"><button class="secondary-button" type="button" @click="closeDeliveries">{{ t('close') }}</button></div>
       </div>
     </div>
 

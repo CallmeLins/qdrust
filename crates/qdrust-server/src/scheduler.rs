@@ -709,28 +709,17 @@ async fn send_notifications(
             ),
         };
         let channel = delivery.channel;
-        let title = vars.render(notification_template(
-            action.title_template.as_deref(),
-            owner_default.and_then(|row| row.title_template.as_deref()),
-            BUILTIN_TITLE_TEMPLATE,
-        ));
-        let body = vars.render(notification_template(
-            action.body_template.as_deref(),
-            owner_default.and_then(|row| row.body_template.as_deref()),
-            BUILTIN_BODY_TEMPLATE,
-        ));
-        let message = Message {
-            title: &title,
-            body: &body,
-            payload: &payload,
-        };
-        match crate::delivery::deliver(
+        match send_one(
+            store,
             outbound,
-            &channel.kind,
-            &channel.config,
-            &message,
-            &|value| vars.render(value),
-            Some(email),
+            task,
+            &action,
+            &channel,
+            event,
+            &vars,
+            &payload,
+            owner_default,
+            email,
         )
         .await
         {
@@ -749,6 +738,157 @@ async fn send_notifications(
             ),
         }
     }
+}
+
+/// Render one binding's message, send it, and append the attempt to the
+/// delivery ledger.
+///
+/// The ledger write is best-effort on purpose: a bookkeeping failure must not
+/// change whether the notification itself counted as delivered. What it does
+/// fix is the case that used to be unanswerable — a channel that failed left
+/// only a log line, and the next restart rotated it away.
+#[allow(clippy::too_many_arguments)]
+async fn send_one(
+    store: &Store,
+    outbound: &OutboundHttp,
+    task: &Task,
+    action: &crate::model::NotificationAction,
+    channel: &crate::model::NotificationChannel,
+    event: &str,
+    vars: &TemplateVars<'_>,
+    payload: &serde_json::Value,
+    owner_default: Option<&crate::model::NotificationDefaultTemplate>,
+    email: &EmailClient,
+) -> anyhow::Result<()> {
+    let title = vars.render(notification_template(
+        action.title_template.as_deref(),
+        owner_default.and_then(|row| row.title_template.as_deref()),
+        BUILTIN_TITLE_TEMPLATE,
+    ));
+    let body = vars.render(notification_template(
+        action.body_template.as_deref(),
+        owner_default.and_then(|row| row.body_template.as_deref()),
+        BUILTIN_BODY_TEMPLATE,
+    ));
+    let message = Message {
+        title: &title,
+        body: &body,
+        payload,
+    };
+    let result = crate::delivery::deliver(
+        outbound,
+        &channel.kind,
+        &channel.config,
+        &message,
+        &|value| vars.render(value),
+        Some(email),
+    )
+    .await;
+    // Numbered from what is already on file so a manual retry continues the
+    // sequence instead of looking like a first attempt.
+    let attempt = store
+        .count_notification_attempts(vars.run_id, action.id, channel.id, event)
+        .await
+        .unwrap_or(0)
+        + 1;
+    let (status, error_text) = match &result {
+        Ok(()) => ("succeeded", None),
+        Err(err) => ("failed", Some(err.to_string())),
+    };
+    if let Err(err) = store
+        .record_notification_delivery(
+            vars.run_id,
+            task.id,
+            Some(action.id),
+            Some(channel.id),
+            &channel.kind,
+            event,
+            attempt,
+            status,
+            None,
+            error_text.as_deref(),
+        )
+        .await
+    {
+        warn!(
+            task_id = task.id,
+            channel_id = channel.id,
+            %err,
+            "cannot record notification delivery"
+        );
+    }
+    result
+}
+
+/// Re-send one recorded delivery from the API's "retry" action.
+///
+/// The message is re-rendered from the run row rather than replayed from a
+/// stored copy, so a template edited since then takes effect — and so the
+/// ledger never has to hold rendered message bodies, which is where the
+/// account's own secrets would otherwise pile up.
+///
+/// The binding's `automatic_only` / failure-threshold gates are not re-applied:
+/// they decide whether a run *triggers* a notification, and a human asking for
+/// this one explicitly has already answered that question.
+pub async fn retry_delivery(
+    store: &Store,
+    outbound: &OutboundHttp,
+    email: &EmailClient,
+    delivery: &crate::model::NotificationDeliveryRecord,
+    task: &Task,
+    action: &crate::model::NotificationAction,
+    channel: &crate::model::NotificationChannel,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let run = store
+        .get_run(delivery.run_id)
+        .await?
+        .context("the run this delivery belongs to no longer exists")?;
+    let event = delivery.event.as_str();
+    let vars = TemplateVars {
+        event,
+        task_id: task.id,
+        task_name: &task.name,
+        run_id: run.id,
+        status: run.http_status.map(|s| s.to_string()).unwrap_or_default(),
+        error: run.error.as_deref().unwrap_or(""),
+        log: run.log.as_deref().unwrap_or(""),
+        time: format_notification_time(
+            run.finished_at.unwrap_or(run.created_at),
+            task.timezone.as_deref(),
+        ),
+    };
+    let payload = serde_json::json!({
+        "event": event,
+        "task_id": task.id,
+        "task_name": task.name,
+        "run_id": run.id,
+        "http_status": run.http_status,
+        "error": run.error,
+        "retry": true,
+    });
+    let owner_default = match store.task_owner_id(task.id).await {
+        Ok(Some(owner)) => store
+            .notification_defaults(owner)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|row| row.event == event),
+        _ => None,
+    };
+    send_one(
+        store,
+        outbound,
+        task,
+        action,
+        channel,
+        event,
+        &vars,
+        &payload,
+        owner_default.as_ref(),
+        email,
+    )
+    .await
 }
 
 fn bounded_error(message: &str) -> String {

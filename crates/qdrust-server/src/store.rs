@@ -15,17 +15,7 @@ use sqlx::{
 };
 
 use crate::auth::{new_token, token_hash};
-use crate::model::{
-    AdminUserUpdate, ApiToken, AuthenticatedSession, BatchTaskOperation, CreateApiToken,
-    CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest,
-    CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity,
-    ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken,
-    IssuedSession, NotificationAction, NotificationChannel, NotificationDefaultTemplate,
-    NotificationDelivery, OidcLoginState, PluginManifest, PushRequest, Run, RunCalendarDay,
-    RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription,
-    UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate,
-    UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
-};
+use crate::model::{AdminUserUpdate, ApiToken, AuthenticatedSession, BatchTaskOperation, CreateApiToken, CreateNotificationAction, CreateNotificationChannel, CreatePluginManifest, CreatePushRequest, CreateTask, CreateTemplate, CreateTemplateSubscription, DecidePushRequest, ExternalIdentity, ExternalIdentityClaim, ExternalLoginResolution, ImportQdHarTemplate, IssuedApiToken, IssuedSession, NotificationAction, NotificationChannel, NotificationDefaultTemplate, NotificationDelivery, NotificationDeliveryRecord, OidcLoginState, PluginManifest, PushRequest, Run, RunCalendarDay, RunStep, SetSiteSetting, SiteSetting, Task, Template, TemplateImport, TemplateSubscription, UpdateNotificationAction, UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask, UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials};
 use qdrust_core::{
     plugin::NotepadSlot,
     qd_har::QdHar,
@@ -60,7 +50,7 @@ const UNUSABLE_PASSWORD_HASH: &str =
 /// clearing it backwards, which is a valid clear order for any arrangement of
 /// children. `backup_covers_every_table` in the tests fails when a migration
 /// adds a table and forgets this list.
-const BACKUP_TABLES: [&str; 21] = [
+const BACKUP_TABLES: [&str; 22] = [
     "users",
     "sessions",
     "plugins",
@@ -76,6 +66,7 @@ const BACKUP_TABLES: [&str; 21] = [
     "tasks",
     "runs",
     "run_steps",
+    "notification_deliveries",
     "notification_channels",
     "notification_actions",
     "template_subscriptions",
@@ -1209,6 +1200,10 @@ macro_rules! define_store {
             transaction.rollback().await?;
             return Ok(false);
         };
+        sqlx::query("DELETE FROM notification_deliveries WHERE task_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)")
             .bind(id)
             .execute(&mut *transaction)
@@ -1510,6 +1505,10 @@ macro_rules! define_store {
     /// foreign keys on MySQL, so the steps are deleted first by hand.
     pub async fn delete_run(&self, run_id: i64) -> Result<bool> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM notification_deliveries WHERE run_id=?")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("DELETE FROM run_steps WHERE run_id=?")
             .bind(run_id)
             .execute(&mut *transaction)
@@ -1528,6 +1527,12 @@ macro_rules! define_store {
     /// number of deleted runs. Steps go first: MySQL has no cascade to rely on.
     pub async fn delete_runs_for_owner(&self, owner_id: i64) -> Result<u64> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM notification_deliveries WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
+        )
+        .bind(owner_id)
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query(
             "DELETE FROM run_steps WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
         )
@@ -1548,6 +1553,9 @@ macro_rules! define_store {
     /// Clear the whole run history (admin).
     pub async fn delete_all_runs(&self) -> Result<u64> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM notification_deliveries")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("DELETE FROM run_steps")
             .execute(&mut *transaction)
             .await?;
@@ -1563,6 +1571,10 @@ macro_rules! define_store {
     /// API layer); returns the number of deleted runs.
     pub async fn delete_runs_for_task(&self, task_id: i64) -> Result<u64> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM notification_deliveries WHERE task_id=?")
+            .bind(task_id)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)")
             .bind(task_id)
             .execute(&mut *transaction)
@@ -2024,6 +2036,118 @@ macro_rules! define_store {
         rows.into_iter().map(notification_delivery_from_row).collect()
     }
 
+    /// Append one delivery attempt to the ledger; returns the new row's id.
+    ///
+    /// Recorded for both outcomes. `channel_kind` is copied in because the id
+    /// columns are deliberately not foreign keys — deleting a channel must not
+    /// erase the evidence that it failed to deliver.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_notification_delivery(
+        &self,
+        run_id: i64,
+        task_id: i64,
+        action_id: Option<i64>,
+        channel_id: Option<i64>,
+        channel_kind: &str,
+        event: &str,
+        attempt: i64,
+        status: &str,
+        http_status: Option<u16>,
+        error: Option<&str>,
+    ) -> Result<i64> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(
+            "INSERT INTO notification_deliveries(run_id,task_id,action_id,channel_id,channel_kind,event,attempt,status,http_status,error,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(run_id)
+        .bind(task_id)
+        .bind(action_id)
+        .bind(channel_id)
+        .bind(channel_kind)
+        .bind(event)
+        .bind(attempt)
+        .bind(status)
+        .bind(http_status.map(i64::from))
+        .bind(error)
+        .bind(Utc::now().timestamp())
+        .execute(&mut *conn)
+        .await?;
+        self.last_insert_id(&mut conn).await
+    }
+
+    pub async fn list_notification_deliveries_for_run(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<NotificationDeliveryRecord>> {
+        let rows = sqlx::query(&format!(
+            "{NOTIFICATION_DELIVERY_FIELDS} WHERE run_id=? ORDER BY id"
+        ))
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(notification_delivery_record_from_row)
+            .collect()
+    }
+
+    /// Deliveries of one run, but only when that run belongs to `owner_id`.
+    /// `None` means "no such run for this account", which the API turns into a
+    /// 404 rather than an empty list (an empty list would confirm the run
+    /// exists).
+    pub async fn list_notification_deliveries_for_run_owner(
+        &self,
+        run_id: i64,
+        owner_id: i64,
+    ) -> Result<Option<Vec<NotificationDeliveryRecord>>> {
+        let owns: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM runs r JOIN tasks t ON t.id=r.task_id
+                           WHERE r.id=? AND t.owner_id=?)",
+        )
+        .bind(run_id)
+        .bind(owner_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !owns {
+            return Ok(None);
+        }
+        self.list_notification_deliveries_for_run(run_id)
+            .await
+            .map(Some)
+    }
+
+    pub async fn get_notification_delivery(
+        &self,
+        id: i64,
+    ) -> Result<Option<NotificationDeliveryRecord>> {
+        let row = sqlx::query(&format!("{NOTIFICATION_DELIVERY_FIELDS} WHERE id=?"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(notification_delivery_record_from_row).transpose()
+    }
+
+    /// Attempts already recorded for this exact (run, action, channel, event)
+    /// pair. Retry uses it to number the next attempt instead of restarting at 1.
+    pub async fn count_notification_attempts(
+        &self,
+        run_id: i64,
+        action_id: i64,
+        channel_id: i64,
+        event: &str,
+    ) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_deliveries
+             WHERE run_id=? AND action_id=? AND channel_id=? AND event=?",
+        )
+        .bind(run_id)
+        .bind(action_id)
+        .bind(channel_id)
+        .bind(event)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn create_plugin(
         &self,
         owner_id: i64,
@@ -2473,6 +2597,12 @@ macro_rules! define_store {
             "delete" => {
                 let mut transaction = self.pool.begin().await?;
                 sqlx::query(&format!(
+                    "DELETE FROM notification_deliveries WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=? AND id IN ({ids}))"
+                ))
+                .bind(owner_id)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query(&format!(
                     "DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=? AND id IN ({ids})))"
                 ))
                 .bind(owner_id)
@@ -2646,6 +2776,12 @@ macro_rules! define_store {
         )
         .bind(id)
         .bind(id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM notification_deliveries WHERE run_id IN (SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.owner_id=?)",
+        )
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -2956,7 +3092,7 @@ macro_rules! define_store {
 
     // ---- Log retention ----
 
-    /// Delete runs (and their steps) finished before the given
+    /// Delete runs (and their steps and delivery rows) finished before the given
     /// timestamp; returns how many runs were removed.
     ///
     /// Deleted in bounded batches rather than one statement. Retention exists
@@ -2987,6 +3123,7 @@ macro_rules! define_store {
             // Children first: MySQL carries no foreign keys here (see the
             // module-level note on the migrations), so nothing cascades.
             for statement in [
+                format!("DELETE FROM notification_deliveries WHERE run_id IN ({placeholders})"),
                 format!("DELETE FROM run_steps WHERE run_id IN ({placeholders})"),
                 format!("DELETE FROM runs WHERE id IN ({placeholders})"),
             ] {
@@ -3539,6 +3676,8 @@ const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_a
 // them as well). Every other reference to this column in the file must be
 // quoted the same way or MySQL deployments fail with a 1064 syntax error.
 const RUN_FIELDS: &str = "SELECT id,task_id,status,http_status,error,log,NULL AS failure_trace,started_at,finished_at,created_at,lease_owner,lease_expires_at,attempt,cancel_requested,run_after,retry_of,`trigger` FROM runs";
+
+const NOTIFICATION_DELIVERY_FIELDS: &str = "SELECT id,run_id,task_id,action_id,channel_id,channel_kind,event,attempt,status,http_status,error,created_at FROM notification_deliveries";
 /// The same shape as [`RUN_FIELDS`], plus the diagnostic blob. Only the
 /// dedicated failure-trace query selects it; list and aggregate reads keep it
 /// out of memory and off the wire.
@@ -3665,6 +3804,23 @@ fn run_step_from_row(row: $row) -> Result<RunStep> {
         error: row.try_get("error")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
+    })
+}
+
+fn notification_delivery_record_from_row(row: $row) -> Result<NotificationDeliveryRecord> {
+    Ok(NotificationDeliveryRecord {
+        id: row.try_get("id")?,
+        run_id: row.try_get("run_id")?,
+        task_id: row.try_get("task_id")?,
+        action_id: row.try_get("action_id")?,
+        channel_id: row.try_get("channel_id")?,
+        channel_kind: row.try_get("channel_kind")?,
+        event: row.try_get("event")?,
+        attempt: row.try_get("attempt")?,
+        status: row.try_get("status")?,
+        http_status: row.try_get("http_status")?,
+        error: row.try_get("error")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 
@@ -3905,6 +4061,9 @@ define_store!(
 macro_rules! delegate {
     ($(pub async fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty { $($call:ident),* };)*) => {
         $(
+            // The signature is the wrapped method's, copied mechanically; a
+            // method with many arguments is judged where it is written, not here.
+            #[allow(clippy::too_many_arguments)]
             pub async fn $name(&self, $($arg: $ty),*) -> $ret {
                 match self {
                     Store::Sqlite(s) => s.$name($($call),*).await,
@@ -4056,6 +4215,11 @@ impl Store {
         pub async fn notification_defaults(owner_id: i64) -> Result<Vec<NotificationDefaultTemplate>> { owner_id };
         pub async fn set_notification_default(owner_id: i64, event: &str, title_template: Option<String>, body_template: Option<String>) -> Result<NotificationDefaultTemplate> { owner_id, event, title_template, body_template };
         pub async fn notification_channels_for_event(task_id: i64, event: &str) -> Result<Vec<NotificationDelivery>> { task_id, event };
+        pub async fn record_notification_delivery(run_id: i64, task_id: i64, action_id: Option<i64>, channel_id: Option<i64>, channel_kind: &str, event: &str, attempt: i64, status: &str, http_status: Option<u16>, error: Option<&str>) -> Result<i64> { run_id, task_id, action_id, channel_id, channel_kind, event, attempt, status, http_status, error };
+        pub async fn list_notification_deliveries_for_run(run_id: i64) -> Result<Vec<NotificationDeliveryRecord>> { run_id };
+        pub async fn list_notification_deliveries_for_run_owner(run_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationDeliveryRecord>>> { run_id, owner_id };
+        pub async fn get_notification_delivery(id: i64) -> Result<Option<NotificationDeliveryRecord>> { id };
+        pub async fn count_notification_attempts(run_id: i64, action_id: i64, channel_id: i64, event: &str) -> Result<i64> { run_id, action_id, channel_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
         pub async fn list_enabled_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };

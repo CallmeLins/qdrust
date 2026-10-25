@@ -423,6 +423,11 @@ pub fn router_with_auth(
         .route("/api/v1/tasks/{id}/run", axum::routing::post(run_task))
         .route("/api/v1/runs/{id}/cancel", axum::routing::post(cancel_run))
         .route("/api/v1/runs/{id}/steps", get(list_run_steps))
+        .route("/api/v1/runs/{id}/deliveries", get(list_run_deliveries))
+        .route(
+            "/api/v1/notification-deliveries/{id}/retry",
+            axum::routing::post(retry_notification_delivery),
+        )
         .route("/api/v1/runs/{id}/steps/live", get(run_steps_websocket))
         .route("/api/v1/runs/{id}", delete(delete_run))
         .route("/api/v1/runs", get(list_runs).delete(delete_all_runs))
@@ -2010,6 +2015,111 @@ async fn list_run_steps(
         return Err(ApiError::NotFound("run_not_found", "Run not found"));
     };
     Ok(Json(json!(steps)))
+}
+
+/// The delivery ledger of one run: every notification attempt, oldest first.
+///
+/// This is the answer to "the task succeeded but I never got the message" --
+/// before it existed the only evidence was a log line the next restart rotated
+/// away, so a silent channel failure was indistinguishable from a task that
+/// never ran.
+async fn list_run_deliveries(
+    State(store): State<Store>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session_from_store(&store, &headers).await?;
+    // A missing run and someone else's run are the same 404 on purpose: an empty
+    // list would still confirm the run id exists.
+    let Some(rows) = store
+        .list_notification_deliveries_for_run_owner(id, session.user.id)
+        .await?
+    else {
+        return Err(ApiError::NotFound("run_not_found", "Run not found"));
+    };
+    Ok(Json(json!(rows)))
+}
+
+/// Re-send one recorded delivery.
+///
+/// The binding is re-read from the database instead of trusting the ledger's
+/// copy of it, so a channel that was fixed after the failure is exercised in its
+/// current state. The ledger's `event` decides which template set applies,
+/// because that is what the original attempt rendered.
+async fn retry_notification_delivery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let store = &state.store;
+    let delivery = store
+        .get_notification_delivery(id)
+        .await?
+        .ok_or(ApiError::NotFound(
+            "delivery_not_found",
+            "Delivery not found",
+        ))?;
+    let Some(task) = store
+        .get_for_owner(delivery.task_id, session.user.id)
+        .await?
+    else {
+        return Err(ApiError::NotFound(
+            "delivery_not_found",
+            "Delivery not found",
+        ));
+    };
+    // A delivery whose binding was deleted since cannot be re-sent: the ledger
+    // keeps the ids precisely so the history stays readable, not so a retry can
+    // resurrect a channel that no longer exists.
+    let (Some(action_id), Some(channel_id)) = (delivery.action_id, delivery.channel_id) else {
+        return Err(ApiError::Conflict(
+            "delivery_unavailable",
+            "The notification binding of this delivery no longer exists".into(),
+        ));
+    };
+    let Some(action) = store
+        .get_notification_action(action_id, session.user.id)
+        .await?
+    else {
+        return Err(ApiError::Conflict(
+            "delivery_unavailable",
+            "The notification binding of this delivery no longer exists".into(),
+        ));
+    };
+    let Some(channel) = store
+        .get_notification_channel(channel_id, session.user.id)
+        .await?
+    else {
+        return Err(ApiError::Conflict(
+            "delivery_unavailable",
+            "The notification channel of this delivery no longer exists".into(),
+        ));
+    };
+    let email = crate::email::EmailClient::new(crate::email::EmailConfig::from_env())
+        .map_err(|err| ApiError::Internal(err.context("email client")))?;
+    // A failed re-send is an outcome, not a server error: the attempt is already
+    // in the ledger with the channel's own reason, and the caller gets that list
+    // back so it can show "still failing, here is why". Only a failure to read
+    // or write the ledger below is a 500.
+    if let Err(err) = crate::scheduler::retry_delivery(
+        store,
+        &state.outbound,
+        &email,
+        &delivery,
+        &task,
+        &action,
+        &channel,
+    )
+    .await
+    {
+        tracing::warn!(delivery_id = id, %err, "retry notification delivery failed");
+    }
+    // Report the attempt that was just written rather than a cached copy.
+    let rows = store
+        .list_notification_deliveries_for_run(delivery.run_id)
+        .await?;
+    Ok(Json(json!(rows)))
 }
 
 async fn list_notification_channels(

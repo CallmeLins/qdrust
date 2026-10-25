@@ -17,6 +17,27 @@ export type RunStep = {
   started_at: number;
   finished_at: number;
 };
+/** One recorded notification attempt for a run.
+ *
+ *  Written for both outcomes, so "the task ran but I got no message" is
+ *  answerable from the UI instead of from container logs that a restart has
+ *  already rotated away. `channel_kind` is copied in, and the id columns are
+ *  optional, because the channel or binding behind an attempt may be deleted
+ *  later while the history stays readable. */
+export interface NotificationDeliveryRecord {
+  id: number;
+  run_id: number;
+  task_id: number;
+  action_id?: number | null;
+  channel_id?: number | null;
+  channel_kind: string;
+  event: string;
+  attempt: number;
+  status: string;
+  http_status?: number | null;
+  error?: string | null;
+  created_at: number;
+}
 export interface LatestFailureTrace {
   run_id: number;
   created_at: number;
@@ -430,6 +451,11 @@ export const api = {
   deleteTaskRuns: (id: number) => request<{ deleted?: number }>(`/api/v1/tasks/${id}/runs`, { method: "DELETE" }),
   deleteRun: (id: number) => request<void>(`/api/v1/runs/${id}`, { method: "DELETE" }),
   runSteps: (id: number) => request<RunStep[]>(`/api/v1/runs/${id}/steps`),
+  /** Every notification attempt recorded for a run, oldest first. */
+  runDeliveries: (id: number) => request<NotificationDeliveryRecord[]>(`/api/v1/runs/${id}/deliveries`),
+  /** Re-send one recorded attempt; returns the run's ledger afterwards. */
+  retryDelivery: (id: number) =>
+    request<NotificationDeliveryRecord[]>(`/api/v1/notification-deliveries/${id}/retry`, { method: "POST" }),
   batchTasks: (ids: number[], action: "enable" | "disable" | "delete" | "run") => request<BatchTaskResult>("/api/v1/tasks/batch", { method: "POST", body: JSON.stringify({ ids, action }) }),
   taskGroups: () => request<string[]>("/api/v1/task-groups"),
 

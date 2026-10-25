@@ -384,6 +384,55 @@
         }
       }
     },
+    "/api/v1/runs/{id}/deliveries": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "operationId": "listRunDeliveries",
+        "summary": "Notification delivery ledger of a run",
+        "description": "Every recorded notification attempt for this run, oldest first. Rows are written for both outcomes, so a task that succeeded without delivering anything is distinguishable from one that never notified at all.",
+        "responses": {
+          "200": {
+            "description": "Delivery attempt list"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/notification-deliveries/{id}/retry": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "retryNotificationDelivery",
+        "summary": "Re-send one recorded delivery",
+        "description": "Re-renders and re-sends one attempt, appending a new row to the ledger. The binding and channel are read fresh, so a channel fixed after the failure is exercised as it is now.",
+        "responses": {
+          "200": {
+            "description": "Updated delivery attempt list of the run"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
     "/api/v1/runs/{id}/cancel": {
       "parameters": [
         {

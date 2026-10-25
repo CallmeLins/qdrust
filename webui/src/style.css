@@ -1725,6 +1725,22 @@ th.sortable .sort-idle { opacity: 0.3; }
    eye lands on, these are its detail. */
 .action-row { margin-left: 22px; border-left: 2px solid var(--line); }
 
+.totp-disable label { flex: 1 1 200px; margin: 0; }
+.totp-disable .secondary-button { flex: 0 0 auto; }
+
+/* ---- notification delivery ledger ---- */
+/* The attempt counter and the HTTP status sit beside the outcome rather than in
+   columns of their own: they only mean anything next to the status they qualify,
+   and two more columns would squeeze the error text that carries the reason. */
+.delivery-attempt { display: block; margin-top: 2px; font-size: 11px; }
+/* Why the attempt failed, verbatim from the channel. A 401 from a stale token
+   reads nothing like a timeout, and that difference is the whole point. */
+.delivery-error {
+  margin-top: 4px; max-width: 340px; max-height: 66px; overflow: auto;
+  color: var(--ink-3); font-family: var(--font-mono); font-size: 11px; line-height: 1.5;
+  word-break: break-word;
+}
+
 /* ---- notification preview (issue #43) ---- */
 .preview-meta { margin: 0 0 10px; font-size: 12px; line-height: 1.6; }
 /* The success/failure switch, shown only for a binding that delivers on both

@@ -759,6 +759,32 @@ pub struct NotificationDelivery {
     pub action: NotificationAction,
 }
 
+/// One recorded delivery attempt for a run.
+///
+/// Written for both outcomes: a channel that silently failed used to leave no
+/// trace beyond a log line, which a restart rotated away. `channel_kind` is
+/// copied in (and the ids are not foreign keys) so the history survives the
+/// channel being deleted afterwards.
+#[derive(Clone, Debug, Serialize)]
+pub struct NotificationDeliveryRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub task_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<i64>,
+    pub channel_kind: String,
+    pub event: String,
+    pub attempt: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
 fn default_failure_threshold() -> i64 {
     1
 }
