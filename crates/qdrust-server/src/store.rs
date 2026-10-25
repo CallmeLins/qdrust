@@ -1455,7 +1455,9 @@ macro_rules! define_store {
         )
         .bind(status)
         .bind(http_status.map(i64::from))
-        .bind(error)
+        // Error text routinely quotes the failing URL; mask it on the way in so
+        // the row, the aggregate log and any backup of them stay clean.
+        .bind(error.map(crate::redact::redact))
         .bind(Utc::now().timestamp())
         .bind(run_id)
         .execute(&self.pool)
@@ -1465,8 +1467,9 @@ macro_rules! define_store {
 
     /// Persist the QD-style log line (the final __log__ value) for a run.
     pub async fn record_run_log(&self, run_id: i64, log: &str) -> Result<()> {
+        // The log line is template-written text and may embed the request URL.
         sqlx::query("UPDATE runs SET log=? WHERE id=?")
-            .bind(log)
+            .bind(crate::redact::redact(log))
             .bind(run_id)
             .execute(&self.pool)
             .await?;
@@ -1492,7 +1495,7 @@ macro_rules! define_store {
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE runs SET failure_trace=? WHERE id=? AND task_id=?")
-            .bind(trace)
+            .bind(crate::redact::redact(trace))
             .bind(run_id)
             .bind(task_id)
             .execute(&mut *tx)
@@ -1574,6 +1577,9 @@ macro_rules! define_store {
     }
 
     pub async fn record_run_step(&self, step: &RunStep) -> Result<()> {
+        // Persisted, then shown in the UI and shipped in a backup: the one copy
+        // that must not carry the template's own credentials. See `redact`.
+        let error = step.error.as_deref().map(crate::redact::redact);
         sqlx::query(
             "INSERT INTO run_steps(run_id,step_index,name,status,http_status,body_size,error,started_at,finished_at)
              VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1584,7 +1590,7 @@ macro_rules! define_store {
         .bind(&step.status)
         .bind(step.http_status)
         .bind(step.body_size)
-        .bind(&step.error)
+        .bind(error.as_deref())
         .bind(step.started_at)
         .bind(step.finished_at)
         .execute(&self.pool)
@@ -8039,5 +8045,62 @@ mod tests {
             count_where(&store, "template_imports", "template_id", imported.id).await,
             0
         );
+    }
+
+    /// Redaction has to happen on the way into the database: everything below is
+    /// rendered in the UI, shipped in an export and pasted into issue reports,
+    /// while the executor keeps the real value for the template's own use.
+    #[tokio::test]
+    async fn credentials_are_masked_before_a_run_is_persisted() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("redact_frank", &password_hash, "user")
+            .await
+            .unwrap();
+        let task = store
+            .create_for_owner(user.id, input("redact task"))
+            .await
+            .unwrap();
+        let run = store.start_run(task.id).await.unwrap();
+        store
+            .record_run_step(&RunStep {
+                id: 0,
+                run_id: run.id,
+                step_index: 0,
+                name: "request".into(),
+                status: "failed".into(),
+                http_status: Some(401),
+                body_size: 0,
+                error: Some("GET https://example.com/checkin?token=abc123&page=2 refused".into()),
+                started_at: 1,
+                finished_at: 2,
+            })
+            .await
+            .unwrap();
+        store
+            .finish_run(
+                run.id,
+                Some(401),
+                Some("Authorization: Bearer sekrit.value rejected"),
+            )
+            .await
+            .unwrap();
+        store
+            .record_run_log(run.id, "https://example.com/p?sign=deadbeef")
+            .await
+            .unwrap();
+
+        let steps = store.list_run_steps(run.id).await.unwrap();
+        assert_eq!(
+            steps[0].error.as_deref(),
+            Some("GET https://example.com/checkin?token=***&page=2 refused")
+        );
+        let run = store.get_run(run.id).await.unwrap().unwrap();
+        assert_eq!(
+            run.error.as_deref(),
+            Some("Authorization: Bearer *** rejected")
+        );
+        assert_eq!(run.log.as_deref(), Some("https://example.com/p?sign=***"));
     }
 }

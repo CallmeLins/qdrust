@@ -250,7 +250,10 @@ fn format_trace_step(event: &ExecutionEvent, started_at: i64, finished_at: i64) 
         "step {}  {} {}\n        started:  {}\n        finished: {}\n        {}",
         event.step_index + 1,
         event.method,
-        event.url,
+        // Masked here as well as in the store: the trace is assembled as plain
+        // text and handed to one place that writes it, but a string that is
+        // already clean cannot leak through a future second consumer.
+        crate::redact::redact(&event.url),
         format_trace_time(started_at),
         format_trace_time(finished_at),
         outcome

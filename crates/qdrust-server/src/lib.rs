@@ -10,6 +10,7 @@ pub mod model;
 pub mod oidc;
 pub mod outbound;
 pub mod push_channels;
+pub mod redact;
 pub mod redis_cache;
 pub mod scheduler;
 pub mod store;
