@@ -71,6 +71,181 @@
         }
       }
     },
+    "/api/v1/auth/totp": {
+      "post": {
+        "operationId": "loginTotp",
+        "summary": "Second step of a TOTP login",
+        "description": "Redeem the challenge that `/auth/login` returned for a user with a second factor. A wrong code counts against the challenge, and the challenge is destroyed after five of them.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpLogin"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/status": {
+      "get": {
+        "operationId": "totpStatus",
+        "summary": "Whether the caller has a second factor",
+        "responses": {
+          "200": {
+            "description": "Enrolment status"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/setup": {
+      "post": {
+        "operationId": "totpSetup",
+        "summary": "Start enrolment and return a secret",
+        "description": "Stores a pending secret without enabling the factor. Running it again replaces the pending secret, which is how a lost QR code is recovered.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Secret and otpauth:// URI"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/enable": {
+      "post": {
+        "operationId": "totpEnable",
+        "summary": "Confirm enrolment with a code",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpCode"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Two-factor is on"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/disable": {
+      "post": {
+        "operationId": "totpDisable",
+        "summary": "Turn the second factor off",
+        "description": "Requires the account password and a current code: an unattended session must not be able to remove the factor.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpDisable"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Two-factor is off"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/users/{id}/totp/reset": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "adminResetTotp",
+        "summary": "Clear a user's second factor",
+        "description": "The escape hatch for a lost device; the user keeps the account and can enrol again.",
+        "responses": {
+          "204": {
+            "description": "Two-factor cleared"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/api/v1/auth/session": {
       "get": {
         "operationId": "getCurrentSession",
@@ -4795,6 +4970,47 @@
           "content": {
             "type": "string",
             "description": "The whole new value for this slot, up to the page's edit limit"
+          }
+        }
+      },
+      "TotpLogin": {
+        "type": "object",
+        "required": [
+          "challenge",
+          "code"
+        ],
+        "properties": {
+          "challenge": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "TotpCode": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "TotpDisable": {
+        "type": "object",
+        "required": [
+          "password",
+          "code"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
           }
         }
       }

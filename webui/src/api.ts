@@ -24,6 +24,14 @@ export type RunStep = {
  *  already rotated away. `channel_kind` is copied in, and the id columns are
  *  optional, because the channel or binding behind an attempt may be deleted
  *  later while the history stays readable. */
+/** What `POST /auth/login` answers with.
+ *
+ *  Two shapes, and the caller has to tell them apart: `totp_required` means the
+ *  password was accepted and a code is still owed, so no session exists yet. */
+export type LoginResult =
+  | { user: User; expires_at: number }
+  | { totp_required: true; challenge: string; expires_at: number };
+
 export interface NotificationDeliveryRecord {
   id: number;
   run_id: number;
@@ -287,7 +295,18 @@ export const api = {
   session: () => request<{ user: User; expires_at: number }>("/api/v1/auth/session"),
   bootstrap: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/bootstrap", { method: "POST", body: JSON.stringify({ username, password }) }),
   register: (username: string, password: string, email?: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/register", { method: "POST", body: JSON.stringify({ username, password, ...(email ? { email } : {}) }) }),
-  login: (username: string, password: string) => request<{ user: User; expires_at: number }>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  /** First step. A user with a second factor gets no session back — only a
+   *  challenge that `loginTotp` can redeem with a code from their app. */
+  login: (username: string, password: string) =>
+    request<LoginResult>("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }),
+  loginTotp: (challenge: string, code: string) =>
+    request<{ user: User; expires_at: number }>("/api/v1/auth/totp", { method: "POST", body: JSON.stringify({ challenge, code }) }),
+  totpStatus: () => request<{ enabled: boolean }>("/api/v1/auth/totp/status"),
+  totpSetup: () => request<{ secret: string; otpauth_uri: string }>("/api/v1/auth/totp/setup", { method: "POST" }),
+  totpEnable: (code: string) => request<{ enabled: boolean }>("/api/v1/auth/totp/enable", { method: "POST", body: JSON.stringify({ code }) }),
+  totpDisable: (password: string, code: string) =>
+    request<{ enabled: boolean }>("/api/v1/auth/totp/disable", { method: "POST", body: JSON.stringify({ password, code }) }),
+  adminResetTotp: (id: number) => request<void>(`/api/v1/admin/users/${id}/totp/reset`, { method: "POST" }),
   logout: () => request<void>("/api/v1/auth/logout", { method: "POST" }),
   changePassword: (currentPassword: string, newPassword: string) => request<{ ok: boolean }>("/api/v1/auth/password", { method: "POST", body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) }),
   changeAvatar: (avatarId: string) => request<User>("/api/v1/auth/avatar", { method: "PUT", body: JSON.stringify({ avatar_id: avatarId }) }),

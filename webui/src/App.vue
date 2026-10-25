@@ -150,7 +150,7 @@ onUnmounted(() => {
 const ready = ref(false);
 const authenticated = ref(false);
 const currentUser = ref<User | null>(null);
-const authMode = ref<"login" | "bootstrap" | "register" | "forgot" | "reset">("login");
+const authMode = ref<"login" | "bootstrap" | "register" | "forgot" | "reset" | "totp">("login");
 const authForm = reactive({ username: "", password: "", email: "", token: "", newPassword: "" });
 const authNotice = ref("");
 const authPolicy = ref<AuthConfig | null>(null);
@@ -2623,6 +2623,73 @@ async function openSettings() {
   view.value = "settings";
   try { apiTokens.value = await api.apiTokens(); }
   catch (cause) { notify(cause instanceof Error ? cause.message : t("genericError"), "error"); }
+  await loadTotpStatus();
+}
+
+// ---------- two-factor ----------
+/** Whether the account has a confirmed second factor. Read on demand rather
+ *  than carried on `User`: the secret lives on the server only, and this flag
+ *  is all the page needs. */
+const totpEnabled = ref(false);
+/** The pending enrolment, present only between "start setup" and a confirmed
+ *  code. Holds the secret because the user has to type it into their app. */
+const totpSetupData = ref<{ secret: string; otpauth_uri: string } | null>(null);
+const totpEnrollCode = ref("");
+const totpBusy = ref(false);
+/** Disabling needs the password as well as a code: an open session alone must
+ *  not be enough to remove the factor. */
+const totpDisableForm = reactive({ password: "", code: "" });
+
+async function loadTotpStatus() {
+  try { totpEnabled.value = (await api.totpStatus()).enabled; }
+  catch { totpEnabled.value = false; }
+}
+async function startTotpSetup() {
+  if (totpBusy.value) return;
+  totpBusy.value = true;
+  try {
+    totpSetupData.value = await api.totpSetup();
+    totpEnrollCode.value = "";
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    totpBusy.value = false;
+  }
+}
+async function enableTotp() {
+  if (!totpSetupData.value || totpBusy.value) return;
+  totpBusy.value = true;
+  try {
+    await api.totpEnable(totpEnrollCode.value.trim());
+    totpEnabled.value = true;
+    totpSetupData.value = null;
+    totpEnrollCode.value = "";
+    notify(t("twoFactorEnabled"));
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    totpBusy.value = false;
+  }
+}
+async function disableTotp() {
+  if (totpBusy.value) return;
+  totpBusy.value = true;
+  try {
+    await api.totpDisable(totpDisableForm.password, totpDisableForm.code.trim());
+    totpEnabled.value = false;
+    totpDisableForm.password = "";
+    totpDisableForm.code = "";
+    notify(t("twoFactorDisabled"));
+  } catch (cause) {
+    notify(cause instanceof Error ? cause.message : t("genericError"), "error");
+  } finally {
+    totpBusy.value = false;
+  }
+}
+async function copyTotpSecret() {
+  if (!totpSetupData.value) return;
+  try { await navigator.clipboard.writeText(totpSetupData.value.secret); notify(t("copied")); }
+  catch { /* the secret is selectable on screen, so a failed copy is not an error */ }
 }
 async function createApiToken() {
   if (!tokenForm.name.trim() || tokenSaving.value) return;
@@ -2676,6 +2743,12 @@ async function resendVerification() {
 }
 
 // ---------- auth ----------
+/** The half-finished login a password got us, and the code being typed for it.
+ *  Held in memory only: it is worthless without the code, and persisting it
+ *  would leave a usable half-login behind after the tab is closed. */
+const totpChallenge = ref("");
+const totpLoginCode = ref("");
+
 async function authenticate() {
   authNotice.value = "";
   try {
@@ -2686,11 +2759,30 @@ async function authenticate() {
       Object.assign(authForm, { username: "", password: "", token: "", newPassword: "" });
       return;
     }
+    if (authMode.value === "totp") {
+      // Second step: the password was already accepted, so only the code is
+      // sent -- and a wrong one keeps us on this step rather than the form.
+      const session = await api.loginTotp(totpChallenge.value, totpLoginCode.value);
+      currentUser.value = session.user;
+      authenticated.value = true;
+      totpChallenge.value = "";
+      totpLoginCode.value = "";
+      await loadTasks();
+      return;
+    }
     const session = authMode.value === "login"
       ? await api.login(authForm.username, authForm.password)
       : authMode.value === "bootstrap"
         ? await api.bootstrap(authForm.username, authForm.password)
         : await api.register(authForm.username, authForm.password, authForm.email || undefined);
+    // A second factor was configured: no session exists yet, so the form moves
+    // on to the code step instead of mounting the app.
+    if ("totp_required" in session) {
+      totpChallenge.value = session.challenge;
+      totpLoginCode.value = "";
+      authMode.value = "totp";
+      return;
+    }
     currentUser.value = session.user;
     authenticated.value = true;
     await loadTasks();
@@ -2869,10 +2961,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
          local login (local_login_enabled = false). -->
     <form v-else class="auth-panel" @submit.prevent="authMode === 'forgot' ? submitForgot() : authenticate()">
       <div class="brand"><span class="brand-mark"><Zap :size="18" /></span><span class="brand-copy">qdrust<small>{{ t('brandTagline') }}</small></span></div>
-      <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : t('resetTitle') }}</h1>
+      <h1>{{ authMode === "login" ? t('loginTitle') : authMode === "bootstrap" ? t('bootstrapTitle') : authMode === "register" ? t('registerTitle') : authMode === "forgot" ? t('forgotTitle') : authMode === "totp" ? t('twoFactorTitle') : t('resetTitle') }}</h1>
 
-      <!-- SSO shortcut (shown above the local form when offered). -->
-      <button v-if="showSso && !ssoForced" class="secondary-button sso-button" type="button" @click="startSso">
+      <!-- SSO shortcut (shown above the local form when offered). Hidden on the
+           second-factor step: that login is already half done with a password,
+           and starting over over there would silently drop it. -->
+      <button v-if="showSso && !ssoForced && authMode !== 'totp'" class="secondary-button sso-button" type="button" @click="startSso">
         <span class="sso-label">{{ t('ssoAction') }} · {{ ssoProviderName }}</span>
       </button>
       <template v-if="showSso && !ssoForced && localAuthAvailable && (authMode === 'login' || authMode === 'bootstrap' || authMode === 'register')">
@@ -2881,8 +2975,14 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <div v-if="ssoError" class="auth-notice auth-error">{{ ssoErrorMessage(ssoError) }}</div>
 
+      <!-- Second factor: the password was accepted, only the code is owed. -->
+      <template v-if="authMode === 'totp'">
+        <p class="auth-hint">{{ t('twoFactorLoginHint') }}</p>
+        <label>{{ t('twoFactorCode') }}<input v-model="totpLoginCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required autofocus /></label>
+      </template>
+
       <!-- Local credential entry (hidden in pure-SSO and when local disabled). -->
-      <template v-if="showLocalForm">
+      <template v-else-if="showLocalForm">
         <label>{{ t('username') }}<input v-model="authForm.username" required autocomplete="username" minlength="3" /></label>
         <label v-if="authMode === 'register'">{{ t('email') }}<input v-model="authForm.email" type="email" autocomplete="email" /></label>
         <label v-if="authMode === 'register'" class="auth-hint">{{ t('registerHint') }}</label>
@@ -2911,12 +3011,12 @@ onUnmounted(() => window.clearInterval(refreshTimer));
 
       <!-- Local actions (submit + mode switch) are only meaningful when a local
            credential entry is present or a forgot/reset flow is active. -->
-      <button v-if="showLocalForm || authMode === 'forgot' || authMode === 'reset'" class="primary-button" type="submit">
-        {{ authMode === 'login' ? t('login') : authMode === 'bootstrap' ? t('createAdmin') : authMode === 'register' ? t('register') : authMode === 'forgot' ? t('forgotSubmit') : t('resetSubmit') }}
+      <button v-if="showLocalForm || authMode === 'forgot' || authMode === 'reset' || authMode === 'totp'" class="primary-button" type="submit">
+        {{ authMode === 'login' ? t('login') : authMode === 'bootstrap' ? t('createAdmin') : authMode === 'register' ? t('register') : authMode === 'forgot' ? t('forgotSubmit') : authMode === 'totp' ? t('twoFactorSubmit') : t('resetSubmit') }}
       </button>
 
       <button v-if="showLocalForm && authMode === 'login'" class="secondary-button" type="button" @click="authMode='forgot'; authNotice=''; ssoError=''">{{ t('forgotPassword') }}</button>
-      <button v-if="(authMode === 'forgot' || authMode === 'reset') && localAuthAvailable" class="secondary-button" type="button" @click="authMode='login'; authNotice=''; ssoError=''">{{ t('backToLogin') }}</button>
+      <button v-if="(authMode === 'forgot' || authMode === 'reset' || authMode === 'totp') && localAuthAvailable" class="secondary-button" type="button" @click="authMode='login'; authNotice=''; ssoError=''; totpChallenge=''; totpLoginCode=''">{{ t('backToLogin') }}</button>
       <button v-if="showLocalForm && (authMode === 'login' || authMode === 'bootstrap' || authMode === 'register')" class="secondary-button" type="button" @click="authMode = authMode === 'login' ? 'bootstrap' : authMode === 'bootstrap' ? 'register' : 'login'; authNotice=''; verifyResult=null">
         {{ authMode === 'login' ? t('initAdmin') : authMode === 'bootstrap' ? t('needAccount') : t('haveAccount') }}
       </button>
@@ -3850,6 +3950,43 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                 <span>{{ avatarName(locale, avatar) }}</span>
               </button>
             </div>
+          </div>
+
+          <h2>{{ t('twoFactor') }}</h2>
+          <div class="settings-band">
+            <div class="settings-band-head">
+              <p class="muted section-hint">{{ t('twoFactorHint') }}</p>
+              <span class="chip" :class="{ 'chip-ok': totpEnabled }">{{ totpEnabled ? t('twoFactorOn') : t('twoFactorOff') }}</span>
+            </div>
+            <!-- Off, and no enrolment in progress: one button to start. -->
+            <div v-if="!totpEnabled && !totpSetupData" class="run-row">
+              <button class="secondary-button" type="button" :disabled="totpBusy" @click="startTotpSetup"><ShieldCheck :size="15" />{{ t('twoFactorEnable') }}</button>
+            </div>
+            <!-- Off, enrolment in progress: the secret, then a code to prove the
+                 app has it. Nothing is enforced until that code checks out. -->
+            <template v-else-if="!totpEnabled">
+              <p class="muted section-hint">{{ t('twoFactorScanHint') }}</p>
+              <div class="token-reveal">
+                <strong>{{ t('twoFactorSecret') }}</strong>
+                <code>{{ totpSetupData?.secret }}</code>
+                <p class="muted section-hint totp-uri">{{ t('twoFactorUriHint') }}</p>
+                <code class="totp-uri">{{ totpSetupData?.otpauth_uri }}</code>
+                <div class="token-reveal-actions">
+                  <button class="secondary-button" type="button" @click="copyTotpSecret"><Copy :size="14" />{{ t('tokenCopy') }}</button>
+                  <button class="text-button" type="button" @click="totpSetupData = null">{{ t('cancel') }}</button>
+                </div>
+              </div>
+              <form class="run-row" @submit.prevent="enableTotp">
+                <input v-model="totpEnrollCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" :placeholder="t('twoFactorCodePlaceholder')" required />
+                <button class="primary-button" type="submit" :disabled="totpBusy">{{ t('twoFactorConfirm') }}</button>
+              </form>
+            </template>
+            <!-- On: turn it off, which needs the password and a live code. -->
+            <form v-else class="settings-form totp-disable" @submit.prevent="disableTotp">
+              <label>{{ t('password') }}<input v-model="totpDisableForm.password" type="password" autocomplete="current-password" required /></label>
+              <label>{{ t('twoFactorCode') }}<input v-model="totpDisableForm.code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" required /></label>
+              <button class="secondary-button" type="submit" :disabled="totpBusy">{{ t('twoFactorDisable') }}</button>
+            </form>
           </div>
 
           <h2>{{ t('service') }}</h2>

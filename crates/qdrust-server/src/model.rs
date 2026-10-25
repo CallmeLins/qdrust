@@ -785,6 +785,50 @@ pub struct NotificationDeliveryRecord {
     pub created_at: i64,
 }
 
+/// What the server knows about a user's second factor.
+///
+/// Deliberately not a `User` field: the secret must never reach a serializer
+/// that renders a user, and this value exists only for the verification and
+/// enrolment paths.
+#[derive(Clone, Debug)]
+pub struct UserTotp {
+    /// `None` before enrolment, or after the factor was disabled.
+    pub secret: Option<String>,
+    /// Whether a code from the user's app has ever been confirmed.
+    pub enabled: bool,
+}
+
+/// A password that checked out and is waiting on a TOTP code.
+#[derive(Clone, Debug)]
+pub struct TotpChallenge {
+    pub id: i64,
+    pub user_id: i64,
+    pub attempts: i64,
+    pub expires_at: i64,
+}
+
+/// The second step of a login: the challenge handed out by `/auth/login` and the
+/// code the user read off their app.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TotpLogin {
+    pub challenge: String,
+    pub code: String,
+}
+
+/// A code on its own, for confirming enrolment.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TotpCode {
+    pub code: String,
+}
+
+/// Turning the second factor off re-checks the password: a session left open on
+/// a shared machine must not be enough to remove it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TotpDisable {
+    pub password: String,
+    pub code: String,
+}
+
 /// Everything `/metrics` reports, read in one go.
 ///
 /// A plain value rather than a set of accessors: the endpoint formats it, the

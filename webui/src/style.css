@@ -1725,6 +1725,14 @@ th.sortable .sort-idle { opacity: 0.3; }
    eye lands on, these are its detail. */
 .action-row { margin-left: 22px; border-left: 2px solid var(--line); }
 
+/* ---- two-factor enrolment ---- */
+/* The otpauth URI is long and must be copied verbatim, so it wraps instead of
+   forcing the settings band wider than the page. */
+.totp-uri {
+  display: block; margin: 4px 0 0; max-width: 100%; overflow-wrap: anywhere;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.5;
+}
+.totp-disable { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
 .totp-disable label { flex: 1 1 200px; margin: 0; }
 .totp-disable .secondary-button { flex: 0 0 auto; }
 

@@ -57,6 +57,19 @@ use openidconnect::{AuthorizationCode, Nonce, OAuth2TokenResponse, PkceCodeVerif
 const SESSION_COOKIE: &str = "qd_session";
 const CSRF_COOKIE: &str = "qd_csrf";
 
+/// How long a password-only login stays usable while the code is typed.
+///
+/// Five minutes is long enough for "where is my phone" and short enough that an
+/// abandoned half-login is not a standing invitation.
+const TOTP_CHALLENGE_TTL_SECS: i64 = 300;
+
+/// Wrong codes allowed per challenge before it is burned.
+///
+/// Six digits is a million possibilities and a code dies after 30 seconds, so
+/// five tries is far outside anything that could succeed by guessing while still
+/// leaving room for a mistyped digit.
+const TOTP_MAX_ATTEMPTS: i64 = 5;
+
 /// Runtime-tunable settings that can be updated without a restart.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeSettings {
@@ -397,6 +410,16 @@ pub fn router_with_auth(
         .route("/api/v1/auth/bootstrap", axum::routing::post(bootstrap))
         .route("/api/v1/auth/register", axum::routing::post(register))
         .route("/api/v1/auth/login", axum::routing::post(login))
+        // The second step of a TOTP login. Public like `login`, because the
+        // whole point is that no session exists yet.
+        .route("/api/v1/auth/totp", axum::routing::post(login_totp))
+        .route("/api/v1/auth/totp/status", get(totp_status))
+        .route("/api/v1/auth/totp/setup", axum::routing::post(totp_setup))
+        .route("/api/v1/auth/totp/enable", axum::routing::post(totp_enable))
+        .route(
+            "/api/v1/auth/totp/disable",
+            axum::routing::post(totp_disable),
+        )
         .route("/api/v1/auth/session", get(current_session))
         .route("/api/v1/auth/logout", axum::routing::post(logout))
         .route("/api/v1/auth/oidc/start", get(oidc_login_start))
@@ -498,6 +521,10 @@ pub fn router_with_auth(
         .route(
             "/api/v1/admin/users/{id}",
             axum::routing::patch(admin_update_user).delete(admin_delete_user),
+        )
+        .route(
+            "/api/v1/admin/users/{id}/totp/reset",
+            axum::routing::post(admin_reset_totp),
         )
         .route("/api/v1/admin/settings", get(admin_list_settings))
         .route(
@@ -1195,6 +1222,40 @@ async fn login(
             "invalid_credentials",
             "Invalid username or password",
         ))?;
+    // The password is only the first factor for a user who turned the second one
+    // on. No session is issued here: what comes back is a challenge that is
+    // worthless without a code from their app, so a stolen password alone no
+    // longer logs anyone in.
+    if let Some(totp) = state.store.user_totp(user.id).await?
+        && totp.enabled
+    {
+        let challenge = crate::auth::new_token();
+        let expires_at = chrono::Utc::now().timestamp() + TOTP_CHALLENGE_TTL_SECS;
+        state
+            .store
+            .create_totp_challenge(user.id, &crate::auth::token_hash(&challenge), expires_at)
+            .await?;
+        state
+            .store
+            .record_audit(
+                Some(user.id),
+                "auth.login_totp_required",
+                Some("user"),
+                Some(user.id),
+                None,
+                &json!({}),
+            )
+            .await?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "totp_required": true,
+                "challenge": challenge,
+                "expires_at": expires_at,
+            })),
+        )
+            .into_response());
+    }
     state
         .store
         .record_audit(
@@ -1207,6 +1268,282 @@ async fn login(
         )
         .await?;
     issue_session_response(&state, user).await
+}
+
+/// Second step of a TOTP-protected login.
+///
+/// Every wrong code counts against the challenge and the challenge is thrown
+/// away after a handful of them, so the six digits cannot be brute-forced by
+/// keeping one half-finished login alive.
+async fn login_totp(
+    State(state): State<AppState>,
+    ApiJson(input): ApiJson<crate::model::TotpLogin>,
+) -> Result<Response, ApiError> {
+    ensure_local_login_allowed(&state)?;
+    let invalid = || {
+        ApiError::Unauthorized(
+            "invalid_totp_code",
+            "That code is not valid; try the next one",
+        )
+    };
+    let Some(challenge) = state
+        .store
+        .totp_challenge_by_hash(&crate::auth::token_hash(&input.challenge))
+        .await?
+    else {
+        return Err(invalid());
+    };
+    if challenge.expires_at <= chrono::Utc::now().timestamp() {
+        state.store.delete_totp_challenge(challenge.id).await?;
+        return Err(ApiError::Unauthorized(
+            "totp_challenge_expired",
+            "This login attempt expired; sign in again",
+        ));
+    }
+    let Some(totp) = state.store.user_totp(challenge.user_id).await? else {
+        return Err(invalid());
+    };
+    let Some(secret) = totp.secret else {
+        return Err(invalid());
+    };
+    let code = input.code;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let valid = tokio::task::spawn_blocking(move || crate::totp::verify(&secret, &code, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    if !valid {
+        let attempts = state.store.record_totp_attempt(challenge.id).await?;
+        if attempts >= TOTP_MAX_ATTEMPTS {
+            state.store.delete_totp_challenge(challenge.id).await?;
+            state
+                .store
+                .record_audit(
+                    Some(challenge.user_id),
+                    "auth.totp_challenge_burned",
+                    Some("user"),
+                    Some(challenge.user_id),
+                    None,
+                    &json!({"attempts": attempts}),
+                )
+                .await?;
+        }
+        return Err(invalid());
+    }
+    // A used challenge must not be replayable, and neither must any other
+    // challenge the same account left open.
+    state.store.delete_totp_challenge(challenge.id).await?;
+    let user = state
+        .store
+        .get_user(challenge.user_id)
+        .await?
+        .ok_or(invalid())?;
+    if user.disabled {
+        return Err(ApiError::Unauthorized(
+            "account_disabled",
+            "This account is disabled",
+        ));
+    }
+    state
+        .store
+        .record_audit(
+            Some(user.id),
+            "auth.login",
+            Some("user"),
+            Some(user.id),
+            None,
+            &json!({"second_factor": "totp"}),
+        )
+        .await?;
+    issue_session_response(&state, user).await
+}
+
+/// Whether this account has a second factor, for the settings panel.
+async fn totp_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    let totp = state.store.user_totp(session.user.id).await?;
+    Ok(Json(json!({
+        "enabled": totp.as_ref().map(|row| row.enabled).unwrap_or(false),
+    })))
+}
+
+/// Start enrolment: mint a secret and hand it over with its `otpauth://` URI.
+///
+/// The factor is not on yet. Storing the secret before a code is confirmed is
+/// what makes "I scanned the QR code but lost the app before saving" recoverable
+/// -- running this again simply replaces the pending secret.
+async fn totp_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
+    if state
+        .store
+        .user_totp(session.user.id)
+        .await?
+        .map(|row| row.enabled)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::Conflict(
+            "totp_already_enabled",
+            "Two-factor authentication is already on".into(),
+        ));
+    }
+    let secret = crate::totp::generate_secret();
+    state
+        .store
+        .set_user_totp_secret(session.user.id, &secret)
+        .await?;
+    Ok(Json(json!({
+        "secret": secret,
+        "otpauth_uri": crate::totp::otpauth_uri("qdrust", &session.user.username, &secret),
+    })))
+}
+
+/// Finish enrolment by proving the app produces the right code.
+async fn totp_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<crate::model::TotpCode>,
+) -> Result<Json<Value>, ApiError> {
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
+    let Some(totp) = state.store.user_totp(session.user.id).await? else {
+        return Err(ApiError::NotFound(
+            "totp_not_started",
+            "No setup in progress",
+        ));
+    };
+    if totp.enabled {
+        return Err(ApiError::Conflict(
+            "totp_already_enabled",
+            "Two-factor authentication is already on".into(),
+        ));
+    }
+    let Some(secret) = totp.secret else {
+        return Err(ApiError::NotFound(
+            "totp_not_started",
+            "Start the setup first",
+        ));
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let code = input.code;
+    let valid = tokio::task::spawn_blocking(move || crate::totp::verify(&secret, &code, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    if !valid {
+        return Err(ApiError::Unauthorized(
+            "invalid_totp_code",
+            "That code is not valid; check the clock on your device",
+        ));
+    }
+    state.store.enable_user_totp(session.user.id).await?;
+    state
+        .store
+        .record_audit(
+            Some(session.user.id),
+            "auth.totp_enabled",
+            Some("user"),
+            Some(session.user.id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({"enabled": true})))
+}
+
+/// Turn the second factor off. Requires both the password and a current code:
+/// an unattended session must not be able to remove it, and neither must someone
+/// who only watched a code being typed.
+async fn totp_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<crate::model::TotpDisable>,
+) -> Result<Json<Value>, ApiError> {
+    let (origin, session) = require_session(&state, &headers).await?;
+    require_csrf(&headers, &origin, &session)?;
+    let credentials = state
+        .store
+        .credentials_by_username(&session.user.username)
+        .await?
+        .ok_or(ApiError::Unauthorized(
+            "authentication_required",
+            "Authentication required",
+        ))?;
+    let password = input.password;
+    let encoded_hash = credentials.password_hash.clone();
+    let password_ok =
+        tokio::task::spawn_blocking(move || verify_password(&password, &encoded_hash))
+            .await
+            .map_err(anyhow::Error::from)?;
+    if !password_ok {
+        return Err(ApiError::Unauthorized(
+            "invalid_credentials",
+            "Password is not correct",
+        ));
+    }
+    let Some(totp) = state.store.user_totp(session.user.id).await? else {
+        return Err(ApiError::NotFound("totp_not_enabled", "Not enabled"));
+    };
+    let Some(secret) = totp.secret else {
+        return Err(ApiError::NotFound("totp_not_enabled", "Not enabled"));
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let code = input.code;
+    let valid = tokio::task::spawn_blocking(move || crate::totp::verify(&secret, &code, now))
+        .await
+        .map_err(anyhow::Error::from)??;
+    if !valid {
+        return Err(ApiError::Unauthorized(
+            "invalid_totp_code",
+            "That code is not valid",
+        ));
+    }
+    state.store.disable_user_totp(session.user.id).await?;
+    state
+        .store
+        .record_audit(
+            Some(session.user.id),
+            "auth.totp_disabled",
+            Some("user"),
+            Some(session.user.id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(Json(json!({"enabled": false})))
+}
+
+/// Administrator escape hatch: a lost phone would otherwise lock an account out
+/// for good.
+async fn admin_reset_totp(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let (_, session) = require_session(&state, &headers).await?;
+    if session.user.role != "admin" {
+        return Err(ApiError::Forbidden("admin_required", "Administrator only"));
+    }
+    if state.store.get_user(id).await?.is_none() {
+        return Err(ApiError::NotFound("user_not_found", "User not found"));
+    }
+    state.store.disable_user_totp(id).await?;
+    state
+        .store
+        .record_audit(
+            Some(session.user.id),
+            "auth.totp_reset_by_admin",
+            Some("user"),
+            Some(id),
+            None,
+            &json!({}),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn current_session(

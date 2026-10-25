@@ -17,3 +17,4 @@ pub mod scheduler;
 pub mod store;
 #[cfg(test)]
 pub mod test_support;
+pub mod totp;

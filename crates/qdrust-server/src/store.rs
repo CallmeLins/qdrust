@@ -23,9 +23,9 @@ use crate::model::{
     IssuedSession, MetricsSnapshot, NotificationAction, NotificationChannel,
     NotificationDefaultTemplate, NotificationDelivery, NotificationDeliveryRecord, OidcLoginState,
     PluginManifest, PushRequest, Run, RunCalendarDay, RunStep, SetSiteSetting, SiteSetting, Task,
-    Template, TemplateImport, TemplateSubscription, UpdateNotificationAction,
+    Template, TemplateImport, TemplateSubscription, TotpChallenge, UpdateNotificationAction,
     UpdateNotificationChannel, UpdatePluginManifest, UpdateQdHarTemplate, UpdateTask,
-    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials,
+    UpdateTemplate, UpdateTemplateSubscription, User, UserCredentials, UserTotp,
 };
 use qdrust_core::{
     plugin::NotepadSlot,
@@ -61,9 +61,10 @@ const UNUSABLE_PASSWORD_HASH: &str =
 /// clearing it backwards, which is a valid clear order for any arrangement of
 /// children. `backup_covers_every_table` in the tests fails when a migration
 /// adds a table and forgets this list.
-const BACKUP_TABLES: [&str; 22] = [
+const BACKUP_TABLES: [&str; 23] = [
     "users",
     "sessions",
+    "totp_login_challenges",
     "plugins",
     "api_tokens",
     "external_identities",
@@ -2756,6 +2757,10 @@ macro_rules! define_store {
         // Children come before parents, so the order holds with keys enforced
         // too: a row whose parent is deleted in the same transaction would
         // otherwise be refused.
+        sqlx::query("DELETE FROM totp_login_challenges WHERE user_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "DELETE FROM notification_actions WHERE channel_id IN (SELECT id FROM notification_channels WHERE owner_id=?) OR task_id IN (SELECT id FROM tasks WHERE owner_id=?)",
         )
@@ -3242,6 +3247,151 @@ macro_rules! define_store {
             deliveries_by_status,
             users,
         })
+    }
+
+    // ---- Two-factor authentication (TOTP) ----
+
+    /// The stored secret and whether the user has confirmed it.
+    ///
+    /// The only read path for `users.totp_secret`, which is why it returns a
+    /// purpose-built value rather than widening `usersFromRow`: nothing that
+    /// serialises a `User` can then include the secret by accident.
+    pub async fn user_totp(&self, user_id: i64) -> Result<Option<UserTotp>> {
+        let row: Option<(Option<String>, bool)> =
+            sqlx::query_as("SELECT totp_secret, totp_enabled FROM users WHERE id=?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(secret, enabled)| UserTotp { secret, enabled }))
+    }
+
+    /// Stage a secret without enabling the factor.
+    ///
+    /// Overwrites any previous unconfirmed secret, so a user who loses the QR
+    /// code before confirming can simply start the setup again.
+    pub async fn set_user_totp_secret(&self, user_id: i64, secret: &str) -> Result<bool> {
+        Ok(sqlx::query("UPDATE users SET totp_secret=?, updated_at=? WHERE id=?")
+            .bind(secret)
+            .bind(Utc::now().timestamp())
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    /// Turn the factor on, after the caller proved a code from the user's app.
+    pub async fn enable_user_totp(&self, user_id: i64) -> Result<bool> {
+        let now = Utc::now().timestamp();
+        Ok(sqlx::query(
+            "UPDATE users SET totp_enabled=1, totp_confirmed_at=?, updated_at=? WHERE id=? AND totp_secret IS NOT NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0)
+    }
+
+    /// Turn the factor off and forget the secret, so re-enrolling produces a
+    /// new key rather than silently reusing the old one.
+    pub async fn disable_user_totp(&self, user_id: i64) -> Result<bool> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM totp_login_challenges WHERE user_id=?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
+        let changed = sqlx::query(
+            "UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_confirmed_at=NULL, updated_at=? WHERE id=?",
+        )
+        .bind(Utc::now().timestamp())
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            > 0;
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    /// Remember a half-authenticated login.
+    pub async fn create_totp_challenge(
+        &self,
+        user_id: i64,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO totp_login_challenges(user_id,token_hash,attempts,created_at,expires_at) VALUES (?,?,0,?,?)",
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(Utc::now().timestamp())
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn totp_challenge_by_hash(&self, token_hash: &str) -> Result<Option<TotpChallenge>> {
+        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT id,user_id,attempts,expires_at FROM totp_login_challenges WHERE token_hash=?",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, user_id, attempts, expires_at)| TotpChallenge {
+            id,
+            user_id,
+            attempts,
+            expires_at,
+        }))
+    }
+
+    /// Count one wrong code; returns the new attempt total.
+    pub async fn record_totp_attempt(&self, challenge_id: i64) -> Result<i64> {
+        sqlx::query("UPDATE totp_login_challenges SET attempts=attempts+1 WHERE id=?")
+            .bind(challenge_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(sqlx::query_scalar("SELECT attempts FROM totp_login_challenges WHERE id=?")
+            .bind(challenge_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0))
+    }
+
+    pub async fn delete_totp_challenge(&self, challenge_id: i64) -> Result<bool> {
+        Ok(sqlx::query("DELETE FROM totp_login_challenges WHERE id=?")
+            .bind(challenge_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    pub async fn delete_totp_challenges_for_user(&self, user_id: i64) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM totp_login_challenges WHERE user_id=?")
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// Drop challenges whose window closed; a login that was abandoned halfway
+    /// must not leave a usable row behind indefinitely.
+    pub async fn purge_expired_totp_challenges(&self, before: i64) -> Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM totp_login_challenges WHERE expires_at<?")
+                .bind(before)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
     }
 
     // ---- Email verification (MustVerifyEmail) ----
@@ -4357,6 +4507,16 @@ impl Store {
         pub async fn prune_run_logs(before: i64) -> Result<u64> { before };
         pub async fn count_old_runs(before: i64) -> Result<i64> { before };
         pub async fn metrics_snapshot() -> Result<MetricsSnapshot> {  };
+        pub async fn user_totp(user_id: i64) -> Result<Option<UserTotp>> { user_id };
+        pub async fn set_user_totp_secret(user_id: i64, secret: &str) -> Result<bool> { user_id, secret };
+        pub async fn enable_user_totp(user_id: i64) -> Result<bool> { user_id };
+        pub async fn disable_user_totp(user_id: i64) -> Result<bool> { user_id };
+        pub async fn create_totp_challenge(user_id: i64, token_hash: &str, expires_at: i64) -> Result<()> { user_id, token_hash, expires_at };
+        pub async fn totp_challenge_by_hash(token_hash: &str) -> Result<Option<TotpChallenge>> { token_hash };
+        pub async fn record_totp_attempt(challenge_id: i64) -> Result<i64> { challenge_id };
+        pub async fn delete_totp_challenge(challenge_id: i64) -> Result<bool> { challenge_id };
+        pub async fn delete_totp_challenges_for_user(user_id: i64) -> Result<u64> { user_id };
+        pub async fn purge_expired_totp_challenges(before: i64) -> Result<u64> { before };
         pub async fn set_user_email(user_id: i64, email: &str) -> Result<bool> { user_id, email };
         pub async fn create_email_verification_token(user_id: i64, ttl_seconds: i64) -> Result<(String, i64)> { user_id, ttl_seconds };
         pub async fn consume_email_verification_token(token: &str) -> Result<Option<i64>> { token };
@@ -8301,6 +8461,169 @@ mod tests {
         );
         assert_eq!(
             count_where(&store, "template_imports", "template_id", imported.id).await,
+            0
+        );
+    }
+
+    /// Enrolment is two steps on purpose: staging a secret must not turn the
+    /// factor on, otherwise a user who never got the QR code into their app is
+    /// locked out by their own unfinished setup.
+    #[tokio::test]
+    async fn totp_enrolment_is_staged_until_a_code_confirms_it() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("totp_alice", &password_hash, "user")
+            .await
+            .unwrap();
+
+        let fresh = store.user_totp(user.id).await.unwrap().unwrap();
+        assert!(fresh.secret.is_none());
+        assert!(!fresh.enabled);
+
+        assert!(
+            store
+                .set_user_totp_secret(user.id, "ABCDEF234567")
+                .await
+                .unwrap()
+        );
+        let staged = store.user_totp(user.id).await.unwrap().unwrap();
+        assert_eq!(staged.secret.as_deref(), Some("ABCDEF234567"));
+        assert!(
+            !staged.enabled,
+            "staging a secret must not enable the factor"
+        );
+
+        assert!(store.enable_user_totp(user.id).await.unwrap());
+        assert!(store.user_totp(user.id).await.unwrap().unwrap().enabled);
+
+        // Disabling forgets the secret, so re-enrolling mints a new one instead
+        // of quietly reusing the old key.
+        assert!(store.disable_user_totp(user.id).await.unwrap());
+        let off = store.user_totp(user.id).await.unwrap().unwrap();
+        assert!(off.secret.is_none());
+        assert!(!off.enabled);
+    }
+
+    /// `enable` without a staged secret must do nothing: it is the last line
+    /// between a half-finished setup and an account nobody can log into.
+    #[tokio::test]
+    async fn enabling_without_a_secret_changes_nothing() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("totp_bob", &password_hash, "user")
+            .await
+            .unwrap();
+        assert!(!store.enable_user_totp(user.id).await.unwrap());
+        assert!(!store.user_totp(user.id).await.unwrap().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn totp_challenges_are_looked_up_by_hash_and_count_their_attempts() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("totp_carol", &password_hash, "user")
+            .await
+            .unwrap();
+
+        store
+            .create_totp_challenge(user.id, "hash-one", 4_000_000_000)
+            .await
+            .unwrap();
+        let challenge = store
+            .totp_challenge_by_hash("hash-one")
+            .await
+            .unwrap()
+            .expect("challenge should exist");
+        assert_eq!(challenge.user_id, user.id);
+        assert_eq!(challenge.attempts, 0);
+
+        assert_eq!(store.record_totp_attempt(challenge.id).await.unwrap(), 1);
+        assert_eq!(store.record_totp_attempt(challenge.id).await.unwrap(), 2);
+
+        // Deleting is what makes a used challenge unreplayable.
+        assert!(store.delete_totp_challenge(challenge.id).await.unwrap());
+        assert!(
+            store
+                .totp_challenge_by_hash("hash-one")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .totp_challenge_by_hash("never-existed")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The sweep must only drop challenges whose window has closed, so a login
+    /// in progress is never cancelled by the hourly maintenance.
+    #[tokio::test]
+    async fn purge_drops_only_expired_totp_challenges() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("totp_dave", &password_hash, "user")
+            .await
+            .unwrap();
+        store
+            .create_totp_challenge(user.id, "expired", 1_000)
+            .await
+            .unwrap();
+        store
+            .create_totp_challenge(user.id, "live", 4_000_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(store.purge_expired_totp_challenges(2_000).await.unwrap(), 1);
+        assert!(
+            store
+                .totp_challenge_by_hash("expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .totp_challenge_by_hash("live")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            count_where(&store, "totp_login_challenges", "user_id", user.id).await,
+            1
+        );
+    }
+
+    /// MySQL has no cascade here, so deleting an account has to name its
+    /// challenges itself -- otherwise a deleted user leaves half-logins behind.
+    #[tokio::test]
+    async fn deleting_an_account_removes_its_totp_state() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let password_hash = hash_password("correct horse battery staple").unwrap();
+        let user = store
+            .create_user("totp_erin", &password_hash, "user")
+            .await
+            .unwrap();
+        store
+            .set_user_totp_secret(user.id, "ABCDEF234567")
+            .await
+            .unwrap();
+        store
+            .create_totp_challenge(user.id, "hash", 4_000_000_000)
+            .await
+            .unwrap();
+
+        disable_cascades(&store).await;
+        assert!(store.delete_user(user.id).await.unwrap());
+        assert_eq!(
+            count_where(&store, "totp_login_challenges", "user_id", user.id).await,
             0
         );
     }
