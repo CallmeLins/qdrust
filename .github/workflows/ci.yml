@@ -81,9 +81,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --bin qdrust-server
+          # The task this job runs points at the server's own loopback address,
+          # which the outbound policy blocks by default. That default is right
+          # for a deployment; here the private-network opt-in is what lets the
+          # run reach `/health` at all.
           DATABASE_URL='mysql://root:qdrust-ci@127.0.0.1:3306/qdrust_ci' \
             PORT=18923 \
             QDRUST_LOCAL_LOGIN_ENABLED=true \
+            QDRUST_ALLOW_PRIVATE_NETWORK=true \
             RUST_LOG=warn \
             ./target/debug/qdrust-server &
           server=$!
