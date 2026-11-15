@@ -7427,6 +7427,133 @@ mod tests {
         assert_eq!(third.task_id, a2.id);
     }
 
+    /// ADR-0004's promise, end to end: a worker that dies mid-run must not leave
+    /// a run stuck forever, and recovering it must not need anything that lived
+    /// in that process.
+    ///
+    /// Two `Store` handles over one file is what a restart looks like from the
+    /// database's side: the first one is closed the way a killed process would
+    /// close it, and the second knows nothing but what is on disk.
+    #[tokio::test]
+    async fn a_run_survives_its_worker_dying_and_is_recovered_after_a_restart() {
+        let dir = TempDir::new("crash-recovery");
+        let url = dir.database_url();
+        let run_id;
+        {
+            let store = Store::connect(&url, 1, 2).await.unwrap();
+            let task = store
+                .create(CreateTask {
+                    name: "doomed".into(),
+                    cron: "0/5 * * * * * *".into(),
+                    method: None,
+                    url: "https://example.invalid".into(),
+                    headers: Default::default(),
+                    body: None,
+                    disabled: false,
+                    template_id: None,
+                    grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    random_delay_max_seconds: None,
+                    variables: None,
+                })
+                .await
+                .unwrap();
+            let run = store.enqueue_run(task.id).await.unwrap().unwrap();
+            run_id = run.id;
+            let claimed = store
+                .claim_run("doomed-worker", 300)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.id, run_id);
+            assert!(
+                store
+                    .start_leased_run(run_id, "doomed-worker")
+                    .await
+                    .unwrap()
+            );
+            // Killed here: the run is `running` under a lease, with no
+            // `finish_run` on the way.
+            store.sqlite_pool().clone().close().await;
+        }
+
+        let store = Store::connect(&url, 1, 2).await.unwrap();
+        let interrupted = store.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(interrupted.status, "running");
+        assert_eq!(interrupted.lease_owner.as_deref(), Some("doomed-worker"));
+
+        // A lease is a wall-clock deadline, so the test moves it rather than
+        // sleeping for its duration.
+        sqlx::query("UPDATE runs SET lease_expires_at=? WHERE id=?")
+            .bind(0_i64)
+            .bind(run_id)
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert_eq!(store.recover_expired_runs().await.unwrap(), 1);
+        let recovered = store.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "pending");
+        assert_eq!(recovered.lease_owner, None);
+        assert_eq!(recovered.lease_expires_at, None);
+
+        // And the restarted server can simply run it.
+        let reclaimed = store.claim_run("new-worker", 300).await.unwrap().unwrap();
+        assert_eq!(reclaimed.id, run_id);
+        assert!(store.start_leased_run(run_id, "new-worker").await.unwrap());
+        store.finish_run(run_id, Some(200), None).await.unwrap();
+        assert_eq!(
+            store.get_run(run_id).await.unwrap().unwrap().status,
+            "succeeded"
+        );
+    }
+
+    /// The other half of recovery: a run whose cancellation was requested while
+    /// its worker was dying must come back cancelled, not pending — otherwise a
+    /// cancelled run would be re-executed after every crash.
+    #[tokio::test]
+    async fn recovery_honours_a_cancellation_requested_before_the_crash() {
+        let store = Store::connect("sqlite::memory:", 1, 2).await.unwrap();
+        let task = owned_task(
+            &store,
+            store
+                .create_user(
+                    "cancel-cara",
+                    &hash_password("cancel-cara-password").unwrap(),
+                    "user",
+                )
+                .await
+                .unwrap()
+                .id,
+            "cancellable",
+        )
+        .await;
+        let run = store.enqueue_run(task.id).await.unwrap().unwrap();
+        store.claim_run("dying-worker", 300).await.unwrap().unwrap();
+        store
+            .start_leased_run(run.id, "dying-worker")
+            .await
+            .unwrap();
+        // The user pressed cancel; the worker never got to act on it.
+        assert!(store.cancel_run(run.id).await.unwrap());
+        sqlx::query("UPDATE runs SET lease_expires_at=? WHERE id=?")
+            .bind(0_i64)
+            .bind(run.id)
+            .execute(store.sqlite_pool())
+            .await
+            .unwrap();
+        assert_eq!(store.recover_expired_runs().await.unwrap(), 1);
+        let recovered = store.get_run(run.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "cancelled");
+        assert!(
+            recovered.finished_at.is_some(),
+            "a cancelled run is finished"
+        );
+    }
+
     #[tokio::test]
     async fn run_leases_are_competitive_and_recoverable() {
         let store = Store::connect("sqlite::memory:", 1, 4).await.unwrap();

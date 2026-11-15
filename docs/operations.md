@@ -45,6 +45,15 @@ To repair a released migration that was edited by mistake, restore the bytes it 
 (`git checkout <tag> -- <path>`); rewriting the stored checksum instead only unblocks the one
 machine that was patched and leaves every other deployment failing.
 
+## 服务被杀之后：正在跑的任务怎么办
+
+不需要人工干预。运行中的 run 会带一个租约（`runs.lease_owner` + `runs.lease_expires_at`，默认 5 分钟），进程死了租约就没人续期：
+
+- **租约到期后自动回收**：调度器每 30 秒扫一次，把过期租约的 run 放回 `pending`（若此前请求过取消，则直接标为 `cancelled`），随后由任意一个 worker 重新领取并**重新执行**——这条 run 不会停在 `running` 状态上。
+- **不需要重启才能恢复**：回收逻辑不依赖任何进程内状态，claim 本身也把「过期租约」当成可领取，所以同一个进程里的其它 worker 也会接走它。
+- **代价是同一任务最多等待一个租约时长**：`runs` 上的唯一索引保证一个任务同时只有一条活动 run，所以在租约到期前，那个任务不会被重复触发（避免一次崩溃变成两条并行执行）。
+- **正在跑的那次执行的结果会丢**：已经执行但尚未落库的步骤不会补记，重跑会从头再来。对签到类任务是幂等的；对下单类任务，这正是需要 `retry_count` 保持默认 0 的原因。
+
 ## 发布检查清单
 
 ### 本地门禁
