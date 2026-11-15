@@ -197,6 +197,35 @@ pub fn preview_event(
 /// The channel's URL is the user's to choose, so every request goes through
 /// [`OutboundHttp`] — the same guard a template run gets. Turning the
 /// private-network switch off closes this path too, which it did not before.
+/// Reject a response that did not carry the message.
+///
+/// `error_for_status` only rejects 4xx and 5xx, so a channel answering `302` to
+/// a login page used to be recorded as a successful delivery while nothing
+/// arrived. Channels do not follow redirects — following one is the executor's
+/// job, because the guard pins a client to the addresses one host resolved to
+/// and the next hop is a different host — so the redirect is a failure here,
+/// and the fix on the user's side is to point the URL at the final address.
+fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_redirection() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let destination = if location.is_empty() {
+            String::new()
+        } else {
+            format!(" (Location: {location})")
+        };
+        anyhow::bail!(
+            "the channel answered {status} instead of a response{destination}; notification \
+             channels do not follow redirects, so the URL has to be the final address"
+        );
+    }
+    Ok(response.error_for_status()?)
+}
+
 pub async fn deliver(
     outbound: &OutboundHttp,
     kind: &str,
@@ -211,14 +240,14 @@ pub async fn deliver(
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("webhook channel requires a url"))?;
-            outbound
+            let response = outbound
                 .post(url)
                 .await?
                 .json(message.payload)
                 .send()
                 .await
-                .and_then(|response| response.error_for_status())
                 .context("webhook delivery failed")?;
+            accepted(response).context("webhook delivery failed")?;
             Ok(())
         }
         "custom_http" => {
@@ -252,8 +281,7 @@ pub async fn deliver(
             } else {
                 request.body(render(configured_body)).send().await
             };
-            result
-                .and_then(|response| response.error_for_status())
+            accepted(result.context("custom HTTP delivery failed")?)
                 .context("custom HTTP delivery failed")?;
             Ok(())
         }
@@ -435,6 +463,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("webhook channel requires a url"));
+    }
+
+    /// A `302` is not a delivery. `error_for_status` rejects only 4xx and 5xx,
+    /// so a channel answering a redirect used to be recorded as succeeded while
+    /// nothing arrived — and the ledger is what decides whether to re-send, so
+    /// the message was lost without ever being retried.
+    #[tokio::test]
+    async fn a_channel_that_redirects_is_a_failure_not_a_delivery() {
+        let (address, served) = crate::test_support::serve_redirect_loopback().await;
+        let config = json!({ "url": format!("http://{address}/hook") });
+        let payload = json!({});
+
+        let error = deliver(
+            &guarded(true),
+            "webhook",
+            &config,
+            &message("t", "b", &payload),
+            &|value| value.to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("302") && error.contains("do not follow redirects"),
+            "the refusal has to say what happened and what to change: {error}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the request itself must still reach the channel"
+        );
     }
 
     /// A channel URL is the user's to choose, and this path used to have no

@@ -69,3 +69,36 @@ pub(crate) async fn serve_counting_loopback() -> (SocketAddr, Arc<AtomicUsize>) 
     });
     (address, served)
 }
+
+/// The same server, answering every request with a redirect instead.
+///
+/// A channel that answers `302` has delivered nothing, and `error_for_status`
+/// says nothing about 3xx — this is the shape a silently-lost notification
+/// takes, so the delivery path needs a server that produces it.
+pub(crate) async fn serve_redirect_loopback() -> (SocketAddr, Arc<AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut scratch = [0_u8; 2048];
+                let _ = socket.read(&mut scratch).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://final.invalid/hook\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (address, served)
+}
