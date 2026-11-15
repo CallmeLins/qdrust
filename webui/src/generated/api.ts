@@ -1471,6 +1471,11 @@ export interface components {
             updated_at: number;
             /** Format: int64 */
             last_run_at: number | null;
+            /**
+             * Format: int64
+             * @description Next scheduled fire time (epoch seconds), evaluated in the task's own timezone, or null when the task is disabled or its cron never fires again. Derived per request rather than stored, so it is only present in the responses that compute it (the task list).
+             */
+            next_run?: number | null;
             last_status: number | null;
             last_error: string | null;
             /** @description Group label (QD _groups equivalent) */

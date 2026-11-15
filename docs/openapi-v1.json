@@ -3220,6 +3220,14 @@
                 ],
                 "format": "int64"
               },
+              "next_run": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Next scheduled fire time (epoch seconds), evaluated in the task's own timezone, or null when the task is disabled or its cron never fires again. Derived per request rather than stored, so it is only present in the responses that compute it (the task list)."
+              },
               "last_status": {
                 "type": [
                   "integer",

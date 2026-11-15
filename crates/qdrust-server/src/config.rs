@@ -64,6 +64,23 @@ pub struct PublicAuthConfig {
 /// first-time visitor on a Chinese page.
 pub const DEFAULT_LOCALE: &str = "zh-CN";
 
+/// The deployment's default IANA timezone, resolved once at startup.
+///
+/// The scheduler needs it to decide what is due, and the API needs the *same*
+/// answer to say when a task will next fire — two places that must not each
+/// parse `QDRUST_DEFAULT_TIMEZONE` and drift. `main` sets it from the validated
+/// config; anything else (tests, an early handler) gets the same
+/// `Asia/Shanghai` default the config itself falls back to.
+static DEFAULT_TIMEZONE: std::sync::OnceLock<chrono_tz::Tz> = std::sync::OnceLock::new();
+
+pub fn set_default_timezone(tz: chrono_tz::Tz) {
+    let _ = DEFAULT_TIMEZONE.set(tz);
+}
+
+pub fn default_timezone() -> chrono_tz::Tz {
+    *DEFAULT_TIMEZONE.get().unwrap_or(&chrono_tz::Asia::Shanghai)
+}
+
 /// Public (safe to expose to the browser) deployment metadata: what the WebUI
 /// needs to render itself before anyone has logged in. Deliberately tiny — the
 /// version identifies the running release in a bug report, and the locale tells

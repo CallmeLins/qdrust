@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
         .default_timezone
         .parse()
         .unwrap_or(chrono_tz::Asia::Shanghai);
+    // Published before anything can ask "when does this task run next": the
+    // API answers that question with the scheduler's own default, not with a
+    // second parse of the same variable.
+    qdrust_server::config::set_default_timezone(default_tz);
     tracing::info!(tz = %default_tz, "scheduler default timezone");
     let base_path = config.base_path.clone();
     scheduler::spawn(

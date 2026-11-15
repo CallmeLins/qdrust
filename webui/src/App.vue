@@ -465,6 +465,7 @@ async function refreshTaskStatuses() {
         task.disabled = fresh.disabled;
         task.last_status = fresh.last_status;
         task.last_run_at = fresh.last_run_at;
+        task.next_run = fresh.next_run;
       }
     }
   } catch {
@@ -3234,7 +3235,9 @@ onUnmounted(() => window.clearInterval(refreshTimer));
                   <tr>
                     <td class="col-check"><input type="checkbox" :checked="selected.has(task.id)" @change="toggleSelect(task.id)" /></td>
                     <td class="col-name"><div class="task-name"><strong>{{ task.name }}</strong></div></td>
-                    <td class="col-schedule"><code>{{ task.cron }}</code></td>
+                    <td class="col-schedule"><code>{{ task.cron }}</code>
+                      <small v-if="task.next_run" class="next-run">{{ t('nextRun') }} {{ formatRunTime(task.next_run, locale, task.timezone || undefined) }}</small>
+                    </td>
                     <td class="col-time">{{ formatRunTime(task.last_run_at, undefined, task.timezone || undefined) }}</td>
                     <td class="col-status"><button :class="['status-pill', { paused: task.disabled, 'run-bad': taskStatusLabel(task) === '失败' }]" @click="toggleTask(task)"><span />{{ taskStatusLabel(task) }}</button></td>
                     <td class="col-group">{{ task.grp ?? '–' }}</td>

@@ -773,6 +773,15 @@ tbody tr:hover { background-color: rgb(var(--interactive-surface) / var(--intera
 td.col-time,
 td.col-status { white-space: nowrap; }
 
+/* The next scheduled moment sits under the cron chip: a cron expression says
+   nothing about which zone it is read in, and the answer ("22:00" or "14:00"?) is
+   what the reader is actually after. Smaller and quieter than the chip so the
+   schedule column keeps reading as one unit. */
+td.col-schedule .next-run {
+  display: block; margin-top: 2px;
+  color: var(--ink-3); font-size: 11px; white-space: nowrap;
+}
+
 /* Inline code is plain monospace again — the tinted pill competed with the
    task name for attention. The accent colour stays in the text, not on a
    surface. A hair of horizontal padding keeps it from touching its neighbours

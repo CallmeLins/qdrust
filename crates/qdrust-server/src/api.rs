@@ -2070,11 +2070,27 @@ async fn list_tasks(
 ) -> Result<Json<Value>, ApiError> {
     let (_, session) = require_session_from_store(&store, &headers).await?;
     let grp = params.get("grp").and_then(|v| v.as_str());
-    Ok(Json(json!(
-        store
-            .list_for_owner_with_group(session.user.id, grp)
-            .await?
-    )))
+    let tasks = store
+        .list_for_owner_with_group(session.user.id, grp)
+        .await?;
+    // "Next run" is derived, not stored: it depends on the current clock, so a
+    // column would be stale the moment it was written. Computed here, next to
+    // the scheduler's own notion of "due", so the two cannot disagree.
+    let tz = crate::config::default_timezone();
+    let items: Vec<Value> = tasks
+        .into_iter()
+        .map(|task| {
+            let mut value = json!(task);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "next_run".into(),
+                    json!(crate::scheduler::next_occurrence(&task, tz)),
+                );
+            }
+            value
+        })
+        .collect();
+    Ok(Json(json!(items)))
 }
 async fn create_task(
     State(store): State<Store>,
@@ -2613,10 +2629,8 @@ async fn test_notification_channel(
             "notification_channel_not_found",
             "Notification channel not found",
         ))?;
-    let timezone = crate::config::Config::from_env()
-        .map(|config| config.default_timezone)
-        .ok();
-    let vars = crate::delivery::test_vars(timezone.as_deref());
+    let timezone = crate::config::default_timezone().to_string();
+    let vars = crate::delivery::test_vars(Some(&timezone));
     // Title/body templates live on the task↔channel bindings, not on the
     // channel, so a channel-level test can only exercise the generic message.
     let title = vars.render("[qdrust] Test notification");

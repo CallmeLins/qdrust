@@ -176,11 +176,7 @@ fn due(task: &Task, interval: Duration, default_tz: chrono_tz::Tz) -> bool {
     let Ok(schedule) = Schedule::from_str(&task.cron) else {
         return false;
     };
-    let tz: chrono_tz::Tz = task
-        .timezone
-        .as_deref()
-        .and_then(|tz| tz.parse().ok())
-        .unwrap_or(default_tz);
+    let tz = task_timezone(task, default_tz);
     let now = Utc::now().with_timezone(&tz);
     // A task that has never run must wait for its *next* scheduled moment.
     // Anchoring "since" at now - interval (instead of epoch 0) prevents a new
@@ -195,6 +191,36 @@ fn due(task: &Task, interval: Duration, default_tz: chrono_tz::Tz) -> bool {
         .after(&since)
         .next()
         .is_some_and(|next| next <= now)
+}
+
+/// The timezone a task's cron is read in: its own, or the deployment default.
+///
+/// Shared by [`due`] and [`next_occurrence`] so "is it due" and "when is it next
+/// due" can never be answered in two different zones.
+fn task_timezone(task: &Task, default_tz: chrono_tz::Tz) -> chrono_tz::Tz {
+    task.timezone
+        .as_deref()
+        .and_then(|tz| tz.parse().ok())
+        .unwrap_or(default_tz)
+}
+
+/// When `task` will fire next, as epoch seconds.
+///
+/// This is the question a cron string cannot answer by itself, and the one a
+/// user actually asks before trusting a schedule ("22:00 daily" — but in which
+/// zone, and does it still run after the clock change?). `None` for a disabled
+/// task and for a cron that never fires again, which is also the case where
+/// showing a time would be a lie.
+pub(crate) fn next_occurrence(task: &Task, default_tz: chrono_tz::Tz) -> Option<i64> {
+    if task.disabled {
+        return None;
+    }
+    let schedule = Schedule::from_str(&task.cron).ok()?;
+    let tz = task_timezone(task, default_tz);
+    schedule
+        .after(&Utc::now().with_timezone(&tz))
+        .next()
+        .map(|next| next.timestamp())
 }
 
 /// Flatten a task's stored variables object into the BTreeMap the executor
