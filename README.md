@@ -69,7 +69,7 @@ Copy-Item .env.example .env
 cargo run -p qdrust-server
 ```
 
-服务默认监听 `http://localhost:8923`，运行数据默认写入 `data/qd.db`。前后端分开开发时再起一个 `npm --prefix webui run dev`（Vite 在 `5173`，已把 API 代理到 Rust 服务）。
+服务默认监听 `http://localhost:8923`，运行数据默认写入 `data/qdrust.db`。前后端分开开发时再起一个 `npm --prefix webui run dev`（Vite 在 `5173`，已把 API 代理到 Rust 服务）。
 
 ---
 

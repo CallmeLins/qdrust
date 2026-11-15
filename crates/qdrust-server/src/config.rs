@@ -1,4 +1,9 @@
-use std::{env, net::IpAddr, path::PathBuf, time::Duration};
+use std::{
+    env,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 
@@ -289,7 +294,7 @@ impl Config {
                 .parse()
                 .context("BIND must be an IP address")?,
             port: parse_env("PORT", 8923)?,
-            database_url: env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/qd.db".into()),
+            database_url: env::var("DATABASE_URL").unwrap_or_else(|_| default_database_url()),
             database_min_connections: parse_env("DATABASE_MIN_CONNECTIONS", 1)?,
             database_max_connections: parse_env("DATABASE_MAX_CONNECTIONS", 8)?,
             scheduler_interval: Duration::from_secs(parse_env("SCHEDULER_INTERVAL_SECONDS", 15)?),
@@ -820,6 +825,37 @@ fn csv_env(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Filename a fresh install writes its SQLite database to.
+///
+/// The image already used `qdrust.db` while a bare `cargo run` used `qd.db`, so
+/// the same project produced two different files depending on how it was
+/// started — and moving between the two looked exactly like losing every task.
+/// The name is now `qdrust.db` everywhere.
+///
+/// The legacy name is still honoured when the *only* thing on disk is the old
+/// file: an existing deployment that never set `DATABASE_URL` keeps its data
+/// instead of coming up on an empty database next to it. A fresh install, or
+/// one that already has a `qdrust.db`, gets the new name.
+fn default_database_url() -> String {
+    default_database_url_in(Path::new("data"))
+}
+
+/// The same choice, with the directory passed in so it can be tested without
+/// depending on the working tree the test happens to run in.
+fn default_database_url_in(dir: &Path) -> String {
+    const LEGACY: &str = "qd.db";
+    const CURRENT: &str = "qdrust.db";
+    if dir.join(LEGACY).exists() && !dir.join(CURRENT).exists() {
+        tracing::warn!(
+            legacy = %dir.join(LEGACY).display(),
+            "reading the legacy SQLite file because DATABASE_URL is unset; rename it to \
+             {CURRENT} (or set DATABASE_URL) to move to the current default"
+        );
+        return format!("sqlite://{}", dir.join(LEGACY).display());
+    }
+    format!("sqlite://{}", dir.join(CURRENT).display())
+}
+
 fn parse_env<T>(name: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
@@ -848,6 +884,44 @@ fn normalize_base_path(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default SQLite path must not silently move an existing database.
+    #[test]
+    fn the_default_database_file_keeps_a_legacy_install() {
+        let dir = std::env::temp_dir().join(format!(
+            "qd-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A fresh install gets the current name.
+        assert!(
+            default_database_url_in(&dir).ends_with("qdrust.db"),
+            "a fresh directory should get qdrust.db"
+        );
+
+        // Only the legacy file exists: keep using it, or the upgrade comes up on
+        // an empty database beside the real one.
+        std::fs::write(dir.join("qd.db"), b"").unwrap();
+        let url = default_database_url_in(&dir);
+        assert!(
+            url.ends_with("qd.db"),
+            "legacy install should be kept: {url}"
+        );
+
+        // Both exist: the current name wins, and the old file stays untouched.
+        std::fs::write(dir.join("qdrust.db"), b"").unwrap();
+        assert!(
+            default_database_url_in(&dir).ends_with("qdrust.db"),
+            "a renamed install should use the new name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn base_path_is_normalized() {

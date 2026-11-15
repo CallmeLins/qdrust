@@ -25,7 +25,7 @@ Copy-Item .env.example .env
 cargo run -p qdrust-server
 ```
 
-服务默认监听 `http://localhost:8923`。首次打开 WebUI 时创建初始管理员账号。运行数据默认写入 `data/qd.db`。
+服务默认监听 `http://localhost:8923`。首次打开 WebUI 时创建初始管理员账号。运行数据默认写入 `data/qdrust.db`（旧版本用的是 `data/qd.db`；若只存在旧文件，服务会继续用它并在日志里提醒改名）。
 
 前后端分开开发时运行：
 
@@ -146,7 +146,7 @@ QDRUST_BASE_PATH=/qd
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `BIND` / `PORT` | `0.0.0.0` / `8923` | 监听地址与端口 |
-| `DATABASE_URL` | `sqlite://data/qd.db` | 数据库；MySQL 用 `mysql://user:pass@host:3306/qdrust` |
+| `DATABASE_URL` | `sqlite://data/qdrust.db` | 数据库；MySQL 用 `mysql://user:pass@host:3306/qdrust` |
 | `DATABASE_MIN_CONNECTIONS` / `DATABASE_MAX_CONNECTIONS` | `1` / `8` | 连接池上下限 |
 | `SCHEDULER_INTERVAL_SECONDS` | `15` | 调度器轮询间隔 |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 单步 HTTP 请求超时 |
