@@ -17,7 +17,26 @@ yanked = "deny"
 # scalar: the only signing keys openidconnect implements are RSA, HMAC and
 # Ed25519, and none of them are used here. Revisit when openidconnect moves to
 # elliptic-curve 0.14 (which pulls crypto-bigint 0.7).
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
+# RUSTSEC-2026-0459 (libsqlite3-sys 0.30.1): opening a database together with
+# a sibling `-wal` whose page size differs from the database's can make ordinary
+# queries return uninitialized page-cache memory. Fixed in libsqlite3-sys 0.39
+# (SQLite 3.54). This one cannot be updated away: the only path that *bundles*
+# SQLite here is sqlx-sqlite, and every sqlx release — including 0.9.0, the
+# latest — requires `libsqlite3-sys >=0.30.1, <0.38.0`, so no sqlx version can
+# carry a 0.39 dependency. The CLI adds no second copy: it does not enable
+# `bundled` itself (`-p qdrust-cli` links the host's SQLite), and either way the
+# file it opens is the operator's own database, not something a template or an
+# import delivers.
+# What the trigger needs is a crafted db + `-wal` pair written by someone less
+# trusted than the operator. In SQLite mode those files live in the data
+# directory the server runs as (uid 10001 in the image, or the mounted path),
+# and whoever can write there already owns the rows the leak would expose.
+# Switching the server to the system SQLite was considered and rejected: that
+# needs a host library >= 3.54 (Debian 12 ships 3.40, itself affected) plus
+# libclang for bindgen, and turns a self-contained image into a version lottery.
+# Revisit when sqlx widens the range to libsqlite3-sys 0.39; the fix is then
+# `cargo update -p libsqlite3-sys`.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
 
 [licenses]
 version = 2
