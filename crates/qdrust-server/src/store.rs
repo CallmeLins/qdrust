@@ -2081,7 +2081,12 @@ macro_rules! define_store {
         .bind(attempt)
         .bind(status)
         .bind(http_status.map(i64::from))
-        .bind(error)
+        // A delivery error is usually a transport error, and a transport error
+        // quotes the URL it failed on — for a webhook or a Telegram channel that
+        // URL carries the channel's own credential in the query string. Same
+        // treatment as every other write that can quote a request: mask on the
+        // way in, so the ledger, the API response and any backup are all clean.
+        .bind(error.map(crate::redact::redact))
         .bind(Utc::now().timestamp())
         .execute(&mut *conn)
         .await?;
@@ -7171,6 +7176,63 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// A delivery error is a transport error, and a transport error quotes its
+    /// URL. For a webhook that URL can carry the channel's own token, and this
+    /// string is rendered in the UI and shipped in every backup.
+    #[tokio::test]
+    async fn delivery_errors_are_masked_before_they_are_recorded() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let task = store
+            .create(CreateTask {
+                name: "masked".into(),
+                cron: "0/5 * * * * * *".into(),
+                method: None,
+                url: "https://example.invalid".into(),
+                headers: Default::default(),
+                body: None,
+                disabled: false,
+                template_id: None,
+                grp: None,
+                timeout_seconds: None,
+                retry_count: None,
+                retry_interval_seconds: None,
+                priority: None,
+                timezone: None,
+                random_delay_max_seconds: None,
+                variables: None,
+            })
+            .await
+            .unwrap();
+        let run = store.enqueue_run(task.id).await.unwrap().unwrap();
+        store
+            .record_notification_delivery(
+                run.id,
+                task.id,
+                Some(1),
+                Some(2),
+                "webhook",
+                "failure",
+                1,
+                "failed",
+                None,
+                Some(
+                    "error sending request for url \
+                     (https://hooks.example/notify?token=abc123&chat=7)",
+                ),
+            )
+            .await
+            .unwrap();
+        let rows = store
+            .list_notification_deliveries_for_run(run.id)
+            .await
+            .unwrap();
+        let error = rows[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("token=***"), "{error}");
+        assert!(!error.contains("abc123"), "{error}");
+        // The harmless neighbours survive, or the message stops being usable.
+        assert!(error.contains("chat=7"), "{error}");
     }
 
     /// The sweep's queue is "the newest attempt of each delivery, still failed,
