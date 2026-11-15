@@ -2139,6 +2139,43 @@ macro_rules! define_store {
         row.map(notification_delivery_record_from_row).transpose()
     }
 
+    /// Failed deliveries that are still worth another attempt.
+    ///
+    /// One row per (run, action, channel, event): the newest attempt of each,
+    /// and only while that attempt failed and the count is below
+    /// `max_attempts`. Whether enough time has passed is the caller's call —
+    /// the backoff schedule lives with the sweep, not in SQL — but the
+    /// `created_at` of the newest attempt is what it needs to decide.
+    pub async fn list_retryable_deliveries(
+        &self,
+        max_attempts: i64,
+    ) -> Result<Vec<NotificationDeliveryRecord>> {
+        // The shared field list has no alias, and the NOT EXISTS below has to
+        // name the outer row. Aliasing it here keeps one column list rather
+        // than a second copy that would drift the moment a column is added.
+        let fields = NOTIFICATION_DELIVERY_FIELDS.replacen(
+            "FROM notification_deliveries",
+            "FROM notification_deliveries d",
+            1,
+        );
+        let rows = sqlx::query(&format!(
+            "{fields} WHERE d.status='failed' AND d.attempt<?
+               AND d.action_id IS NOT NULL AND d.channel_id IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM notification_deliveries later
+                 WHERE later.run_id=d.run_id AND later.action_id=d.action_id
+                   AND later.channel_id=d.channel_id AND later.event=d.event
+                   AND later.attempt>d.attempt)
+             ORDER BY d.id LIMIT 200"
+        ))
+        .bind(max_attempts)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(notification_delivery_record_from_row)
+            .collect()
+    }
+
     /// Attempts already recorded for this exact (run, action, channel, event)
     /// pair. Retry uses it to number the next attempt instead of restarting at 1.
     pub async fn count_notification_attempts(
@@ -4462,6 +4499,7 @@ impl Store {
         pub async fn list_notification_deliveries_for_run(run_id: i64) -> Result<Vec<NotificationDeliveryRecord>> { run_id };
         pub async fn list_notification_deliveries_for_run_owner(run_id: i64, owner_id: i64) -> Result<Option<Vec<NotificationDeliveryRecord>>> { run_id, owner_id };
         pub async fn get_notification_delivery(id: i64) -> Result<Option<NotificationDeliveryRecord>> { id };
+        pub async fn list_retryable_deliveries(max_attempts: i64) -> Result<Vec<NotificationDeliveryRecord>> { max_attempts };
         pub async fn count_notification_attempts(run_id: i64, action_id: i64, channel_id: i64, event: &str) -> Result<i64> { run_id, action_id, channel_id, event };
         pub async fn create_plugin(owner_id: i64, input: CreatePluginManifest) -> Result<PluginManifest> { owner_id, input };
         pub async fn list_plugins(owner_id: i64) -> Result<Vec<PluginManifest>> { owner_id };
@@ -7104,6 +7142,109 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// One ledger row, with the columns a delivery actually uses. Action and
+    /// channel ids are plain numbers here: the table deliberately has no foreign
+    /// keys pointing at them, so a test needs no bindings to exist.
+    async fn record_delivery(
+        store: &Store,
+        run_id: i64,
+        task_id: i64,
+        action: i64,
+        channel: i64,
+        attempt: i64,
+        status: &str,
+    ) {
+        store
+            .record_notification_delivery(
+                run_id,
+                task_id,
+                Some(action),
+                Some(channel),
+                "webhook",
+                "failure",
+                attempt,
+                status,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The sweep's queue is "the newest attempt of each delivery, still failed,
+    /// still under the limit". Anything looser re-sends a notification that has
+    /// already gone through, or one that has run out of attempts.
+    #[tokio::test]
+    async fn only_the_newest_failed_attempt_of_a_delivery_is_retryable() {
+        let store = Store::connect("sqlite::memory:", 1, 4).await.unwrap();
+        let task = store
+            .create(CreateTask {
+                name: "retry".into(),
+                cron: "0/5 * * * * * *".into(),
+                method: None,
+                url: "https://example.invalid".into(),
+                headers: Default::default(),
+                body: None,
+                disabled: false,
+                template_id: None,
+                grp: None,
+                timeout_seconds: None,
+                retry_count: None,
+                retry_interval_seconds: None,
+                priority: None,
+                timezone: None,
+                random_delay_max_seconds: None,
+                variables: None,
+            })
+            .await
+            .unwrap();
+        let run = store.enqueue_run(task.id).await.unwrap().unwrap();
+        let max = 4;
+
+        // A first failure is retryable.
+        record_delivery(&store, run.id, task.id, 7, 11, 1, "failed").await;
+        let due = store.list_retryable_deliveries(max).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].attempt, due[0].action_id), (1, Some(7)));
+
+        // Once a newer attempt exists, the older failure is history: re-sending
+        // it would duplicate a notification that has already been delivered.
+        record_delivery(&store, run.id, task.id, 7, 11, 2, "succeeded").await;
+        assert!(
+            store
+                .list_retryable_deliveries(max)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a delivery that later succeeded must not be re-sent"
+        );
+
+        // Out of attempts: the row stays as evidence, but is no longer queued.
+        record_delivery(&store, run.id, task.id, 8, 11, max, "failed").await;
+        assert!(
+            store
+                .list_retryable_deliveries(max)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A different binding on the same run is its own delivery.
+        record_delivery(&store, run.id, task.id, 9, 12, 1, "failed").await;
+        let due = store.list_retryable_deliveries(max).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].action_id, Some(9));
+
+        // A row with no binding cannot be re-rendered, so it is never queued.
+        store
+            .record_notification_delivery(
+                run.id, task.id, None, None, "webhook", "failure", 1, "failed", None, None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_retryable_deliveries(max).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

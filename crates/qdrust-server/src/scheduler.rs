@@ -44,6 +44,10 @@ pub fn spawn(
     browser: Option<Arc<BrowserSessionManager>>,
     default_tz: chrono_tz::Tz,
 ) {
+    // Shared rather than moved: the run path sends the first attempt and the
+    // retry sweep re-sends, and neither should own the client the other needs.
+    let email = Arc::new(email);
+    let worker_email = email.clone();
     let worker_store = store.clone();
     let worker_outbound = outbound.clone();
     tokio::spawn(async move {
@@ -76,7 +80,7 @@ pub fn spawn(
                             run,
                             &worker,
                             &run_events,
-                            &email,
+                            &worker_email,
                             policy,
                             browser.clone(),
                         )
@@ -122,6 +126,19 @@ pub fn spawn(
                 };
                 let _ = result;
             }
+        }
+    });
+    // Automatic re-send of notifications that failed. `send_one` records every
+    // attempt, so the backlog is already written down; this loop is what makes
+    // a transient SMTP failure something the user never has to notice.
+    let retry_store = store.clone();
+    let retry_outbound = outbound.clone();
+    let retry_email = email.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RETRY_SWEEP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            retry_failed_deliveries(&retry_store, &retry_outbound, &retry_email).await;
         }
     });
     // Periodic maintenance: log retention (runtime-tunable via site settings),
@@ -921,6 +938,119 @@ pub async fn retry_delivery(
         email,
     )
     .await
+}
+
+/// How often the re-send sweep looks for work. One minute: the shortest backoff
+/// is a minute, so a shorter interval would only re-read the same rows.
+const RETRY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Wait before re-sending, indexed by the attempt that just failed: a minute,
+/// then five, then fifteen. Long enough that a site-wide outage is not hammered
+/// by every task at once, short enough that a transient failure is invisible.
+const RETRY_BACKOFF_SECS: [i64; 4] = [60, 300, 900, 3600];
+
+/// Attempts per delivery before the sweep leaves it failed for a human to see.
+/// One initial attempt plus three re-sends.
+const RETRY_MAX_ATTEMPTS: i64 = 4;
+
+fn retry_backoff(attempt: i64) -> i64 {
+    let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+    RETRY_BACKOFF_SECS[index.min(RETRY_BACKOFF_SECS.len() - 1)]
+}
+
+/// Re-send the notifications that failed and are due another attempt.
+///
+/// The ledger is the queue: a failed attempt leaves a row, and this scans for
+/// the newest row of each delivery that is still failed. No new table, no
+/// in-memory state — an attempt made before a restart is picked up after it,
+/// which is the whole point of having recorded it.
+async fn retry_failed_deliveries(store: &Store, outbound: &OutboundHttp, email: &EmailClient) {
+    let candidates = match store.list_retryable_deliveries(RETRY_MAX_ATTEMPTS).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(%err, "cannot load notification deliveries to retry");
+            return;
+        }
+    };
+    let now = Utc::now().timestamp();
+    for delivery in candidates {
+        if now - delivery.created_at < retry_backoff(delivery.attempt) {
+            continue;
+        }
+        // Every reason below is permanent: nothing about waiting longer makes a
+        // deleted channel come back. The attempt is still recorded, because it
+        // is what advances the counter — otherwise the sweep would re-check the
+        // same dead row every minute for as long as the run exists.
+        let Some(task) = store.get(delivery.task_id).await.ok().flatten() else {
+            abandon_delivery(store, &delivery, "the task no longer exists").await;
+            continue;
+        };
+        let Some(owner) = store.task_owner_id(task.id).await.ok().flatten() else {
+            abandon_delivery(store, &delivery, "the task no longer has an owner").await;
+            continue;
+        };
+        let (Some(action_id), Some(channel_id)) = (delivery.action_id, delivery.channel_id) else {
+            abandon_delivery(store, &delivery, "the binding was not recorded").await;
+            continue;
+        };
+        let action = match store.get_notification_action(action_id, owner).await {
+            Ok(Some(action)) => action,
+            _ => {
+                abandon_delivery(store, &delivery, "the notification binding was deleted").await;
+                continue;
+            }
+        };
+        let channel = match store.get_notification_channel(channel_id, owner).await {
+            Ok(Some(channel)) => channel,
+            _ => {
+                abandon_delivery(store, &delivery, "the notification channel was deleted").await;
+                continue;
+            }
+        };
+        info!(
+            delivery_id = delivery.id,
+            run_id = delivery.run_id,
+            attempt = delivery.attempt + 1,
+            "re-sending a failed notification"
+        );
+        if let Err(err) =
+            retry_delivery(store, outbound, email, &delivery, &task, &action, &channel).await
+        {
+            warn!(delivery_id = delivery.id, %err, "automatic notification retry failed");
+        }
+    }
+}
+
+/// Record an attempt that will never be sent, so the sweep stops picking it.
+///
+/// The row says why, in the same ledger and the same numbering as a real
+/// attempt: "attempt 2 failed: not retried automatically, the channel was
+/// deleted" is what the user needs to read, and it is also what stops this from
+/// becoming an infinite retry against something that cannot work.
+async fn abandon_delivery(
+    store: &Store,
+    delivery: &crate::model::NotificationDeliveryRecord,
+    reason: &str,
+) {
+    let note = format!("not retried automatically: {reason}");
+    warn!(delivery_id = delivery.id, %note, "giving up on a notification delivery");
+    if let Err(err) = store
+        .record_notification_delivery(
+            delivery.run_id,
+            delivery.task_id,
+            delivery.action_id,
+            delivery.channel_id,
+            &delivery.channel_kind,
+            &delivery.event,
+            delivery.attempt + 1,
+            "failed",
+            None,
+            Some(&note),
+        )
+        .await
+    {
+        warn!(delivery_id = delivery.id, %err, "cannot record the abandoned attempt");
+    }
 }
 
 fn bounded_error(message: &str) -> String {
@@ -2048,6 +2178,50 @@ mod tests {
         let mut task = due_probe_task("0 * * * * *", None, None);
         task.disabled = true;
         assert!(!due(&task, Duration::from_secs(15), chrono_tz::UTC));
+    }
+
+    /// "Next run" has to be answered in the same zone the scheduler uses, or the
+    /// card shows a time that is not when the task fires.
+    #[test]
+    fn next_occurrence_is_answered_in_the_task_timezone() {
+        let utc = next_occurrence(&due_probe_task("0 0 22 * * *", None, None), chrono_tz::UTC)
+            .expect("a daily cron always has a next occurrence");
+        let shanghai = next_occurrence(
+            &due_probe_task("0 0 22 * * *", None, Some("Asia/Shanghai")),
+            chrono_tz::UTC,
+        )
+        .expect("a daily cron always has a next occurrence");
+        // Same cron text, different zones: 22:00 UTC and 22:00 CST are eight
+        // hours apart, so the epochs cannot agree.
+        assert_ne!(utc, shanghai);
+        // Both are within the next day and a bit, not in the past.
+        let now = Utc::now().timestamp();
+        for at in [utc, shanghai] {
+            assert!(at > now, "{at} should be in the future");
+            assert!(at <= now + 86_400 + 1, "{at} should be within a day");
+        }
+
+        // A disabled or unparsable schedule has no next run to show.
+        let mut disabled = due_probe_task("0 0 22 * * *", None, None);
+        disabled.disabled = true;
+        assert_eq!(next_occurrence(&disabled, chrono_tz::UTC), None);
+        assert_eq!(
+            next_occurrence(&due_probe_task("not a cron", None, None), chrono_tz::UTC),
+            None
+        );
+    }
+
+    /// The backoff has to grow and then stop growing: an attempt count that
+    /// exceeded the table would otherwise panic inside the sweep.
+    #[test]
+    fn retry_backoff_grows_then_saturates() {
+        assert_eq!(retry_backoff(1), 60);
+        assert_eq!(retry_backoff(2), 300);
+        assert_eq!(retry_backoff(3), 900);
+        assert_eq!(retry_backoff(4), 3600);
+        assert_eq!(retry_backoff(9), 3600);
+        // Attempt numbers below 1 are not a thing; they must not index backwards.
+        assert_eq!(retry_backoff(0), 60);
     }
 
     #[test]
