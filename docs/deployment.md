@@ -149,6 +149,8 @@ QDRUST_BASE_PATH=/qd
 | `DATABASE_URL` | `sqlite://data/qdrust.db` | 数据库；MySQL 用 `mysql://user:pass@host:3306/qdrust` |
 | `DATABASE_MIN_CONNECTIONS` / `DATABASE_MAX_CONNECTIONS` | `1` / `8` | 连接池上下限 |
 | `SCHEDULER_INTERVAL_SECONDS` | `15` | 调度器轮询间隔 |
+| `SCHEDULER_WORKERS` | SQLite `2` / MySQL `4` | 同时执行的任务数。见[并发执行](#并发执行) |
+| `SCHEDULER_MAX_RUNS_PER_USER` | `0` | 单个账号同时执行的任务数上限，`0` = 不限（由全局上限决定）。共享部署用它防止一个账号占满全部 worker |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 单步 HTTP 请求超时 |
 | `SESSION_TTL_SECONDS` | `604800` | 会话有效期（7 天） |
 | `COOKIE_SECURE` | `false` | **HTTPS 下必须设为 `true`** |
@@ -170,6 +172,17 @@ QDRUST_BASE_PATH=/qd
 | `QDRUST_ALLOW_INVALID_CERTIFICATES` | `false` | **高风险**：不再校验证书（自签名 / 过期 / 域名不匹配都接受）。与上一个开关互相独立，理由见[接受无效证书](usage.md#接受无效证书高风险开关)。同样可在管理页运行时开关，优先级高于本变量 |
 
 第三方登录（OIDC / 反向代理 Header）另有一组变量，见 [账号与第三方登录](authentication.md)。
+
+## 并发执行
+
+`SCHEDULER_WORKERS` 决定**同一时刻最多有几个任务在跑**。这不是吞吐量的数字游戏，而是故障隔离：在只有一个 worker 的版本里，一个跑 5 分钟的浏览器任务、或者一个目标卡到 `REQUEST_TIMEOUT_SECONDS` 的请求，会把**整台机器上所有人的所有任务**一起堵住。
+
+- **默认值按后端给**：SQLite 是 `2`（它只有一个写者，再多也主要是加锁竞争），MySQL 是 `4`（没有这个上限，瓶颈在网络上）。
+- **领取是串行的，执行不是。** `claim_run` 是一次「先查后改」的事务；SQLite 上这种从读升级到写的事务在另一个连接持写锁时会**立即**失败（busy handler 对这种升级不生效），所以同一进程内的领取用一把锁串起来，执行完全并发。
+- **SQLite 的写等待放宽到 15 秒**（`busy_timeout`）。默认的 5 秒是单写者时代的取值，而超时的代价是**静默丢掉一条 `run_steps`**（这些写是尽力而为的），比慢一点糟得多。
+- **过期租约每 30 秒回收一次**，不再由每个 worker 各自每 250 毫秒查一遍。领取本身不依赖它（过期租约可以直接被领取），这个间隔只决定一条 run 最多能在 `running` 状态无人认领多久。
+- **同一个任务仍然不会并行**：`runs` 上的唯一索引保证一个任务同时只有一条活动 run，多 worker 不会让同一个任务重叠执行。
+- **一个账号的上限**用 `SCHEDULER_MAX_RUNS_PER_USER` 单独控制。默认 `0` 表示「全局上限允许多少就是多少」——单租户部署不需要再设；共享部署设成 `1`~`2` 可以保证某个人的积压不会占满所有 worker。
 
 ## 监控指标
 

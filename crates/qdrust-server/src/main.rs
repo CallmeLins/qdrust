@@ -75,6 +75,10 @@ async fn main() -> Result<()> {
         settings.clone(),
         browser,
         default_tz,
+        scheduler::Concurrency {
+            workers: config.scheduler_workers,
+            max_per_user: config.scheduler_max_runs_per_user,
+        },
     );
     let app = api::router_with_auth(
         store,

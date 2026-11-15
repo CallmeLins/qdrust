@@ -212,6 +212,20 @@ pub struct Config {
     pub database_min_connections: u32,
     pub database_max_connections: u32,
     pub scheduler_interval: Duration,
+    /// How many runs may execute at once (`SCHEDULER_WORKERS`).
+    ///
+    /// More than one is what keeps a slow target from being a global outage: a
+    /// browser task, or a site that sits until its timeout, used to hold up every
+    /// other task in the install because there was exactly one worker loop. The
+    /// default is per backend — SQLite has a single writer, so extra workers buy
+    /// little past a couple; MySQL has no such ceiling.
+    pub scheduler_workers: u32,
+    /// Runs one account may have executing at once
+    /// (`SCHEDULER_MAX_RUNS_PER_USER`). 0 means "whatever the global ceiling
+    /// allows", which is right for the single-tenant install this mostly runs
+    /// as; a shared install sets it so one account's tasks cannot occupy every
+    /// worker.
+    pub scheduler_max_runs_per_user: u32,
     pub request_timeout: Duration,
     pub session_ttl: Duration,
     pub cookie_secure: bool,
@@ -305,16 +319,25 @@ impl Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        // Resolved first: how many workers make sense depends on which database
+        // is behind them.
+        let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| default_database_url());
+        let scheduler_workers = parse_env(
+            "SCHEDULER_WORKERS",
+            default_scheduler_workers(&database_url),
+        )?;
         Ok(Self {
             bind: env::var("BIND")
                 .unwrap_or_else(|_| "0.0.0.0".into())
                 .parse()
                 .context("BIND must be an IP address")?,
             port: parse_env("PORT", 8923)?,
-            database_url: env::var("DATABASE_URL").unwrap_or_else(|_| default_database_url()),
+            database_url,
             database_min_connections: parse_env("DATABASE_MIN_CONNECTIONS", 1)?,
             database_max_connections: parse_env("DATABASE_MAX_CONNECTIONS", 8)?,
             scheduler_interval: Duration::from_secs(parse_env("SCHEDULER_INTERVAL_SECONDS", 15)?),
+            scheduler_workers,
+            scheduler_max_runs_per_user: parse_env("SCHEDULER_MAX_RUNS_PER_USER", 0)?,
             request_timeout: Duration::from_secs(parse_env("REQUEST_TIMEOUT_SECONDS", 30)?),
             session_ttl: Duration::from_secs(parse_env("SESSION_TTL_SECONDS", 604_800)?),
             cookie_secure: parse_env("COOKIE_SECURE", false)?,
@@ -480,6 +503,10 @@ impl Config {
             bind,
             port: get_i64("port").map_or(self.port, |v| u16::try_from(v).unwrap_or(self.port)),
             database_url: apply(&self.database_url, "database_url"),
+            // Deliberately not file keys: how many runs may execute at once is a
+            // property of the machine, and the env var is the deploy-time answer.
+            scheduler_workers: self.scheduler_workers,
+            scheduler_max_runs_per_user: self.scheduler_max_runs_per_user,
             scheduler_interval: get_i64("scheduler_interval_seconds")
                 .map_or(self.scheduler_interval, |v| {
                     Duration::from_secs(v.max(1) as u64)
@@ -842,6 +869,20 @@ fn csv_env(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How many runs may execute at once, when the deployer has not said.
+///
+/// SQLite has one writer at a time, so past a couple of concurrent runs each
+/// extra worker mostly adds lock contention; MySQL has no such ceiling and the
+/// work is I/O-bound, so it gets more. Either way the point of more than one is
+/// that a slow target stops being a global outage.
+fn default_scheduler_workers(database_url: &str) -> u32 {
+    if database_url.starts_with("mysql") {
+        4
+    } else {
+        2
+    }
+}
+
 /// Filename a fresh install writes its SQLite database to.
 ///
 /// The image already used `qdrust.db` while a bare `cargo run` used `qd.db`, so
@@ -992,6 +1033,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1037,6 +1080,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1115,6 +1160,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1162,6 +1209,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1205,6 +1254,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1252,6 +1303,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1290,6 +1343,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,
@@ -1339,6 +1394,8 @@ mod tests {
             database_min_connections: 1,
             database_max_connections: 4,
             scheduler_interval: Duration::from_secs(15),
+            scheduler_workers: 1,
+            scheduler_max_runs_per_user: 0,
             request_timeout: Duration::from_secs(30),
             session_ttl: Duration::from_secs(60),
             cookie_secure: false,

@@ -111,6 +111,13 @@ fn sqlite_options(url: &str) -> Result<SqliteConnectOptions> {
     Ok(SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .foreign_keys(true)
+        // Several runs may now write at once (`SCHEDULER_WORKERS`). SQLite
+        // serialises writers, so a write can find the database busy and has to
+        // wait; the 5s default was chosen for the single-writer use this had
+        // before, and the failure mode when it is exceeded is a *dropped* step
+        // row (those writes are best-effort) rather than an error anyone sees —
+        // silently missing steps in a run history are worse than a slower write.
+        .busy_timeout(Duration::from_secs(15))
         .journal_mode(SqliteJournalMode::Wal))
 }
 
@@ -1393,20 +1400,43 @@ macro_rules! define_store {
     }
 
     pub async fn claim_run(&self, worker: &str, lease_seconds: i64) -> Result<Option<Run>> {
+        self.claim_run_limited(worker, lease_seconds, 0).await
+    }
+
+    /// Claim the next run, skipping accounts that already have `max_per_owner`
+    /// runs in flight. `0` means no per-account limit.
+    ///
+    /// The limit is applied here rather than by the caller because the caller
+    /// cannot see what it needs to count: it knows the run it is holding, not the
+    /// three another worker is holding. Putting it in the query makes the claim
+    /// atomic with the decision — a run cannot slip past the cap between a check
+    /// and an update.
+    pub async fn claim_run_limited(
+        &self,
+        worker: &str,
+        lease_seconds: i64,
+        max_per_owner: u32,
+    ) -> Result<Option<Run>> {
         let now = Utc::now().timestamp();
         let expires = now + lease_seconds.max(1);
         let mut tx = self.pool.begin().await?;
         // Claim pending runs (or expired leases). Delayed retry runs (run_after)
         // become claimable once their delay elapses; higher task priority claims
-        // first.
+        // first. The subquery counts what the *candidate run's* account is
+        // already running, which is why the cap belongs in here: it is the only
+        // place that sees every worker's leases.
         let row = sqlx::query(
             "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task_id \
              WHERE r.cancel_requested=0 AND (r.status='pending' OR (r.status IN ('leased','running') AND r.lease_expires_at<=?)) \
              AND (r.run_after IS NULL OR r.run_after<=?) \
+             AND (?<=0 OR (SELECT COUNT(*) FROM runs busy JOIN tasks busy_task ON busy_task.id=busy.task_id \
+                           WHERE busy_task.owner_id=t.owner_id AND busy.status IN ('leased','running'))<?) \
              ORDER BY COALESCE(t.priority,0) DESC, r.created_at, r.id LIMIT 1",
         )
         .bind(now)
         .bind(now)
+        .bind(i64::from(max_per_owner))
+        .bind(i64::from(max_per_owner))
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -4464,6 +4494,7 @@ impl Store {
         pub async fn count_retries(original_run_id: i64) -> Result<i64> { original_run_id };
         pub async fn count_recent_failures(task_id: i64) -> Result<i64> { task_id };
         pub async fn claim_run(worker: &str, lease_seconds: i64) -> Result<Option<Run>> { worker, lease_seconds };
+        pub async fn claim_run_limited(worker: &str, lease_seconds: i64, max_per_owner: u32) -> Result<Option<Run>> { worker, lease_seconds, max_per_owner };
         pub async fn start_leased_run(run_id: i64, worker: &str) -> Result<bool> { run_id, worker };
         pub async fn renew_run(run_id: i64, worker: &str, lease_seconds: i64) -> Result<bool> { run_id, worker, lease_seconds };
         pub async fn cancel_run(run_id: i64) -> Result<bool> { run_id };
@@ -7307,6 +7338,93 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.list_retryable_deliveries(max).await.unwrap().len(), 1);
+    }
+
+    async fn owned_task(store: &Store, owner: i64, name: &str) -> Task {
+        store
+            .create_for_owner(
+                owner,
+                CreateTask {
+                    name: name.into(),
+                    cron: "0/5 * * * * * *".into(),
+                    method: None,
+                    url: "https://example.invalid".into(),
+                    headers: Default::default(),
+                    body: None,
+                    disabled: false,
+                    template_id: None,
+                    grp: None,
+                    timeout_seconds: None,
+                    retry_count: None,
+                    retry_interval_seconds: None,
+                    priority: None,
+                    timezone: None,
+                    random_delay_max_seconds: None,
+                    variables: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The per-account ceiling is what keeps one backlog from occupying every
+    /// worker. It has to be enforced inside the claim, because the caller cannot
+    /// count what the other workers are holding.
+    #[tokio::test]
+    async fn claim_run_skips_an_account_that_is_at_its_ceiling() {
+        let store = Store::connect("sqlite::memory:", 1, 4).await.unwrap();
+        let password = hash_password("cap-password").unwrap();
+        let alice = store
+            .create_user("cap-alice", &password, "user")
+            .await
+            .unwrap();
+        let bob = store
+            .create_user("cap-bob", &password, "user")
+            .await
+            .unwrap();
+        // Alice has a backlog; Bob has one task behind her. Ordering is by
+        // creation, so every claim would go to Alice without a ceiling.
+        let a1 = owned_task(&store, alice.id, "a1").await;
+        let a2 = owned_task(&store, alice.id, "a2").await;
+        let b1 = owned_task(&store, bob.id, "b1").await;
+        for task in [&a1, &a2, &b1] {
+            store.enqueue_run(task.id).await.unwrap().unwrap();
+        }
+
+        let first = store
+            .claim_run_limited("w0", 300, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.task_id, a1.id);
+        // Alice is at her ceiling, so the next claim has to reach past her.
+        let second = store
+            .claim_run_limited("w1", 300, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.task_id, b1.id,
+            "the claim should skip the account that already has one running"
+        );
+        assert!(
+            store
+                .claim_run_limited("w2", 300, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "both accounts are at the ceiling; nothing may be claimed"
+        );
+
+        // Once Alice's run finishes she is eligible again.
+        store.start_leased_run(first.id, "w0").await.unwrap();
+        store.finish_run(first.id, Some(200), None).await.unwrap();
+        let third = store
+            .claim_run_limited("w2", 300, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.task_id, a2.id);
     }
 
     #[tokio::test]

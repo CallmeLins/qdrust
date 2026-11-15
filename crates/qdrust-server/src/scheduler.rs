@@ -32,6 +32,40 @@ use crate::{
     store::Store,
 };
 
+/// How much of the schedule may run at once.
+///
+/// Two numbers because they answer different questions: `workers` is what the
+/// machine is allowed to do, `max_per_user` is how much of it one account may
+/// occupy. A single-tenant install leaves the second at 0.
+#[derive(Clone, Copy, Debug)]
+pub struct Concurrency {
+    /// Claim/execute loops. Each runs at most one run at a time, so this is also
+    /// the global ceiling.
+    pub workers: u32,
+    /// Runs one account may have executing at once; 0 means "whatever the
+    /// global ceiling allows".
+    pub max_per_user: u32,
+}
+
+impl Default for Concurrency {
+    fn default() -> Self {
+        Self {
+            workers: 1,
+            max_per_user: 0,
+        }
+    }
+}
+
+/// How long a claim is valid for before another worker may take the run.
+const RUN_LEASE_SECS: i64 = 300;
+
+/// How often an idle worker asks for work. One shared value so a change applies
+/// to every worker instead of to the one that was edited.
+const IDLE_POLL: Duration = Duration::from_millis(250);
+
+/// How long a run may sit in `running` with no owner before it is put back.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Store,
@@ -43,55 +77,112 @@ pub fn spawn(
     settings: Arc<std::sync::RwLock<crate::api::RuntimeSettings>>,
     browser: Option<Arc<BrowserSessionManager>>,
     default_tz: chrono_tz::Tz,
+    concurrency: Concurrency,
 ) {
     // Shared rather than moved: the run path sends the first attempt and the
     // retry sweep re-sends, and neither should own the client the other needs.
     let email = Arc::new(email);
-    let worker_email = email.clone();
-    let worker_store = store.clone();
-    let worker_outbound = outbound.clone();
-    tokio::spawn(async move {
-        let worker = format!("worker-{}", std::process::id());
-        loop {
-            let _ = worker_store.recover_expired_runs().await;
-            match worker_store.claim_run(&worker, 300).await {
-                Ok(Some(run)) => {
-                    if worker_store
-                        .start_leased_run(run.id, &worker)
+    // Claims are serialized; execution is not.
+    //
+    // `claim_run` is a read-then-write transaction: it selects the next run, then
+    // conditionally updates that row. On SQLite a deferred transaction that
+    // upgrades from read to write while another connection holds the write lock
+    // fails *immediately* — the busy handler does not apply to that upgrade — so
+    // two workers claiming at the same instant would produce "database is
+    // locked" instead of one of them simply waiting. One mutex in this process
+    // removes the case entirely, at the cost of one round trip of latency per
+    // claim. Run execution happens outside it.
+    let claims = Arc::new(tokio::sync::Mutex::new(()));
+    let workers = concurrency.workers.max(1);
+    for index in 0..workers {
+        let store = store.clone();
+        let outbound = outbound.clone();
+        let email = email.clone();
+        let run_events = run_events.clone();
+        let settings = settings.clone();
+        let browser = browser.clone();
+        let claims = claims.clone();
+        let max_per_user = concurrency.max_per_user;
+        tokio::spawn(async move {
+            // One name per loop: a lease records which worker holds it, and
+            // `start_leased_run` only accepts a claim from its own.
+            let worker = format!("worker-{}-{index}", std::process::id());
+            loop {
+                let (claimed, failed) = {
+                    let _guard = claims.lock().await;
+                    match store
+                        .claim_run_limited(&worker, RUN_LEASE_SECS, max_per_user)
                         .await
-                        .unwrap_or(false)
-                        && let Ok(Some(task)) = worker_store.get(run.task_id).await
                     {
-                        let _ = run_events.send(Value::from(crate::api::RunEvent {
-                            run_id: run.id,
-                            kind: "status",
-                            status: Some("running".into()),
-                            step: None,
-                            error: None,
-                        }));
-                        // Read the admin's network policy per run rather than
-                        // snapshotting it at boot, so flipping the switch in the
-                        // UI takes effect on the next run, not the next restart.
-                        let policy = run_policy(task.timeout_seconds, &settings);
-                        execute_with_run(
-                            worker_store.clone(),
-                            worker_outbound.clone(),
-                            task,
-                            run,
-                            &worker,
-                            &run_events,
-                            &worker_email,
-                            policy,
-                            browser.clone(),
-                        )
-                        .await;
+                        Ok(Some(run)) => {
+                            // A claim can be lost between the select and the
+                            // update (a cancel, another worker's expiry), in
+                            // which case there is nothing to run.
+                            let started = store
+                                .start_leased_run(run.id, &worker)
+                                .await
+                                .unwrap_or(false);
+                            (started.then_some(run), false)
+                        }
+                        Ok(None) => (None, false),
+                        Err(err) => {
+                            error!(worker = %worker, %err, "cannot claim run");
+                            (None, true)
+                        }
                     }
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
-                Err(err) => {
-                    error!(%err, "cannot claim run");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                };
+                let Some(run) = claimed else {
+                    let wait = if failed {
+                        Duration::from_secs(1)
+                    } else {
+                        IDLE_POLL
+                    };
+                    tokio::time::sleep(wait).await;
+                    continue;
+                };
+                // The task can be gone (deleted between enqueue and claim); the
+                // run row goes with it, so there is nothing left to record.
+                let Ok(Some(task)) = store.get(run.task_id).await else {
+                    continue;
+                };
+                let _ = run_events.send(Value::from(crate::api::RunEvent {
+                    run_id: run.id,
+                    kind: "status",
+                    status: Some("running".into()),
+                    step: None,
+                    error: None,
+                }));
+                // Read the admin's network policy per run rather than
+                // snapshotting it at boot, so flipping the switch in the UI
+                // takes effect on the next run, not the next restart.
+                let policy = run_policy(task.timeout_seconds, &settings);
+                execute_with_run(
+                    store.clone(),
+                    outbound.clone(),
+                    task,
+                    run,
+                    &worker,
+                    &run_events,
+                    &email,
+                    policy,
+                    browser.clone(),
+                )
+                .await;
+            }
+        });
+    }
+    // Expired leases are recovered here rather than inside every worker loop: it
+    // is one query over the whole table, and N workers running it four times a
+    // second each is N times the load for the same answer. Claiming does not
+    // depend on it — an expired lease is claimable directly — so the interval
+    // only bounds how long a row can sit in `running` with nobody holding it.
+    let recovery_store = store.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RECOVERY_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = recovery_store.recover_expired_runs().await {
+                error!(%err, "cannot recover expired runs");
             }
         }
     });
