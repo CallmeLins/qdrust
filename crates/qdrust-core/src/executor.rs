@@ -28,6 +28,13 @@ use crate::{
 const DEFAULT_REQUEST_LIMIT: usize = 100;
 const DEFAULT_RESPONSE_LIMIT: usize = 5 * 1024 * 1024;
 const MAX_LOOP_ITERATIONS: usize = 1_000;
+/// How many redirects one request may follow before it is refused.
+///
+/// Ten is the browser convention and more than any chain this project meets:
+/// `github.com/{owner}/{repo}/raw/{branch}/path` reaching
+/// `raw.githubusercontent.com` is one hop. The cap exists so that a redirect
+/// loop costs a bounded number of connections, not because ten is special.
+const MAX_REDIRECTS: usize = 10;
 
 #[derive(Clone, Default)]
 pub struct CancellationToken {
@@ -599,14 +606,7 @@ impl QdExecutor {
 
         let method = self.render(&entry.request.method, context)?;
         let url = self.render(&entry.request.url, context)?;
-        let debug_requests = std::env::var("QDRUST_DEBUG_REQUESTS")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+        let debug_requests = debug_requests_enabled();
         if debug_requests {
             eprintln!(
                 "[qdrust:request:start] method={} url={} variables={}",
@@ -668,8 +668,12 @@ impl QdExecutor {
         let client = self.client_for_url(&url, context).await?;
         let method = Method::from_bytes(method.as_bytes()).context("invalid rendered method")?;
         let request_method = method.clone();
-        let mut request = client.request(method, &url);
+        // Headers are collected instead of attached to one request: a redirect
+        // replays them onto a request built for the next hop, which is a
+        // different client (see `send_following_redirects`).
+        let mut request_headers: Vec<(String, String)> = Vec::new();
         let mut rendered_body: Option<String> = None;
+        let mut multipart_body: Option<reqwest::multipart::Form> = None;
         let mut explicit_cookie = false;
         let mut rendered_cookie_header: Option<String> = None;
         for header in entry.request.headers.iter().filter(|header| header.checked) {
@@ -684,7 +688,7 @@ impl QdExecutor {
             // reqwest is built without compression decoders; request identity
             // responses so extracted content remains readable for all HARs.
             if rendered_name.eq_ignore_ascii_case("accept-encoding") {
-                request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+                request_headers.push(("accept-encoding".into(), "identity".into()));
                 continue;
             }
             if rendered_name.eq_ignore_ascii_case("cookie") {
@@ -697,7 +701,7 @@ impl QdExecutor {
                     url, rendered_name, rendered_value
                 );
             }
-            request = request.header(rendered_name, rendered_value);
+            request_headers.push((rendered_name, rendered_value));
         }
         if let Some(cookie_header) = rendered_cookie_header {
             context.variables.insert(
@@ -720,7 +724,7 @@ impl QdExecutor {
             .collect::<Result<Vec<_>>>()?;
         if !cookies.is_empty() {
             let cookie_header = cookies.join("; ");
-            request = request.header(reqwest::header::COOKIE, &cookie_header);
+            request_headers.push(("cookie".into(), cookie_header.clone()));
             context.variables.insert(
                 "__qdrust_cookie_header".into(),
                 Value::String(cookie_header),
@@ -739,10 +743,13 @@ impl QdExecutor {
             if let Some(Value::String(cookie_header)) =
                 context.variables.get("__qdrust_cookie_header")
             {
-                request = request.header(reqwest::header::COOKIE, cookie_header);
+                request_headers.push(("cookie".into(), cookie_header.clone()));
             }
             if let Some(value) = self.cookies.cookies(&reqwest::Url::parse(&url)?) {
-                request = request.header(reqwest::header::COOKIE, value);
+                request_headers.push((
+                    "cookie".into(),
+                    value.to_str().unwrap_or_default().to_string(),
+                ));
             }
         }
         if let Some(post_data) = entry.request.post_data.as_ref() {
@@ -756,7 +763,7 @@ impl QdExecutor {
             if !mime_type.is_empty() && !has_content_type {
                 // Browsers add this header when submitting a form even when
                 // older QD HAR exports omit it (notably loginSubmit.do).
-                request = request.header(reqwest::header::CONTENT_TYPE, mime_type);
+                request_headers.push(("content-type".into(), mime_type.to_string()));
                 if debug_requests {
                     eprintln!(
                         "[qdrust:request:header:auto] url={} Content-Type={}",
@@ -769,7 +776,7 @@ impl QdExecutor {
                 .as_deref()
                 .is_some_and(|m| m.starts_with("multipart/"));
             if is_multipart {
-                request = request.multipart(self.build_multipart(post_data, context)?);
+                multipart_body = Some(self.build_multipart(post_data, context)?);
             } else if let Some(text) = post_data.text.as_ref() {
                 // Render once: the same body goes onto the wire and into the
                 // assertion-failure digest, so log diagnosis sees what was sent.
@@ -790,12 +797,22 @@ impl QdExecutor {
                         body
                     );
                 }
-                rendered_body = Some(body.clone());
-                request = request.body(body);
+                rendered_body = Some(body);
             }
         }
 
-        let response = request.send().await?;
+        let response = self
+            .send_following_redirects(
+                context,
+                Some(client),
+                method,
+                url.clone(),
+                request_headers,
+                rendered_body.clone(),
+                multipart_body,
+                self.follows_redirects(context),
+            )
+            .await?;
         let status = response.status().as_u16();
         let headers: Vec<(String, String)> = response
             .headers()
@@ -1067,12 +1084,172 @@ impl QdExecutor {
         Ok(form)
     }
 
+    /// Send one request, following redirects with the guard re-run on every
+    /// hop.
+    ///
+    /// [`guarded_client_for_url`] pins a client to the addresses the URL just
+    /// resolved to, so a redirect cannot be followed by the client that sent
+    /// the request: the next hop is a different name with different addresses,
+    /// and the pinned client would either fail to connect or reach an address
+    /// nothing classified. That is why redirects used to be switched off
+    /// wholesale (`Policy::none()`), and why following them is safe only as
+    /// this hand-written loop, in which every hop rebuilds its client through
+    /// the same constructor the first hop used.
+    ///
+    /// Method and body follow the browser rules, because the templates were
+    /// captured from a browser: 307 and 308 replay both, while 303 and a POST
+    /// answered by 301/302 fall back to a body-less GET. Credentials follow
+    /// them too — `Authorization`, `Cookie` and `Proxy-Authorization` are
+    /// dropped when a hop leaves the origin, so a redirect cannot hand one
+    /// host's session to another; the jar's cookies for the new host are
+    /// attached instead.
+    ///
+    /// Following is opt-in (`follow`, from [`Self::follows_redirects`]) because
+    /// QD does not follow redirects and templates are written around that: a 3xx
+    /// is a step whose `Location` is the next step's URL. A run that does not
+    /// ask keeps the single-hop behaviour, and this function is then just the
+    /// one send.
+    ///
+    /// A multipart body is not replayed either: `reqwest::multipart::Form` is a
+    /// stream that cannot be rewound, so a request carrying one keeps the
+    /// single-hop behaviour whatever the switch says.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_following_redirects(
+        &self,
+        context: &ExecutionContext,
+        client: Option<Client>,
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+        mut multipart: Option<reqwest::multipart::Form>,
+        follow: bool,
+    ) -> Result<reqwest::Response> {
+        let debug_requests = debug_requests_enabled();
+        let follow = follow && multipart.is_none();
+        let mut client = client;
+        let mut method = method;
+        let mut url = url;
+        let mut headers = headers;
+        let mut body = body;
+        let mut followed = 0usize;
+        let response = loop {
+            let http = match client.take() {
+                // The first hop is handed its client: the guard already ran on
+                // this URL before a single header was rendered, and repeating
+                // it here would only resolve the same name twice.
+                Some(http) => http,
+                None => self.client_for_url(&url, context).await?,
+            };
+            let mut request = http.request(method.clone(), &url);
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
+            if let Some(form) = multipart.take() {
+                request = request.multipart(form);
+            } else if let Some(body) = body.as_ref() {
+                request = request.body(body.clone());
+            }
+            let response = request.send().await?;
+            // 304 is a redirection without a `Location`; so is a malformed
+            // reply. Both end the chain here — and with `follow` off, every 3xx
+            // does, which is the behaviour templates rely on.
+            let location = if follow && response.status().is_redirection() {
+                response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            let Some(location) = location else {
+                break response;
+            };
+            ensure!(
+                followed < MAX_REDIRECTS,
+                "too many redirects (the limit is {MAX_REDIRECTS})"
+            );
+            let base = reqwest::Url::parse(&url).context("invalid rendered URL")?;
+            // `join` resolves a relative `Location` against the URL that
+            // produced it, and refuses nothing on its own — the scheme is
+            // checked where every other target is, in `resolve_target`, when
+            // the next hop builds its client.
+            let next = base
+                .join(&location)
+                .with_context(|| format!("invalid redirect location {location:?}"))?;
+            let downgrade = matches!(response.status().as_u16(), 301..=303)
+                && method != Method::GET
+                && method != Method::HEAD;
+            if downgrade {
+                method = Method::GET;
+                body = None;
+            }
+            let same_origin = shares_origin(&base, &next);
+            headers.retain(|(name, _)| {
+                let credential = name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("proxy-authorization")
+                    || name.eq_ignore_ascii_case("cookie");
+                // A GET with no body must not describe the body it no longer
+                // has, or the target sees a length that matches nothing.
+                let describes_body = name.eq_ignore_ascii_case("content-type")
+                    || name.eq_ignore_ascii_case("content-length");
+                !(credential && !same_origin) && !(describes_body && downgrade)
+            });
+            if !same_origin && let Some(cookie) = self.cookies.cookies(&next) {
+                headers.push((
+                    "cookie".into(),
+                    cookie.to_str().unwrap_or_default().to_string(),
+                ));
+            }
+            if debug_requests {
+                eprintln!(
+                    "[qdrust:request:redirect] url={} status={} location={}",
+                    url,
+                    response.status().as_u16(),
+                    next
+                );
+            }
+            url = next.to_string();
+            followed += 1;
+        };
+        Ok(response)
+    }
+
     /// The part of this executor that decides whether a request may happen at
     /// all, in the form [`guarded_client_for_url`] takes.
     ///
     async fn client_for_url(&self, url: &str, context: &ExecutionContext) -> Result<Client> {
         let policy = self.policy_with_proxy(context);
         guarded_client_for_url(url, &policy, Some(self.cookies.clone())).await
+    }
+
+    /// Whether this run asked for redirects to be followed.
+    ///
+    /// QD does not follow them, and templates are written for that: the 189
+    /// template asserts `302` on its first two steps and extracts the next URL
+    /// from the `Location` header, so a redirect hop *is* a step. Following by
+    /// default would collapse those steps into one and break every template of
+    /// that shape — the reason this is a switch rather than something the
+    /// executor decides on its own.
+    ///
+    /// Reading it off `_follow_redirects` follows the same pattern as
+    /// [`Self::policy_with_proxy`]: declaring it in the template
+    /// (`{{_follow_redirects|default("")}}`) makes it an input, and a run that
+    /// leaves it empty behaves exactly as before.
+    fn follows_redirects(&self, context: &ExecutionContext) -> bool {
+        let Some(value) = context.variables.get("_follow_redirects") else {
+            return false;
+        };
+        match value {
+            Value::Bool(flag) => *flag,
+            Value::Number(number) => number.as_i64().is_some_and(|number| number != 0),
+            Value::String(text) => matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            _ => false,
+        }
     }
 
     /// The run policy with this step's `_proxy` applied.
@@ -1250,12 +1427,12 @@ fn response_body_is_stored_value(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Collapse whitespace and cap a text preview for failure diagnostics.
+/// `QDRUST_DEBUG_REQUESTS` — the per-request trace of what went on the wire.
 fn debug_requests_enabled() -> bool {
     std::env::var("QDRUST_DEBUG_REQUESTS")
         .map(|value| {
             matches!(
-                value.to_ascii_lowercase().as_str(),
+                value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
         })
@@ -2500,6 +2677,9 @@ pub async fn guarded_client_for_url(
     let (parsed, addresses) = resolve_target(url, policy.allow_private_network).await?;
     let host = parsed.host_str().context("URL host is missing")?;
     let mut builder = Client::builder()
+        // Redirects are followed by hand (`send_following_redirects`), one
+        // classified hop at a time. Handing the policy to reqwest would be a
+        // second redirect implementation, and that one never sees the guard.
         .redirect(Policy::none())
         .danger_accept_invalid_certs(policy.allow_invalid_certificates)
         .timeout(policy.timeout);
@@ -2528,6 +2708,14 @@ pub async fn guarded_client_for_url(
         .resolve_to_addrs(host, &addresses)
         .build()
         .context("cannot build pinned HTTP client")
+}
+
+/// Whether two URLs agree on scheme, host and port — the boundary a browser
+/// uses before it stops forwarding credentials across a redirect.
+fn shares_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 async fn resolve_target(
@@ -3103,6 +3291,351 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// A context that asked for redirects, the way a template declaring
+    /// `{{_follow_redirects|default("")}}` and a user filling it in would.
+    fn following_context() -> ExecutionContext {
+        let mut context = ExecutionContext::new(BTreeMap::new());
+        context
+            .variables
+            .insert("_follow_redirects".into(), json!(true));
+        context
+    }
+
+    /// The compatibility contract, and the reason following is a switch.
+    ///
+    /// QD does not follow redirects, and the templates exported from it are
+    /// written around that: the 189 template in `tests/fixtures` asserts `302`
+    /// on its first two steps and extracts the next URL from the `Location`
+    /// header, so a redirect hop is a step of its own. Following by default
+    /// collapses those steps into one and no `saomaurl` is ever captured.
+    #[tokio::test]
+    async fn a_redirect_is_left_alone_unless_the_run_asks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reached.clone();
+        let app = Router::new()
+            .route(
+                "/start",
+                // Absolute, the way a real 302 chain answers, so the template
+                // can use the header as the next step's URL unchanged.
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [("location", format!("http://{address}/final"))],
+                    )
+                }),
+            )
+            .route(
+                "/final",
+                get(move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "arrived=yes"
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/start")},
+            "success_asserts": [{"re": "302", "from": "status"}],
+            "extract_variables": [
+                {"name": "saomaurl", "re": "([\\s\\S]*)", "from": "header-location"}
+            ]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        // No `_follow_redirects`: the posture a template written for QD gets.
+        let mut context = ExecutionContext::new(BTreeMap::new());
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(
+            results[0].status, 302,
+            "the 3xx has to reach the step, or a template cannot read its Location"
+        );
+        assert_eq!(
+            context.variables.get("saomaurl"),
+            Some(&json!(format!("http://{address}/final"))),
+            "the Location header is the next step's URL, which is how QD templates navigate"
+        );
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing may be fetched behind the template's back"
+        );
+    }
+
+    /// `shares_origin` is what decides whether a hop keeps credentials, and
+    /// scheme/host/port is the boundary a browser uses.
+    #[test]
+    fn an_origin_is_a_scheme_a_host_and_a_port() {
+        let parse = |url: &str| reqwest::Url::parse(url).unwrap();
+        assert!(shares_origin(
+            &parse("http://a.test/x"),
+            &parse("http://a.test/y?z=1")
+        ));
+        // The default port and an explicit one are the same origin.
+        assert!(shares_origin(
+            &parse("http://a.test:80/x"),
+            &parse("http://a.test/x")
+        ));
+        assert!(!shares_origin(
+            &parse("http://a.test/x"),
+            &parse("https://a.test/x")
+        ));
+        assert!(!shares_origin(
+            &parse("http://a.test/x"),
+            &parse("http://a.test:8080/x")
+        ));
+        assert!(!shares_origin(
+            &parse("http://a.test/x"),
+            &parse("http://b.test/x")
+        ));
+    }
+
+    /// Redirects used to be switched off wholesale because a pinned client
+    /// cannot follow one: the next host has different addresses. Following them
+    /// is only correct if the hop is resolved and classified on its own, which
+    /// is what this test locks in — the URL the template wrote is a loopback
+    /// target that the relaxed policy allows, and the hop points at a scheme
+    /// that `resolve_target` refuses.
+    #[tokio::test]
+    async fn a_redirect_is_classified_again_on_the_target_it_points_at() {
+        let app = Router::new().route(
+            "/start",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [("location", "file:///etc/passwd")],
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/start")}
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = following_context();
+
+        let error = failure_message(executor.execute(&program, &mut context).await.unwrap_err());
+        assert!(error.contains("unsupported URL scheme"), "{error}");
+    }
+
+    /// A relative `Location` is resolved against the URL that produced it, and
+    /// the body of the final hop is what the step sees. The step keeps the URL
+    /// the template wrote: it is the step's identity in run history, and a
+    /// redirect must not rename it.
+    #[tokio::test]
+    async fn a_redirect_is_followed_and_the_step_keeps_its_own_url() {
+        let app = Router::new()
+            .route(
+                "/start",
+                get(|| async { (axum::http::StatusCode::FOUND, [("location", "/final")]) }),
+            )
+            .route("/final", get(|| async { "arrived=yes" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/start")},
+            "success_asserts": [{"re": "200", "from": "status"}],
+            "extract_variables": [{"name": "final", "re": "arrived=(.+)", "from": "content"}]
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = following_context();
+
+        let results = executor.execute(&program, &mut context).await.unwrap();
+
+        assert_eq!(results[0].status, 200);
+        assert!(
+            results[0].url.ends_with("/start"),
+            "the step must keep the URL the template wrote: {}",
+            results[0].url
+        );
+        assert_eq!(context.variables.get("final"), Some(&json!("yes")));
+    }
+
+    /// A chain that points at itself must cost a bounded number of connections.
+    #[tokio::test]
+    async fn a_redirect_loop_is_cut_off() {
+        let app = Router::new().route(
+            "/loop",
+            get(|| async { (axum::http::StatusCode::FOUND, [("location", "/loop")]) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": [{
+            "checked": true,
+            "request": {"method": "GET", "url": format!("http://{address}/loop")}
+        }]}}))
+        .unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = following_context();
+
+        let error = failure_message(executor.execute(&program, &mut context).await.unwrap_err());
+        assert!(error.contains("too many redirects"), "{error}");
+    }
+
+    /// The method and body rules the templates were captured under: a POST
+    /// answered by 302 arrives as a body-less GET, and 307 is the status that
+    /// exists precisely to replay both.
+    #[tokio::test]
+    async fn a_redirect_downgrades_a_post_but_307_replays_it() {
+        async fn echo(method: axum::http::Method, body: axum::body::Bytes) -> String {
+            format!("{method} body={}", String::from_utf8_lossy(&body))
+        }
+        let app = Router::new()
+            .route(
+                "/found",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::FOUND, [("location", "/echo")])
+                }),
+            )
+            .route(
+                "/temporary",
+                axum::routing::post(|| async { axum::response::Redirect::temporary("/echo") }),
+            )
+            .route("/echo", axum::routing::any(echo));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut entries = vec![];
+        for (path, name) in [("/found", "downgraded"), ("/temporary", "replayed")] {
+            entries.push(json!({
+                "checked": true,
+                "request": {
+                    "method": "POST",
+                    "url": format!("http://{address}{path}"),
+                    "postData": {"mimeType": "application/x-www-form-urlencoded", "text": "token=abc"}
+                },
+                "extract_variables": [{"name": name, "re": "^(.*)$", "from": "content"}]
+            }));
+        }
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": entries}})).unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = following_context();
+
+        executor.execute(&program, &mut context).await.unwrap();
+
+        let read = |name: &str| {
+            context
+                .variables
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            read("downgraded"),
+            "GET body=",
+            "a 302 must not replay a POST body"
+        );
+        assert_eq!(
+            read("replayed"),
+            "POST body=token=abc",
+            "a 307 must replay method and body"
+        );
+    }
+
+    /// A hop that leaves the origin must not hand over the session. `localhost`
+    /// and `127.0.0.1` are the same machine and two different origins, so the
+    /// redirect can be followed by the same test server.
+    #[tokio::test]
+    async fn a_redirect_that_leaves_the_origin_drops_credentials() {
+        async fn echo(headers: HeaderMap) -> String {
+            let read = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            format!(
+                "cookie={} authorization={}",
+                read("cookie"),
+                read("authorization")
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let elsewhere = format!("http://localhost:{}/landing", address.port());
+        let app = Router::new()
+            .route(
+                "/away",
+                get(move || {
+                    let elsewhere = elsewhere.clone();
+                    async move { (axum::http::StatusCode::FOUND, [("location", elsewhere)]) }
+                }),
+            )
+            .route(
+                "/stay",
+                get(|| async { (axum::http::StatusCode::FOUND, [("location", "/landing")]) }),
+            )
+            .route("/landing", get(echo));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut entries = vec![];
+        for (path, name) in [("/away", "crossed"), ("/stay", "stayed")] {
+            entries.push(json!({
+                "checked": true,
+                "request": {
+                    "method": "GET",
+                    "url": format!("http://{address}{path}"),
+                    "headers": [
+                        {"name": "cookie", "value": "session=secret", "checked": true},
+                        {"name": "authorization", "value": "Bearer secret", "checked": true}
+                    ]
+                },
+                "extract_variables": [{"name": name, "re": "^(.*)$", "from": "content"}]
+            }));
+        }
+        let har = QdHar::parse(json!({"log": {"version": "1.2", "entries": entries}})).unwrap();
+        let program = QdProgram::compile(&har).unwrap();
+        let executor = local_executor();
+        let mut context = following_context();
+
+        executor.execute(&program, &mut context).await.unwrap();
+
+        let read = |name: &str| {
+            context
+                .variables
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            read("crossed"),
+            "cookie=- authorization=-",
+            "a redirect to another origin must not carry the session"
+        );
+        assert_eq!(
+            read("stayed"),
+            "cookie=session=secret authorization=Bearer secret",
+            "a same-origin hop must keep it, or every login flow breaks"
+        );
     }
 
     /// A template's `_proxy` is user input, so the proxy host must pass the same

@@ -121,12 +121,32 @@ WebUI 提供可视化编辑器，可直接增删改请求、设置请求头 / �
 
 开关只放宽「地址是否公网」这一项判断。DNS 仍在每次请求前解析并校验，且无代理时连接会被固定到已校验的那个地址（防 DNS rebinding）；请求超时、响应体上限、重定向策略都不受影响。
 
+### 跟随重定向（`_follow_redirects`，默认关闭）
+
+QD 本身不跟随重定向，导出的模板是照着这个前提写的：`tests/fixtures/189cloud.189.submit.har` 的前两步都断言 `302`、并从 `Location` 头里取下一步的 URL（`saomaurl`、`toUrl`）——**一次跳转就是一步**。所以 qdrust 默认同样不跟随，与旧版行为一致；把重定向交给 reqwest 自动跟随会让这些步骤塌成一步，`saomaurl` 再也取不到。
+
+需要跟随的模板（典型是直接抓 GitHub 的 `raw` 地址，会 302 到 `raw.githubusercontent.com`）显式打开开关：模板里写 `{{_follow_redirects|default("")}}`，它就会作为一个普通输入变量列出（与 `_proxy` 同一套机制），填 `true` / `1` / `yes` / `on` 即对本次运行的每个请求开启逐跳跟随。
+
+开启后每一跳都重新解析并分类目标地址，用的是与第一跳完全相同的那道闸门——ADR-0008 里原先写着「未实现」的最后一项，现已补齐：
+
+| 项 | 行为 |
+|---|---|
+| 跳数上限 | 10 跳，超过即失败，报 `too many redirects` |
+| 地址校验 | 每一跳重新解析并分类；开关关闭时跳到私网 / 回环地址同样被拒 |
+| 协议 | 只接受 `http` / `https`；跳到 `file://` 之类以 `unsupported URL scheme` 失败 |
+| 方法 | 307 / 308 原样重放方法与请求体；301 / 302 / 303 按浏览器习惯退化成无 body 的 GET |
+| 凭据 | 跨源（scheme、host、port 任一项不同）时丢弃 `Authorization`、`Cookie`、`Proxy-Authorization`，改带 cookie jar 里新主机自己的 cookie |
+| multipart | 不重放（表单流无法倒回），这类请求保持单跳：3xx 就是响应 |
+| 步骤记录 | 步骤仍以模板写的 URL 命名，不会被重定向改写成最终地址 |
+
+不能把重定向交给 reqwest：地址固定是「主机 → 地址」的整客户端映射，一个 client 只能固定一个主机，所以每一跳都要重新构造 client（`Executor::send_following_redirects`）。交给 reqwest 就等于多出第二条绕过闸门的实现。
+
 ### 从旧版本升级：通知渠道、订阅源与 DdddOCR 转发现在也受约束
 
 在统一之前，通知渠道与订阅抓取用的是另一个不带防护的 HTTP client，`docs/notifications.md` 甚至写明「`http` 与 `https` 均可（便于内网服务）」。现在它们与模板走同一策略，因此：
 
 - **指向内网的渠道 / 订阅源会失败**，报 `private or special-use network target is blocked`，需要开启本开关。原来能用的自建 ntfy、内网 GitLab 订阅地址属于这一类。
-- **不再跟随重定向。** 以前共享 client 按 reqwest 默认最多跟 10 跳，现在与模板一致一律不跟随——逐跳复检是 ADR-0008 里尚未实现的一项，所以要放开重定向就得先做那件事。受影响的典型写法：`https://github.com/{owner}/{repo}/raw/{branch}/tpls_history.json` 会 302 到 `raw.githubusercontent.com`，请直接写最终地址。
+- **通知渠道、订阅源与 `api://util/dddd` 转发不跟随重定向。** 以前它们共用的 client 按 reqwest 默认最多跟 10 跳；统一之后这几条路径各自只发一个请求，3xx 就是响应本身（模板运行另有一个默认关闭的开关，见上一节）。受影响的典型写法：`https://github.com/{owner}/{repo}/raw/{branch}/tpls_history.json` 会 302 到 `raw.githubusercontent.com`，订阅源请直接写最终地址。通知渠道回 3xx 现在会**记为投递失败**而不是静默成功，同样请把地址写成最终地址。
 - **每次出站请求各自建一个 client**（地址固定是 client 级的，共享 client 只能固定一个主机），所以订阅源抓取不再复用连接池；目录本身有 90 秒缓存，影响主要在首次读取。
 - **模板里的 `api://util/dddd/...` 转发同样受约束。** 它的目标来自模板的 `_server` 参数（取不到才退回环境变量 `QDRUST_DDDDOCR_SERVER`），以前用的是不带防护的 client，并且会跟最多 10 跳重定向——比「管不到」更糟。指向内网或本机的自建 DdddOCR 服务现在需要开启本开关；模板写法不用改，只是会先被闸门拦一次。这里按**用户可控**对待：环境变量确实是管理员配的，但 `_server` 是模板作者能写的。
 - **不在范围内**（目标由部署者写死，模板改不动）：OIDC 身份提供方（配置文件里的 URL）、SMTP 投递、浏览器插件的 CDP 端点（`QDRUST_BROWSER_URL`，官方示例就是 `http://localhost:9222` / `ws://browserless:3000` 这种内网地址——它连的是你指定的浏览器服务，模板想用 `_browser_url` 改目标会被直接拒绝），以及 Redis / 数据库连接。
