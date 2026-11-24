@@ -36,7 +36,29 @@ yanked = "deny"
 # libclang for bindgen, and turns a self-contained image into a version lottery.
 # Revisit when sqlx widens the range to libsqlite3-sys 0.39; the fix is then
 # `cargo update -p libsqlite3-sys`.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387", "RUSTSEC-2026-0459"]
+# RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz): both crates are
+# *unmaintained* rather than known-vulnerable, so there is no release to upgrade
+# to and no `cargo update` that clears either. chrono enters the tree twice: this
+# workspace calls it directly (unix timestamps, `%Y%m%d-%H%M%S` archive names,
+# the template `datetime` filter, serde fields), and it also arrives through
+# `cron`, which parses the schedule strings, and through openidconnect -> oauth2.
+# Rewriting our own 32 call sites would leave the crate in the tree and the
+# advisory standing, so "migrate instead of ignore" is not available yet.
+# chrono-tz is ours alone: it resolves the deployment default and each task's
+# timezone (`Asia/Shanghai` unless configured) for `due()` / `next_occurrence()`.
+# What the two are asked to do is narrow — format an epoch we generated, or parse
+# an IANA name that has to succeed before it is stored — and the failure mode of
+# bad input is an error, not undefined behaviour. Revisit when `cron` and
+# openidconnect ship without chrono: the target is `jiff`, and jiff has no
+# chrono-tz counterpart, so the two crates have to go in one change rather than
+# one at a time.
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0387",
+    "RUSTSEC-2026-0459",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+]
 
 [licenses]
 version = 2
