@@ -7200,6 +7200,7 @@ mod tests {
     /// runs rather than going through the executor.
     fn seeded_task(name: &str) -> crate::model::CreateTask {
         crate::model::CreateTask {
+            proxy: None,
             name: name.into(),
             cron: "0 * * * * *".into(),
             method: Some("GET".into()),

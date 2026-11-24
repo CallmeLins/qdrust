@@ -347,6 +347,24 @@ fn task_variables(task: &Task) -> BTreeMap<String, Value> {
             }
         }
     }
+    // The task's own proxy is the run's default, expressed as the variable the
+    // executor already reads before every request. One mechanism serves both
+    // kinds of run: a template's steps take it from `policy_with_proxy`, and a
+    // plain request reads the same variable in `execute_plain_task`.
+    //
+    // `or_insert` rather than `insert` because the variable is the more
+    // specific statement: a task whose variables name `_proxy`, or a template
+    // that declares it, still wins — the field is a default, not a lock.
+    if let Some(proxy) = task
+        .proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        variables
+            .entry("_proxy".to_string())
+            .or_insert_with(|| Value::String(proxy.to_string()));
+    }
     variables
 }
 
@@ -470,7 +488,17 @@ async fn execute_plain_task(
 ) -> anyhow::Result<u16> {
     let method = Method::from_bytes(task.method.as_bytes())?;
     let target = render_plain(&task.url, variables)?;
+    // The same `_proxy` a template run takes from its context, read here because
+    // this path builds no execution context: `task_variables` has already put
+    // the task's proxy in it, and an explicit variable has already won.
+    let proxy = variables
+        .get("_proxy")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|proxy| !proxy.is_empty())
+        .map(str::to_string);
     let mut request = outbound
+        .with_proxy(proxy)
         .request(method, &target)
         .await?
         .timeout(policy.request_timeout);
@@ -1806,6 +1834,66 @@ mod tests {
         );
     }
 
+    /// A task's proxy field has to reach the request it was set for.
+    ///
+    /// An address that cannot even be parsed is the cheapest proof: the failure
+    /// can only come from the proxy, and it has to arrive before anything is
+    /// sent — a task whose proxy is broken must not quietly fetch directly,
+    /// because that is the connection the proxy exists to replace.
+    #[tokio::test]
+    async fn a_plain_task_dials_through_the_proxy_it_names() {
+        let (address, served) = crate::test_support::serve_counting_loopback().await;
+        let mut task = plain_task(format!("http://{address}/"));
+        task.proxy = Some("not a proxy".into());
+
+        // The variables a real run hands this path, not an empty map: that is
+        // where the task's proxy turns into `_proxy`.
+        let variables = task_variables(&task);
+        let error = execute_plain_task(&guarded(true, false), &task, &variables, policy(true))
+            .await
+            .unwrap_err();
+        let error = whole_chain(error);
+        assert!(
+            error.contains("invalid proxy URL"),
+            "the proxy has to be the thing that failed: {error}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            0,
+            "a task with a broken proxy must not fall back to a direct request"
+        );
+    }
+
+    /// The precedence the form and the docs promise: a `_proxy` variable is the
+    /// more specific statement and wins, the field is the run's default, and a
+    /// blank field means "no proxy" rather than "a proxy with no address".
+    #[test]
+    fn the_task_proxy_becomes_the_proxy_variable_unless_one_is_given() {
+        let mut task = due_probe_task("0 0 8 * * *", None, None);
+        assert!(!task_variables(&task).contains_key("_proxy"));
+
+        task.proxy = Some("  http://task.proxy:8080  ".into());
+        assert_eq!(
+            task_variables(&task).get("_proxy").and_then(Value::as_str),
+            Some("http://task.proxy:8080"),
+            "the field is trimmed and applied as the run's proxy"
+        );
+
+        task.variables = Some(serde_json::json!({"_proxy": "http://var.proxy:8080"}));
+        assert_eq!(
+            task_variables(&task).get("_proxy").and_then(Value::as_str),
+            Some("http://var.proxy:8080"),
+            "an explicit variable must win over the field"
+        );
+
+        task.variables = None;
+        task.proxy = Some("   ".into());
+        assert!(
+            !task_variables(&task).contains_key("_proxy"),
+            "blank means no proxy at all"
+        );
+    }
+
     /// Self-signed certificate and its matching key, DER, base64.
     ///
     /// Generated once (Git Bash; `MSYS_NO_PATHCONV=1` keeps openssl from
@@ -2086,6 +2174,7 @@ mod tests {
             .create_for_owner(
                 owner.id,
                 crate::model::CreateTask {
+                    proxy: None,
                     name: "plugin-task".into(),
                     cron: "0 * * * * *".into(),
                     method: Some("GET".into()),
@@ -2199,6 +2288,7 @@ mod tests {
 
     fn due_probe_task(cron: &str, last_run_at: Option<i64>, timezone: Option<&str>) -> Task {
         Task {
+            proxy: None,
             id: 1,
             name: "probe".into(),
             cron: cron.into(),

@@ -2748,6 +2748,28 @@ async fn resolve_target(
     Ok((parsed, addresses))
 }
 
+/// Check that `proxy` is an address a request could be dialled through,
+/// without resolving it.
+///
+/// This is as far as a save-time check can go: whether the proxy resolves, and
+/// whether it sits on a private network, are questions about the moment of the
+/// connection — a proxy reachable while the form was being filled in may be
+/// gone by the time the cron fires, and neither answer is what a typo looks
+/// like. [`classify_proxy`] asks the rest where the client is built.
+pub fn check_proxy_url(proxy: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(proxy).context("invalid proxy URL")?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h"),
+        "unsupported proxy scheme"
+    );
+    ensure!(parsed.host_str().is_some(), "proxy host is missing");
+    ensure!(
+        parsed.port_or_known_default().is_some(),
+        "proxy port is missing"
+    );
+    Ok(())
+}
+
 /// Parse a proxy URL and classify its host with the same rules as a target.
 ///
 /// HTTP(S) and SOCKS5 are accepted (QD's `_proxy` supports all three). The host
@@ -2755,11 +2777,8 @@ async fn resolve_target(
 /// resolves to must be public — otherwise a template's `_proxy` would be a way
 /// around the SSRF switch. Returns the parsed URL to hand to reqwest.
 async fn classify_proxy(proxy: &str, allow_private_network: bool) -> Result<reqwest::Url> {
+    check_proxy_url(proxy)?;
     let parsed = reqwest::Url::parse(proxy).context("invalid proxy URL")?;
-    ensure!(
-        matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h"),
-        "unsupported proxy scheme"
-    );
     let host = parsed.host_str().context("proxy host is missing")?;
     let port = parsed
         .port_or_known_default()
@@ -3636,6 +3655,35 @@ mod tests {
             "cookie=session=secret authorization=Bearer secret",
             "a same-origin hop must keep it, or every login flow breaks"
         );
+    }
+
+    /// The shape check the save path can run: no DNS, so it answers only "could
+    /// this string ever be proxied through", which is the half of the question
+    /// a form submit can settle.
+    #[test]
+    fn a_proxy_address_is_checked_for_shape_without_resolving_it() {
+        for accepted in [
+            "http://proxy.example.com:8080",
+            "https://proxy.example.com:3128",
+            "socks5://proxy.example.com:1080",
+            "socks5h://proxy.example.com:1080",
+        ] {
+            check_proxy_url(accepted).unwrap_or_else(|err| panic!("{accepted}: {err:#}"));
+        }
+        for refused in [
+            "ftp://proxy.example.com:21",
+            "socks5://proxy.example.com",
+            "proxy.example.com:8080",
+        ] {
+            assert!(
+                check_proxy_url(refused).is_err(),
+                "{refused} must be refused before it is stored"
+            );
+        }
+        // `.invalid` never resolves; accepting it proves this check does not
+        // reach the network (a form submit must not depend on DNS).
+        check_proxy_url("http://does-not-resolve.invalid:8080")
+            .expect("the shape check must not resolve the host");
     }
 
     /// A template's `_proxy` is user input, so the proxy host must pass the same

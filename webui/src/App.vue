@@ -273,9 +273,12 @@ interface TaskForm {
   retryInterval: string;
   priority: string;
   timezone: string;
+  /** Proxy for this task's runs; blank means direct. Sent on every save so a
+   *  cleared field removes a stored proxy. */
+  proxy: string;
   variables: { name: string; value: string }[];
 }
-const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", variables: [] });
+const blankTaskForm = (): TaskForm => ({ id: null, name: "", cron: "", scheduleTime: "08:00:00", scheduleDays: "1", scheduleAdvanced: false, randomDelay: "", disabled: false, grp: "", templateId: null, timeoutSeconds: "", retryCount: "", retryInterval: "", priority: "", timezone: "", proxy: "", variables: [] });
 const taskForm = reactive<TaskForm>(blankTaskForm());
 const templatesForSelect = computed(() => templates.value);
 /** Result of the last "test" run in the task dialog; cleared when the dialog or
@@ -496,6 +499,10 @@ async function submitTask() {
     retry_interval_seconds: taskForm.retryInterval ? Number(taskForm.retryInterval) : null,
     priority: taskForm.priority ? Number(taskForm.priority) : null,
     timezone: taskForm.timezone || null,
+    // Always sent, and blank rather than null: the update endpoint reads a
+    // blank address as "remove the stored one", which is the only way this form
+    // can say "no proxy".
+    proxy: taskForm.proxy.trim(),
     random_delay_max_seconds: Number(taskForm.randomDelay) > 0 ? Math.floor(Number(taskForm.randomDelay)) : null,
     variables: taskForm.variables.length ? rowsToVariables(taskForm.variables) : null,
   };
@@ -551,6 +558,7 @@ function openCreateTask() {
     retryInterval: task.retry_interval_seconds != null ? String(task.retry_interval_seconds) : "",
     priority: task.priority != null ? String(task.priority) : "",
     timezone: task.timezone ?? "",
+    proxy: task.proxy ?? "",
     variables: variablesToRows(task.variables),
   });
   showCreate.value = true;
@@ -1300,9 +1308,14 @@ async function runTemplateTest() {
   testing.value = true;
   testResult.value = null;
   try {
-    const variables = Object.fromEntries(
+    const variables: Record<string, unknown> = Object.fromEntries(
       taskForm.variables.filter((row) => row.name.trim()).map((row) => [row.name.trim(), row.value])
     );
+    // The same `_proxy` a real run derives from the task's proxy field, so the
+    // test reaches what the run will reach. An explicit `_proxy` row wins, as
+    // it does at run time.
+    const proxy = taskForm.proxy.trim();
+    if (proxy && variables._proxy === undefined) variables._proxy = proxy;
     testResult.value = await api.testTemplate(taskForm.templateId, variables);
     notify(t("templateTestDone"));
   } catch (cause) {
@@ -2057,7 +2070,7 @@ const {
   page: subsPage, pages: subsTotalPages, items: pagedSubscriptions,
   prev: subsPrevPage, next: subsNextPage,
 } = usePager(() => subscriptions.value, () => subsPageSize.value, { onPageChange: () => scrollToPaged(subscriptionsAnchor) });
-const subForm = reactive<{ name: string; url: string }>({ name: "", url: "" });
+const subForm = reactive<{ name: string; url: string; proxy: string }>({ name: "", url: "", proxy: "" });
 /** Add/edit dialog state: a null edit target means "create". */
 const showSubModal = ref(false);
 const subEditing = ref<TemplateSubscription | null>(null);
@@ -2068,7 +2081,7 @@ async function loadSubscriptions() {
 }
 function openSubModal(sub?: TemplateSubscription) {
   subEditing.value = sub ?? null;
-  Object.assign(subForm, { name: sub?.name ?? "", url: sub?.url ?? "" });
+  Object.assign(subForm, { name: sub?.name ?? "", url: sub?.url ?? "", proxy: sub?.proxy ?? "" });
   showSubModal.value = true;
 }
 function closeSubModal() {
@@ -2078,9 +2091,9 @@ function closeSubModal() {
 async function saveSubModal() {
   try {
     if (subEditing.value) {
-      await api.updateSubscription(subEditing.value.id, { name: subForm.name, url: subForm.url });
+      await api.updateSubscription(subEditing.value.id, { name: subForm.name, url: subForm.url, proxy: subForm.proxy.trim() });
     } else {
-      await api.createSubscription(subForm.name, subForm.url);
+      await api.createSubscription(subForm.name, subForm.url, subForm.proxy.trim());
     }
     closeSubModal();
     await loadSubscriptions();
@@ -4089,6 +4102,10 @@ onUnmounted(() => window.clearInterval(refreshTimer));
         <label :title="t('timezoneHint')">{{ t('timezone') }}
           <Dropdown v-model="taskForm.timezone" :options="timezoneDropdownOptions" />
         </label>
+        <label :title="t('taskProxyHint')">{{ t('proxy') }}
+          <input v-model="taskForm.proxy" placeholder="http://127.0.0.1:8080" />
+        </label>
+        <small class="kv-hint">{{ t('taskProxyHint') }}</small>
         <label class="kv-label">{{ t('variables') }}
           <span class="kv-rows">
             <span v-for="(row, i) in taskForm.variables" :key="i" class="kv-row">
@@ -4170,6 +4187,8 @@ onUnmounted(() => window.clearInterval(refreshTimer));
           <div class="har-meta">
             <label>{{ t('subName') }}<input v-model="subForm.name" required /></label>
             <label>{{ t('subUrl') }}<input v-model="subForm.url" required type="url" placeholder="https://github.com/qd-today/templates" /></label>
+            <label class="field-full" :title="t('subProxyHint')">{{ t('proxy') }}<input v-model="subForm.proxy" placeholder="http://127.0.0.1:8080" /></label>
+            <small class="kv-hint field-full">{{ t('subProxyHint') }}</small>
           </div>
           <div class="modal-actions">
             <button class="secondary-button" type="button" @click="closeSubModal">{{ t('close') }}</button>

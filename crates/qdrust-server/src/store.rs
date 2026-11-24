@@ -1017,10 +1017,11 @@ macro_rules! define_store {
             input.timezone.as_deref(),
         )?;
         let now = Utc::now().timestamp();
+        let proxy = normalize_proxy(input.proxy)?;
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp, timeout_seconds, retry_count, retry_interval_seconds, priority, timezone, random_delay_max_seconds, variables)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks(name, cron, method, url, headers, body, disabled, created_at, updated_at, owner_id, template_id, grp, timeout_seconds, retry_count, retry_interval_seconds, priority, timezone, random_delay_max_seconds, variables, proxy)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(input.name)
         .bind(input.cron)
@@ -1041,6 +1042,7 @@ macro_rules! define_store {
         .bind(input.timezone.as_deref())
         .bind(input.random_delay_max_seconds.unwrap_or(0))
         .bind(input.variables.map(|v| v.to_string()))
+        .bind(proxy)
         .execute(&mut *conn)
         .await?;
         let id = self.last_insert_id(&mut conn).await?;
@@ -1162,8 +1164,15 @@ macro_rules! define_store {
             Some(grp) => grp,
             None => current.grp,
         };
+        // Absent keeps the stored proxy, a present-but-blank address removes it:
+        // the edit form always sends the field, so it has to be able to say
+        // "none" — the same rule `timezone` follows.
+        let proxy = match input.proxy {
+            Some(proxy) => normalize_proxy(Some(proxy))?,
+            None => current.proxy,
+        };
         sqlx::query(
-            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, timeout_seconds=?, retry_count=?, retry_interval_seconds=?, priority=?, timezone=?, random_delay_max_seconds=?, variables=?, updated_at=? WHERE id=?",
+            "UPDATE tasks SET name=?, cron=?, method=?, url=?, headers=?, body=?, disabled=?, template_id=?, grp=?, timeout_seconds=?, retry_count=?, retry_interval_seconds=?, priority=?, timezone=?, random_delay_max_seconds=?, variables=?, proxy=?, updated_at=? WHERE id=?",
         )
         .bind(name)
         .bind(cron)
@@ -1184,6 +1193,7 @@ macro_rules! define_store {
             merge_optional(input.variables, current.variables)
                 .map(|v| v.to_string()),
         )
+        .bind(proxy)
         .bind(Utc::now().timestamp())
         .bind(id)
         .execute(&self.pool)
@@ -3570,14 +3580,16 @@ macro_rules! define_store {
             url.starts_with("https://") || url.starts_with("http://"),
             "subscription URL must be http(s)"
         );
+        let proxy = normalize_proxy(input.proxy)?;
         let now = Utc::now().timestamp();
         let mut conn = self.pool.acquire().await?;
         sqlx::query(
-            "INSERT INTO template_subscriptions(owner_id,name,url,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+            "INSERT INTO template_subscriptions(owner_id,name,url,proxy,enabled,created_at,updated_at) VALUES(?,?,?,?,1,?,?)",
         )
         .bind(owner_id)
         .bind(&name)
         .bind(&url)
+        .bind(&proxy)
         .bind(now)
         .bind(now)
         .execute(&mut *conn)
@@ -3627,11 +3639,16 @@ macro_rules! define_store {
             "subscription URL must be http(s)"
         );
         let enabled = input.enabled.unwrap_or(current.enabled);
+        let proxy = match input.proxy {
+            Some(proxy) => normalize_proxy(Some(proxy))?,
+            None => current.proxy,
+        };
         sqlx::query(
-            "UPDATE template_subscriptions SET name=?,url=?,enabled=?,updated_at=? WHERE id=? AND owner_id=?",
+            "UPDATE template_subscriptions SET name=?,url=?,proxy=?,enabled=?,updated_at=? WHERE id=? AND owner_id=?",
         )
         .bind(name.trim())
         .bind(url.trim())
+        .bind(&proxy)
         .bind(enabled)
         .bind(Utc::now().timestamp())
         .bind(id)
@@ -3984,9 +4001,9 @@ fn setting_from_row(row: $row) -> Result<SiteSetting> {
     })
 }
 
-const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables,(SELECT COUNT(*) FROM notification_actions WHERE notification_actions.task_id = tasks.id) AS notification_action_count FROM tasks";
+const TASK_FIELDS: &str = "SELECT id,name,cron,method,url,headers,body,disabled,created_at,updated_at,last_run_at,last_status,last_error,template_id,grp,timeout_seconds,retry_count,retry_interval_seconds,priority,timezone,random_delay_max_seconds,variables,proxy,(SELECT COUNT(*) FROM notification_actions WHERE notification_actions.task_id = tasks.id) AS notification_action_count FROM tasks";
 const TEMPLATE_FIELDS: &str = "SELECT id,name,description,schema_version,definition,source_format,source,created_at,updated_at,grp,(SELECT COUNT(*) FROM tasks WHERE tasks.template_id = templates.id) AS task_count FROM templates";
-const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,enabled,created_at,updated_at FROM template_subscriptions";
+const SUBSCRIPTION_FIELDS: &str = "SELECT id,owner_id,name,url,proxy,enabled,created_at,updated_at FROM template_subscriptions";
 // `trigger` is a MySQL reserved word, hence the backticks (SQLite tolerates
 // them as well). Every other reference to this column in the file must be
 // quoted the same way or MySQL deployments fail with a 1064 syntax error.
@@ -4100,6 +4117,7 @@ fn task_from_row(row: $row) -> Result<Task> {
         priority: row.try_get("priority")?,
         timezone: row.try_get("timezone")?,
         random_delay_max_seconds: row.try_get("random_delay_max_seconds")?,
+        proxy: row.try_get("proxy")?,
         notification_action_count: row.try_get("notification_action_count")?,
         variables: variables
             .map(|v| serde_json::from_str(&v).context("invalid task variables in database"))
@@ -4319,6 +4337,7 @@ fn subscription_from_row(row: $row) -> Result<TemplateSubscription> {
         owner_id: row.try_get("owner_id")?,
         name: row.try_get("name")?,
         url: row.try_get("url")?,
+        proxy: row.try_get("proxy")?,
         enabled: row.try_get("enabled")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -4639,6 +4658,26 @@ fn blank_to_none(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+/// A proxy address as it will be stored: trimmed, blank collapsed to none, and
+/// checked for the shape a connection needs.
+///
+/// The shape check runs here — at save time, on both the create and the update
+/// path — because a typo would otherwise surface as a failed scheduled run
+/// hours later, attributed to the target and nowhere near the form that made
+/// it. Resolution and the private-network classification stay at the point of
+/// connection: both are facts about that moment, not about this address.
+fn normalize_proxy(proxy: Option<String>) -> Result<Option<String>> {
+    let Some(proxy) = proxy
+        .map(|proxy| proxy.trim().to_string())
+        .filter(|proxy| !proxy.is_empty())
+    else {
+        return Ok(None);
+    };
+    qdrust_core::executor::check_proxy_url(&proxy)
+        .with_context(|| format!("invalid proxy {proxy}"))?;
+    Ok(Some(proxy))
 }
 
 fn validate_notification(name: &str, kind: &str, config: &serde_json::Value) -> Result<()> {
@@ -5101,6 +5140,7 @@ mod tests {
 
     fn input(name: &str) -> CreateTask {
         CreateTask {
+            proxy: None,
             name: name.into(),
             cron: "0 * * * * * *".into(),
             method: Some("GET".into()),
@@ -5339,6 +5379,7 @@ mod tests {
             .update(
                 created.id,
                 UpdateTask {
+                    proxy: None,
                     name: Some("renamed".into()),
                     cron: None,
                     method: None,
@@ -5479,6 +5520,7 @@ mod tests {
                     task.id,
                     bob.id,
                     UpdateTask {
+                        proxy: None,
                         name: Some("hijacked".into()),
                         cron: None,
                         method: None,
@@ -5585,6 +5627,7 @@ mod tests {
                 bob_task.id,
                 bob.id,
                 UpdateTask {
+                    proxy: None,
                     name: None,
                     cron: None,
                     method: None,
@@ -6541,6 +6584,7 @@ mod tests {
         // entry's URL would not parse standalone (braces in the query), which is
         // exactly why a bound task skips URL validation.
         let mut bound_input = CreateTask {
+            proxy: None,
             name: "bound".into(),
             cron: "0 0 8 * * * *".into(),
             method: None,
@@ -6577,6 +6621,7 @@ mod tests {
             .update(
                 bound.id,
                 UpdateTask {
+                    proxy: None,
                     name: None,
                     cron: None,
                     method: None,
@@ -7217,6 +7262,7 @@ mod tests {
         let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
         let task = store
             .create(CreateTask {
+                proxy: None,
                 name: "masked".into(),
                 cron: "0/5 * * * * * *".into(),
                 method: None,
@@ -7274,6 +7320,7 @@ mod tests {
         let store = Store::connect("sqlite::memory:", 1, 4).await.unwrap();
         let task = store
             .create(CreateTask {
+                proxy: None,
                 name: "retry".into(),
                 cron: "0/5 * * * * * *".into(),
                 method: None,
@@ -7345,6 +7392,7 @@ mod tests {
             .create_for_owner(
                 owner,
                 CreateTask {
+                    proxy: None,
                     name: name.into(),
                     cron: "0/5 * * * * * *".into(),
                     method: None,
@@ -7443,6 +7491,7 @@ mod tests {
             let store = Store::connect(&url, 1, 2).await.unwrap();
             let task = store
                 .create(CreateTask {
+                    proxy: None,
                     name: "doomed".into(),
                     cron: "0/5 * * * * * *".into(),
                     method: None,
@@ -7559,6 +7608,7 @@ mod tests {
         let store = Store::connect("sqlite::memory:", 1, 4).await.unwrap();
         let task = store
             .create(CreateTask {
+                proxy: None,
                 name: "lease".into(),
                 cron: "0/5 * * * * * *".into(),
                 method: None,
@@ -7669,6 +7719,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_proxy_is_stored_trimmed_and_cleared_by_a_blank_address() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let mut request = input("proxied");
+        request.proxy = Some("  http://proxy.test:8080  ".into());
+        let task = store.create(request).await.unwrap();
+        assert_eq!(
+            task.proxy.as_deref(),
+            Some("http://proxy.test:8080"),
+            "the address is stored as the form meant it, not as it was typed"
+        );
+
+        // Omitted: untouched. Blank: removed. The edit form always sends the
+        // field, so those are the two statements it has to be able to make.
+        let kept = store
+            .update(task.id, UpdateTask::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.proxy.as_deref(), Some("http://proxy.test:8080"));
+        let cleared = store
+            .update(
+                task.id,
+                UpdateTask {
+                    proxy: Some("   ".into()),
+                    ..UpdateTask::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.proxy.is_none(), "a blank address must clear it");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_could_never_be_dialled_is_refused_when_it_is_saved() {
+        // Caught here rather than at the first run: that one is a scheduled
+        // failure hours later, blamed on the target and nowhere near the form.
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        for refused in ["proxy.test:8080", "ftp://proxy.test:21"] {
+            let mut request = input("bad proxy");
+            request.proxy = Some(refused.into());
+            let error = store.create(request).await.unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("invalid proxy") || error.contains("unsupported proxy scheme"),
+                "{refused} must be refused: {error}"
+            );
+        }
+        // And nothing was written on the way to refusing it.
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_subscription_proxy_is_stored_and_can_be_cleared() {
+        let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
+        let user = store
+            .create_user("sub_proxy_owner", "$argon2id$test", "user")
+            .await
+            .unwrap();
+        let created = store
+            .create_subscription(
+                user.id,
+                CreateTemplateSubscription {
+                    name: "mirrored".into(),
+                    url: "https://github.com/qd-today/templates".into(),
+                    proxy: Some("socks5://127.0.0.1:1080".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+
+        let cleared = store
+            .update_subscription(
+                created.id,
+                user.id,
+                UpdateTemplateSubscription {
+                    name: None,
+                    url: None,
+                    enabled: None,
+                    proxy: Some(String::new()),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.proxy.is_none());
+        // A refused address never reaches the row either.
+        let error = store
+            .update_subscription(
+                created.id,
+                user.id,
+                UpdateTemplateSubscription {
+                    name: None,
+                    url: None,
+                    enabled: None,
+                    proxy: Some("ftp://proxy.test:21".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported proxy scheme"));
+    }
+
+    #[tokio::test]
     async fn subscriptions_crud_and_import_provenance() {
         let store = Store::connect("sqlite::memory:", 1, 1).await.unwrap();
         let user = store
@@ -7679,6 +7834,7 @@ mod tests {
             .create_subscription(
                 user.id,
                 CreateTemplateSubscription {
+                    proxy: None,
                     name: "qd-templates".into(),
                     url: "https://github.com/qd-today/templates".into(),
                 },
@@ -7710,6 +7866,7 @@ mod tests {
                 created.id,
                 user.id,
                 UpdateTemplateSubscription {
+                    proxy: None,
                     name: Some("renamed".into()),
                     url: None,
                     enabled: Some(false),
@@ -7899,6 +8056,7 @@ mod tests {
             .create_for_owner(
                 user.id,
                 CreateTask {
+                    proxy: None,
                     name: "backup task".into(),
                     cron: "0 * * * * * *".into(),
                     method: Some("GET".into()),
@@ -8064,6 +8222,7 @@ mod tests {
                 .create_subscription(
                     user,
                     CreateTemplateSubscription {
+                        proxy: None,
                         name: format!("{label} feed"),
                         url: format!("https://example.invalid/{label}.json"),
                     },
@@ -8445,6 +8604,7 @@ mod tests {
                 .create_subscription(
                     user,
                     CreateTemplateSubscription {
+                        proxy: None,
                         name: format!("feed {user}"),
                         url: format!("https://example.invalid/{user}.json"),
                     },
@@ -8816,6 +8976,7 @@ mod tests {
             .create_subscription(
                 alice.id,
                 CreateTemplateSubscription {
+                    proxy: None,
                     name: "feed".into(),
                     url: "https://example.invalid/feed.json".into(),
                 },

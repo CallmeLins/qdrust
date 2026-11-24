@@ -38,11 +38,22 @@ pub struct OutboundHttp {
     /// `RequestBuilder::timeout`. Same value the bare client carried, so a
     /// path that never opted into a different timeout keeps its pace.
     timeout: Duration,
+    /// The proxy this handle's requests go through, when its caller named one:
+    /// a task names one for its runs, a subscription for its library reads.
+    ///
+    /// Carried on the handle rather than read from the settings because it is
+    /// the caller's, not the deployment's — and because two callers have to be
+    /// able to reach the network differently in the same second.
+    proxy: Option<String>,
 }
 
 impl OutboundHttp {
     pub fn new(settings: Arc<RwLock<RuntimeSettings>>, timeout: Duration) -> Self {
-        Self { settings, timeout }
+        Self {
+            settings,
+            timeout,
+            proxy: None,
+        }
     }
 
     /// A client for code with no settings to read: the `router()` convenience
@@ -50,6 +61,30 @@ impl OutboundHttp {
     /// off — which is also what a fresh [`RuntimeSettings`] holds.
     pub fn standalone() -> Self {
         Self::new(crate::api::runtime_settings(), Duration::from_secs(30))
+    }
+
+    /// The same posture, with this handle's requests dialled through `proxy`.
+    ///
+    /// The address is checked when it passes the guard, not here: whether it
+    /// resolves and whether it is on a private network are both facts about the
+    /// moment of the connection, and the refusal has to name the request it
+    /// belongs to. A blank address means "none", the same as an empty `_proxy`.
+    pub fn with_proxy(&self, proxy: Option<String>) -> Self {
+        Self {
+            settings: Arc::clone(&self.settings),
+            timeout: self.timeout,
+            proxy: proxy
+                .map(|proxy| proxy.trim().to_string())
+                .filter(|proxy| !proxy.is_empty()),
+        }
+    }
+
+    /// The proxy this handle dials through, if any.
+    ///
+    /// Public because the library cache keys on it: the same source read
+    /// through two proxies is two different answers.
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
     }
 
     /// The posture for one request, read as the settings are now.
@@ -64,9 +99,10 @@ impl OutboundHttp {
             timeout: self.timeout,
             allow_private_network: settings.allow_private_network,
             allow_invalid_certificates: settings.allow_invalid_certificates,
-            // The server has no per-request proxy; the environment is left to
-            // reqwest, which is what the bare client did too.
-            proxy: None,
+            // `None` leaves the proxy to reqwest's environment detection, which
+            // is what the bare client did and what a deployment that sets
+            // `HTTPS_PROXY` expects.
+            proxy: self.proxy.clone(),
         }
     }
 
@@ -253,6 +289,52 @@ mod tests {
         assert!(!policy.allow_private_network);
         assert!(!policy.allow_invalid_certificates);
         assert!(policy.proxy.is_none());
+    }
+
+    #[test]
+    fn a_handles_proxy_is_the_callers_and_a_blank_one_is_none() {
+        // The precedence the form relies on: the field is trimmed, and blank
+        // means "no proxy" rather than "a proxy with an empty address".
+        let outbound = OutboundHttp::standalone();
+        assert!(outbound.proxy().is_none());
+        for blank in ["", "   "] {
+            let handle = outbound.with_proxy(Some(blank.to_string()));
+            assert!(handle.proxy().is_none(), "{blank:?} must mean no proxy");
+        }
+        let handle = outbound.with_proxy(Some("  http://proxy.test:8080 ".into()));
+        assert_eq!(handle.proxy(), Some("http://proxy.test:8080"));
+        // Derived handles share the settings, so a caller that clones one for
+        // its proxy does not get a frozen copy of the admin's switches.
+        let settings = settings();
+        let shared = OutboundHttp::new(settings.clone(), Duration::from_secs(5))
+            .with_proxy(Some("http://proxy.test:8080".into()));
+        assert!(!shared.policy().allow_private_network);
+        settings.write().unwrap().allow_private_network = true;
+        assert!(shared.policy().allow_private_network);
+    }
+
+    #[tokio::test]
+    async fn a_handle_that_names_a_proxy_builds_the_client_through_it() {
+        // The failure can only come from the proxy — the target is a loopback
+        // address the settings below allow — so this is what proves the handle
+        // reaches the one place a client is built.
+        let settings = settings();
+        settings.write().unwrap().allow_private_network = true;
+        let outbound = OutboundHttp::new(settings, Duration::from_secs(5));
+        let url = loopback_url();
+        let error = outbound
+            .with_proxy(Some("ftp://127.0.0.1:21".into()))
+            .get(&url)
+            .await
+            .expect_err("a scheme nothing can be proxied through must be refused");
+        assert!(
+            format!("{error:#}").contains("unsupported proxy scheme"),
+            "{error:#}"
+        );
+        let _request = outbound
+            .get(&url)
+            .await
+            .expect("the same handle without a proxy still builds its client");
     }
 
     #[tokio::test]

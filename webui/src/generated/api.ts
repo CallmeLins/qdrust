@@ -1433,6 +1433,8 @@ export interface components {
             variables?: {
                 [key: string]: unknown;
             } | null;
+            /** @description Proxy every outbound request of this task's runs goes through, as http(s):// or socks5(h)://; blank or omitted means none. Applied as the run's _proxy, so a _proxy variable or one a template declares still wins over it */
+            proxy?: string | null;
         };
         UpdateTask: {
             name?: string | null;
@@ -1460,6 +1462,8 @@ export interface components {
             variables?: {
                 [key: string]: unknown;
             } | null;
+            /** @description Set to an address to change, a blank address to remove, omit to leave unchanged — the same rule as timezone */
+            proxy?: string | null;
         };
         Task: components["schemas"]["CreateTask"] & {
             /** Format: int64 */
@@ -1873,6 +1877,8 @@ export interface components {
             owner_id: number;
             name: string;
             url: string;
+            /** @description Proxy this source's fetches go through, or null for none */
+            proxy?: string | null;
             enabled: boolean;
             /** Format: int64 */
             created_at: number;
@@ -1882,11 +1888,15 @@ export interface components {
         CreateTemplateSubscription: {
             name: string;
             url: string;
+            /** @description Proxy for this source's fetches, as http(s):// or socks5(h)://; blank or omitted means none */
+            proxy?: string | null;
         };
         UpdateTemplateSubscription: {
             name?: string | null;
             url?: string | null;
             enabled?: boolean | null;
+            /** @description Set to an address to change, a blank address to remove, omit to leave unchanged */
+            proxy?: string | null;
         };
         LibraryEntry: {
             /** @description The entry's identity inside the source, and the local template name */

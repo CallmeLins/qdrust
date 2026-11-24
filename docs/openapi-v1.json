@@ -3068,6 +3068,13 @@
             ],
             "additionalProperties": true,
             "description": "Seed variables rendered into URLs, headers, bodies and template tasks"
+          },
+          "proxy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Proxy every outbound request of this task's runs goes through, as http(s):// or socks5(h)://; blank or omitted means none. Applied as the run's _proxy, so a _proxy variable or one a template declares still wins over it"
           }
         }
       },
@@ -3176,6 +3183,13 @@
               "null"
             ],
             "additionalProperties": true
+          },
+          "proxy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set to an address to change, a blank address to remove, omit to leave unchanged — the same rule as timezone"
           }
         }
       },
@@ -4473,6 +4487,13 @@
           "url": {
             "type": "string"
           },
+          "proxy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Proxy this source's fetches go through, or null for none"
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -4498,6 +4519,13 @@
           },
           "url": {
             "type": "string"
+          },
+          "proxy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Proxy for this source's fetches, as http(s):// or socks5(h)://; blank or omitted means none"
           }
         }
       },
@@ -4521,6 +4549,13 @@
               "boolean",
               "null"
             ]
+          },
+          "proxy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set to an address to change, a blank address to remove, omit to leave unchanged"
           }
         }
       },

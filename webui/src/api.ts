@@ -480,8 +480,8 @@ export const api = {
 
   // ---- subscriptions ----
   subscriptions: () => request<TemplateSubscription[]>("/api/v1/subscriptions"),
-  createSubscription: (name: string, url: string) => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url }) }),
-  updateSubscription: (id: number, patch: { name?: string; url?: string; enabled?: boolean }) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
+  createSubscription: (name: string, url: string, proxy?: string) => request<TemplateSubscription>("/api/v1/subscriptions", { method: "POST", body: JSON.stringify({ name, url, proxy: proxy ?? null }) }),
+  updateSubscription: (id: number, patch: { name?: string; url?: string; enabled?: boolean; proxy?: string }) => request<TemplateSubscription>(`/api/v1/subscriptions/${id}`, { method: "PUT", body: JSON.stringify(patch) }),
   deleteSubscription: (id: number) => request<void>(`/api/v1/subscriptions/${id}`, { method: "DELETE" }),
   /** Catalogue a subscription source: what it offers, what is already imported,
    *  and what has moved on upstream. */

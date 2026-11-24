@@ -135,9 +135,19 @@ pub struct CreateTask {
     /// Seed variables rendered into URLs, headers, bodies and template tasks.
     #[serde(default)]
     pub variables: Option<serde_json::Value>,
+    /// Proxy every outbound request of this task's runs goes through, as
+    /// `http(s)://` or `socks5(h)://`. Blank or omitted means none.
+    ///
+    /// It is applied as the run's `_proxy`, so a template (or the task's own
+    /// variables) naming `_proxy` still wins over it — the field is a default
+    /// for the run, not a lock on it.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// Every field optional: omitted means "leave it alone". `Default` is only
+/// there so a test can state the one field it is about.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct UpdateTask {
     pub name: Option<String>,
     pub cron: Option<String>,
@@ -155,6 +165,9 @@ pub struct UpdateTask {
     pub timezone: Option<Option<String>>,
     pub random_delay_max_seconds: Option<Option<i64>>,
     pub variables: Option<Option<serde_json::Value>>,
+    /// Proxy for this task's runs. Omit to leave it as it is, send a blank
+    /// address to remove it — the same "empty means none" rule the form uses.
+    pub proxy: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -187,6 +200,10 @@ pub struct Task {
     pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub random_delay_max_seconds: Option<i64>,
+    /// The proxy this task's runs go through, if any. Present only when set, so
+    /// the form can tell "none" from "not loaded".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
     /// How many notification bindings this task has right now. Derived on read
     /// (see `TASK_FIELDS`) so the task list can show whether a task notifies at
     /// all without fetching every binding; 0 means "no notification".
@@ -340,6 +357,9 @@ pub struct TemplateSubscription {
     pub owner_id: i64,
     pub name: String,
     pub url: String,
+    /// Proxy this source's fetches go through, if any. `null` is "none", which
+    /// is also what a source created before this field existed holds.
+    pub proxy: Option<String>,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -349,6 +369,10 @@ pub struct TemplateSubscription {
 pub struct CreateTemplateSubscription {
     pub name: String,
     pub url: String,
+    /// Proxy for this source's fetches, as `http(s)://` or `socks5(h)://`.
+    /// Blank or omitted means none.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -356,6 +380,8 @@ pub struct UpdateTemplateSubscription {
     pub name: Option<String>,
     pub url: Option<String>,
     pub enabled: Option<bool>,
+    /// Omit to leave it as it is, send a blank address to remove it.
+    pub proxy: Option<String>,
 }
 
 /// One template offered by a subscription source, as seen by the library

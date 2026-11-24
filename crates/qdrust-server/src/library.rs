@@ -105,18 +105,31 @@ impl CatalogueCache {
         url: &str,
         max_age: Duration,
     ) -> Result<(Catalogue, bool)> {
-        self.catalogue_via(url, max_age, || catalogue(outbound, url))
+        // The proxy belongs to the identity: a source reached through a proxy is
+        // a different read from the same source reached directly, and a caller
+        // whose proxy is the only way to reach it must not be answered with
+        // another caller's failure — or handed another proxy's content.
+        let key = match outbound.proxy() {
+            None => url.to_string(),
+            Some(proxy) => format!("{url}\n{proxy}"),
+        };
+        self.catalogue_via(&key, url, max_age, || catalogue(outbound, url))
             .await
     }
 
     /// The cache policy, kept apart from where a catalogue comes from so the
     /// fallback below can be exercised without a live source.
     ///
+    /// `key` is what the entry is stored under (see [`Self::catalogue`]) and
+    /// `url` is only what a warning names — the key can carry a proxy address,
+    /// which is not something to write to a log.
+    ///
     /// `max_age` doubles as "may this read be answered from a copy the reader
     /// has already seen". Zero is the refresh path: the reader asked for the
     /// current state, so it either reaches the source or says why it could not.
     async fn catalogue_via<F, Fut>(
         &self,
+        key: &str,
         url: &str,
         max_age: Duration,
         fetch: F,
@@ -128,7 +141,7 @@ impl CatalogueCache {
         let cacheable = !max_age.is_zero();
         if cacheable {
             let entries = self.entries.lock().await;
-            if let Some(hit) = entries.get(url)
+            if let Some(hit) = entries.get(key)
                 && hit.fetched_at.elapsed() < max_age
             {
                 return Ok((hit.catalogue.clone(), true));
@@ -146,7 +159,7 @@ impl CatalogueCache {
             // apply to a reader's refresh — see `max_age`.
             Err(err) if cacheable => {
                 let entries = self.entries.lock().await;
-                let Some(hit) = entries.get(url) else {
+                let Some(hit) = entries.get(key) else {
                     return Err(err);
                 };
                 tracing::warn!(
@@ -161,7 +174,7 @@ impl CatalogueCache {
         let mut entries = self.entries.lock().await;
         entries.retain(|_, hit| hit.fetched_at.elapsed() < CATALOGUE_TTL);
         entries.insert(
-            url.to_string(),
+            key.to_string(),
             CachedCatalogue {
                 fetched_at: Instant::now(),
                 catalogue: fetched.clone(),
@@ -350,6 +363,9 @@ pub async fn browse(
     outbound: &OutboundHttp,
     subscription: &TemplateSubscription,
 ) -> Result<TemplateLibrary> {
+    // A source that can only be reached through a proxy is the whole reason the
+    // subscription carries one: every read below dials through it.
+    let outbound = &outbound.with_proxy(subscription.proxy.clone());
     let catalogue = catalogue(outbound, &subscription.url).await?;
     let installed = installed_index(store.list_template_imports(subscription.id).await?);
     let entries = catalogue
@@ -375,6 +391,7 @@ pub async fn import_selected(
     names: &[String],
 ) -> Result<LibraryImportResult> {
     ensure!(!names.is_empty(), "no templates selected");
+    let outbound = &outbound.with_proxy(subscription.proxy.clone());
     let catalogue = catalogue(outbound, &subscription.url).await?;
     let index = catalogue.by_name();
     let linked = installed_index(store.list_template_imports(subscription.id).await?);
@@ -468,6 +485,7 @@ pub async fn preview(
     subscription: &TemplateSubscription,
     name: &str,
 ) -> Result<LibraryPreview> {
+    let outbound = &outbound.with_proxy(subscription.proxy.clone());
     let (catalogue, _) = cache
         .catalogue(outbound, &subscription.url, CATALOGUE_TTL)
         .await?;
@@ -507,6 +525,7 @@ pub async fn apply(
     input: ApplyLibraryTemplate,
 ) -> Result<LibraryImportOutcome> {
     ensure!(!input.name.trim().is_empty(), "the template needs a name");
+    let outbound = &outbound.with_proxy(subscription.proxy.clone());
     let (catalogue, _) = cache
         .catalogue(outbound, &subscription.url, CATALOGUE_TTL)
         .await?;
@@ -550,11 +569,12 @@ pub async fn overview(
     } else {
         CATALOGUE_TTL
     };
-    let catalogues = futures::future::join_all(
-        subscriptions
-            .iter()
-            .map(|subscription| cache.catalogue(outbound, &subscription.url, max_age)),
-    )
+    let catalogues = futures::future::join_all(subscriptions.iter().map(|subscription| {
+        // Each source reads through its own proxy, so the concurrent fetches
+        // below cannot share one handle.
+        let outbound = outbound.with_proxy(subscription.proxy.clone());
+        async move { cache.catalogue(&outbound, &subscription.url, max_age).await }
+    }))
     .await;
     let mut entries = Vec::new();
     let mut sources = Vec::with_capacity(subscriptions.len());
@@ -1485,6 +1505,18 @@ mod tests {
             .await
             .unwrap();
         assert!(cached, "the second read must reuse the first");
+        // The proxy is part of what a cached read is keyed on: the same source
+        // through another proxy is another read, and answering it with the
+        // direct one would hide the reason its own read failed.
+        let (_, cached) = cache
+            .catalogue(
+                &outbound.with_proxy(Some("http://proxy.test:8080".into())),
+                url,
+                CATALOGUE_TTL,
+            )
+            .await
+            .unwrap();
+        assert!(!cached, "a proxied read must not reuse the direct one");
         let (_, cached) = cache
             .catalogue(&outbound, url, Duration::ZERO)
             .await
@@ -1518,7 +1550,7 @@ mod tests {
         );
 
         let (catalogue, cached) = cache
-            .catalogue_via(url, CATALOGUE_TTL, || async {
+            .catalogue_via(url, url, CATALOGUE_TTL, || async {
                 anyhow::bail!("connection closed")
             })
             .await
@@ -1530,7 +1562,7 @@ mod tests {
         // failure, because silently serving the old copy would make the button
         // look like it worked.
         let error = match cache
-            .catalogue_via(url, Duration::ZERO, || async {
+            .catalogue_via(url, url, Duration::ZERO, || async {
                 anyhow::bail!("connection closed")
             })
             .await
@@ -1543,7 +1575,7 @@ mod tests {
         // With nothing cached, the failure is the answer.
         assert!(
             CatalogueCache::new()
-                .catalogue_via(url, CATALOGUE_TTL, || async {
+                .catalogue_via(url, url, CATALOGUE_TTL, || async {
                     anyhow::bail!("connection closed")
                 })
                 .await
